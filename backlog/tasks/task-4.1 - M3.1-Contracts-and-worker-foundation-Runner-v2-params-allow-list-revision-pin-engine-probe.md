@@ -3,10 +3,10 @@ id: TASK-4.1
 title: >-
   M3.1: Contracts and worker foundation (Runner v2, params allow-list, revision
   pin, engine probe)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-15 22:49'
+updated_date: '2026-10-15 22:54'
 labels:
   - M3
 dependencies: []
