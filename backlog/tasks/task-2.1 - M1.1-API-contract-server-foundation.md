@@ -4,7 +4,7 @@ title: 'M1.1: API contract + server foundation'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 14:26'
+updated_date: '2026-10-15 14:37'
 labels:
   - M1
 dependencies: []
@@ -21,9 +21,9 @@ Plan steps A1, A2, B1, B2 of TASK-2: Pydantic API schemas + typed httpx client (
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Schemas in minion-common used by server and client; mypy strict clean
-- [ ] #2 Auth: valid/invalid/expired/revoked tokens and API keys covered by tests
-- [ ] #3 URI validation rejects other buckets, bad prefixes, .. and //
-- [ ] #4 SeaweedFS fixture: presigned GET/PUT round-trip test passes
-- [ ] #5 Migration 0002 round-trips; drift test clean
+- [x] #1 Schemas in minion-common used by server and client; mypy strict clean
+- [x] #2 Auth: valid/invalid/expired/revoked tokens and API keys covered by tests
+- [x] #3 URI validation rejects other buckets, bad prefixes, .. and //
+- [x] #4 SeaweedFS fixture: presigned GET/PUT round-trip test passes
+- [x] #5 Migration 0002 round-trips; drift test clean
 <!-- AC:END -->
