@@ -1,8 +1,10 @@
 """Heartbeat (SPEC §6.2, plan D2): owner-only liveness + refreshed output URL."""
 
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from fastapi import HTTPException
 from minion_common.enums import TaskStatus
 from minion_common.schemas import HeartbeatRequest, HeartbeatResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +34,14 @@ async def heartbeat(
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
+        if await heartbeats_repo.too_soon(
+            session, acquirement_id, settings.heartbeat_min_interval_s
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "TOO_MANY_HEARTBEATS", "message": "heartbeating too fast"},
+                headers={"Retry-After": str(max(1, math.ceil(settings.heartbeat_min_interval_s)))},
+            )
         # Reject (422), not clamp: a total above the subtask's record_count is a client bug.
         if req.progress is not None and req.progress.records_total > o.record_count:
             raise api_error(

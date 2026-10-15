@@ -4,7 +4,7 @@ import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from minion_common.enums import SubtaskStatus
+from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import SLUG_PATTERN, ModelEntry, TaskCounts, TaskCreate, TaskOut
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -160,6 +160,32 @@ async def get_task(
             raise api_error(404, "NOT_FOUND", "task not found")
     if team not in user.teams:
         raise api_error(403, "FORBIDDEN", "not a member of this team")
+    return await _get(session, team, project, task_name)
+
+
+@router.post("/{team}/{project}/{task_name}/cancel")
+async def cancel_task(
+    team: str,
+    project: str,
+    task_name: str,
+    user: Annotated[User, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> TaskOut:
+    """Lazy two-phase cancel (plan D4). Idempotent: re-cancel returns 200; a finished task 409."""
+    for part in (team, project, task_name):
+        if not _slug_ok(part):
+            raise api_error(404, "NOT_FOUND", "task not found")
+    if team not in user.teams:
+        raise api_error(403, "FORBIDDEN", "not a member of this team")
+    async with session.begin():
+        status = await tasks_repo.cancel_task(session, team, project, task_name)
+    if status is None:
+        raise api_error(404, "NOT_FOUND", "task not found")
+    if status != TaskStatus.CANCELLED:
+        raise api_error(409, "TASK_FINISHED", "task already finished")
+    # Separate transaction (D4); also heals a cancel whose second phase never ran.
+    async with session.begin():
+        await tasks_repo.cancel_pending_subtasks(session, team, project, task_name)
     return await _get(session, team, project, task_name)
 
 

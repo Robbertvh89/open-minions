@@ -29,6 +29,38 @@ async def stale_ids(session: AsyncSession, timeout_s: float, limit: int) -> list
     return list(rows.scalars())
 
 
+async def over_lease_ids(session: AsyncSession, max_lease_s: float, limit: int) -> list[uuid.UUID]:
+    """Acquirements older than the max lease, however fresh their heartbeat (unlocked scan).
+
+    The acquirement table only holds currently running work, so the scan stays small.
+    """
+    rows = await session.execute(
+        select(SubtaskAcquirement.acquirement_id)
+        .where(SubtaskAcquirement.acquired_at < _cutoff(max_lease_s))
+        .order_by(SubtaskAcquirement.acquired_at)
+        .limit(limit)
+    )
+    return list(rows.scalars())
+
+
+async def lease_expired(
+    session: AsyncSession, acquirement_id: uuid.UUID, max_lease_s: float
+) -> bool:
+    """Fresh statement after the lock, like `heartbeat_stale`."""
+    return bool(
+        (
+            await session.execute(
+                select(
+                    exists().where(
+                        SubtaskAcquirement.acquirement_id == acquirement_id,
+                        SubtaskAcquirement.acquired_at < _cutoff(max_lease_s),
+                    )
+                )
+            )
+        ).scalar_one()
+    )
+
+
 async def lock_for_reclaim(session: AsyncSession, acquirement_id: uuid.UUID) -> Owned | None:
     """Lock the acquirement; None if it is gone or an owner op / other watchdog holds the lock."""
     row = (

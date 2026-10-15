@@ -168,6 +168,7 @@ def _settings(url: str) -> ServerSettings:
         s3_secret_key=SecretStr("sk"),
         models_file=TEST_MODELS_FILE,
         splitter_poll_s=60,
+        heartbeat_min_interval_s=0,  # tests beat back-to-back; the limit has its own test
     )
 
 

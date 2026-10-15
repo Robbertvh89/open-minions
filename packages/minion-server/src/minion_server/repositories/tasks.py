@@ -7,7 +7,7 @@ from typing import Any
 
 from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import ModelEntry, TaskCreate
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -257,3 +257,76 @@ async def schedule_split_retry(session: AsyncSession, task: Task, delay_s: float
         .values(next_split_at=func.now() + timedelta(seconds=delay_s))
     )
     return bool(res.rowcount)  # type: ignore[attr-defined]
+
+
+_CANCELLABLE = (TaskStatus.SPLITTING.value, TaskStatus.PENDING.value, TaskStatus.RUNNING.value)
+
+
+async def cancel_task(
+    session: AsyncSession, team: str, project: str, task_name: str
+) -> TaskStatus | None:
+    """Txn 1 of cancel (plan D4): flip the task to CANCELLED; return its resulting status.
+
+    Returns CANCELLED both when this call cancelled it and when it already was (idempotent),
+    another terminal status if the task already finished, None if it does not exist. Only the
+    task row is locked here; subtasks are cancelled in a second transaction because acquire locks
+    subtask -> task and holding both orders would deadlock.
+    """
+    key = (Task.team == team, Task.project == project, Task.task_name == task_name)
+    cancelled = (
+        await session.execute(
+            update(Task)
+            .where(*key, Task.status.in_(_CANCELLABLE))
+            .values(status=TaskStatus.CANCELLED.value, finished_at=func.now(), next_split_at=None)
+            .returning(Task.task_name)
+        )
+    ).first()
+    if cancelled is not None:
+        return TaskStatus.CANCELLED
+    current = (await session.execute(select(Task.status).where(*key))).scalar_one_or_none()
+    return None if current is None else TaskStatus(current)
+
+
+async def cancel_pending_subtasks(
+    session: AsyncSession, team: str, project: str, task_name: str
+) -> int:
+    """Txn 2 of cancel: PENDING -> CANCELLED; RUNNING keep their owner."""
+    result = await session.execute(
+        update(Subtask)
+        .where(
+            Subtask.team == team,
+            Subtask.project == project,
+            Subtask.task_name == task_name,
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+    )
+    return int(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def sweep_cancelled(session: AsyncSession, window_s: float = 3600) -> int:
+    """Heal PENDING subtasks left under tasks cancelled in the last `window_s` seconds.
+
+    A requeue that read the task status just before cancel committed can leave one behind. They
+    are never acquired (the acquire filter requires a PENDING/RUNNING task); this keeps the counts
+    consistent. Locks subtask rows only, so it cannot deadlock with acquire (subtask -> task).
+    """
+    recent = (
+        select(Task.team, Task.project, Task.task_name)
+        .where(
+            Task.status == TaskStatus.CANCELLED.value,
+            Task.finished_at > func.now() - func.make_interval(0, 0, 0, 0, 0, 0, window_s),
+        )
+        .subquery()
+    )
+    result = await session.execute(
+        update(Subtask)
+        .where(
+            Subtask.status == SubtaskStatus.PENDING.value,
+            tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
+                select(recent.c.team, recent.c.project, recent.c.task_name)
+            ),
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+    )
+    return int(result.rowcount)  # type: ignore[attr-defined]
