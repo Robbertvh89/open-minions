@@ -7,7 +7,7 @@ from typing import Any
 
 from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import ModelEntry, TaskCreate
-from sqlalchemy import func, or_, select, tuple_, update
+from sqlalchemy import Select, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -287,16 +287,40 @@ async def cancel_task(
     return None if current is None else TaskStatus(current)
 
 
+CANCEL_BATCH = 10_000
+
+
+def _pending_of(team: str, project: str, task_name: str) -> Select[Any]:
+    return (
+        select(Subtask.subtask_id)
+        .where(
+            Subtask.team == team,
+            Subtask.project == project,
+            Subtask.task_name == task_name,
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .order_by(Subtask.subtask_id)
+        .limit(CANCEL_BATCH)
+        .with_for_update(skip_locked=True)
+    )
+
+
 async def cancel_pending_subtasks(
     session: AsyncSession, team: str, project: str, task_name: str
 ) -> int:
-    """Txn 2 of cancel: PENDING -> CANCELLED; RUNNING keep their owner."""
+    """Txn 2 of cancel: one batch (<= CANCEL_BATCH rows) PENDING -> CANCELLED; RUNNING keep owner.
+
+    The caller loops (one transaction per call) until this returns 0 so no single transaction
+    holds an unbounded number of row locks.
+    """
+    ids = _pending_of(team, project, task_name).scalar_subquery()
     result = await session.execute(
         update(Subtask)
         .where(
             Subtask.team == team,
             Subtask.project == project,
             Subtask.task_name == task_name,
+            Subtask.subtask_id.in_(ids),
             Subtask.status == SubtaskStatus.PENDING.value,
         )
         .values(status=SubtaskStatus.CANCELLED.value)
@@ -308,8 +332,9 @@ async def sweep_cancelled(session: AsyncSession, window_s: float = 3600) -> int:
     """Heal PENDING subtasks left under tasks cancelled in the last `window_s` seconds.
 
     A requeue that read the task status just before cancel committed can leave one behind. They
-    are never acquired (the acquire filter requires a PENDING/RUNNING task); this keeps the counts
-    consistent. Locks subtask rows only, so it cannot deadlock with acquire (subtask -> task).
+    are never acquired (candidates and `try_acquire` both require a PENDING/RUNNING task); this
+    keeps the counts consistent. Locks subtask rows only, so it cannot deadlock with acquire
+    (subtask -> task). Stragglers older than the window are healed only by re-cancelling.
     """
     recent = (
         select(Task.team, Task.project, Task.task_name)

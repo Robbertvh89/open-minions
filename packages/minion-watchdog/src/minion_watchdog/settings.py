@@ -19,6 +19,7 @@ class WatchdogSettings(BaseSettings):
     watchdog_interval_s: float = Field(default=60.0, gt=0)
     watchdog_batch_size: int = Field(default=500, ge=1)
     cancel_sweep_window_s: float = Field(default=3600.0, gt=0)  # how far back to heal cancels
+    db_command_timeout_s: float = Field(default=30.0, gt=0)  # per-statement client timeout
     watchdog_max_backoff_s: float = Field(default=300.0, gt=0)  # cap after repeated DB errors
 
     @model_validator(mode="after")

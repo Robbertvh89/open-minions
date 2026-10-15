@@ -11,13 +11,20 @@ import signal
 
 import structlog
 from minion_server.db.session import create_engine, create_sessionmaker
-from minion_server.services.reclaim import reclaim_stale, sweep_cancelled
+from minion_server.services.reclaim import ReclaimResult, reclaim_stale, sweep_cancelled
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_watchdog.settings import WatchdogSettings
 
 log = structlog.get_logger()
 
+_EXPIRED = frozenset(
+    {
+        ReclaimResult.EXPIRED_REQUEUED,
+        ReclaimResult.EXPIRED_FAILED,
+        ReclaimResult.EXPIRED_CANCELLED,
+    }
+)
 MAX_ROUNDS_PER_TICK = 100  # bound one tick when a mass outage leaves more than a batch stale
 
 
@@ -39,7 +46,8 @@ async def tick(
         )
         if results:
             log.info("watchdog_reclaim", **{k.value: v for k, v in results.items()})
-        if sum(results.values()) < cfg.watchdog_batch_size or stop.is_set():
+        expired = sum(n for r, n in results.items() if r in _EXPIRED)
+        if expired < cfg.watchdog_batch_size or stop.is_set():
             break
     await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)
 
@@ -49,6 +57,30 @@ async def _sleep(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=seconds)
 
 
+async def _tick_or_stop(
+    sm: async_sessionmaker[AsyncSession], cfg: WatchdogSettings, stop: asyncio.Event
+) -> bool:
+    """Run one tick, abandoning it as soon as `stop` is set. False if it was abandoned.
+
+    Cancelling mid-tick is safe: every reclaim/sweep step is its own short transaction, which
+    rolls back on cancellation.
+    """
+    work = asyncio.create_task(tick(sm, cfg, stop))
+    waiter = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+        if not work.done():
+            work.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await work
+    if not work.done() or work.cancelled():
+        return False
+    work.result()  # re-raise a tick error
+    return True
+
+
 async def run_watchdog(
     sm: async_sessionmaker[AsyncSession], cfg: WatchdogSettings, stop: asyncio.Event
 ) -> None:
@@ -56,7 +88,8 @@ async def run_watchdog(
     failures = 0
     while not stop.is_set():
         try:
-            await tick(sm, cfg, stop)
+            if not await _tick_or_stop(sm, cfg, stop):
+                break
             failures = 0
         except asyncio.CancelledError:
             raise
@@ -86,7 +119,12 @@ def configure_logging() -> None:
 
 async def _amain() -> None:
     cfg = WatchdogSettings()
-    engine = create_engine(cfg.database_url, pool_size=cfg.db_pool_size, max_overflow=0)
+    engine = create_engine(
+        cfg.database_url,
+        pool_size=cfg.db_pool_size,
+        max_overflow=0,
+        connect_args={"command_timeout": cfg.db_command_timeout_s},
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

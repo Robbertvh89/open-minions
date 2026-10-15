@@ -184,8 +184,11 @@ async def cancel_task(
     if status != TaskStatus.CANCELLED:
         raise api_error(409, "TASK_FINISHED", "task already finished")
     # Separate transaction (D4); also heals a cancel whose second phase never ran.
-    async with session.begin():
-        await tasks_repo.cancel_pending_subtasks(session, team, project, task_name)
+    while True:  # batched: bounded row locks per transaction; also heals a re-cancel
+        async with session.begin():
+            n = await tasks_repo.cancel_pending_subtasks(session, team, project, task_name)
+        if n == 0:
+            break
     return await _get(session, team, project, task_name)
 
 

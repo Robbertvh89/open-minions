@@ -2,19 +2,26 @@
 
 import asyncio
 import hashlib
+import threading
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from minion_common.enums import Engine
+from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.app import create_app
+from minion_server.repositories import acquisition as acq_repo
+from minion_server.repositories import tasks as tasks_repo
 from minion_server.services.reclaim import (
     ReclaimResult,
     reclaim_one,
     reclaim_stale,
     sweep_cancelled,
 )
+from minion_server.services.splitter import split_one
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
@@ -168,6 +175,67 @@ async def test_cancel_splitting_task(env: tuple[AsyncClient, Any]) -> None:
     assert tuple(row) == ("CANCELLED", True)  # the splitter's fenced lease ops no longer match
 
 
+@pytest.mark.integration
+async def test_cancel_during_split(
+    env: tuple[AsyncClient, Any], s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancel while the splitter is mid-plan: it loses its lease and never overwrites CANCELLED."""
+    c, app = env
+    sm = app.state.sessionmaker
+    storage = app.state.storage
+    app.state.splitter_task.cancel()  # the test drives split_one itself
+    await asyncio.gather(app.state.splitter_task, return_exceptions=True)
+    data = b"".join(f'{{"id":"{i}"}}\n'.encode() for i in range(40))
+    s3.client.put_object(Bucket=s3.bucket, Key="inputs/acq/dur/a.jsonl", Body=data)
+    body = TaskCreate.model_validate(
+        {
+            "team": "acq",
+            "project": "p",
+            "task_name": "dur",
+            "type": "embedding",
+            "model": "fake-embed",
+            "input_uri": f"s3://{s3.bucket}/inputs/acq/dur/",
+            "output_uri": f"s3://{s3.bucket}/outputs/acq/dur/",
+            "records_per_subtask": 5,
+        }
+    )
+    model = ModelEntry(
+        model_id="fake-embed", type="embedding", engine="mlx", ref="f", memory_gb=0.1
+    )
+    async with sm() as s, s.begin():
+        assert await tasks_repo.insert_task(
+            s,
+            body,
+            model=model,
+            input_uri=body.input_uri,
+            output_uri=body.output_uri,
+            created_by="t",
+        )
+    release = threading.Event()
+    cut = len(data) * 3 // 4
+
+    def slow_iter(key: str, *, etag: str, size: int) -> Any:
+        yield data[:cut]
+        release.wait(10)  # blocks the splitter thread until the cancel has committed
+        yield data[cut:]
+
+    monkeypatch.setattr(storage, "iter_object", slow_iter)
+    split = asyncio.create_task(split_one(sm, storage, batch_size=2))
+    for _ in range(200):  # first batch(es) land while the rest of the input is "downloading"
+        n = (await _rows(sm, "SELECT count(*) FROM minion_subtask WHERE task_name='dur'"))[0][0]
+        if n >= 2:
+            break
+        await asyncio.sleep(0.05)
+    assert n >= 2
+    assert (await _cancel(c, "dur")).status_code == 200
+    release.set()
+    assert await asyncio.wait_for(split, 20) is True
+    await sweep_cancelled(sm)
+    status, _, subs = await _task_state(sm, "dur")
+    assert status == "CANCELLED" and "PENDING" not in subs and subs  # no overwrite, no stragglers
+    assert (await _rows(sm, "SELECT next_split_at IS NULL FROM minion_task"))[0][0] is True
+
+
 # --- running owners ------------------------------------------------------------------------------
 
 
@@ -271,7 +339,11 @@ async def test_sweep_heals_pending_under_cancelled_task(env: tuple[AsyncClient, 
 @pytest.mark.integration
 async def test_cancel_concurrent_with_acquires(env: tuple[AsyncClient, Any]) -> None:
     """No 5xx or deadlock. An acquire in flight when cancel commits may win (RUNNING subtask under
-    a CANCELLED task, told to stop by heartbeat.cancel); everything else ends CANCELLED."""
+    a CANCELLED task, told to stop by heartbeat.cancel); everything else ends CANCELLED.
+
+    Residual READ COMMITTED window: an acquire statement that started before the cancel commit
+    cannot see it, so it may still win. That is accepted and handled by heartbeat cancel=true; the
+    deterministic guarantee (no acquire starting after the commit) is the stale-candidate test."""
     c, app = env
     sm = app.state.sessionmaker
     await seed_task(sm, "cc", 20)
@@ -295,6 +367,69 @@ async def test_cancel_concurrent_with_acquires(env: tuple[AsyncClient, Any]) -> 
         assert (await _call(c, a, t, "heartbeat")).json()["cancel"] is True
         assert (await _call(c, a, t, "release")).status_code == 204
     assert (await _task_state(sm, "cc"))[2] == ["CANCELLED"] * 20
+
+
+@pytest.mark.integration
+async def test_stale_candidate_cannot_acquire_after_cancel(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm = app.state.sessionmaker
+    await seed_task(sm, "sc", 2)
+    [(ex, _)] = await make_executors(sm, 1)
+    async with sm() as s, s.begin():
+        stale = await acq_repo.candidates(
+            s,
+            engines=[Engine.MLX],
+            model_ids=["fake-embed"],
+            memory_gb=8,
+            pool="default",
+            preference=None,
+        )
+    assert len(stale) == 2
+    assert (await _cancel(c, "sc")).status_code == 200
+    for cand in stale:  # candidate list read before the cancel committed
+        async with sm() as s, s.begin():
+            assert await acq_repo.try_acquire(s, cand, ex.executor_id) is None
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
+    assert (await _task_state(sm, "sc"))[2] == ["CANCELLED"] * 2
+
+
+@pytest.mark.integration
+async def test_acquire_update_guard_rolls_back(
+    env: tuple[AsyncClient, Any],
+) -> None:
+    """If the task is cancelled between the INSERT and the subtask UPDATE, nothing is left."""
+    _, app = env
+    sm = app.state.sessionmaker
+    await seed_task(sm, "ug", 1)
+    [(ex, _)] = await make_executors(sm, 1)
+    async with sm() as s, s.begin():
+        [cand] = await acq_repo.candidates(
+            s,
+            engines=[Engine.MLX],
+            model_ids=["fake-embed"],
+            memory_gb=8,
+            pool="default",
+            preference=None,
+        )
+    async with sm() as s:
+        await s.begin()
+        # The INSERT sees PENDING (our snapshot); cancel commits via another session in between
+        # by flipping the task inside this same transaction right before try_acquire's UPDATE.
+        real_execute = s.execute
+        calls = {"n": 0}
+
+        async def execute(stmt: Any, *a: Any, **kw: Any) -> Any:
+            res = await real_execute(stmt, *a, **kw)
+            calls["n"] += 1
+            if calls["n"] == 1:  # after the INSERT won
+                await real_execute(text("UPDATE minion_task SET status='CANCELLED'"))
+            return res
+
+        s.execute = execute
+        assert await acq_repo.try_acquire(s, cand, ex.executor_id) is None
+        await s.rollback()
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
+    assert (await _task_state(sm, "ug"))[2] == ["PENDING"]
 
 
 # --- max lease -----------------------------------------------------------------------------------
@@ -323,8 +458,6 @@ async def test_max_lease_reclaims_despite_fresh_heartbeat(env: tuple[AsyncClient
     assert (await _call(c, b, tb, "heartbeat")).status_code == 200
     # Re-check under the lock: a fresh acquirement is NOT reclaimed by id either.
     async with sm() as s, s.begin():
-        import uuid
-
         r = await reclaim_one(s, uuid.UUID(b["acquirement_id"]), timeout_s=900, max_lease_s=1800)
     assert r == ReclaimResult.NOT_STALE
 
@@ -343,11 +476,18 @@ async def test_heartbeat_rate_limit(fresh_url: str, s3: S3Env, tmp_path: Path) -
         await seed_task(sm, "rl", 1)
         [(_, tok)] = await make_executors(sm, 1)
         a = await _acquire(c, tok)
-        r = await _call(c, a, tok, "heartbeat")  # acquire counts as the first beat
+        before = await _rows(sm, "SELECT last_seen_at, progress FROM minion_executor_heartbeat")
+        r = await c.post(
+            f"{BASE}/subtasks/{a['acquirement_id']}/heartbeat",
+            json={"progress": {"records_done": 1, "records_total": 2}},
+            headers=_auth(tok),
+        )  # acquire counts as the first beat
         assert r.status_code == 429
         assert r.json()["detail"]["code"] == "TOO_MANY_HEARTBEATS"
         assert int(r.headers["retry-after"]) >= 1
-        # The rejected beat must not have refreshed anything; an aged row is accepted again.
+        after = await _rows(sm, "SELECT last_seen_at, progress FROM minion_executor_heartbeat")
+        assert after == before and after[0][1] is None  # not refreshed, progress not stored
+        # An aged row is accepted again.
         await _backdate(sm, "heartbeat")
         assert (await _call(c, a, tok, "heartbeat")).status_code == 200
         assert (await _call(c, a, tok, "heartbeat")).status_code == 429

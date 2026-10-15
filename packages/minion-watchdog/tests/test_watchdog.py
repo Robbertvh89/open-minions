@@ -223,3 +223,82 @@ async def test_watchdog_process_reclaims_and_exits_on_sigterm(
     events = [json.loads(line)["event"] for line in out.splitlines() if line.startswith("{")]
     assert "watchdog_started" in events and "watchdog_stopped" in events
     assert "u:p" not in out and "token" not in out.lower()
+
+
+@pytest.mark.integration
+async def test_tick_repeats_while_batches_are_full(env: tuple[AsyncClient, Any, str]) -> None:
+    c, app, url = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "many", 5)
+    execs = await make_executors(sm, 5)
+    for _, tok in execs:
+        await _acquire(c, tok)
+    await _backdate_beats(sm)
+    cfg = _cfg(url, watchdog_batch_size=2, heartbeat_timeout_s=900)
+    await wd.tick(sm, cfg, asyncio.Event())
+    assert await _scalar(sm, EXPIRED_SQL) == 5  # 2 + 2 + 1 in one tick
+    assert await _scalar(sm, "SELECT count(*) FROM minion_subtask_acquirement") == 0
+
+
+@pytest.mark.integration
+async def test_tick_round_cap(
+    env: tuple[AsyncClient, Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, app, url = env
+    sm: Sm = app.state.sessionmaker
+    calls = {"n": 0}
+
+    async def always_full(*a: Any, **kw: Any) -> Any:
+        calls["n"] += 1
+        return {reclaim_service.ReclaimResult.EXPIRED_REQUEUED: 2}
+
+    monkeypatch.setattr(wd, "reclaim_stale", always_full)
+    monkeypatch.setattr(wd, "MAX_ROUNDS_PER_TICK", 4)
+    await wd.tick(sm, _cfg(url, watchdog_batch_size=2), asyncio.Event())
+    assert calls["n"] == 4
+
+
+@pytest.mark.integration
+async def test_non_expired_results_do_not_repeat(
+    env: tuple[AsyncClient, Any, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, app, url = env
+    sm: Sm = app.state.sessionmaker
+    calls = {"n": 0}
+
+    async def skipped(*a: Any, **kw: Any) -> Any:
+        calls["n"] += 1
+        return {reclaim_service.ReclaimResult.SKIPPED: 5}
+
+    monkeypatch.setattr(wd, "reclaim_stale", skipped)
+    await wd.tick(sm, _cfg(url, watchdog_batch_size=2), asyncio.Event())
+    assert calls["n"] == 1
+
+
+async def test_stop_interrupts_hanging_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = asyncio.Event()
+    cancelled = {"v": False}
+
+    async def hang(*a: Any, **kw: Any) -> Any:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled["v"] = True
+            raise
+
+    monkeypatch.setattr(wd, "reclaim_stale", hang)
+    stop = asyncio.Event()
+    sm: Any = None  # never used: the stub replaces every DB call
+    task = asyncio.create_task(wd.run_watchdog(sm, _cfg(), stop))
+    await asyncio.wait_for(started.wait(), 2)
+    t0 = time.monotonic()
+    stop.set()
+    await asyncio.wait_for(task, 1.0)
+    assert time.monotonic() - t0 < 0.5 and cancelled["v"]
+
+
+def test_command_timeout_setting() -> None:
+    assert _cfg().db_command_timeout_s == 30.0
+    with pytest.raises(ValidationError):
+        _cfg(db_command_timeout_s=0)
