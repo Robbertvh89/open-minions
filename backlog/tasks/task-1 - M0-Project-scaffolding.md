@@ -1,9 +1,10 @@
 ---
 id: TASK-1
 title: 'M0: Project scaffolding'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 14:02'
+updated_date: '2026-10-15 14:03'
 labels:
   - milestone
   - M0

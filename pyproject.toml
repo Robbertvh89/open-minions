@@ -1,0 +1,67 @@
+[project]
+name = "open-minions"
+version = "0.1.0"
+description = "Distributed virtual GPU cloud on idle Apple Silicon Macs (implementation of arXiv:2610.12970)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "minion-common",
+    "minion-server",
+    "minion-executor",
+    "minion-watchdog",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+minion-common = { workspace = true }
+minion-server = { workspace = true }
+minion-executor = { workspace = true }
+minion-watchdog = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "testcontainers[postgres]>=4.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "ASYNC", "RUF", "SIM", "PTH"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "S105", "S106"]
+"migrations/**" = ["N999", "E501"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/migrations"
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["packages"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "integration: needs Docker (Postgres/MinIO via testcontainers)",
+]
+addopts = "--import-mode=importlib"

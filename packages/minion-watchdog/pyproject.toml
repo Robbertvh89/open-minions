@@ -1,0 +1,20 @@
+[project]
+name = "minion-watchdog"
+version = "0.1.0"
+description = "open-minions watchdog: reclaims subtasks from executors with stale heartbeats"
+requires-python = ">=3.12"
+dependencies = [
+    "minion-common",
+    "minion-server",
+]
+
+[project.scripts]
+minion-watchdog = "minion_watchdog.main:main"
+
+[tool.uv.sources]
+minion-common = { workspace = true }
+minion-server = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"

@@ -23,7 +23,7 @@ Status: **Draft v0.2** · 2026-10-15 · Companion to [`SPEC.md`](SPEC.md)
                └──────┬───────┴──────┬───────┴──────┬───────┘
                       │ presigned GET/PUT           │
                       ▼                             ▼
-                  ┌──────────────── S3 / MinIO ────────────┐
+                  ┌──────────────── S3 / SeaweedFS─────────┐
                   │ inputs/…   outputs/…   (no traffic via │
                   │                         the server)    │
                   └────────────────────────────────────────┘
@@ -254,9 +254,11 @@ newline boundaries. Executors fetch with HTTP `Range` on a presigned GET. Avoids
 
 ## 6. Deployment
 
+Local dev uses SeaweedFS instead of MinIO (MinIO community images are no longer pullable).
+
 | Env | Topology |
 |---|---|
-| Local dev | `deploy/compose.yml`: postgres, minio, grafana, server, watchdog; executor runs natively on the Mac (needs Metal — not in Docker) |
+| Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana, server, watchdog; executor runs natively on the Mac (needs Metal — not in Docker) |
 | Prod | Managed Postgres (separate dev/prod DBs **[paper]**), S3, ≥2 server replicas, 1–2 watchdogs, Grafana. One deployment per team/org for isolation **[paper]** |
 
 Executor distribution: `uv tool install`, signed `launchd` plist, config in `~/.config/minion/executor.toml`,

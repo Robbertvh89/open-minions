@@ -1,0 +1,14 @@
+apiVersion: 1
+datasources:
+  - name: minion-postgres
+    uid: minion-postgres
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    user: minion
+    secureJsonData:
+      password: minion
+    jsonData:
+      database: minion
+      sslmode: disable
+      postgresVersion: 1600
+    isDefault: true

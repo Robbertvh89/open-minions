@@ -1,0 +1,13 @@
+[project]
+name = "minion-common"
+version = "0.1.0"
+description = "Shared schemas, enums and settings for open-minions"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"

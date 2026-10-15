@@ -214,7 +214,7 @@ The paper states 7 tables and names `minion_subtask_acquirement` and a heartbeat
 1. `minion_task` — `(team, project, task_name)` PK/unique; type, model_id (→ allow-list; engine and memory_gb snapshotted at create), input_uri, output_uri, params jsonb, status, priority, counts, created_by, timestamps.
 2. `minion_subtask` — `(team, project, task_name, subtask_id)` unique; input slice, status, attempt, max_attempts, error, output_uri, timestamps.
 3. `minion_subtask_acquirement` — **UNIQUE `(team, project, task_name, subtask_id)`** **[paper]**; `acquirement_id` uuid, executor_id, attempt, acquired_at.
-4. `minion_executor_heartbeat` — executor_id, acquirement_id, last_seen_at, progress jsonb (one row per active acquirement, upserted).
+4. `minion_executor_heartbeat` — acquirement_id (the executor is reached by joining `minion_subtask_acquirement`), last_seen_at, progress jsonb (one row per active acquirement, upserted).
 5. `minion_executor` — executor_id, token_hash, hostname, owner, chip, total_memory_gb, os_version, engines, status, **profile, budget jsonb, paused_reason**, registered_at, last_seen_at.
 6. `minion_executor_preference` — executor_id, team, project, task_name (nullable for wildcards).
 7. `minion_subtask_attempt` — history: one row per finished attempt (executor, outcome `SUCCEEDED|FAILED|EXPIRED|RELEASED|CANCELLED`, duration, error). Feeds Grafana.

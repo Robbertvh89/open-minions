@@ -1,0 +1,67 @@
+# Local development stack. The executor runs natively on macOS (needs Metal), not in Docker.
+# Server and watchdog services are added in a later milestone (ARCHITECTURE §6).
+name: open-minions
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: minion
+      POSTGRES_PASSWORD: minion
+      POSTGRES_DB: minion
+    ports:
+      - "127.0.0.1:${MINION_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U minion -d minion"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  s3:
+    # S3-compatible object store (SeaweedFS). MinIO no longer publishes community images.
+    image: chrislusf/seaweedfs:4.05
+    command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0
+    ports:
+      - "127.0.0.1:${MINION_S3_PORT:-9000}:9000"
+    volumes:
+      - s3data:/data
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9000/status || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  s3-init:
+    image: amazon/aws-cli:2.22.0
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: minion
+      AWS_SECRET_ACCESS_KEY: minion-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      aws --endpoint-url http://s3:9000 s3api head-bucket --bucket minion 2>/dev/null ||
+      aws --endpoint-url http://s3:9000 s3 mb s3://minion
+      "
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:${MINION_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  s3data:
