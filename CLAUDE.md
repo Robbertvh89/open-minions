@@ -51,6 +51,7 @@ docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
 
 ```bash
 uv sync                                   # install workspace
+cp .env.example .env                      # dev settings (database_url is required)
 docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana
 uv run alembic upgrade head               # migrate
 uv run minion-server                      # API on :8080

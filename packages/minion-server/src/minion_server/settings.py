@@ -6,6 +6,6 @@ class ServerSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="MINION_", env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql+asyncpg://minion:minion@localhost:5432/minion"
+    database_url: str  # required; see .env.example
     host: str = "127.0.0.1"
     port: int = 8080

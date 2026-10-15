@@ -48,6 +48,10 @@ def upgrade() -> None:
         ),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
+            "engines <@ ARRAY['mlx','ollama','hf']::varchar[]",
+            name=op.f("ck_minion_executor_engines_known"),
+        ),
+        sa.CheckConstraint(
             "profile IN ('light', 'balanced', 'full', 'custom')",
             name=op.f("ck_minion_executor_capacity_profile"),
         ),
@@ -100,6 +104,19 @@ def upgrade() -> None:
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint("engine IN ('mlx', 'ollama', 'hf')", name=op.f("ck_minion_task_engine")),
         sa.CheckConstraint(
+            "failed_subtasks >= 0", name=op.f("ck_minion_task_failed_subtasks_nonneg")
+        ),
+        sa.CheckConstraint("max_attempts > 0", name=op.f("ck_minion_task_max_attempts_positive")),
+        sa.CheckConstraint(
+            "records_per_subtask > 0", name=op.f("ck_minion_task_records_per_subtask_positive")
+        ),
+        sa.CheckConstraint(
+            "succeeded_subtasks >= 0", name=op.f("ck_minion_task_succeeded_subtasks_nonneg")
+        ),
+        sa.CheckConstraint(
+            "total_subtasks >= 0", name=op.f("ck_minion_task_total_subtasks_nonneg")
+        ),
+        sa.CheckConstraint(
             "status IN ('SPLITTING', 'PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'PARTIAL', 'CANCELLED')",
             name=op.f("ck_minion_task_task_status"),
         ),
@@ -142,6 +159,7 @@ def upgrade() -> None:
         sa.Column("subtask_id", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=32), server_default="PENDING", nullable=False),
         sa.Column("attempt", sa.Integer(), server_default=sa.text("0"), nullable=False),
+        sa.Column("max_attempts", sa.Integer(), server_default=sa.text("3"), nullable=False),
         sa.Column("input_object_key", sa.Text(), nullable=False),
         sa.Column("byte_start", sa.BigInteger(), nullable=False),
         sa.Column("byte_end", sa.BigInteger(), nullable=False),
@@ -160,6 +178,15 @@ def upgrade() -> None:
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
+        ),
+        sa.CheckConstraint("attempt >= 0", name=op.f("ck_minion_subtask_attempt_nonneg")),
+        sa.CheckConstraint("byte_end > byte_start", name=op.f("ck_minion_subtask_byte_range")),
+        sa.CheckConstraint("first_record >= 0", name=op.f("ck_minion_subtask_first_record_nonneg")),
+        sa.CheckConstraint(
+            "max_attempts > 0", name=op.f("ck_minion_subtask_max_attempts_positive")
+        ),
+        sa.CheckConstraint(
+            "record_count > 0", name=op.f("ck_minion_subtask_record_count_positive")
         ),
         sa.CheckConstraint(
             "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')",
@@ -218,6 +245,9 @@ def upgrade() -> None:
             ondelete="SET NULL",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_minion_subtask_attempt")),
+        sa.UniqueConstraint(
+            "acquirement_id", name=op.f("uq_minion_subtask_attempt_acquirement_id")
+        ),
     )
     op.create_index(
         "ix_minion_subtask_attempt_finished_at",
@@ -250,7 +280,7 @@ def upgrade() -> None:
             ["executor_id"],
             ["minion_executor.executor_id"],
             name=op.f("fk_minion_subtask_acquirement_executor_id_minion_executor"),
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["team", "project", "task_name", "subtask_id"],
@@ -275,7 +305,6 @@ def upgrade() -> None:
     op.create_table(
         "minion_executor_heartbeat",
         sa.Column("acquirement_id", sa.UUID(), nullable=False),
-        sa.Column("executor_id", sa.UUID(), nullable=False),
         sa.Column(
             "last_seen_at",
             sa.DateTime(timezone=True),
@@ -287,12 +316,6 @@ def upgrade() -> None:
             ["acquirement_id"],
             ["minion_subtask_acquirement.acquirement_id"],
             name=op.f("fk_minion_executor_heartbeat_acquirement_id_minion_subtask_acquirement"),
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["executor_id"],
-            ["minion_executor.executor_id"],
-            name=op.f("fk_minion_executor_heartbeat_executor_id_minion_executor"),
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("acquirement_id", name=op.f("pk_minion_executor_heartbeat")),

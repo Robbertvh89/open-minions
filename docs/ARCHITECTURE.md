@@ -254,6 +254,8 @@ newline boundaries. Executors fetch with HTTP `Range` on a presigned GET. Avoids
 
 ## 6. Deployment
 
+Local dev uses SeaweedFS instead of MinIO (MinIO community images are no longer pullable).
+
 | Env | Topology |
 |---|---|
 | Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana, server, watchdog; executor runs natively on the Mac (needs Metal — not in Docker) |

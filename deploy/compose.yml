@@ -1,4 +1,5 @@
 # Local development stack. The executor runs natively on macOS (needs Metal), not in Docker.
+# Server and watchdog services are added in a later milestone (ARCHITECTURE §6).
 name: open-minions
 
 services:
@@ -9,7 +10,7 @@ services:
       POSTGRES_PASSWORD: minion
       POSTGRES_DB: minion
     ports:
-      - "${MINION_PG_PORT:-5432}:5432"
+      - "127.0.0.1:${MINION_PG_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +24,7 @@ services:
     image: chrislusf/seaweedfs:4.05
     command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0
     ports:
-      - "${MINION_S3_PORT:-9000}:9000"
+      - "127.0.0.1:${MINION_S3_PORT:-9000}:9000"
     volumes:
       - s3data:/data
       - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -54,7 +55,7 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
     ports:
-      - "${MINION_GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${MINION_GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:

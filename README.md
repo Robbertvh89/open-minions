@@ -15,6 +15,7 @@ owner chooses, and writes results to S3.
 
 ```bash
 uv sync
+cp .env.example .env
 docker compose -f deploy/compose.yml up -d
 uv run alembic upgrade head
 uv run minion-server
