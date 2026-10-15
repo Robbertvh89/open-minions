@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 
 from minion_common.enums import TaskType
 from minion_common.schemas import Budget, ModelEntry
@@ -33,6 +34,8 @@ class FakeRunner:
         for rec in batch:
             if rec.get("fail"):
                 raise RunnerError(str(rec["fail"]), "injected failure")
+            if rec.get("sleep_s"):  # test hook: simulate a slow subtask (capped)
+                time.sleep(min(float(rec["sleep_s"]), 60.0))
             text = str(rec.get("text", ""))
             if self._model.type is TaskType.EMBEDDING:
                 out.append({"id": rec.get("id"), "embedding": fake_vector(text)})
