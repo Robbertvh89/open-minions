@@ -1,10 +1,10 @@
 ---
 id: TASK-3.1
 title: 'M2.1: Heartbeat endpoint, watchdog reclaim service, release cap'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 18:02'
-updated_date: '2026-10-15 18:17'
+updated_date: '2026-10-15 18:36'
 labels:
   - M2
 dependencies: []
