@@ -4,6 +4,7 @@ title: Security hardening follow-ups from TASK-2.1 audit
 status: To Do
 assignee: []
 created_date: '2026-10-15 14:41'
+updated_date: '2026-10-15 20:42'
 labels:
   - security
 dependencies: []
@@ -22,3 +23,9 @@ Deferred MEDIUM/LOW findings from TASK-2.1 security audit: (1) pin HF model revi
 - [ ] #2 Presigned GET signs Range; oversize PUT rejected
 - [ ] #3 Unknown task params rejected with 422
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Items #1 (revision pin) and #3 (params allow-list) delivered by TASK-4.1; #2 (Range-signed GET, PUT size cap) remains.
+<!-- SECTION:NOTES:END -->
