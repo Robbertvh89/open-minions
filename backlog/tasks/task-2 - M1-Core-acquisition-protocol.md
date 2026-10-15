@@ -1,10 +1,10 @@
 ---
 id: TASK-2
 title: 'M1: Core acquisition protocol'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-15 14:18'
+updated_date: '2026-10-15 14:22'
 labels:
   - milestone
   - M1
