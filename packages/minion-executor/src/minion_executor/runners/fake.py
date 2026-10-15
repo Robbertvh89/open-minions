@@ -39,7 +39,18 @@ def _text_of(rec: Record) -> str:
     return str(rec.get("text", ""))
 
 
-_SANDBOX_PROBES = ("read_path", "write_path", "connect", "exec", "mach_lookup")
+_SANDBOX_PROBES = (
+    "read_path",
+    "write_path",
+    "list_dir",
+    "connect",
+    "exec",
+    "mach_lookup",
+    "sandbox_check",
+    "cfprefs",
+    "signal_parent",
+    "mlx_matmul",
+)
 
 
 def _sandbox_probe(rec: Record) -> dict[str, object]:
@@ -67,9 +78,74 @@ def _sandbox_probe(rec: Record) -> dict[str, object]:
             return {"ok": r.returncode == 0, "returncode": r.returncode}
         if "mach_lookup" in rec:
             return _mach_lookup(str(rec["mach_lookup"]))
+        if "list_dir" in rec:
+            names = os.listdir(str(rec["list_dir"]))  # noqa: PTH208
+            return {"ok": True, "entries": len(names)}
+        if "sandbox_check" in rec:
+            return _sandbox_check(str(rec["sandbox_check"]), rec.get("path"))
+        if "cfprefs" in rec:
+            return _cfprefs_keys(str(rec["cfprefs"]))
+        if "signal_parent" in rec:
+            os.kill(os.getppid(), 0)
+            return {"ok": True}
+        if "mlx_matmul" in rec:
+            return _mlx_matmul(int(rec["mlx_matmul"]))
     except Exception as exc:
         return {"ok": False, "error": type(exc).__name__}
     return {"ok": False, "error": "unknown"}
+
+
+def _sandbox_check(op: str, path: object) -> dict[str, object]:
+    """`sandbox_check(getpid(), op, [PATH filter, path])`: 0 = the operation would be allowed.
+    Asks the kernel policy without performing the operation (nothing is ever written). `path`
+    must exist: for a missing one the call reports 1 whatever the policy says."""
+    import ctypes
+
+    lib = ctypes.CDLL("/usr/lib/libsandbox.1.dylib")
+    lib.sandbox_check.restype = ctypes.c_int
+    # variadic: only the fixed args are declared so ctypes uses the variadic (stack) ABI on arm64
+    lib.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    if path is None:
+        rc = lib.sandbox_check(os.getpid(), op.encode(), 0)
+    else:  # SANDBOX_FILTER_PATH = 1
+        rc = lib.sandbox_check(os.getpid(), op.encode(), 1, ctypes.c_char_p(str(path).encode()))
+    return {"ok": rc == 0, "rc": rc}
+
+
+def _cfprefs_keys(domain: str) -> dict[str, object]:
+    """Number of keys CFPreferences returns for `domain` (0 / failure when preferences are
+    denied)."""
+    import ctypes
+
+    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    cf.CFPreferencesCopyKeyList.restype = ctypes.c_void_p
+    cf.CFPreferencesCopyKeyList.argtypes = [ctypes.c_void_p] * 3
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    user = ctypes.c_void_p.in_dll(cf, "kCFPreferencesCurrentUser")
+    host = ctypes.c_void_p.in_dll(cf, "kCFPreferencesAnyHost")
+    dom = cf.CFStringCreateWithCString(None, domain.encode(), 0x08000100)
+    arr = cf.CFPreferencesCopyKeyList(dom, user, host)
+    n = int(cf.CFArrayGetCount(arr)) if arr else 0
+    return {"ok": n > 0, "keys": n}
+
+
+def _mlx_matmul(n: int) -> dict[str, object]:
+    """GPU matmul + compiled fusion with MLX (the sandbox must not break Metal)."""
+    import mlx.core as mx  # engine import, test hook only
+
+    a = mx.ones((n, n))
+    b = a @ a
+    c = mx.compile(lambda x: mx.softmax(x * 0.5 + mx.sin(x), axis=-1))(b)
+    mx.eval(b, c)
+    return {
+        "ok": True,
+        "device": str(mx.default_device()),
+        "value": float(b[0, 0].item().real),
+        "softmax_sum": float(c[0].sum().item().real),
+    }
 
 
 def _mach_lookup(name: str) -> dict[str, object]:

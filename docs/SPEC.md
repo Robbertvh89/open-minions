@@ -322,11 +322,18 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - S-10. Inference worker confinement **[ours]** (ADR-0009). Models are fetched by a separate killable
   subprocess at a pinned revision, safetensors-only, sha256-verified; `HF_TOKEN`, proxy and CA settings
   reach only that subprocess. The worker is offline (`HF_HUB_OFFLINE=1`) and runs inside a macOS
-  Seatbelt sandbox applied before any engine import: no HOME access (except read-only model dir, cache
-  root and Python paths, and its own tmp dir), no network (except loopback Ollama port when
-  requested), no process exec, no Keychain/securityd lookup, cache read-only. If the sandbox cannot be
-  applied the worker fails (`SANDBOX_FAILED`) and `run` exits 2. `MINION_EXECUTOR_SANDBOX=0` requires
-  `MINION_EXECUTOR_DEV=1`. Residual: the profile is allow-default outside the denied areas.
+  Seatbelt sandbox applied before any engine import: no network (except the loopback Ollama port,
+  granted to Ollama loads only), no process exec, no LaunchServices/AppleEvents/distributed
+  notifications/preferences/foreign signals, Mach lookups deny-default with a six-service Metal and
+  logging allow-list (no Keychain, tccd, pasteboard, WindowServer, mds, nsurlsessiond), writes denied
+  except the worker's tmp dir, a few `/dev` nodes and the Python Metal cache, reads denied for HOME,
+  `/Users`, `/Volumes`, `/private/tmp`, `/private/var/folders` and `/Library` except the current model
+  dir, the Python prefixes/site-packages/editable source roots and the tmp dir. A self-test after
+  applying the profile aborts the worker if HOME is listable or an outside write succeeds. If the
+  sandbox cannot be applied the worker fails (`SANDBOX_FAILED`) and `run` exits 2; off macOS only the
+  fake engine runs. `MINION_EXECUTOR_SANDBOX=0` requires `MINION_EXECUTOR_DEV=1`. Residual: the profile
+  is allow-default outside the denied areas, so non-denied system paths (`/etc`, `/opt`, ...) stay
+  readable (ADR-0009).
 
 ## 9. Non-functional requirements
 

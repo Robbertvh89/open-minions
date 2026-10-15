@@ -24,6 +24,7 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from minion_common.enums import Engine
 from minion_common.schemas import Budget, ModelEntry, TaskParams, parse_params
@@ -311,7 +312,9 @@ class WorkerHandle:
             gen = self._seen_gen
             env = {**scrub_env(os.environ), **FORCED_WORKER_ENV}
             if self._sandbox is not None:
-                self._tmp_dir = Path(os.path.realpath(tempfile.mkdtemp(prefix="minion-worker-")))
+                # `minion-exec-<pid>-` so `cleanup_stale_tmp` sweeps it if the control dies
+                prefix = f"minion-exec-{os.getpid()}-worker-"
+                self._tmp_dir = Path(os.path.realpath(tempfile.mkdtemp(prefix=prefix)))
                 env["TMPDIR"] = str(self._tmp_dir)
             parent, child = self._ctx.Pipe()
             proc = self._ctx.Process(
@@ -403,7 +406,7 @@ class WorkerHandle:
             self._call(
                 {
                     "op": "load",
-                    "sandbox": self._sandbox_spec(model_path),
+                    "sandbox": self._sandbox_spec(model_path, model),
                     "model": model.model_dump(mode="json"),
                     "budget": budget.model_dump(mode="json"),
                     "model_path": str(model_path) if model_path else None,
@@ -413,13 +416,23 @@ class WorkerHandle:
             )
             self._model_id = model.model_id
 
-    def _sandbox_spec(self, model_path: Path | None) -> dict[str, Any] | None:
+    def _sandbox_spec(
+        self, model_path: Path | None, model: ModelEntry | None
+    ) -> dict[str, Any] | None:
         if self._sandbox is None:
             return None
         self._ensure_started()  # the tmp dir is created with the process
         if self._tmp_dir is None:  # pragma: no cover - _ensure_started guarantees it
             raise WorkerCrashed("worker tmp dir missing")
-        return sbx.sandbox_spec(self._sandbox, model_path=model_path, tmp_dir=self._tmp_dir)
+        # Loopback access to Ollama only for an Ollama load, from the same config the runner uses.
+        ollama = model is not None and model.engine == Engine.OLLAMA
+        return sbx.sandbox_spec(
+            self._sandbox,
+            model_path=model_path,
+            tmp_dir=self._tmp_dir,
+            engines=[model.engine.value] if model is not None else self._engines,
+            ollama_port=urlsplit(self._cfg.ollama_url).port if ollama else None,
+        )
 
     def run(
         self,
@@ -451,7 +464,7 @@ class WorkerHandle:
                     {
                         "op": "probe",
                         "cfg": asdict(self._cfg),
-                        "sandbox": self._sandbox_spec(None),
+                        "sandbox": self._sandbox_spec(None, None),
                     },
                     timeout_s,
                 )

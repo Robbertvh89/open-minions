@@ -4,7 +4,7 @@ title: 'M3.2: Model cache, fetch subprocess and worker sandbox'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-15 22:54'
+updated_date: '2026-10-15 23:21'
 labels:
   - M3
   - security
@@ -23,8 +23,8 @@ Plan steps S4-S5 of TASK-4 (D5-D8). ADR-0009.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Cache: pinned revision, safetensors-only allow-patterns, sha256 verified, LRU eviction under MINION_EXECUTOR_MODEL_CACHE_GB, cancel/SIGTERM kills fetch
-- [ ] #2 Worker is offline and sandboxed: cannot read HOME secrets, open non-loopback sockets or reach securityd; fail-closed if sandbox_init fails
-- [ ] #3 HF_TOKEN/proxy/CA reach only the fetch subprocess, never the worker or logs
-- [ ] #4 ADR-0009 written
+- [x] #1 Cache: pinned revision, safetensors-only allow-patterns, sha256 verified, LRU eviction under MINION_EXECUTOR_MODEL_CACHE_GB, cancel/SIGTERM kills fetch
+- [x] #2 Worker is offline and sandboxed: cannot read HOME secrets, open non-loopback sockets or reach securityd; fail-closed if sandbox_init fails
+- [x] #3 HF_TOKEN/proxy/CA reach only the fetch subprocess, never the worker or logs
+- [x] #4 ADR-0009 written
 <!-- AC:END -->

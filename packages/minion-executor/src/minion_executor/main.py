@@ -22,7 +22,7 @@ from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profil
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
-from minion_executor.runners.base import EngineConfig, RunnerError
+from minion_executor.runners.base import RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
@@ -103,8 +103,7 @@ def sandbox_policy(settings: ExecutorSettings, engines: list[Engine]) -> Sandbox
     """The worker sandbox for these settings (`None` only with the dev opt-out)."""
     if not settings.sandbox:
         return None
-    port = urlsplit(EngineConfig().ollama_url).port if Engine.OLLAMA in engines else None
-    return SandboxPolicy(cache_root=settings.model_cache_dir, ollama_port=port)
+    return SandboxPolicy(cache_root=settings.model_cache_dir)
 
 
 def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = None) -> list[Engine]:

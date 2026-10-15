@@ -1,6 +1,6 @@
 # ADR-0009: Offline, sandboxed inference worker with a pinned, verified model fetch
 
-- Status: **Proposed** (implemented in TASK-4.2; Accepted at review)
+- Status: **Accepted** (implemented in TASK-4.2; profile hardened after the security audit)
 - Date: 2026-10-16
 - Deciders: project owner
 - Deviates from paper: **yes**. The paper has no sandbox and lets the inference process load models
@@ -38,42 +38,78 @@ additionally gets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `HF_DATASETS_OFF
 
 **D8. Seatbelt sandbox on the worker.**
 Before any engine import or model load, the worker calls `sandbox_init` (libsandbox, via ctypes) with
-a profile built by the pure function `worker/sandbox.build_profile`:
+a profile built by the pure function `worker/sandbox.build_profile`. The base is `(allow default)`
+(Metal, IOKit and dyld cannot be enumerated for every Mac), then whole classes are denied and the
+minimum is re-allowed (last match wins, so order matters):
 
-- `(allow default)` as the base, then in this order (last match wins):
-- `(deny network*)`, plus `(allow network-outbound (remote tcp "localhost:<port>"))` only when the
-  Ollama engine is requested;
-- `(deny process-exec*)`: the worker cannot run `security`, `curl`, `osascript` or anything else;
-- `(deny mach-lookup ...)` for `com.apple.SecurityServer`, `com.apple.securityd.xpc`, `com.apple.secd`
-  and the other Keychain services;
-- `(deny file-read* file-write* (subpath HOME))` for the passwd home and `$HOME`;
-- `file-read*` re-allowed for the model dir, the cache root, Python prefixes, site-packages and the
-  `sys.path` entries, and `file-read-metadata` (only) on their ancestors under HOME so path walks work;
-- `(deny file-write* ...)` on every read-only path, so the cache is read-only for the worker;
-- read-write on one per-spawn tmp dir, created by the control side (`TMPDIR` points to it) and removed
-  when the worker is reset.
+- **Network.** `(deny network*)`; `(allow network-outbound (remote tcp "localhost:<port>"))` only in
+  the spec of an **Ollama load**, with the port taken from the same `EngineConfig` the handle passes to
+  the runner. Probe, MLX, HF and fake workers get no network at all.
+- **Exec.** `(deny process-exec*)`.
+- **Escape hatches.** `(deny lsopen)` (LaunchServices: `open`, URL handlers),
+  `(deny appleevent-send)`, `(deny distributed-notification-post)`,
+  `(deny user-preference-read user-preference-write)` (so `cfprefsd` cannot be used to read
+  `~/Library/Preferences` although the path is denied), and `(deny signal)` +
+  `(allow signal (target self))`. `(deny signal (target others))` is accepted by the parser but does
+  not deny anything on macOS 27 (verified: `SIGCONT` to the parent succeeded), so deny-all plus
+  allow-self is used.
+- **Mach.** `(deny mach-lookup)`, then allow only `com.apple.MTLCompilerService`,
+  `com.apple.cvmsServ`, `com.apple.gpumemd.source`, `com.apple.logd`,
+  `com.apple.system.notification_center`, `com.apple.system.opendirectoryd.libinfo`. Ablation on
+  macOS 27 with mlx 0.32 (matmul, `mx.compile`, a custom Metal kernel) showed MLX runs with an empty
+  list; these are kept because they are Metal/logging/libinfo daemons that expose no user data and
+  other macOS releases or mlx-lm/transformers may use them. Denied (and tested): launchservicesd,
+  appleevents, pasteboard, nsurlsessiond, windowserver, mds, tccd, SecurityServer, secd, trustd.
+- **Writes.** `(deny file-write* (subpath "/"))`, then allow the per-spawn tmp dir (created by the
+  control side as `minion-exec-<control pid>-worker-*` so `cleanup_stale_tmp` sweeps it; `TMPDIR`
+  points to it), `/dev/null`, `/dev/dtracehelper`, `/dev/tty`, `/dev/zero`, and Metal's shader cache
+  `<DARWIN_USER_CACHE_DIR>/(org.python.python|python*)/com.apple.metal/**` (regex, not other apps').
+- **Reads.** HOME (passwd and `$HOME`), `/Users`, `/Volumes`, `/private/tmp`, `/private/var/tmp`,
+  `/private/var/folders` and `/Library` are denied, then re-allowed read-only: the **one model dir**
+  of the current load (not the cache root), `sys.prefix`, `sys.base_prefix`, site-packages, the source
+  roots named in `.pth` files (editable installs), and the tmp dir and Metal cache above. No cwd,
+  `sys.path[0]` or `PYTHONPATH` entry is granted; the worker moves to its tmp dir and prunes `sys.path`
+  to granted roots before applying. `file-read-metadata` (only) is allowed on ancestors of the grants
+  so path walks work. A model or cache dir that is HOME, an ancestor of HOME, or an ancestor of
+  `~/Library/Keychains` is refused.
+- **Self-test.** After `apply`, the worker asserts that listing HOME and creating a file in
+  `/private/tmp` both fail; otherwise it exits immediately (exit code 78, seen by the control side as a
+  crashed worker, so `run` exits 2 from the probe).
 
 Paths are symlink-resolved and escaped (`\` and `"`); control characters are rejected. `apply()` raises
-`SANDBOX_FAILED` on any error and never continues unsandboxed (fail closed). The startup probe runs in
-a sandboxed worker, so a broken sandbox makes `minion-executor run` exit 2. A sandboxed worker's grants
-are fixed, so each load gets a fresh worker. `MINION_EXECUTOR_SANDBOX=0` is accepted only together with
-`MINION_EXECUTOR_DEV=1`. Off macOS the sandbox is a no-op (only the fake engine runs there).
+`SANDBOX_FAILED` on any error and never continues unsandboxed (fail closed). Off macOS only the fake
+engine may run unsandboxed; every other engine fails closed with `SANDBOX_FAILED`. The startup probe
+runs in a sandboxed worker, so a broken sandbox makes `minion-executor run` exit 2. A sandboxed worker's
+grants are fixed, so each load gets a fresh worker. `MINION_EXECUTOR_SANDBOX=0` is accepted only
+together with `MINION_EXECUTOR_DEV=1`.
 
 ## Consequences
 
-- A compromised worker cannot read HOME secrets, reach the Keychain, exec tools, open outside
-  sockets or modify the cache. It can still use CPU/GPU within the budget and read non-HOME files
-  that `allow default` leaves readable (for example `/etc`, other users' world-readable files).
-- **Residual risk.** The base is allow-default, not deny-default, because a deny-default profile for
-  Metal/IOKit/dyld cannot be validated for every Mac model and engine. Writes outside HOME and the
-  tmp dir are not blocked. Tightening to deny-default is a follow-up once `gpu` e2e tests run through
-  the sandbox on several chips.
+- A compromised worker cannot read HOME secrets or other users' data under `/Users`, reach the
+  Keychain, launch or script apps, read preferences or the pasteboard, signal other processes, exec
+  tools, open outside sockets, or write anywhere except its tmp dir, a few `/dev` nodes and the Python
+  Metal cache. It can still use CPU/GPU within the budget.
+- **Residual risks (honest list).**
+  - The base is still allow-default. Reads of the rest of the filesystem outside the denied roots
+    (`/etc`, `/opt`, `/usr`, `/var` except `tmp` and `folders`, `/private/var/db`, `/Applications`) and
+    most other operations (sysctl, IOKit, other Mach-free syscalls) remain possible. Nothing under
+    those roots is a per-user secret by default, but a Mac with secrets in e.g. `/opt` or `/etc` is
+    exposed.
+  - Allowed Mach services (above) and the `com.apple.metal` cache are shared system surface; a bug in
+    Metal's compiler service is reachable from the worker.
+  - A malicious model can still burn CPU/GPU up to the budget and can fill its tmp dir (disk quota is
+    not enforced).
+  - Seatbelt does not filter by hostname; the Ollama grant is a loopback port, so a hostile local
+    service on that port is trusted.
+  - The profile is validated on macOS 27 / Apple Silicon with mlx 0.32 only; other macOS releases may
+    need extra allows (the failure mode is `SANDBOX_FAILED`/engine error, never silent widening).
 - **`sandbox_init` is deprecated** by Apple. It is still shipped and is what Chromium, Firefox and
   Bazel use for self-sandboxing. The use is isolated in `worker/sandbox.py`; if it disappears, the
   probe fails closed and the executor refuses to start rather than run unconfined.
 - Model download needs the network on the control side; the worker never needs it.
-- The `macos`-marked tests exercise the real kernel sandbox with the fake engine. They do not import
-  MLX/Metal (mlx is not a CI dependency); the MLX e2e through the sandbox is TASK-4.3's `gpu` test.
+- The `macos`-marked tests exercise the real kernel sandbox with the fake engine, and, when the
+  optional `mlx` extra is installed (`uv sync --extra mlx`), a real MLX GPU matmul and `mx.compile`
+  through the same profile. CI is Linux and skips them.
 
 ## Alternatives considered
 

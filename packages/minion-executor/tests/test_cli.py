@@ -308,7 +308,6 @@ def test_sandbox_policy_reaches_probe_and_worker(
     assert runner.invoke(app, ["run", "--engines", "ollama"]).exit_code == 0
     policy = seen["probe"]
     assert policy is not None and policy.cache_root == tmp_path  # type: ignore[attr-defined]
-    assert policy.ollama_port == 11434  # type: ignore[attr-defined]
     assert seen["handle_sandbox"] == policy
 
 
