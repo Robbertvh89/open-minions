@@ -192,12 +192,17 @@ key's teams, 422 invalid input or URI, 404) carry the same shape with their own 
 `TASK_EXISTS` and `OUTPUT_URI_IN_USE` (409, task create: the name, respectively the normalized
 output prefix, belongs to another task), `PAYLOAD_TOO_LARGE` (413: request body above
 `MINION_MAX_REQUEST_BODY_BYTES`, default 1 MiB, enforced before authentication), and
-`OUTPUT_CHANGED` (422, complete: the attempt object changed during verification). A task whose
+`OUTPUT_CHANGED` (422, complete: the attempt object changed during verification), and task-create
+422s `UNKNOWN_MODEL`, `MODEL_TYPE_MISMATCH`, `EMPTY_INPUT` (no object under the input prefix),
+`INVALID_URI`, plus `RECORD_COUNT_MISMATCH` and `OUTPUT_MISSING` on complete. A task whose
 splitting fails becomes `FAILED` with `error` set to a short code-prefixed message, for example
 `LINE_TOO_LONG` (a JSONL line above `MINION_SPLIT_MAX_LINE_BYTES`, default 16 MiB) or
 `INPUT_CHANGED` (the input differs from rows written by an earlier split attempt, or an object
 changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_MAX_ATTEMPTS` times
 without finishing).
+
+**Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
+and all of §6.2 except `heartbeat` and `presence`. The other rows are not yet implemented.
 
 ### 6.1 User-facing
 | Method | Path | Purpose |
@@ -214,7 +219,7 @@ without finishing).
 |---|---|---|
 | `POST` | `/executor/register` | Report host capabilities + engines + capacity profile; returns `executor_id` |
 | `PUT` | `/executor/preference` | Set/clear `(team?, project?, task_name?)` preference |
-| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb` and engine. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
+| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb`, engine and `allowed_pool`. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
 | `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state; response `{cancel: bool}` |
 | `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (fleet view only) |
 | `POST` | `/executor/subtasks/{acquirement_id}/complete` | Report success + output metadata (record count, checksum) |

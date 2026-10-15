@@ -140,7 +140,8 @@ used by the executor and by tests, shared settings base.
 ### 3.1 Task submission
 ```
 User ─POST /tasks─▶ Server: validate (team membership, model allow-list + type, team-scoped S3 URIs
-                    `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output)
+                    `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output;
+                    at least one object under the input prefix, else `422 EMPTY_INPUT`)
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
 Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
                     list input objects → scan JSONL → stream batches of slices of N records
@@ -173,7 +174,7 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
                  AND (matches preference)            -- pass 1
                ORDER BY task.priority DESC, task.created_at, subtask_id
                LIMIT 16
-  if empty: candidates = same query without preference filter (engine + memory filters stay) -- pass 2 (global FIFO)
+  if empty: candidates = same query without preference filter (engine, memory and allowed_pool filters stay) -- pass 2 (global FIFO)
   for c in shuffle_head(candidates):          -- light shuffle reduces contention
       INSERT INTO minion_subtask_acquirement (...) VALUES (...)
         ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
@@ -182,7 +183,7 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
           UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ...  (same txn)
           INSERT minion_executor_heartbeat(...)                           (same txn)
           COMMIT → return assignment + presigned URLs
-  return 204
+  return 204   (the whole round repeats up to MAX_ROUNDS=10 when every candidate lost its insert race; then 204)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
@@ -204,7 +205,8 @@ Executor: write results to local temp JSONL
           PUT to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
           POST /complete {record_count, sha256}
 Server:   verify acquirement is current (else 409)
-          S3 CopyObject → {output_prefix}/{subtask_id:06d}.jsonl   (promotion = idempotency)
+          S3 CopyObject → {output_prefix}/{subtask_id:06d}.jsonl   (promotion = idempotency;
+                          CopySourceIfMatch on the ETag verified at HEAD, mismatch → 422 OUTPUT_CHANGED)
           txn: DELETE acquirement, DELETE heartbeat row,
                UPDATE subtask SUCCEEDED, INSERT minion_subtask_attempt,
                UPDATE task counters / status
