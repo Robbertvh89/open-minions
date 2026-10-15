@@ -45,7 +45,7 @@ async def app(migrated_url: str, s3: S3Env) -> AsyncIterator[Any]:
 @pytest.mark.integration
 async def test_loop_runs_one_subtask_end_to_end(app: Any, s3: S3Env, tmp_path: Path) -> None:
     sm = app.state.sessionmaker
-    await seed_task(sm, "loop1", 1, team="exl1")
+    await seed_task(sm, "loop1", 1, team="exl1", engine=Engine.FAKE)
     key = "inputs/exl1/loop1/a.jsonl"
     s3.client.put_object(Bucket=s3.bucket, Key=key, Body=INPUT)
     async with sm() as s, s.begin():
@@ -60,12 +60,12 @@ async def test_loop_runs_one_subtask_end_to_end(app: Any, s3: S3Env, tmp_path: P
     budget = Budget.model_validate(
         {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 3}
     )
-    worker = WorkerHandle("fake")
+    worker = WorkerHandle([Engine.FAKE])
     async with ExecutorClient(
         "http://localhost", SecretStr(token), transport=ASGITransport(app=app)
     ) as client:
         loop = ExecutorLoop(
-            client, worker, budget, [Engine.MLX], tmp_root=tmp_path, allow_http_loopback=True
+            client, worker, budget, [Engine.FAKE], tmp_root=tmp_path, allow_http_loopback=True
         )
         assert await loop.run(max_subtasks=1) == 1
 

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,7 +31,14 @@ from minion_executor.worker.process import WorkerCrashed
 BUDGET = Budget.model_validate(
     {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 2}
 )
-MODEL = {"model_id": "m", "type": "embedding", "engine": "mlx", "ref": "r", "memory_gb": 0.1}
+MODEL = {
+    "model_id": "m",
+    "type": "embedding",
+    "engine": "mlx",
+    "ref": "o/m",
+    "revision": "a" * 40,
+    "memory_gb": 0.1,
+}
 INPUT = b'{"id":"a","text":"x"}\n{"id":"b","text":"y"}\n{"id":"c","text":"z"}\n'
 
 
@@ -136,11 +144,23 @@ class FakeWorker:
         self.killed = False
         self.interrupted = False
         self.closed = False
+        self.params: list[Any] = []
+        self.ensured: list[tuple[ModelEntry, Budget]] = []
+        self.unloads = 0
 
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
-        pass
+        self.ensured.append((model, budget))
 
-    def run(self, batch: list[Record]) -> list[Record]:
+    def unload(self) -> None:
+        self.unloads += 1
+
+    def run(
+        self,
+        batch: list[Record],
+        params: Any = None,
+        on_progress: Any = None,
+    ) -> list[Record]:
+        self.params.append(params)
         if self.block:
             import time
 
@@ -150,6 +170,8 @@ class FakeWorker:
         if self.exc:
             raise self.exc
         self.batches.append(len(batch))
+        if on_progress is not None:
+            on_progress(len(batch))
         return [{"id": r["id"], "embedding": [1.0]} for r in batch]
 
     def interrupt(self) -> None:
@@ -383,7 +405,7 @@ async def test_complete_non_stale_409_is_discarded(tmp_path: Path) -> None:
 
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
     class ShortWorker(FakeWorker):
-        def run(self, batch: list[Record]) -> list[Record]:
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
             return super().run(batch)[:-1]
 
     client, s3 = FakeClient([assignment()]), FakeS3()
@@ -482,7 +504,7 @@ async def test_unexpected_error_fails_subtask_and_loop_keeps_going(tmp_path: Pat
     class Boom(FakeWorker):
         n = 0
 
-        def run(self, batch: list[Record]) -> list[Record]:
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
             Boom.n += 1
             if Boom.n == 1:
                 raise ValueError("secret payload text")
@@ -662,12 +684,12 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     # the second assignment must run normally: the worker stops blocking once interrupted
     orig_run = worker.run
 
-    def run(batch: list[Record]) -> list[Record]:
+    def run(batch: list[Record], *_: Any) -> list[Record]:
         if worker.interrupted:
             worker.block = False
         return orig_run(batch)
 
-    worker.run = run  # type: ignore[method-assign]
+    worker.run = run  # type: ignore[method-assign,assignment]
     assert await loop.run() == 1
     assert worker.interrupted and not worker.killed
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire", "complete", "acquire"]
@@ -732,13 +754,13 @@ async def test_transport_error_in_heartbeat_does_not_fail_subtask(tmp_path: Path
     # slow the worker so both beats happen while the subtask is running
     orig = worker.run
 
-    def slow(batch: list[Record]) -> list[Record]:
+    def slow(batch: list[Record], *_: Any) -> list[Record]:
         import time
 
         time.sleep(0.2)
         return orig(batch)
 
-    worker.run = slow  # type: ignore[method-assign]
+    worker.run = slow  # type: ignore[method-assign,assignment]
     client.on_empty = loop.stop
     assert await loop.run() == 1
     assert client.kinds().count("heartbeat") == 2
@@ -761,13 +783,13 @@ async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
     worker = FakeWorker()
     orig = worker.run
 
-    def slow(batch: list[Record]) -> list[Record]:
+    def slow(batch: list[Record], *_: Any) -> list[Record]:
         import time
 
         time.sleep(0.3)
         return orig(batch)
 
-    worker.run = slow  # type: ignore[method-assign]
+    worker.run = slow  # type: ignore[method-assign,assignment]
     loop = make_loop(
         client, worker, s3, tmp_path, [],
         heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
@@ -792,11 +814,11 @@ def _slow_worker(worker: FakeWorker, secs: float) -> None:
 
     orig = worker.run
 
-    def slow(batch: list[Record]) -> list[Record]:
+    def slow(batch: list[Record], *_: Any) -> list[Record]:
         time.sleep(secs)
         return orig(batch)
 
-    worker.run = slow  # type: ignore[method-assign]
+    worker.run = slow  # type: ignore[method-assign,assignment]
 
 
 @pytest.mark.parametrize(
@@ -1007,3 +1029,187 @@ async def test_cancel_during_output_write_leaves_no_files(
     await loop.run()
     assert seen == [[]]
     assert "release" in client.kinds() and s3.puts == []
+
+
+def _asn(**over: Any) -> Assignment:
+    return Assignment.model_validate({**assignment().model_dump(mode="json"), **over})
+
+
+async def _run_one(
+    tmp_path: Path, a: Assignment, worker: FakeWorker, s3: FakeS3 | None = None, **kw: Any
+) -> tuple[FakeClient, FakeS3]:
+    client, s3 = FakeClient([a]), s3 or FakeS3()
+    loop = make_loop(client, worker, s3, tmp_path, [], **kw)
+    client.on_empty = loop.stop
+    await loop.run()
+    return client, s3
+
+
+async def test_params_are_parsed_and_forwarded_to_worker(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    await _run_one(tmp_path, _asn(params={"normalize": False}), worker)
+    assert worker.params and all(p.normalize is False for p in worker.params)
+
+
+async def test_bad_params_fail_non_retryable_without_running(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    client, _ = await _run_one(tmp_path, _asn(params={"trust_remote_code": True}), worker)
+    req = next(r for k, r in client.calls if k == "fail")
+    assert (req.retryable, req.code) == (False, "BAD_PARAMS")
+    assert worker.batches == []
+
+
+async def test_non_retryable_runner_error_fails_non_retryable(tmp_path: Path) -> None:
+    worker = FakeWorker(RunnerError("MODEL_BROKEN", "x", retryable=False))
+    client, _ = await _run_one(tmp_path, _asn(), worker)
+    req = next(r for k, r in client.calls if k == "fail")
+    assert (req.retryable, req.code) == (False, "MODEL_BROKEN")
+
+
+async def test_outputs_stamped_with_model_and_revision(tmp_path: Path) -> None:
+    _, s3 = await _run_one(tmp_path, _asn(), FakeWorker())
+    lines = [json.loads(x) for x in s3.puts[0].splitlines()]
+    assert len(lines) == 3
+    assert all(x["model"] == "m" and x["model_revision"] == "a" * 40 for x in lines)
+
+
+class TooLongWorker(FakeWorker):
+    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+        return [
+            {"id": r["id"], "error": "PROMPT_TOO_LONG"}
+            if r["id"] == "b"
+            else {"id": r["id"], "embedding": [1.0]}
+            for r in batch
+        ]
+
+
+async def test_prompt_too_long_records_count_and_subtask_completes(tmp_path: Path) -> None:
+    client, s3 = await _run_one(tmp_path, _asn(), TooLongWorker())
+    assert "fail" not in client.kinds()
+    req = next(r for k, r in client.calls if k == "complete")
+    assert req.record_count == 3
+    errs = [json.loads(x) for x in s3.puts[0].splitlines() if b"PROMPT_TOO_LONG" in x]
+    assert [e["id"] for e in errs] == ["b"] and errs[0]["model"] == "m"
+
+
+class TickingWorker(FakeWorker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.progressed = threading.Event()
+
+    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+        on_progress(1)  # one record done mid-batch
+        self.progressed.set()
+        self.release.wait(10)  # held until a heartbeat has observed it
+        return super().run(batch, params, None)
+
+
+async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
+    worker = TickingWorker()
+    client = FakeClient([_asn()])
+    s3 = FakeS3()
+    inner = gated_sleep(1, [])
+
+    async def hb_sleep(d: float) -> None:
+        await asyncio.to_thread(worker.progressed.wait, 10)  # first beat only after progress
+        await inner(d)
+
+    loop = make_loop(
+        client,
+        worker,
+        s3,
+        tmp_path,
+        [],
+        heartbeat_interval_s=1.0,
+        heartbeat_sleep=hb_sleep,
+    )
+    client.on_empty = loop.stop
+    orig = client.heartbeat
+
+    async def hb(*a: Any, **k: Any) -> Any:
+        try:
+            return await orig(*a, **k)
+        finally:
+            worker.release.set()
+
+    client.heartbeat = hb  # type: ignore[method-assign]
+    await loop.run()
+    beats = [r for k, r in client.calls if k == "heartbeat"]
+    assert beats and beats[0].progress.records_done == 1
+
+
+async def test_budget_duty_cycle_reaches_worker(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    await _run_one(tmp_path, _asn(), worker)
+    assert worker.ensured and worker.ensured[0][1].gpu_duty_cycle == BUDGET.gpu_duty_cycle
+
+
+async def test_engine_not_advertised_or_too_big_is_always_released(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    a = _asn(model={**MODEL, "engine": "ollama", "revision": "sha256:" + "b" * 64})
+    client, _ = await _run_one(tmp_path, a, worker)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert worker.ensured == []
+    big = _asn(model={**MODEL, "memory_gb": 64})
+    client, _ = await _run_one(tmp_path, big, worker)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
+async def test_engine_unavailable_runner_error_is_released_not_failed(tmp_path: Path) -> None:
+    worker = FakeWorker(RunnerError("ENGINE_UNAVAILABLE", "mlx"))
+    client, _ = await _run_one(tmp_path, _asn(), worker)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
+async def test_idle_unload_also_while_acquire_keeps_failing(tmp_path: Path) -> None:
+    now = [0.0]
+    worker = FakeWorker()
+    client = FakeClient([httpx.ConnectError("down")] * 4)
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], idle_unload_s=60.0, clock=lambda: now[0]
+    )
+    orig = client.acquire
+
+    async def acquire(req: AcquireRequest) -> Assignment | None:
+        now[0] += 40.0
+        if len(client.calls) >= 4:
+            loop.stop()
+        return await orig(req)
+
+    client.acquire = acquire  # type: ignore[method-assign]
+    await loop.run()
+    assert worker.unloads == 1
+
+
+async def test_idle_worker_unloaded_once_after_idle_period(tmp_path: Path) -> None:
+    now = [0.0]
+    worker, client = FakeWorker(), FakeClient([])
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], idle_unload_s=60.0, clock=lambda: now[0]
+    )
+    polls = []
+
+    def tick() -> None:
+        polls.append(now[0])
+        now[0] += 40.0
+        if len(polls) == 5:
+            loop.stop()
+
+    client.on_empty = tick
+    await loop.run()
+    assert worker.unloads == 1  # polls at 0 and 40 do not unload; 80 does; no repeat
+
+
+async def test_idle_unload_disabled_with_zero(tmp_path: Path) -> None:
+    now = [0.0]
+    worker, client = FakeWorker(), FakeClient([])
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], idle_unload_s=0, clock=lambda: now[0])
+
+    def tick() -> None:
+        now[0] += 1e6
+        loop.stop()
+
+    client.on_empty = tick
+    await loop.run()
+    assert worker.unloads == 0

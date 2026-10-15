@@ -106,7 +106,9 @@ minion_executor/
     process.py         # spawns + supervises inference subprocess; IPC via multiprocessing Pipe
     throttle.py        # duty-cycle pacer used inside the worker between steps/batches
   runners/             # run INSIDE the worker subprocess only
-    base.py            # Runner protocol: load(model, budget) / run(batch) -> results / unload()
+    base.py            # Runner protocol v2: load(model, path, budget, EngineConfig) /
+                       # run(batch, params, StepControl) -> results / memory_in_use() / unload();
+                       # worker ops also include probe (engine versions) and stats
     mlx_completion.py  # mlx-lm BatchGenerator (default)
     mlx_embedding.py   # mlx-embeddings (default)
     ollama.py          # fallback: Ollama HTTP (localhost:11434)
@@ -183,13 +185,20 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   Memory is `min(fraction, 75 %) × RAM`, sent in `Budget`. CPU priority is applied only as a POSIX
   `nice` value in the worker (15 / 10 / 0); there is no `Budget` field for it and no `taskpolicy`.
 - **Token and CLI** (`secrets.py`, `main.py`): token from `$MINION_EXECUTOR_TOKEN`, else the macOS
-  Keychain item `open-minions-executor` via `/usr/bin/security`. Token is never logged. `run` exits 2
+  Keychain item `open-minions-executor` via `/usr/bin/security` (run with a scrubbed environment).
+  Token is never logged. `run` exits 2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
   missing token or unknown runner. The token is removed from `os.environ` right after loading, before
-  any child process. `--runner` (hidden) defaults to the real engine `mlx` (arrives in M3, so `run`
-  currently exits 2); `--runner fake` is refused unless `MINION_EXECUTOR_DEV=1`, and then registers
-  with engines `[fake]` only, so it can only be served tasks whose model uses engine `fake`.
+  any child process. `--engines auto` (default) or a list such as `mlx,ollama`: after the environ is
+  restricted, a short-lived worker subprocess (90 s timeout) probes which engines work (only engines
+  `create_runner` implements, see `runners.SUPPORTED`) and the executor registers with those; none
+  available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden
+  `--runner fake`) needs `MINION_EXECUTOR_DEV=1`. Subtasks whose engine/memory is not admissible, or
+  whose engine turns out unavailable at load (`ENGINE_UNAVAILABLE`), are released, not failed.
   `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
+- **Idle unload** (`loop.py`, FR-13, invariant 6): after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600 s; 0
+  disables) without a subtask, the loop calls `worker.unload()` to free model memory; the same check
+  runs on the acquire-error path.
 - **Heartbeater** (`heartbeat.py`, TASK-3.3, FR-14): an asyncio task beside the work coroutine.
   Interval `--heartbeat-interval` / `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (default 300 s, min 1 s),
   each sleep jittered ×U(0.9, 1.1). Each beat sends progress, budget and pause reason, and keeps the
@@ -287,7 +296,7 @@ Executor: GET input via presigned URL (Range header for byte slice)
           ensure model cached → hand records to worker subprocess
 Worker:   load model (or reuse warm one) with MLX memory/cache limits from budget
           loop: run one generation step / embedding batch (≤ budget.max_batch_size)
-                throttle.pace()   ← duty-cycle sleep + check governor events
+                ctl.checkpoint()  ← duty-cycle sleep + check governor events
           stream results back to control process
 Executor: write results to local temp JSONL
           PUT to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
@@ -363,7 +372,7 @@ executor therefore enforces the owner's budget cooperatively, at four levers (SP
    Inside the worker: `mx.set_memory_limit(budget)` and a small `mx.set_cache_limit` so freed buffers are
    returned to the OS instead of hoarded. Downgrade below the loaded model → finish batch → `release`
    subtask → kill worker (only reliable way to return all unified memory).
-2. **GPU duty cycle** — `throttle.pace()` after each step: measure GPU-synchronized step time `t`
+2. **GPU duty cycle** — `StepControl.checkpoint()` (→ `throttle.step_done()`) after each step: measure GPU-synchronized step time `t`
    (`mx.eval` + `mx.synchronize`), then sleep `t·(1−d)/d` for duty `d`. Short bursts (one decode step
    ≈ 10–50 ms) keep the window server and video encoders getting GPU time between bursts. Batch size is
    the second knob: smaller batch → shorter bursts → smoother foreground.

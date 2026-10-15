@@ -12,22 +12,34 @@ import contextlib
 import json
 import multiprocessing as mp
 import os
+import resource
+import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import asdict
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from typing import Any
 
-from minion_common.schemas import Budget, ModelEntry
+from minion_common.enums import Engine
+from minion_common.schemas import Budget, ModelEntry, TaskParams, parse_params
 
-from minion_executor.runners.base import Record, RunnerError
+from minion_executor.runners.base import (
+    ENGINE_UNAVAILABLE,
+    EngineConfig,
+    Record,
+    Runner,
+    RunnerError,
+)
+from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
-# TODO(M3): real engines need proxy/CA/HF_HUB_*/HF_ENDPOINT/OLLAMA_HOST handling here; decide
-# how to treat credential-bearing proxy URLs at that point.
+# TODO(TASK-4.2): proxy/CA/HF_HUB_* handling for real engines (credential-bearing proxy URLs
+# only ever reach the fetch subprocess, never the worker).
 _ALLOWED_NAMES = frozenset(
     {
         "PATH",
@@ -86,18 +98,58 @@ def _watch_parent(parent_pid: int, interval_s: float) -> None:
             os._exit(1)
 
 
+class _Ctl:
+    """`StepControl` inside the worker: static duty-cycle pacing plus rate-limited ticks."""
+
+    def __init__(self, conn: Connection, duty: float, tick_interval_s: float) -> None:
+        self._conn = conn
+        self._tick_s = tick_interval_s
+        self._last_tick = 0.0
+        self._done: int | None = None  # last records_done seen; re-sent on pacer ticks
+        self._pacer = DutyCyclePacer(duty, time.monotonic, self._sleep)
+
+    def start(self) -> None:
+        self._pacer.reset()
+
+    def _tick(self, records_done: int | None) -> None:
+        now = time.monotonic()
+        if now - self._last_tick >= self._tick_s:
+            self._last_tick = now
+            _send(self._conn, {"tick": records_done})
+
+    def _sleep(self, seconds: float) -> None:
+        """Pace sleep in tick-sized chunks so a long pause never looks like a hang."""
+        end = time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            time.sleep(min(left, self._tick_s))
+            self._tick(self._done)
+
+    def checkpoint(self, records_done: int | None = None) -> None:
+        if records_done is not None:
+            self._done = records_done
+        self._tick(self._done)  # before pacing: the pacer's own ticks share the rate limit
+        self._pacer.step_done()
+
+
+def _maxrss_bytes() -> int:
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss if sys.platform == "darwin" else rss * 1024  # macOS: bytes, Linux: KiB
+
+
 def worker_main(
     conn: Connection,
-    runner_name: str,
+    engines: list[str],
     nice: int = 0,
     env: dict[str, str] | None = None,
     test_hooks: bool = False,
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     parent_pid: int | None = None,
     parent_watch_interval_s: float = 1.0,
+    tick_interval_s: float = 1.0,
 ) -> None:
-    """Child entry point (top level so it is picklable under spawn)."""
-    from minion_executor.runners import create_runner
+    """Child entry point (top level so it is picklable under spawn). The runner is created at
+    `load` from the model's engine, which must be in `engines`."""
+    from minion_executor.runners import create_runner, probe_engines
 
     if env is not None:  # explicit, scrubbed environment replaces whatever was inherited
         os.environ.clear()
@@ -109,7 +161,10 @@ def worker_main(
     if nice:
         with contextlib.suppress(OSError):
             os.nice(nice)
-    runner = create_runner(runner_name, test_hooks=test_hooks)
+    allowed = {Engine(e) for e in engines}
+    runner: Runner | None = None
+    model: ModelEntry | None = None
+    budget: Budget | None = None
     while True:
         try:
             msg = _recv(conn, max_message_bytes)
@@ -117,22 +172,52 @@ def worker_main(
             break
         op = msg["op"]
         if op == "shutdown":
-            runner.unload()
+            if runner is not None:
+                runner.unload()
             _send(conn, {"ok": True})
             break
         try:
-            result: list[Record] | None = None
+            result: Any = None
             if op == "load":
-                runner.load(ModelEntry(**msg["model"]), Budget(**msg["budget"]))
+                if runner is not None:
+                    runner.unload()
+                    runner = None
+                model = ModelEntry(**msg["model"])
+                budget = Budget(**msg["budget"])
+                cfg = EngineConfig(**msg.get("cfg", {}))
+                if model.engine not in allowed:
+                    raise RunnerError("ENGINE_NOT_ALLOWED", model.engine.value)
+                path = Path(msg["model_path"]) if msg.get("model_path") else None
+                try:
+                    new_runner = create_runner(model.engine, model.type, test_hooks=test_hooks)
+                    new_runner.load(model, path, budget, cfg)
+                except ImportError:  # extra not installed in this venv
+                    raise RunnerError(ENGINE_UNAVAILABLE, model.engine.value) from None
+                runner = new_runner
             elif op == "run":
-                result = runner.run(msg["batch"])
-            elif op == "unload":
-                runner.unload()
+                if runner is None or model is None or budget is None:
+                    raise RunnerError("not_loaded")
+                params: TaskParams = parse_params(model.type, msg.get("params") or {})
+                ctl = _Ctl(conn, budget.gpu_duty_cycle, tick_interval_s)
+                ctl.start()
+                result = runner.run(msg["batch"], params, ctl)
+            elif op == "stats":
+                mem = runner.memory_in_use() if runner is not None else None
+                result = {
+                    "active_bytes": mem["active_bytes"] if mem else 0,
+                    "peak_bytes": mem["peak_bytes"] if mem else 0,
+                    "max_rss_bytes": _maxrss_bytes(),
+                }
+            elif op == "probe":
+                result = probe_engines(allowed, EngineConfig(**msg.get("cfg", {})))
             else:
                 raise RunnerError("bad_op", op)
             _send(conn, {"ok": True, "result": result})
         except RunnerError as e:
-            _send(conn, {"ok": False, "code": e.code, "message": e.message})
+            _send(
+                conn,
+                {"ok": False, "code": e.code, "message": e.message, "retryable": e.retryable},
+            )
         except Exception as e:
             _send(conn, {"ok": False, "code": "runner_error", "message": type(e).__name__})
     conn.close()
@@ -149,19 +234,23 @@ class WorkerHandle:
 
     def __init__(
         self,
-        runner_name: str,
+        engines: Collection[Engine],
         nice: int = 0,
         *,
-        load_timeout_s: float = 900.0,
-        run_timeout_s: float = 600.0,
+        load_timeout_s: float = 1800.0,
+        step_timeout_s: float = 300.0,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         test_hooks: bool = False,
         parent_watch_interval_s: float = 1.0,
+        tick_interval_s: float = 1.0,
+        engine_config: EngineConfig | None = None,
     ) -> None:
-        self._runner_name = runner_name
+        self._engines = sorted(e.value for e in engines)
         self._nice = nice
         self._load_timeout_s = load_timeout_s
-        self._run_timeout_s = run_timeout_s
+        self._step_timeout_s = step_timeout_s
+        self._tick_interval_s = tick_interval_s
+        self._cfg = engine_config or EngineConfig()
         self._max_message_bytes = max_message_bytes
         self._test_hooks = test_hooks
         self._watch_s = parent_watch_interval_s
@@ -194,13 +283,14 @@ class WorkerHandle:
                 target=worker_main,
                 args=(
                     child,
-                    self._runner_name,
+                    self._engines,
                     self._nice,
                     scrub_env(os.environ),
                     self._test_hooks,
                     self._max_message_bytes,
                     os.getpid(),
                     self._watch_s,
+                    self._tick_interval_s,
                 ),
                 daemon=True,
             )
@@ -214,7 +304,14 @@ class WorkerHandle:
                 raise WorkerCrashed("worker handle is stopped")
         return self._conn
 
-    def _call(self, msg: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    def _call(
+        self,
+        msg: dict[str, Any],
+        timeout_s: float,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Send `msg`, wait for the reply. `timeout_s` is an inactivity limit: every tick from
+        the worker resets it, and ticks are forwarded to `on_progress`."""
         with self._lock:
             gen = self._seen_gen
             conn = self._ensure_started()
@@ -225,16 +322,23 @@ class WorkerHandle:
                 _send(conn, msg)
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
-                while not conn.poll(0.1):
-                    if abortable and (self._closed or self._interrupt_gen != gen):
-                        raise WorkerCrashed("worker handle is stopped")
-                    if not proc.is_alive():
-                        if conn.poll(0):
-                            break
-                        raise WorkerCrashed(f"worker exited with code {proc.exitcode}")
-                    if time.monotonic() > deadline:
-                        raise WorkerCrashed("worker timed out")
-                reply = _recv(conn, self._max_message_bytes)
+                while True:
+                    if not conn.poll(0.1):
+                        if abortable and (self._closed or self._interrupt_gen != gen):
+                            raise WorkerCrashed("worker handle is stopped")
+                        if not proc.is_alive() and not conn.poll(0):
+                            raise WorkerCrashed(f"worker exited with code {proc.exitcode}")
+                        if time.monotonic() > deadline:
+                            raise WorkerCrashed("worker timed out")
+                        continue
+                    reply = _recv(conn, self._max_message_bytes)
+                    if "tick" not in reply:
+                        break
+                    deadline = time.monotonic() + timeout_s  # liveness: restart the clock
+                    done = reply["tick"]
+                    if on_progress is not None and isinstance(done, int):
+                        with contextlib.suppress(Exception):  # a bad callback must not kill a run
+                            on_progress(done)
             except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
                 code = proc.exitcode
                 self._reset()
@@ -243,10 +347,14 @@ class WorkerHandle:
                 self._reset()
                 raise
             if not reply["ok"]:
-                raise RunnerError(reply["code"], reply.get("message", ""))
+                raise RunnerError(
+                    reply["code"], reply.get("message", ""), retryable=reply.get("retryable", True)
+                )
             return reply
 
-    def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
+    def ensure_model(
+        self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+    ) -> None:
         """Load `model`; no-op if already warm, kill+restart on a model switch."""
         with self._lock:
             g = self._interrupt_gen  # read once: an interrupt landing now must not be swallowed
@@ -262,15 +370,49 @@ class WorkerHandle:
                     "op": "load",
                     "model": model.model_dump(mode="json"),
                     "budget": budget.model_dump(mode="json"),
+                    "model_path": str(model_path) if model_path else None,
+                    "cfg": asdict(self._cfg),
                 },
                 self._load_timeout_s,
             )
             self._model_id = model.model_id
 
-    def run(self, batch: list[Record]) -> list[Record]:
-        reply = self._call({"op": "run", "batch": batch}, self._run_timeout_s)
+    def run(
+        self,
+        batch: list[Record],
+        params: TaskParams | None = None,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> list[Record]:
+        """Run `batch` on the loaded model. `params=None` means the type's defaults."""
+        msg = {
+            "op": "run",
+            "batch": batch,
+            "params": params.model_dump(mode="json") if params is not None else {},
+        }
+        reply = self._call(msg, self._step_timeout_s, on_progress)
         result: list[Record] = reply["result"]
         return result
+
+    def stats(self) -> dict[str, int]:
+        """Worker memory: runner `active_bytes`/`peak_bytes` plus process `max_rss_bytes`."""
+        stats: dict[str, int] = self._call({"op": "stats"}, self._step_timeout_s)["result"]
+        return stats
+
+    def probe(self, timeout_s: float = 90.0) -> dict[str, str | None]:
+        """Spawn a worker, report `{engine: version | None}` for this handle's engines (imports
+        happen in the child only), then shut it down. Do not call with a model loaded."""
+        with self._lock:
+            try:
+                reply = self._call({"op": "probe", "cfg": asdict(self._cfg)}, timeout_s)
+                result: dict[str, str | None] = reply["result"]
+                return result
+            finally:
+                self._reset()
+
+    def unload(self) -> None:
+        """Drop the model and free its memory by resetting the worker; the handle stays usable."""
+        with self._lock:
+            self._reset()
 
     def kill(self) -> None:
         """Stop for good: hard-kill the worker (reclaiming model memory), never respawn.

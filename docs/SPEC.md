@@ -58,16 +58,23 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 - FR-4. Supported task types **[paper]**:
   - `embedding` — input: JSONL with `id` + `text` field.
   - `completion` — input: JSONL with `id` + `prompt` (or `messages`);
-    params: `temperature`, `max_tokens`, `system`, etc.
+    params (allow-list, unknown keys rejected with `422 INVALID_PARAMS`): `temperature` (0..2,
+    default 0), `top_p` ((0,1], default 1), `max_tokens` (1..4096, default 256), `seed` (int or
+    null), `system` (string, at most 8000 chars). Embedding params: `normalize` (bool, default true).
 - FR-4a. Each task names a `model` from the deployment's **model allow-list** (`models.yaml`). An entry
   defines `model_id`, `type`, `engine` (`mlx` | `ollama` | `hf`; plus `fake`, a test/dev-only engine for the fake runner, never in a production allow-list), engine-specific reference (HF repo for
-  MLX/HF, tag for Ollama), and `memory_gb` (peak resident estimate incl. KV cache at default batch size).
+  MLX/HF, tag for Ollama), a pinned `revision` (40-hex commit SHA for MLX/HF, 64-hex manifest digest
+  for Ollama; optional only for `fake`), and `memory_gb` (peak resident estimate incl. KV cache at default batch size).
   Default engine is `mlx` **[ours, ADR-0005]**; the paper used HF transformers + Ollama.
 - FR-5. Input format **[ours]**: one or more JSONL objects under an S3 prefix. Splitting is by record
   count (`records_per_subtask`, default 500). Each subtask stores `(input_uri, byte_offset, byte_length)`
   or a pre-split object key — see ARCHITECTURE §5.2.
 - FR-6. Output **[ours]**: one JSONL object per subtask at
-  `{output_prefix}/{subtask_id:06d}.jsonl`, each line `{id, embedding|completion, model, ...}`.
+  `{output_prefix}/{subtask_id:06d}.jsonl`, each line `{id, embedding|completion, model,
+  model_revision, ...}`. A record that cannot be processed (e.g. a prompt longer than the model
+  context minus `max_tokens`) yields a per-record line `{id, error: "PROMPT_TOO_LONG", model,
+  model_revision}` instead of failing the subtask. Operators never change the revision of an
+  existing `model_id`; a new revision gets a new id.
   Written to an attempt-scoped key first and promoted on completion (idempotency).
 - FR-7. Users can query task status, per-subtask status, progress counts, and the output location **[paper]**.
 - FR-8. Users can cancel a task; pending subtasks become `CANCELLED`, running ones are told to stop on
@@ -105,6 +112,8 @@ subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, whi
 "finish-or-release within grace" wording). Not yet implemented: FR-12 model cache, FR-13 MLX/Ollama/HF
 runners, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
 governor (M4). ARCHITECTURE §2.2 describes the executor as built.
+
+**M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
 
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 

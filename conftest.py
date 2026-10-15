@@ -221,7 +221,12 @@ async def seed_task(
         }
     )
     model = ModelEntry(
-        model_id=model_id, type="embedding", engine=engine, ref="f", memory_gb=memory_gb
+        model_id=model_id,
+        type="embedding",
+        engine=engine,
+        ref={Engine.OLLAMA: "m:latest", Engine.FAKE: "fake"}.get(engine, "o/m"),
+        revision={Engine.OLLAMA: "b" * 64, Engine.FAKE: None}.get(engine, "a" * 40),
+        memory_gb=memory_gb,
     )
     async with sm() as s, s.begin():
         inserted = await tasks_repo.insert_task(

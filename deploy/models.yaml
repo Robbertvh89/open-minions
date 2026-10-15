@@ -1,12 +1,16 @@
 # Model allow-list (MINION_MODELS_FILE). memory_gb = approximate resident size for admission.
+# revision = pinned commit SHA (mlx/hf) or manifest digest (ollama). Never change the revision of an
+# existing model_id: add a new model_id instead (outputs are stamped with model + model_revision).
 models:
   - model_id: qwen2.5-0.5b-instruct
     type: completion
     engine: mlx
     ref: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+    revision: a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3
     memory_gb: 1.0
   - model_id: bge-small-en
     type: embedding
     engine: mlx
     ref: mlx-community/bge-small-en-v1.5-bf16
+    revision: 0e415031434cdf5f1b89d584e11be33b82abfc8d
     memory_gb: 0.5

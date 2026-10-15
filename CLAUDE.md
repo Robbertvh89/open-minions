@@ -60,7 +60,7 @@ uv run minion-server-admin --help          # operator CLI (typer); subcommands b
 uv run minion-server-admin generate-api-key --name <who> --teams a,b   # prints key once + keys-file entry
 uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]  # prints token once
 uv run minion-server-admin revoke-executor-token --executor-id <uuid>
-uv run minion-executor run --server http://localhost:8080 --profile balanced [--heartbeat-interval SECONDS]  # heartbeat default 300 s (server timeout >= 2-3x); token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (until M3 the default mlx runner exits 2: use `MINION_EXECUTOR_DEV=1 uv run minion-executor run --runner fake ...`; profiles: light|balanced|full)
+uv run minion-executor run --server http://localhost:8080 --profile balanced [--engines auto|mlx,ollama,hf] [--heartbeat-interval SECONDS]  # heartbeat default 300 s (server timeout >= 2-3x); token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (`--engines auto` (default) probes mlx/ollama/hf in a worker subprocess and advertises what works, exit 2 if none; the `fake` engine is never implicit: `MINION_EXECUTOR_DEV=1 uv run minion-executor run --engines fake ...`; idle worker unloaded after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600, 0 disables); profiles: light|balanced|full)
 # uv run minion-executor bench --model <id>  # not implemented yet (M3); was: engine/throughput benchmark on this Mac (not implemented yet, M3)
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only

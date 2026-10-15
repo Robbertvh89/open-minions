@@ -7,6 +7,8 @@ import subprocess
 
 from pydantic import SecretStr
 
+from minion_executor.worker.process import scrub_env
+
 ENV_VAR = "MINION_EXECUTOR_TOKEN"
 KEYCHAIN_SERVICE = "open-minions-executor"
 
@@ -22,6 +24,7 @@ def load_token() -> SecretStr:
             text=True,
             timeout=10,
             check=False,
+            env=scrub_env(os.environ),
         )
     except (OSError, subprocess.SubprocessError):
         out = None

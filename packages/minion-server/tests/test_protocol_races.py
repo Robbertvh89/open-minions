@@ -292,7 +292,12 @@ async def test_concurrent_splitters_no_duplicates_full_coverage(fresh_url: str, 
         from minion_common.schemas import ModelEntry
 
         model = ModelEntry(
-            model_id="fake-embed", type="embedding", engine="mlx", ref="f", memory_gb=0.1
+            model_id="fake-embed",
+            type="embedding",
+            engine="mlx",
+            ref="o/m",
+            revision="a" * 40,
+            memory_gb=0.1,
         )
         async with sm() as s, s.begin():
             assert await tasks_repo.insert_task(

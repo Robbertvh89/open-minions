@@ -149,6 +149,24 @@ async def test_create_split_and_get(app_client: tuple[AsyncClient, FastAPI], s3:
 
 
 @pytest.mark.integration
+async def test_create_params_allow_list(app_client: tuple[AsyncClient, FastAPI], s3: S3Env) -> None:
+    c, _ = app_client
+    _put(s3, "inputs/api1/prm/a.jsonl", _jsonl(1, "x"))
+    for bad in ({"trust_remote_code": True}, {"normalize": "yes"}, {"temperature": 1}):
+        r = await c.post("/api/v1/tasks", json=_payload("api1", "prm", params=bad))
+        assert r.status_code == 422, bad
+        assert r.json()["detail"]["code"] == "INVALID_PARAMS"
+    # values are never echoed back
+    r = await c.post(
+        "/api/v1/tasks", json=_payload("api1", "prm", params={"secret-key": "hunter2"})
+    )
+    assert r.status_code == 422 and "hunter2" not in r.text
+    ok = await c.post("/api/v1/tasks", json=_payload("api1", "prm", params={"normalize": False}))
+    assert ok.status_code == 202, ok.text
+    assert ok.json()["params"] == {"normalize": False}
+
+
+@pytest.mark.integration
 async def test_create_rejections(app_client: tuple[AsyncClient, FastAPI], s3: S3Env) -> None:
     c, _ = app_client
     _put(s3, "inputs/api1/rej/a.jsonl", _jsonl(1, "x"))
@@ -197,7 +215,12 @@ async def _insert_task(engine: AsyncEngine, team: str, name: str, n: int = 10) -
     from minion_common.schemas import ModelEntry
 
     model = ModelEntry(
-        model_id="fake-embed", type="embedding", engine="mlx", ref="f", memory_gb=0.1
+        model_id="fake-embed",
+        type="embedding",
+        engine="mlx",
+        ref="o/m",
+        revision="a" * 40,
+        memory_gb=0.1,
     )
     async with sm() as s, s.begin():
         assert await tasks_repo.insert_task(

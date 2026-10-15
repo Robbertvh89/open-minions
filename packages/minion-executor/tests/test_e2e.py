@@ -182,7 +182,9 @@ async def test_two_executors_complete_task_exactly_once(live: Live, tmp_path: Pa
     await live.submit("two", rps=25)
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    counts = await _run_loops(live, [WorkerHandle("fake"), WorkerHandle("fake")], "two", scratch)
+    counts = await _run_loops(
+        live, [WorkerHandle([Engine.FAKE]), WorkerHandle([Engine.FAKE])], "two", scratch
+    )
 
     assert await live.task_status("two") == "SUCCEEDED"
     n_sub = (await live.rows("SELECT count(*) FROM minion_subtask WHERE task_name='two'"))[0][0]
@@ -207,14 +209,14 @@ class CrashOnceWorker(WorkerHandle):
     """SIGKILLs its own worker subprocess during the first batch it runs."""
 
     def __init__(self) -> None:
-        super().__init__("fake")
+        super().__init__([Engine.FAKE])
         self.killed_pid: int | None = None
 
-    def run(self, batch: Any) -> Any:
+    def run(self, batch: Any, params: Any = None, on_progress: Any = None) -> Any:
         if self.killed_pid is None and self.pid is not None:
             self.killed_pid = self.pid
             os.kill(self.pid, signal.SIGKILL)
-        return super().run(batch)
+        return super().run(batch, params, on_progress)
 
 
 async def test_worker_sigkill_is_retried_to_success(live: Live, tmp_path: Path) -> None:
@@ -382,7 +384,7 @@ async def test_killed_executor_subtask_is_reclaimed_and_rerun(
 
         await eventually(expired, 30)
         b_client, b_loop = _in_process_loop(
-            live, await live.token("exec-b"), WorkerHandle("fake"), tmp_path
+            live, await live.token("exec-b"), WorkerHandle([Engine.FAKE]), tmp_path
         )
         b_task = asyncio.create_task(b_loop.run())
 
@@ -416,7 +418,7 @@ async def test_cancel_interrupts_worker_and_executor_keeps_running(
     """Cancel -> next beat sees cancel=true -> worker killed, release CANCELLED, loop idles."""
     live.put_input("cxl", "a.jsonl", SLOW + _records("c", 4))
     await live.submit("cxl", rps=10)
-    worker = WorkerHandle("fake", test_hooks=True)
+    worker = WorkerHandle([Engine.FAKE], test_hooks=True)
     client, loop = _in_process_loop(live, await live.token("exec-c"), worker, tmp_path)
     run = asyncio.create_task(loop.run())
     try:
@@ -451,7 +453,7 @@ async def test_stale_acquirement_409_stops_work_sends_nothing_and_continues(
     """Forced reclaim -> next beat gets 409 -> worker killed, nothing reported, keeps polling."""
     live.put_input("stale", "a.jsonl", SLOW + _records("s", 4))
     await live.submit("stale", rps=10)
-    worker = WorkerHandle("fake", test_hooks=True)
+    worker = WorkerHandle([Engine.FAKE], test_hooks=True)
     client, loop = _in_process_loop(live, await live.token("exec-s"), worker, tmp_path)
     run = asyncio.create_task(loop.run())
     try:
