@@ -3,6 +3,7 @@
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,21 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from botocore.config import Config as BotoConfig
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from minion_common.enums import Engine
+from minion_common.schemas import AcquireRequest, Budget, ModelEntry, TaskCreate
+from minion_server.admin import issue_executor_token
+from minion_server.auth import ExecutorPrincipal
+from minion_server.db.models import Subtask
+from minion_server.repositories import tasks as tasks_repo
+from minion_server.settings import ServerSettings
+from pydantic import SecretStr
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -106,3 +121,100 @@ def s3() -> Iterator[S3Env]:
                     raise
                 time.sleep(0.5)
         yield S3Env(endpoint, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, client)
+
+
+# --- server test helpers (seeding, executors, settings) ---
+
+
+def _settings(url: str) -> ServerSettings:
+    return ServerSettings(
+        database_url=SecretStr(url),
+        s3_access_key=SecretStr("ak"),
+        s3_secret_key=SecretStr("sk"),
+        models_file="deploy/models.yaml",
+        splitter_poll_s=60,
+    )
+
+
+def _budget(mem: float = 8.0) -> Budget:
+    return Budget.model_validate(
+        {"profile": "balanced", "memory_gb": mem, "gpu_duty_cycle": 0.5, "max_batch_size": 8}
+    )
+
+
+def _req(mem: float = 8.0, engines: tuple[Engine, ...] = (Engine.MLX,)) -> AcquireRequest:
+    return AcquireRequest(engines=list(engines), budget=_budget(mem))
+
+
+async def seed_task(
+    sm: async_sessionmaker[AsyncSession],
+    name: str,
+    n: int,
+    *,
+    engine: Engine = Engine.MLX,
+    memory_gb: float = 0.1,
+    pool: str | None = None,
+    priority: int = 0,
+    status: str = "PENDING",
+    team: str = "acq",
+) -> None:
+    body = TaskCreate.model_validate(
+        {
+            "team": team,
+            "project": "p",
+            "task_name": name,
+            "type": "embedding",
+            "model": "fake-embed",
+            "input_uri": f"s3://minion/inputs/{team}/{name}/",
+            "output_uri": f"s3://minion/outputs/{team}/{name}/",
+            "priority": priority,
+            "allowed_pool": pool,
+        }
+    )
+    model = ModelEntry(
+        model_id="fake-embed", type="embedding", engine=engine, ref="f", memory_gb=memory_gb
+    )
+    async with sm() as s, s.begin():
+        inserted = await tasks_repo.insert_task(
+            s,
+            body,
+            model=model,
+            input_uri=body.input_uri,
+            output_uri=body.output_uri,
+            created_by="t",
+        )
+        if not inserted:
+            raise RuntimeError("seed task already exists")
+        for i in range(n):
+            s.add(
+                Subtask(
+                    team=team,
+                    project="p",
+                    task_name=name,
+                    subtask_id=i,
+                    input_object_key=f"inputs/{team}/{name}/a.jsonl",
+                    byte_start=i * 100,
+                    byte_end=i * 100 + 100,
+                    first_record=i * 10,
+                    record_count=10,
+                )
+            )
+        await s.flush()
+        await s.execute(
+            text("UPDATE minion_task SET status=:st, total_subtasks=:n WHERE task_name=:name"),
+            {"st": status, "n": n, "name": name},
+        )
+
+
+async def make_executors(
+    sm: async_sessionmaker[AsyncSession], n: int, pool: str = "default"
+) -> list[tuple[ExecutorPrincipal, str]]:
+    out = []
+    for i in range(n):
+        eid, token = await issue_executor_token(sm, owner=f"o{i}", pool=pool, ttl_days=1)
+        out.append((ExecutorPrincipal(uuid.UUID(eid), f"o{i}", pool), token))
+    return out
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}

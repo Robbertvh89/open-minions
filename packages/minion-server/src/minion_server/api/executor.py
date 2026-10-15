@@ -1,11 +1,14 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
 from minion_common.schemas import (
     AcquireRequest,
     Assignment,
+    CompleteRequest,
+    FailRequest,
     ModelEntry,
     PreferenceRequest,
     RegisterRequest,
@@ -17,7 +20,7 @@ from minion_server.auth import ExecutorPrincipal, current_executor
 from minion_server.db.session import get_session
 from minion_server.errors import api_error
 from minion_server.repositories import executors as executors_repo
-from minion_server.services import acquisition
+from minion_server.services import acquisition, completion
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 
@@ -94,3 +97,39 @@ async def acquire(
     if assignment is None:
         return Response(status_code=204)
     return Response(content=assignment.model_dump_json(), media_type="application/json")
+
+
+@router.post("/subtasks/{acquirement_id}/complete", status_code=204)
+async def complete(
+    acquirement_id: uuid.UUID,
+    body: CompleteRequest,
+    principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[ServerSettings, Depends(_settings)],
+    storage: Annotated[S3Storage, Depends(_storage)],
+) -> Response:
+    await completion.complete(
+        session, principal, acquirement_id, body, settings=settings, storage=storage
+    )
+    return Response(status_code=204)
+
+
+@router.post("/subtasks/{acquirement_id}/fail", status_code=204)
+async def fail(
+    acquirement_id: uuid.UUID,
+    body: FailRequest,
+    principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    await completion.fail(session, principal, acquirement_id, body)
+    return Response(status_code=204)
+
+
+@router.post("/subtasks/{acquirement_id}/release", status_code=204)
+async def release(
+    acquirement_id: uuid.UUID,
+    principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    await completion.release(session, principal, acquirement_id)
+    return Response(status_code=204)

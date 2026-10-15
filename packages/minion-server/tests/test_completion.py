@@ -1,0 +1,294 @@
+"""Complete / fail / release (TASK-2.2 B5). Each test uses its own team for isolation."""
+
+import hashlib
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from minion_common.enums import TaskStatus
+from minion_server.app import create_app
+from minion_server.repositories import executors as executors_repo
+from minion_server.services.completion import derive_task_status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from conftest import S3Env, _auth, _req, _settings, make_executors, seed_task
+
+BASE = "/api/v1/executor"
+DATA = b'{"id":"a"}\n{"id":"b"}\n'
+
+
+@pytest.mark.parametrize(
+    ("total", "ok", "bad", "expected"),
+    [
+        (3, 2, 0, None),
+        (3, 3, 0, TaskStatus.SUCCEEDED),
+        (3, 2, 1, TaskStatus.PARTIAL),
+        (3, 0, 3, TaskStatus.FAILED),
+        (0, 0, 0, None),
+    ],
+)
+def test_derive_task_status(total: int, ok: int, bad: int, expected: TaskStatus | None) -> None:
+    assert derive_task_status(total, ok, bad) == expected
+
+
+@pytest.fixture
+async def http(migrated_url: str, s3: S3Env) -> AsyncIterator[tuple[AsyncClient, Any]]:
+    cfg = _settings(migrated_url).model_copy(
+        update={
+            "s3_endpoint_url": s3.endpoint_url,
+            "public_s3_endpoint_url": s3.endpoint_url,
+        }
+    )
+    from pydantic import SecretStr
+
+    cfg = cfg.model_copy(
+        update={
+            "s3_access_key": SecretStr(s3.access_key),
+            "s3_secret_key": SecretStr(s3.secret_key),
+            "s3_bucket": s3.bucket,
+        }
+    )
+    app = create_app(cfg)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c,
+    ):
+        yield c, app
+
+
+async def _own(
+    c: AsyncClient, sm: async_sessionmaker[AsyncSession], team: str, token: str, eid: uuid.UUID
+) -> dict[str, Any]:
+    """Prefer `team`, acquire one subtask over HTTP."""
+    async with sm() as s, s.begin():
+        await executors_repo.set_preference(s, eid, team=team, project=None, task_name=None)
+    r = await c.post(f"{BASE}/acquire", json=_req().model_dump(mode="json"), headers=_auth(token))
+    assert r.status_code == 200, r.text
+    a: dict[str, Any] = r.json()
+    return a
+
+
+def _put(s3: S3Env, team: str, name: str, a: dict[str, Any], body: bytes = DATA) -> tuple[str, str]:
+    base = f"outputs/{team}/{name}"
+    src = f"{base}/_attempts/{a['subtask_id']:06d}/{a['attempt']}.jsonl"
+    s3.client.put_object(Bucket=s3.bucket, Key=src, Body=body)
+    return src, f"{base}/{a['subtask_id']:06d}.jsonl"
+
+
+def _complete_body(body: bytes = DATA, records: int = 10) -> dict[str, Any]:
+    return {
+        "record_count": records,
+        "byte_size": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+
+def _exists(s3: S3Env, key: str) -> bool:
+    return bool(s3.client.list_objects_v2(Bucket=s3.bucket, Prefix=key).get("Contents"))
+
+
+async def _one(sm: async_sessionmaker[AsyncSession], sql: str, **p: Any) -> Any:
+    async with sm() as s:
+        return (await s.execute(text(sql), p)).one()
+
+
+FAIL = {"retryable": True, "code": "OOM", "message": "boom"}
+
+
+@pytest.mark.integration
+async def test_complete_promotes_and_is_idempotent(
+    http: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "done", 1, team="cmp1")
+    (p, tok), (_q, qtok) = await make_executors(sm, 2)
+    a = await _own(c, sm, "cmp1", tok, p.executor_id)
+    src, dst = _put(s3, "cmp1", "done", a)
+    assert not _exists(s3, dst)
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/complete"
+    assert (await c.post(url, json=_complete_body(), headers=_auth(tok))).status_code == 204
+    assert s3.client.get_object(Bucket=s3.bucket, Key=dst)["Body"].read() == DATA
+    assert _exists(s3, src)  # attempt-scoped object is kept
+    st = await _one(
+        sm,
+        "SELECT s.status, s.output_uri, t.status, t.succeeded_subtasks, t.finished_at IS NOT NULL,"
+        " (SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='done'),"
+        " (SELECT count(*) FROM minion_subtask_attempt WHERE task_name='done'"
+        "  AND outcome='SUCCEEDED')"
+        " FROM minion_subtask s JOIN minion_task t USING (team, project, task_name)"
+        " WHERE s.task_name='done'",
+    )
+    assert tuple(st) == ("SUCCEEDED", f"s3://minion/{dst}", "SUCCEEDED", 1, True, 0, 1)
+    # lost-response retry by the same owner is a no-op; another executor still gets 409
+    assert (await c.post(url, json=_complete_body(), headers=_auth(tok))).status_code == 204
+    assert (await c.post(url, json=_complete_body(), headers=_auth(qtok))).status_code == 409
+    again = await _one(sm, "SELECT succeeded_subtasks FROM minion_task WHERE task_name='done'")
+    assert again[0] == 1
+
+
+@pytest.mark.integration
+async def test_complete_validation_keeps_ownership(
+    http: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "val", 1, team="cmp2")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp2", tok, p.executor_id)
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/complete"
+    r = await c.post(url, json=_complete_body(), headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_MISSING")
+    _, dst = _put(s3, "cmp2", "val", a)
+    r = await c.post(url, json=_complete_body(b"short"), headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_SIZE_MISMATCH")
+    r = await c.post(url, json=_complete_body(records=9), headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "RECORD_COUNT_MISMATCH")
+    assert not _exists(s3, dst)
+    row = await _one(sm, "SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='val'")
+    assert row[0] == 1
+    assert (await c.post(url, json=_complete_body(), headers=_auth(tok))).status_code == 204
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("route", ["complete", "fail", "release"])
+async def test_stale_and_foreign_acquirement_409(
+    http: tuple[AsyncClient, Any], s3: S3Env, route: str
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    team = f"cmp3{route[0]}"
+    name = f"stale-{route}"
+    await seed_task(sm, name, 1, team=team)
+    (p, tok), (_, other) = await make_executors(sm, 2)
+    a = await _own(c, sm, team, tok, p.executor_id)
+    body = {"complete": _complete_body(), "fail": FAIL, "release": None}[route]
+    _, dst = _put(s3, team, name, a)
+
+    def post(acq: object, token: str) -> Any:
+        return c.post(f"{BASE}/subtasks/{acq}/{route}", json=body, headers=_auth(token))
+
+    for acq, token in [(a["acquirement_id"], other), (uuid.uuid4(), tok)]:
+        r = await post(acq, token)
+        assert (r.status_code, r.json()["detail"]["code"]) == (409, "STALE_ACQUIREMENT")
+    assert not _exists(s3, dst)
+    row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name=:n", n=name)
+    assert row[0] == "RUNNING"  # untouched by the rejected calls
+    # owner releases; a late complete/fail/release with the old id is now stale too
+    assert (
+        await c.post(f"{BASE}/subtasks/{a['acquirement_id']}/release", headers=_auth(tok))
+    ).status_code == 204
+    r = await post(a["acquirement_id"], tok)
+    assert r.status_code == 409
+    assert not _exists(s3, dst)  # late complete after release did not promote
+
+
+@pytest.mark.integration
+async def test_release_does_not_consume_retry_budget(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "rel", 1, team="cmp4")
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET max_attempts=2 WHERE task_name='rel'"))
+    ((p, tok),) = await make_executors(sm, 1)
+    for n in range(1, 5):  # more releases than max_attempts
+        a = await _own(c, sm, "cmp4", tok, p.executor_id)
+        assert a["attempt"] == n
+        r = await c.post(f"{BASE}/subtasks/{a['acquirement_id']}/release", headers=_auth(tok))
+        assert r.status_code == 204
+        row = await _one(
+            sm,
+            "SELECT s.status, t.status, (SELECT count(*) FROM minion_subtask_acquirement"
+            " WHERE task_name='rel'), (SELECT count(*) FROM minion_executor_heartbeat h JOIN"
+            " minion_subtask_acquirement a USING (acquirement_id) WHERE a.task_name='rel')"
+            " FROM minion_subtask s JOIN minion_task t USING (team, project, task_name)"
+            " WHERE s.task_name='rel'",
+        )
+        assert tuple(row) == ("PENDING", "RUNNING", 0, 0)
+    a = await _own(c, sm, "cmp4", tok, p.executor_id)
+    assert a["attempt"] == 5
+    rows = await _one(
+        sm,
+        "SELECT count(*) FROM minion_subtask_attempt WHERE task_name='rel' AND outcome='RELEASED'",
+    )
+    assert rows[0] == 4
+
+
+@pytest.mark.integration
+async def test_fail_consumes_budget_then_terminal(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "fl", 1, team="cmp5")
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET max_attempts=2 WHERE task_name='fl'"))
+    ((p, tok),) = await make_executors(sm, 1)
+
+    async def fail(a: dict[str, Any], **kw: Any) -> None:
+        r = await c.post(
+            f"{BASE}/subtasks/{a['acquirement_id']}/fail", json=FAIL | kw, headers=_auth(tok)
+        )
+        assert r.status_code == 204
+
+    async def state() -> tuple[Any, ...]:
+        row = await _one(
+            sm,
+            "SELECT (SELECT string_agg(status, ',' ORDER BY subtask_id) FROM minion_subtask"
+            " WHERE task_name='fl'), t.status, t.failed_subtasks FROM minion_task t"
+            " WHERE task_name='fl'",
+        )
+        return tuple(row)
+
+    a = await _own(c, sm, "cmp5", tok, p.executor_id)
+    await fail(a)  # 1st failure of 2: retryable -> PENDING
+    assert await state() == ("PENDING", "RUNNING", 0)
+    a = await _own(c, sm, "cmp5", tok, p.executor_id)
+    assert a["attempt"] == 2
+    await fail(a)  # budget exhausted -> FAILED; all subtasks terminal -> task FAILED
+    assert await state() == ("FAILED", "FAILED", 1)
+    # non-retryable fails at once, despite budget left
+    await seed_task(sm, "fl-nr", 1, team="cmp5")
+    b = await _own(c, sm, "cmp5", tok, p.executor_id)
+    assert b["attempt"] == 1
+    await fail(b, retryable=False)
+    row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name='fl-nr'")
+    assert row[0] == "FAILED"
+    err = await _one(
+        sm,
+        "SELECT error->>'code', error->>'message' FROM minion_subtask_attempt"
+        " WHERE task_name='fl' AND outcome='FAILED' LIMIT 1",
+    )
+    assert tuple(err) == ("OOM", "boom")
+
+
+@pytest.mark.integration
+async def test_task_partial_when_mixed(http: tuple[AsyncClient, Any], s3: S3Env) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "mix", 2, team="cmp6")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp6", tok, p.executor_id)
+    _put(s3, "cmp6", "mix", a)
+    r = await c.post(
+        f"{BASE}/subtasks/{a['acquirement_id']}/complete",
+        json=_complete_body(),
+        headers=_auth(tok),
+    )
+    assert r.status_code == 204
+    mid = await _one(sm, "SELECT status, finished_at FROM minion_task WHERE task_name='mix'")
+    assert tuple(mid) == ("RUNNING", None)
+    b = await _own(c, sm, "cmp6", tok, p.executor_id)
+    r = await c.post(
+        f"{BASE}/subtasks/{b['acquirement_id']}/fail",
+        json=FAIL | {"retryable": False},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 204
+    end = await _one(
+        sm,
+        "SELECT status, finished_at IS NOT NULL, succeeded_subtasks, failed_subtasks"
+        " FROM minion_task WHERE task_name='mix'",
+    )
+    assert tuple(end) == ("PARTIAL", True, 1, 1)
