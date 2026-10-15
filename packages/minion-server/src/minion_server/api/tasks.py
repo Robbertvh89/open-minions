@@ -27,7 +27,10 @@ def _as_prefix(uri: str) -> str:
 
 
 def validate_uris(body: TaskCreate, settings: ServerSettings) -> tuple[str, str, str]:
-    """Return `(normalized_input_uri, normalized_output_uri, input_key_prefix)`.
+    """Return `(canonical_input_uri, canonical_output_uri, input_key_prefix)`.
+
+    Stored URIs are rebuilt as `s3://{bucket}/{key}` from the parsed key, so every spelling of
+    the same prefix maps to one string (the output-prefix unique constraint relies on that).
 
     Keys must live under `{configured prefix}{team}/`; both URIs are treated as prefixes. Output
     may not touch the reserved `_attempts` namespace (attempt-scoped upload keys,
@@ -50,7 +53,8 @@ def validate_uris(body: TaskCreate, settings: ServerSettings) -> tuple[str, str,
     for key in (inp.key, out.key):
         if ATTEMPTS_SEGMENT in key.split("/"):
             raise api_error(422, "INVALID_URI", f"{ATTEMPTS_SEGMENT} is a reserved path segment")
-    return in_uri, out_uri, inp.key
+    bucket = settings.s3_bucket
+    return f"s3://{bucket}/{inp.key}", f"s3://{bucket}/{out.key}", inp.key
 
 
 def to_out(task: Task, counts: dict[SubtaskStatus, int]) -> TaskOut:

@@ -385,10 +385,10 @@ async def test_bad_task_does_not_block_queue(
 
     real = S3Storage.iter_object
 
-    def broken(self: S3Storage, key: str, chunk_size: int = 1 << 20) -> Any:
+    def broken(self: S3Storage, key: str, chunk_size: int = 1 << 20, **kw: Any) -> Any:
         if "/bad/" in key:
             raise ConnectionError("simulated outage")
-        return real(self, key, chunk_size)
+        return real(self, key, chunk_size, **kw)
 
     monkeypatch.setattr(S3Storage, "iter_object", broken)
     lim = SplitLimits(backoff_base_s=1000, max_attempts=3)
@@ -417,7 +417,7 @@ async def test_deterministic_s3_error_fails_immediately(
     _put(s3, "inputs/hd4/denied/a.jsonl", _jsonl(2, "a"))
     await _insert_task(engine, "hd4", "denied")
 
-    def denied(self: S3Storage, key: str, chunk_size: int = 1 << 20) -> Any:
+    def denied(self: S3Storage, key: str, chunk_size: int = 1 << 20, **kw: Any) -> Any:
         raise ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetObject")
 
     monkeypatch.setattr(S3Storage, "iter_object", denied)
@@ -516,3 +516,220 @@ async def test_oversize_body_rejected_before_auth(app_client: tuple[AsyncClient,
     assert r.status_code == 413
     ok = await c.post("/api/v1/tasks", json={}, headers=unauth)
     assert ok.status_code == 401  # small bodies still reach auth
+
+
+@pytest.fixture
+async def fresh_engine(fresh_url: str) -> AsyncIterator[AsyncEngine]:
+    """Empty database: claims cannot pick up other tests' SPLITTING tasks."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    eng = create_async_engine(fresh_url)
+    yield eng
+    await eng.dispose()
+
+
+EXPIRE = text("UPDATE minion_task SET next_split_at=now() WHERE task_name=:n")
+BUMP = text("UPDATE minion_task SET split_attempts=split_attempts+1 WHERE task_name='lost'")
+
+
+# --- TASK-2.2 final fixes: canonical URIs, lease fencing, input guards ---------------------------
+
+
+@pytest.mark.integration
+async def test_uppercase_scheme_rejected_and_uris_canonical(
+    app_client: tuple[AsyncClient, FastAPI], s3: S3Env
+) -> None:
+    c, _ = app_client
+    _put(s3, "inputs/api1/canon/a.jsonl", _jsonl(1, "x"))
+    first = _payload(
+        "api1",
+        "cn1",
+        input_uri="s3://minion/inputs/api1/canon",
+        output_uri="s3://minion/outputs/api1/canon",
+    )
+    r = await c.post("/api/v1/tasks", json=first)
+    assert r.status_code == 202
+    assert r.json()["output_uri"] == "s3://minion/outputs/api1/canon/"
+    assert r.json()["input_uri"] == "s3://minion/inputs/api1/canon/"
+    dup = first | {"task_name": "cn2", "output_uri": "S3://minion/outputs/api1/canon/"}
+    r = await c.post("/api/v1/tasks", json=dup)
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "INVALID_URI"
+    r = await c.post(
+        "/api/v1/tasks",
+        json=first | {"task_name": "cn3", "input_uri": "S3://minion/inputs/api1/canon"},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.integration
+async def test_stale_split_holder_is_fenced(fresh_engine: AsyncEngine) -> None:
+    await _insert_task(fresh_engine, "fz1", "fence")
+    sm = create_sessionmaker(fresh_engine)
+    async with sm() as s, s.begin():
+        stale = await tasks_repo.claim_splitting(s, 900, 5)
+    assert stale is not None and stale.split_attempts == 1
+    async with fresh_engine.begin() as conn:  # lease "expires"
+        await conn.execute(EXPIRE, {"n": "fence"})
+    async with sm() as s, s.begin():
+        fresh = await tasks_repo.claim_splitting(s, 900, 5)
+    assert fresh is not None and fresh.split_attempts == 2
+    async with sm() as s, s.begin():
+        assert not await tasks_repo.renew_split_lease(s, stale, 900)
+        assert not await tasks_repo.mark_split_done(s, stale, 3)
+        assert not await tasks_repo.mark_split_failed(s, stale, "x")
+        assert not await tasks_repo.schedule_split_retry(s, stale, 0)
+    assert (await _task_row(fresh_engine, "fence"))[:3] == ("SPLITTING", None, 2)
+    async with sm() as s, s.begin():
+        assert await tasks_repo.renew_split_lease(s, fresh, 900)
+        assert await tasks_repo.mark_split_done(s, fresh, 3)
+    assert (await _task_row(fresh_engine, "fence"))[0] == "PENDING"
+
+
+@pytest.mark.integration
+async def test_renewal_keeps_lease_across_slow_split(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put(s3, "inputs/fz2/slow/a.jsonl", _jsonl(8, "s"))
+    await _insert_task(fresh_engine, "fz2", "slow", 1)  # 8 subtasks, batch_size=1 -> 8 batches
+    sm = create_sessionmaker(fresh_engine)
+    real = tasks_repo.insert_subtasks
+
+    async def slow(session: Any, task: Any, rows: Any) -> None:
+        await asyncio.sleep(0.4)
+        await real(session, task, rows)
+
+    monkeypatch.setattr(tasks_repo, "insert_subtasks", slow)
+    lim = SplitLimits(lease_s=1.5)  # total split takes ~3.2s, well past the lease
+    stolen = 0
+    stop = asyncio.Event()
+
+    async def rival() -> None:
+        nonlocal stolen
+        while not stop.is_set():
+            async with sm() as s, s.begin():
+                if await tasks_repo.claim_splitting(s, 900, 5) is not None:
+                    stolen += 1
+            await asyncio.sleep(0.1)
+
+    splitting = asyncio.create_task(split_one(sm, storage, lim, batch_size=1))
+    await asyncio.sleep(0.3)  # the splitter holds the claim; now a rival starts polling
+    rt = asyncio.create_task(rival())
+    try:
+        assert await splitting
+    finally:
+        stop.set()
+        await rt
+    assert stolen == 0
+    assert (await _task_row(fresh_engine, "slow"))[0] == "PENDING"
+
+
+@pytest.mark.integration
+async def test_lost_lease_aborts_quietly(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put(s3, "inputs/fz3/lost/a.jsonl", _jsonl(6, "s"))
+    await _insert_task(fresh_engine, "fz3", "lost", 1)
+    sm = create_sessionmaker(fresh_engine)
+    real = tasks_repo.renew_split_lease
+    n = 0
+
+    async def steal(session: Any, task: Any, lease_s: float) -> bool:
+        nonlocal n
+        n += 1
+        if n == 3:  # someone else claims between batches (before our third renewal)
+            async with sm() as other, other.begin():
+                await other.execute(BUMP)
+        return await real(session, task, lease_s)
+
+    monkeypatch.setattr(tasks_repo, "renew_split_lease", steal)
+    assert await split_one(sm, storage, SplitLimits(), batch_size=1)
+    status, error, attempts, _ = await _task_row(fresh_engine, "lost")
+    assert (status, error, attempts) == ("SPLITTING", None, 2)  # untouched by the old holder
+    assert n == 3 and len(await _subtasks(fresh_engine, "lost")) == 2  # stopped at renewal 3
+
+
+@pytest.mark.integration
+async def test_split_wall_clock_budget_backs_off(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env
+) -> None:
+    _put(s3, "inputs/fz4/budget/a.jsonl", _jsonl(6, "s"))
+    await _insert_task(fresh_engine, "fz4", "budget", 1)
+    sm = create_sessionmaker(fresh_engine)
+    assert await split_one(
+        sm, storage, SplitLimits(max_seconds=-1, backoff_base_s=1000), batch_size=1
+    )
+    status, error, attempts, _ = await _task_row(fresh_engine, "budget")
+    assert (status, error, attempts) == ("SPLITTING", None, 1)
+    assert not await split_one(sm, storage)  # backing off
+
+
+@pytest.mark.integration
+async def test_claim_fails_exhausted_tasks_crash_loop(fresh_engine: AsyncEngine) -> None:
+    await _insert_task(fresh_engine, "fz5", "loop")
+    sm = create_sessionmaker(fresh_engine)
+    for expected in (1, 2):  # claims whose holder crashed before any retry/fail bookkeeping
+        async with sm() as s, s.begin():
+            t = await tasks_repo.claim_splitting(s, 900, 2)
+        assert t is not None and t.split_attempts == expected
+        async with fresh_engine.begin() as conn:
+            await conn.execute(EXPIRE, {"n": "loop"})
+    async with sm() as s, s.begin():
+        assert await tasks_repo.claim_splitting(s, 900, 2) is None
+    status, error, attempts, _ = await _task_row(fresh_engine, "loop")
+    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", 2)
+
+
+@pytest.mark.integration
+async def test_object_replaced_after_listing_is_input_changed(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "inputs/fz6/swap/a.jsonl"
+    _put(s3, key, _jsonl(10, "o"))
+    await _insert_task(fresh_engine, "fz6", "swap", 2)
+    sm = create_sessionmaker(fresh_engine)
+    real = S3Storage.list_objects
+
+    async def list_then_swap(self: S3Storage, *a: Any, **kw: Any) -> Any:
+        out = await real(self, *a, **kw)
+        _put(s3, key, _jsonl(10, "o") + _jsonl(50, "grown"))  # replaced after listing
+        return out
+
+    monkeypatch.setattr(S3Storage, "list_objects", list_then_swap)
+    assert await split_one(sm, storage, batch_size=2)
+    status, error, attempts, _ = await _task_row(fresh_engine, "swap")
+    assert status == "FAILED" and error.startswith("INPUT_CHANGED") and attempts == 1
+
+
+@pytest.mark.integration
+async def test_iter_object_guards(storage: S3Storage, s3: S3Env) -> None:
+    from minion_server.storage import PreconditionFailedError
+
+    data = _jsonl(5, "g")
+    _put(s3, "inputs/fz7/g.jsonl", data)
+    ((_, size, etag),) = await storage.list_objects("inputs/fz7/")
+    assert b"".join(storage.iter_object("inputs/fz7/g.jsonl", etag=etag, size=size)) == data
+    with pytest.raises(PreconditionFailedError):  # grew beyond the listed size
+        b"".join(storage.iter_object("inputs/fz7/g.jsonl", chunk_size=8, size=size - 1))
+    with pytest.raises(PreconditionFailedError):  # shorter than listed
+        b"".join(storage.iter_object("inputs/fz7/g.jsonl", size=size + 1))
+    with pytest.raises(PreconditionFailedError):  # If-Match with a stale ETag
+        b"".join(storage.iter_object("inputs/fz7/g.jsonl", etag='"deadbeef"'))
+
+
+@pytest.mark.integration
+async def test_insert_readback_detects_mismatch(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put(s3, "inputs/fz8/rb/a.jsonl", _jsonl(6, "r"))
+    await _insert_task(fresh_engine, "fz8", "rb", 2)
+    sm = create_sessionmaker(fresh_engine)
+
+    real = tasks_repo.insert_subtasks
+
+    async def partial(session: Any, task: Any, rows: Any) -> None:
+        await real(session, task, rows[:-1])
+
+    monkeypatch.setattr(tasks_repo, "insert_subtasks", partial)
+    assert await split_one(sm, storage, batch_size=2)
+    status, error, _, _ = await _task_row(fresh_engine, "rb")
+    assert status == "FAILED" and error.startswith("INPUT_CHANGED")

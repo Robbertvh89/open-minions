@@ -195,7 +195,9 @@ output prefix, belongs to another task), `PAYLOAD_TOO_LARGE` (413: request body 
 `OUTPUT_CHANGED` (422, complete: the attempt object changed during verification). A task whose
 splitting fails becomes `FAILED` with `error` set to a short code-prefixed message, for example
 `LINE_TOO_LONG` (a JSONL line above `MINION_SPLIT_MAX_LINE_BYTES`, default 16 MiB) or
-`INPUT_CHANGED` (the input differs from rows written by an earlier split attempt).
+`INPUT_CHANGED` (the input differs from rows written by an earlier split attempt, or an object
+changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_MAX_ATTEMPTS` times
+without finishing).
 
 ### 6.1 User-facing
 | Method | Path | Purpose |

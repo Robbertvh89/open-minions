@@ -98,28 +98,50 @@ def _task_key(task: Task) -> tuple[Any, ...]:
     return (Task.team == task.team, Task.project == task.project, Task.task_name == task.task_name)
 
 
-async def claim_splitting(session: AsyncSession, lease_s: float) -> Task | None:
+SPLIT_ATTEMPTS_EXHAUSTED = "SPLIT_ATTEMPTS_EXHAUSTED"
+
+
+async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: int) -> Task | None:
     """Claim one due SPLITTING task with a lease; the caller commits straight away.
 
     `FOR NO KEY UPDATE SKIP LOCKED` serialises concurrent claimers only for the instant of the
     claim. The claim bumps `split_attempts` and pushes `next_split_at` out by `lease_s`, so other
     splitters skip the task while it is being worked on, and a crashed splitter's task becomes
-    claimable again once the lease expires (counting as one attempt).
+    claimable again once the lease expires (counting as one attempt). `split_attempts` doubles as
+    the fencing token for every later write by the claim holder. Tasks that already used
+    `max_attempts` claims (e.g. a crash loop that never reaches the retry logic) are marked
+    FAILED (`SPLIT_ATTEMPTS_EXHAUSTED`) instead of being handed out again.
     """
-    task = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.status == TaskStatus.SPLITTING.value,
-                or_(Task.next_split_at.is_(None), Task.next_split_at <= func.now()),
+    while True:
+        task = (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.SPLITTING.value,
+                    or_(Task.next_split_at.is_(None), Task.next_split_at <= func.now()),
+                )
+                .order_by(Task.next_split_at.asc().nulls_first(), Task.created_at)
+                .limit(1)
+                .with_for_update(skip_locked=True, key_share=True)
             )
-            .order_by(Task.next_split_at.asc().nulls_first(), Task.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True, key_share=True)
-        )
-    ).scalar_one_or_none()
-    if task is None:
-        return None
+        ).scalar_one_or_none()
+        if task is None:
+            return None
+        if task.split_attempts >= max_attempts:
+            await session.execute(
+                update(Task)
+                .where(*_task_key(task), Task.status == TaskStatus.SPLITTING.value)
+                .values(
+                    status=TaskStatus.FAILED.value,
+                    error=SPLIT_ATTEMPTS_EXHAUSTED,
+                    finished_at=datetime.now(UTC),
+                    next_split_at=None,
+                )
+            )
+            await session.refresh(task)
+            session.expunge(task)
+            continue
+        break
     await session.execute(
         update(Task)
         .where(*_task_key(task))
@@ -130,6 +152,25 @@ async def claim_splitting(session: AsyncSession, lease_s: float) -> Task | None:
     )
     await session.refresh(task)
     return task
+
+
+def _held(task: Task) -> tuple[Any, ...]:
+    """WHERE clauses: still SPLITTING and still the claim identified by `split_attempts`."""
+    return (
+        *_task_key(task),
+        Task.status == TaskStatus.SPLITTING.value,
+        Task.split_attempts == task.split_attempts,
+    )
+
+
+async def renew_split_lease(session: AsyncSession, task: Task, lease_s: float) -> bool:
+    """Extend the lease; False if another claim superseded ours (stop splitting)."""
+    res = await session.execute(
+        update(Task)
+        .where(*_held(task))
+        .values(next_split_at=func.now() + timedelta(seconds=lease_s))
+    )
+    return bool(res.rowcount)  # type: ignore[attr-defined]
 
 
 async def existing_subtasks(
@@ -184,18 +225,20 @@ async def insert_subtasks(session: AsyncSession, task: Task, rows: Sequence[NewS
     await session.execute(pg_insert(Subtask).values(values).on_conflict_do_nothing())
 
 
-async def mark_split_done(session: AsyncSession, task: Task, total: int) -> None:
-    await session.execute(
+async def mark_split_done(session: AsyncSession, task: Task, total: int) -> bool:
+    """Fenced on the claim's `split_attempts`; False means the lease was lost (no-op)."""
+    res = await session.execute(
         update(Task)
-        .where(*_task_key(task), Task.status == TaskStatus.SPLITTING.value)
+        .where(*_held(task))
         .values(status=TaskStatus.PENDING.value, total_subtasks=total, next_split_at=None)
     )
+    return bool(res.rowcount)  # type: ignore[attr-defined]
 
 
-async def mark_split_failed(session: AsyncSession, task: Task, error: str) -> None:
-    await session.execute(
+async def mark_split_failed(session: AsyncSession, task: Task, error: str) -> bool:
+    res = await session.execute(
         update(Task)
-        .where(*_task_key(task), Task.status == TaskStatus.SPLITTING.value)
+        .where(*_held(task))
         .values(
             status=TaskStatus.FAILED.value,
             error=error,
@@ -203,12 +246,14 @@ async def mark_split_failed(session: AsyncSession, task: Task, error: str) -> No
             next_split_at=None,
         )
     )
+    return bool(res.rowcount)  # type: ignore[attr-defined]
 
 
-async def schedule_split_retry(session: AsyncSession, task: Task, delay_s: float) -> None:
+async def schedule_split_retry(session: AsyncSession, task: Task, delay_s: float) -> bool:
     """Make the task claimable again after `delay_s` (exponential backoff)."""
-    await session.execute(
+    res = await session.execute(
         update(Task)
-        .where(*_task_key(task), Task.status == TaskStatus.SPLITTING.value)
+        .where(*_held(task))
         .values(next_split_at=func.now() + timedelta(seconds=delay_s))
     )
+    return bool(res.rowcount)  # type: ignore[attr-defined]

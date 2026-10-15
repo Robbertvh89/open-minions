@@ -14,6 +14,8 @@ def test_valid() -> None:
     [
         "s3://other/inputs/a",
         "http://minion/inputs/a",
+        "S3://minion/inputs/a",
+        "s3:/minion/inputs/a",
         "s3://minion/outputs/a",
         "s3://minion/inputs/../outputs/a",
         "s3://minion/inputs/a/../../x",

@@ -79,13 +79,15 @@ class S3Storage:
     async def presign_put(self, key: str, ttl_s: int | None = None) -> str:
         return await asyncio.to_thread(self._presign, "put_object", key, ttl_s)
 
-    def _list_keys(self, prefix: str, max_keys: int | None) -> list[tuple[str, int]]:
-        out: list[tuple[str, int]] = []
+    def _list_keys(self, prefix: str, max_keys: int | None) -> list[tuple[str, int, str]]:
+        out: list[tuple[str, int, str]] = []
         pages = self._client.get_paginator("list_objects_v2").paginate(
             Bucket=self._bucket, Prefix=prefix
         )
         for page in pages:
-            out.extend((o["Key"], o["Size"]) for o in page.get("Contents", []))
+            out.extend(
+                (o["Key"], o["Size"], str(o.get("ETag", ""))) for o in page.get("Contents", [])
+            )
             if max_keys is not None and len(out) > max_keys:
                 break  # caller sees > max_keys and rejects; never hold an unbounded listing
         return sorted(out)
@@ -96,6 +98,13 @@ class S3Storage:
         With `max_keys`, listing stops once more than `max_keys` keys were seen (the result then
         has more than `max_keys` entries and is not complete).
         """
+        listing = await asyncio.to_thread(self._list_keys, prefix, max_keys)
+        return [(k, size) for k, size, _ in listing]
+
+    async def list_objects(
+        self, prefix: str, max_keys: int | None = None
+    ) -> list[tuple[str, int, str]]:
+        """Like `list_keys` but `(key, size, etag)`, for readers that pin the listed version."""
         return await asyncio.to_thread(self._list_keys, prefix, max_keys)
 
     async def any_key(self, prefix: str) -> bool:
@@ -126,11 +135,36 @@ class S3Storage:
         st = await self.stat(key)
         return None if st is None else st.size
 
-    def iter_object(self, key: str, chunk_size: int = 1 << 20) -> Iterator[bytes]:
-        """Blocking chunk iterator; call from a worker thread (splitter)."""
-        body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
+    def iter_object(
+        self,
+        key: str,
+        chunk_size: int = 1 << 20,
+        *,
+        etag: str | None = None,
+        size: int | None = None,
+    ) -> Iterator[bytes]:
+        """Blocking chunk iterator; call from a worker thread (splitter).
+
+        With `etag` the GET is conditional (`If-Match`); with `size` the stream is cut off and
+        `PreconditionFailedError` raised as soon as it exceeds (or ends short of) that many bytes,
+        so an object replaced after listing cannot be read past what was checked.
+        """
+        extra: dict[str, str] = {"IfMatch": etag} if etag else {}
         try:
-            yield from body.iter_chunks(chunk_size)
+            body = self._client.get_object(Bucket=self._bucket, Key=key, **extra)["Body"]  # type: ignore[arg-type]
+        except self._client.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"PreconditionFailed", "412"}:
+                raise PreconditionFailedError from exc
+            raise
+        read = 0
+        try:
+            for chunk in body.iter_chunks(chunk_size):
+                read += len(chunk)
+                if size is not None and read > size:
+                    raise PreconditionFailedError
+                yield chunk
+            if size is not None and read != size:
+                raise PreconditionFailedError
         finally:
             body.close()
 

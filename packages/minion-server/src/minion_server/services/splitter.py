@@ -10,11 +10,15 @@ input changed underneath us (`INPUT_CHANGED`).
 Failure policy per task, so one bad task never blocks the queue:
 - deterministic problems (bad URI, empty input, limits, unreadable S3 4xx) -> FAILED at once;
 - anything else -> exponential backoff via `next_split_at`; FAILED after `max_attempts`.
+The claim is a lease fenced by `split_attempts`: every write by the holder (lease renewal per
+batch, done, failed, retry) matches on it, so a holder that lost its lease becomes a no-op.
 Only the error class and task id are logged, never payload contents.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from itertools import islice
 
@@ -27,7 +31,7 @@ from minion_server.repositories import tasks as tasks_repo
 from minion_server.repositories.tasks import NewSubtask
 from minion_server.settings import ServerSettings
 from minion_server.splitting import LineTooLongError, Slice, slice_jsonl
-from minion_server.storage import S3Storage
+from minion_server.storage import PreconditionFailedError, S3Storage
 from minion_server.uris import InvalidUriError, parse_s3_uri
 
 log = structlog.get_logger()
@@ -49,6 +53,7 @@ class SplitLimits:
     backoff_base_s: float = 2.0
     backoff_max_s: float = 300.0
     lease_s: float = 900.0
+    max_seconds: float = 3600.0
 
     @classmethod
     def from_settings(cls, s: ServerSettings) -> "SplitLimits":
@@ -61,11 +66,23 @@ class SplitLimits:
             backoff_base_s=s.split_backoff_base_s,
             backoff_max_s=s.split_backoff_max_s,
             lease_s=s.split_lease_s,
+            max_seconds=s.split_max_seconds,
         )
 
 
 class SplitFailedError(Exception):
     """Deterministic failure: the task is marked FAILED with this message, no retry."""
+
+
+class LeaseLostError(Exception):
+    """Another splitter claimed the task (our lease expired); abandon this split quietly."""
+
+
+class SplitTimeoutError(Exception):
+    """The per-attempt wall-clock budget ran out; handled as a transient failure (backoff)."""
+
+
+INPUT_CHANGED_DURING_SPLIT = "INPUT_CHANGED: input object changed while it was being split"
 
 
 def _take(it: Iterator[Slice], n: int) -> list[Slice]:
@@ -74,22 +91,25 @@ def _take(it: Iterator[Slice], n: int) -> list[Slice]:
 
 async def _plan_batches(
     storage: S3Storage, task: Task, limits: SplitLimits, batch_size: int
-) -> AsyncIterator[list[NewSubtask]]:
+) -> AsyncGenerator[list[NewSubtask]]:
     """Stream the plan in batches; memory is bounded by `batch_size` and the object listing."""
     prefix = parse_s3_uri(task.input_uri, bucket=storage.bucket, prefixes=("",)).key
-    listing = await storage.list_keys(prefix, max_keys=limits.max_objects)
+    listing = await storage.list_objects(prefix, max_keys=limits.max_objects)
     if len(listing) > limits.max_objects:
         raise SplitFailedError(f"input has more than {limits.max_objects} objects")
-    if sum(size for _, size in listing) > limits.max_input_bytes:
+    if sum(size for _, size, _ in listing) > limits.max_input_bytes:
         raise SplitFailedError(f"input is larger than {limits.max_input_bytes} bytes")
     next_id = 0
     first_record = 0
     batch: list[NewSubtask] = []
-    for key, size in listing:  # sorted -> deterministic ids
+    for key, size, etag in listing:  # sorted -> deterministic ids
         if size == 0:
             continue
         slices = slice_jsonl(
-            storage.iter_object(key), 0, task.records_per_subtask, limits.max_line_bytes
+            storage.iter_object(key, etag=etag, size=size),
+            0,
+            task.records_per_subtask,
+            limits.max_line_bytes,
         )
         try:
             while chunk := await asyncio.to_thread(_take, slices, batch_size):
@@ -108,6 +128,8 @@ async def _plan_batches(
                     if len(batch) >= batch_size:
                         yield batch
                         batch = []
+        except PreconditionFailedError as exc:  # replaced/grown after listing
+            raise SplitFailedError(INPUT_CHANGED_DURING_SPLIT) from exc
         except LineTooLongError as exc:
             raise SplitFailedError(
                 f"LINE_TOO_LONG: a line in an input object exceeds {limits.max_line_bytes} bytes"
@@ -119,15 +141,29 @@ async def _plan_batches(
 
 
 async def _insert_batch(
-    sessionmaker: async_sessionmaker[AsyncSession], task: Task, batch: list[NewSubtask]
+    sessionmaker: async_sessionmaker[AsyncSession],
+    task: Task,
+    batch: list[NewSubtask],
+    lease_s: float,
 ) -> None:
+    def stored(have: dict[int, tuple[str, int, int]]) -> bool:
+        return all(
+            have.get(r.subtask_id) == (r.input_object_key, r.byte_start, r.byte_end) for r in batch
+        )
+
     async with sessionmaker() as s, s.begin():
+        if not await tasks_repo.renew_split_lease(s, task, lease_s):
+            raise LeaseLostError
         have = await tasks_repo.existing_subtasks(s, task, [r.subtask_id for r in batch])
         for r in batch:
             prev = have.get(r.subtask_id)
             if prev is not None and prev != (r.input_object_key, r.byte_start, r.byte_end):
                 raise SplitFailedError("INPUT_CHANGED: input differs from a previous split attempt")
         await tasks_repo.insert_subtasks(s, task, batch)
+        # Read back what is really stored: a concurrent writer must not leave other rows behind.
+        after = await tasks_repo.existing_subtasks(s, task, [r.subtask_id for r in batch])
+        if not stored(after):
+            raise SplitFailedError("INPUT_CHANGED: stored subtasks differ from the split plan")
 
 
 async def _split(
@@ -138,9 +174,13 @@ async def _split(
     batch_size: int,
 ) -> int:
     total = 0
-    async for batch in _plan_batches(storage, task, limits, batch_size):
-        await _insert_batch(sessionmaker, task, batch)
-        total += len(batch)
+    deadline = time.monotonic() + limits.max_seconds
+    async with aclosing(_plan_batches(storage, task, limits, batch_size)) as batches:
+        async for batch in batches:
+            if time.monotonic() > deadline:
+                raise SplitTimeoutError
+            await _insert_batch(sessionmaker, task, batch, limits.lease_s)
+            total += len(batch)
     if total == 0:
         raise SplitFailedError(EMPTY_INPUT_ERROR)
     async with sessionmaker() as s, s.begin():
@@ -162,12 +202,14 @@ async def split_one(
     """Claim and split one due task. Returns False if nothing was due."""
     limits = limits or SplitLimits()
     async with sessionmaker() as claim, claim.begin():
-        task = await tasks_repo.claim_splitting(claim, limits.lease_s)
+        task = await tasks_repo.claim_splitting(claim, limits.lease_s, limits.max_attempts)
     if task is None:
         return False
     tid = f"{task.team}/{task.project}/{task.task_name}"
     try:
         total = await _split(sessionmaker, storage, task, limits, batch_size)
+    except LeaseLostError:
+        log.warning("task_split_lease_lost", task=tid)
     except SplitFailedError as exc:
         await _fail(sessionmaker, task, str(exc))
         log.warning("task_split_failed", task=tid, error_class=type(exc).__name__)
@@ -185,14 +227,22 @@ async def split_one(
         await _retry(sessionmaker, task, limits, type(exc).__name__, tid)
     else:
         async with sessionmaker() as s, s.begin():
-            await tasks_repo.mark_split_done(s, task, total)
-        log.info("task_split", task=tid, subtasks=total)
+            done = await tasks_repo.mark_split_done(s, task, total)
+        if done:
+            log.info("task_split", task=tid, subtasks=total)
+        else:
+            log.warning("task_split_lease_lost", task=tid)
     return True
+
+
+def tid_of(task: Task) -> str:
+    return f"{task.team}/{task.project}/{task.task_name}"
 
 
 async def _fail(sessionmaker: async_sessionmaker[AsyncSession], task: Task, error: str) -> None:
     async with sessionmaker() as s, s.begin():
-        await tasks_repo.mark_split_failed(s, task, error)
+        if not await tasks_repo.mark_split_failed(s, task, error):
+            log.warning("task_split_lease_lost", task=tid_of(task))
 
 
 async def _retry(
@@ -209,7 +259,9 @@ async def _retry(
         return
     delay = backoff_s(task.split_attempts, limits)
     async with sessionmaker() as s, s.begin():
-        await tasks_repo.schedule_split_retry(s, task, delay)
+        if not await tasks_repo.schedule_split_retry(s, task, delay):
+            log.warning("task_split_lease_lost", task=tid)
+            return
     log.warning("task_split_retry", task=tid, error_class=error_class, delay_s=delay)
 
 

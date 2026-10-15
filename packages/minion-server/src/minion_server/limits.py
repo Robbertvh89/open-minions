@@ -56,7 +56,14 @@ class BodyLimitMiddleware:
             responded = True
             await send(msg)
 
-        await self.app(scope, counting_receive, guarded_send)
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except Exception:
+            # The app saw a truncated body and may blow up on it: answer 413, not 500.
+            if exceeded and not responded:
+                await self._reject(send)
+                return
+            raise
         if exceeded and not responded:
             await self._reject(send)
 

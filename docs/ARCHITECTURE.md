@@ -144,7 +144,8 @@ User ─POST /tasks─▶ Server: validate (team membership, model allow-list + 
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
 Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
                     list input objects → scan JSONL → stream batches of slices of N records
-                    per batch: compare with existing rows (key, byte range; mismatch → INPUT_CHANGED),
+                    per batch: renew the lease, compare with existing rows (key, byte range;
+                    mismatch → INPUT_CHANGED), GET pinned by listed ETag + size (change → INPUT_CHANGED),
                     INSERT minion_subtask(status=PENDING, attempt=0) ON CONFLICT DO NOTHING
                     UPDATE minion_task SET status=PENDING, total_subtasks=k
 ```
@@ -153,7 +154,14 @@ and no transaction is held open while reading S3. Deterministic problems (bad UR
 limit exceeded, `LINE_TOO_LONG`, `INPUT_CHANGED`, S3 `AccessDenied`/`NoSuchKey`/`InvalidObjectState`)
 mark the task `FAILED` with `error`. Anything else backs off exponentially via `next_split_at` and
 fails the task after `split_max_attempts`, so one bad task never blocks the queue. `output_uri` is
-unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it.
+unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it. Stored
+URIs are canonical (`s3://{bucket}/{key}/`); a non-lowercase scheme is `422 INVALID_URI`.
+
+The claim is a lease fenced by `split_attempts`: lease renewal (once per batch), done, failed and
+retry all match on the claimed value, so a splitter whose lease expired and was re-claimed becomes
+a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
+default 3600; exceeding it backs off like any transient error). A claim never hands out a task with
+`split_attempts >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED` (crash loop).
 
 ### 3.2 Acquire (the core protocol)
 ```
