@@ -21,8 +21,8 @@ class Budget(_Model):
     """Capacity budget the Mac's owner granted (SPEC §4.6)."""
 
     profile: CapacityProfile
-    memory_gb: float = Field(gt=0)
-    gpu_duty_cycle: float = Field(gt=0, le=1)
+    memory_gb: float = Field(gt=0, le=1024, allow_inf_nan=False)
+    gpu_duty_cycle: float = Field(gt=0, le=1, allow_inf_nan=False)
     max_batch_size: int = Field(ge=1, le=4096)
 
 
@@ -141,8 +141,14 @@ class FailRequest(_Model):
 
 
 class Progress(_Model):
-    records_done: int = Field(ge=0)
-    records_total: int = Field(ge=0)
+    records_done: int = Field(ge=0, le=2**31 - 1)
+    records_total: int = Field(ge=0, le=2**31 - 1)
+
+    @model_validator(mode="after")
+    def _done_le_total(self) -> Self:
+        if self.records_done > self.records_total:
+            raise ValueError("records_done must not exceed records_total")
+        return self
 
 
 class HeartbeatRequest(_Model):

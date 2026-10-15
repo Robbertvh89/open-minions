@@ -33,6 +33,8 @@ _BY_STATUS = {
     SubtaskStatus.CANCELLED: ReclaimResult.EXPIRED_CANCELLED,
 }
 
+_EXPIRED = frozenset(_BY_STATUS.values())
+
 
 async def reclaim_one(
     session: AsyncSession, acquirement_id: uuid.UUID, *, timeout_s: float
@@ -61,9 +63,13 @@ async def reclaim_stale(
         ids = await repo.stale_ids(s, timeout_s, batch_size)
     results: Counter[ReclaimResult] = Counter()
     for aid in ids:
-        async with sm() as s, s.begin():
-            res = await reclaim_one(s, aid, timeout_s=timeout_s)
+        try:
+            async with sm() as s, s.begin():
+                res = await reclaim_one(s, aid, timeout_s=timeout_s)
+        except Exception as exc:  # one bad row must not block the rest of the batch
+            log.error("reclaim_failed", acquirement_id=str(aid), error_type=type(exc).__name__)
+            continue
         results[res] += 1
-        if res.name.startswith("EXPIRED"):
+        if res in _EXPIRED:
             log.info("subtask_reclaimed", acquirement_id=str(aid), result=res.value)
     return results

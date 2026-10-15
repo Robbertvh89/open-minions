@@ -151,6 +151,7 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
     sm: Sm = app.state.sessionmaker
     rng = random.Random(1234)  # noqa: S311
     n, rounds = 16, 4
+    complete_wins = 0
     execs = await make_executors(sm, n)
     for rnd in range(rounds):
         team, name = f"rr{rnd}", f"rr{rnd}"
@@ -160,11 +161,11 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
         await _backdate(sm)
 
         async def complete(a: dict[str, Any], tok: str) -> int:
-            await asyncio.sleep(rng.random() * 0.02)
+            await asyncio.sleep(rng.random() * 0.01)
             return int((await _call(c, a, tok, "complete")).status_code)
 
         async def reclaim(a: dict[str, Any]) -> ReclaimResult:
-            await asyncio.sleep(rng.random() * 0.02)
+            await asyncio.sleep(rng.random() * 0.06)
             return await _reclaim(sm, a["acquirement_id"])
 
         results = await asyncio.gather(
@@ -201,7 +202,7 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
             assert len(att) == 1 and acq == [(0,)]
             if code == 204:
                 wins += 1
-                assert rec in (ReclaimResult.SKIPPED, ReclaimResult.NOT_STALE)
+                assert rec == ReclaimResult.SKIPPED  # the acquirement row is already gone
                 assert (status, att[0][0]) == ("SUCCEEDED", "SUCCEEDED")
                 assert outuri is not None and outuri.endswith(dsts[sid])
                 assert _exists(s3, dsts[sid])
@@ -216,10 +217,13 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
             " WHERE task_name=:n",
             n=name,
         )
+        complete_wins += wins
         assert (succ, failed) == (wins, 0)
         assert tstatus == ("SUCCEEDED" if wins == n else "RUNNING")
         # drain: finish this round's leftovers so the next round starts from an empty queue
         await _cancel_pending(sm, name)
+    # both orderings must have been exercised, else the race is not actually being tested
+    assert 0 < complete_wins < n * rounds, complete_wins
 
 
 async def _cancel_pending(sm: Sm, name: str) -> None:
@@ -270,6 +274,17 @@ async def test_complete_first_reclaim_skipped(
     assert await _rows(sm, "SELECT outcome FROM minion_subtask_attempt") == [("SUCCEEDED",)]
 
 
+async def _wait_lock_waiter(sm: Sm, deadline_s: float = 10.0) -> None:
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_s
+    while loop.time() < end:
+        n = await _rows(sm, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'")
+        if n[0][0] > 0:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("no backend ever waited on a lock")
+
+
 @pytest.mark.integration
 async def test_reclaim_first_complete_rejected(env: tuple[AsyncClient, Any], s3: S3Env) -> None:
     c, app = env
@@ -286,8 +301,8 @@ async def test_reclaim_first_complete_rejected(env: tuple[AsyncClient, Any], s3:
         res = await reclaim_one(s, uuid.UUID(a["acquirement_id"]), timeout_s=TIMEOUT)
         assert res == ReclaimResult.EXPIRED_REQUEUED
         task = asyncio.create_task(_call(c, a, tok, "complete"))
-        await asyncio.sleep(0.3)
-        assert not task.done()  # blocked on the acquirement row lock
+        await _wait_lock_waiter(sm)  # complete is blocked on the acquirement row lock
+        assert not task.done()
     r = await asyncio.wait_for(task, 10)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "STALE_ACQUIREMENT"
     assert not _exists(s3, dst)
@@ -453,3 +468,78 @@ async def test_release_cap_turns_into_failed_attempt(env_cap2: tuple[AsyncClient
     )
     assert rows == [("RELEASED", None)] * 2 + [("FAILED", "RELEASE_LIMIT")] * 3
     assert await _rows(sm, "SELECT status FROM minion_task") == [("FAILED",)]
+
+
+# --- cancelled task paths -----------------------------------------------------------------------
+
+
+async def _cancel_task(sm: Sm, name: str) -> None:
+    async with sm() as s, s.begin():
+        await s.execute(
+            text("UPDATE minion_task SET status='CANCELLED' WHERE task_name=:n"), {"n": name}
+        )
+
+
+@pytest.mark.integration
+async def test_cancelled_task_release_fail_reclaim(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "cx", 3, team="cx")
+    execs = await make_executors(sm, 3)
+    ra, fa, xa = await _acquire_all(c, execs)
+    await _cancel_task(sm, "cx")
+
+    assert (await _call(c, ra, execs[0][1], "release")).status_code == 204
+    assert (await _call(c, fa, execs[1][1], "fail")).status_code == 204
+    await _backdate(sm)
+    assert await _reclaim(sm, xa["acquirement_id"]) == ReclaimResult.EXPIRED_CANCELLED
+
+    rows = await _rows(sm, "SELECT subtask_id, status FROM minion_subtask ORDER BY subtask_id")
+    assert {st for _, st in rows} == {"CANCELLED"}
+    outcomes = await _rows(sm, "SELECT outcome FROM minion_subtask_attempt ORDER BY outcome")
+    assert outcomes == [("CANCELLED",), ("EXPIRED",), ("FAILED",)]
+    assert await _rows(sm, "SELECT failed_subtasks FROM minion_task") == [(0,)]
+
+
+# --- reclaim robustness -------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+async def test_reclaim_one_not_stale_after_heartbeat(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "ns", 1, team="ns")
+    ((_, tok),) = await make_executors(sm, 1)
+    a = await _acquire(c, tok)
+    await _backdate(sm)
+    assert (await _call(c, a, tok, "heartbeat")).status_code == 200
+    assert await _reclaim(sm, a["acquirement_id"]) == ReclaimResult.NOT_STALE
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(1,)]
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_attempt") == [(0,)]
+
+
+@pytest.mark.integration
+async def test_reclaim_stale_continues_after_failing_id(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    n = 4
+    await seed_task(sm, "bad", n, team="bad")
+    execs = await make_executors(sm, n)
+    owned = await _acquire_all(c, execs)
+    await _backdate(sm)
+    poisoned = owned[0]["acquirement_id"]
+    real = mod.reclaim_one
+
+    async def flaky(session: AsyncSession, aid: Any, *, timeout_s: float) -> ReclaimResult:
+        if str(aid) == poisoned:
+            raise RuntimeError("boom")
+        return await real(session, aid, timeout_s=timeout_s)
+
+    monkeypatch.setattr(mod, "reclaim_one", flaky)
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == n - 1
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(1,)]

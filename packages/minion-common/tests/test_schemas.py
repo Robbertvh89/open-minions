@@ -147,3 +147,20 @@ def test_heartbeat_request_validation() -> None:
             HeartbeatRequest.model_validate(bad)
     with pytest.raises(ValidationError):
         Progress(records_done=-1, records_total=0)
+
+
+def test_budget_and_progress_hardening() -> None:
+    from minion_common.schemas import Progress
+
+    for bad in (float("inf"), float("nan"), 1025.0):
+        with pytest.raises(ValidationError):
+            Budget(profile=CapacityProfile.FULL, memory_gb=bad, gpu_duty_cycle=1, max_batch_size=1)
+    with pytest.raises(ValidationError):
+        Budget(
+            profile=CapacityProfile.FULL, memory_gb=1, gpu_duty_cycle=float("nan"), max_batch_size=1
+        )
+    with pytest.raises(ValidationError):
+        Progress(records_done=0, records_total=2**31)
+    with pytest.raises(ValidationError):
+        Progress(records_done=3, records_total=2)
+    Progress(records_done=2, records_total=2)

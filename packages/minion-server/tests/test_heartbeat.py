@@ -1,5 +1,6 @@
 """Heartbeat endpoint (TASK-3.1 S2). Each test uses its own team for isolation."""
 
+import hashlib
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -55,6 +56,20 @@ async def _own(
 async def _one(sm: async_sessionmaker[AsyncSession], sql: str, **p: Any) -> Any:
     async with sm() as s:
         return (await s.execute(text(sql), p)).one()
+
+
+async def executors_repo_pref(
+    sm: async_sessionmaker[AsyncSession], eid: uuid.UUID, team: str
+) -> None:
+    async with sm() as s, s.begin():
+        await executors_repo.set_preference(s, eid, team=team, project=None, task_name=None)
+
+
+async def _acquire_for(c: AsyncClient, token: str) -> dict[str, Any]:
+    r = await c.post(f"{BASE}/acquire", json=_req().model_dump(mode="json"), headers=_auth(token))
+    assert r.status_code == 200, r.text
+    a: dict[str, Any] = r.json()
+    return a
 
 
 @pytest.mark.integration
@@ -118,7 +133,9 @@ async def test_heartbeat_updates_state_and_refreshes_url(
 
 
 @pytest.mark.integration
-async def test_heartbeat_stale_and_foreign_identical_409(http: tuple[AsyncClient, Any]) -> None:
+async def test_heartbeat_stale_and_foreign_identical_409(
+    http: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
     c, app = http
     sm = app.state.sessionmaker
     await seed_task(sm, "hb2", 1, team="hb2")
@@ -140,6 +157,21 @@ async def test_heartbeat_stale_and_foreign_identical_409(http: tuple[AsyncClient
     assert r.status_code == 409
     bodies.append(r.json())
     assert bodies[0] == bodies[1] == bodies[2]
+    # complete-then-heartbeat: a finished acquirement is gone, same body again
+    await seed_task(sm, "hb2b", 1, team="hb2b")
+    await executors_repo_pref(sm, p.executor_id, "hb2b")
+    a2 = await _acquire_for(c, tok)
+    body = b'{"id":"a"}\n'
+    key = f"outputs/hb2b/hb2b/_attempts/{a2['subtask_id']:06d}/{a2['attempt']}.jsonl"
+    s3.client.put_object(Bucket=s3.bucket, Key=key, Body=body)
+    done = await c.post(
+        f"{BASE}/subtasks/{a2['acquirement_id']}/complete",
+        json={"record_count": 10, "byte_size": 11, "sha256": hashlib.sha256(body).hexdigest()},
+        headers=_auth(tok),
+    )
+    assert done.status_code == 204, done.text
+    r = await beat(a2["acquirement_id"], tok)
+    assert r.status_code == 409 and r.json() == bodies[0]
     assert (
         await c.post(f"{BASE}/subtasks/{uuid.uuid4()}/heartbeat", json={"x": 1}, headers=_auth(tok))
     ).status_code == 422
@@ -157,3 +189,23 @@ async def test_heartbeat_cancel_flag(http: tuple[AsyncClient, Any]) -> None:
     async with sm() as s, s.begin():
         await s.execute(text("UPDATE minion_task SET status='CANCELLED' WHERE task_name='hb3'"))
     assert (await c.post(url, json={}, headers=_auth(tok))).json()["cancel"] is True
+
+
+@pytest.mark.integration
+async def test_heartbeat_progress_over_record_count_rejected(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "hb4", 1, team="hb4")  # record_count comes from the seed
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "hb4", tok, p.executor_id)
+    rc = (await _one(sm, "SELECT record_count FROM minion_subtask WHERE task_name='hb4'"))[0]
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/heartbeat"
+    ok = {"progress": {"records_done": rc, "records_total": rc}}
+    assert (await c.post(url, json=ok, headers=_auth(tok))).status_code == 200
+    over = {"progress": {"records_done": 1, "records_total": rc + 1}}
+    r = await c.post(url, json=over, headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "INVALID_PROGRESS")
+    bad = {"progress": {"records_done": 5, "records_total": 2}}
+    assert (await c.post(url, json=bad, headers=_auth(tok))).status_code == 422

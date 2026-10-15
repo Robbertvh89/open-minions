@@ -8,6 +8,7 @@ from minion_common.schemas import HeartbeatRequest, HeartbeatResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
+from minion_server.errors import api_error
 from minion_server.repositories import completion as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.repositories import heartbeats as heartbeats_repo
@@ -31,6 +32,11 @@ async def heartbeat(
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
+        # Reject (422), not clamp: a total above the subtask's record_count is a client bug.
+        if req.progress is not None and req.progress.records_total > o.record_count:
+            raise api_error(
+                422, "INVALID_PROGRESS", "records_total exceeds the subtask's record_count"
+            )
         await heartbeats_repo.beat(
             session,
             acquirement_id,
