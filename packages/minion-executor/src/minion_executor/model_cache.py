@@ -7,10 +7,13 @@ Weights are downloaded by the *control side* so the inference worker can stay of
   download thread (invariant 6).
 * Only the pinned `ModelEntry.revision` is fetched, and only files matching `SAFE_PATTERNS`
   (safetensors, json, tokenizer files); never `*.py`, `*.bin`, `*.pt`, `*.pkl` or `*.gguf`.
-* The child reports the file list from the hub's `files_metadata` (size + LFS sha256). The
-  *parent* re-hashes every downloaded file against it, so verification does not depend on the
-  child. Non-LFS files (small json) carry no sha256 on the hub: their size is checked and their
-  sha256 is recorded in the manifest.
+* The child reports the file list from the hub's `files_metadata` (size, LFS sha256 or, for
+  non-LFS files, the git blob id). The expected digests therefore come *from the hub, via the
+  child*; the *parent* re-hashes every downloaded file against them (sha256 for LFS files, the
+  git blob sha1 `sha1("blob <size>\0" + content)` for the small non-LFS ones) and records the
+  sha256 in the manifest. A compromised child can at most make the parent accept what the
+  child says the hub said, which is why the child is also sandboxed (Seatbelt: writes only to
+  its staging dir, no HOME reads, no exec).
 * `HF_TOKEN`, proxy and CA settings (`FetchEnv`) reach only the fetch subprocess, never the
   worker, and are never logged.
 """
@@ -18,7 +21,9 @@ Weights are downloaded by the *control side* so the inference worker can stay of
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -27,6 +32,8 @@ import multiprocessing as mp
 import os
 import shutil
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -40,6 +47,7 @@ from minion_common.schemas import ModelEntry
 from pydantic import SecretStr
 
 from minion_executor.runners.base import RunnerError
+from minion_executor.worker import sandbox as seatbelt
 
 log = structlog.get_logger(__name__)
 
@@ -77,7 +85,22 @@ _PROXY_NAMES = (
 _CA_NAMES = ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
 # Never forwarded even if set: would make the fetch fail or leak telemetry / change the cache.
 _HF_HUB_EXCLUDED = frozenset({"HF_HUB_OFFLINE", "HF_HUB_CACHE", "HF_HUB_DISABLE_TELEMETRY"})
-_BASE_CHILD_NAMES = ("PATH", "HOME", "TMPDIR", "LANG")
+_BASE_CHILD_NAMES = ("PATH", "HOME", "LANG")
+
+# Local-only failures are remembered per (repo, revision) so repeated assignments of the same
+# model are released without touching the network or the disk again.
+_LOCAL_MEMORY_MAX = 64
+_LOCAL_TTL_S = 3600.0
+_DISK_FULL_TTL_S = 600.0  # the owner may free space, so look again sooner
+DEFAULT_MIN_FREE_BYTES = 10 * _GIB
+_DISK_RESERVE_FRACTION = 0.10
+
+# Extra Mach services the sandboxed fetch child may look up on top of the worker's list
+# (`sandbox.MACH_ALLOW`). Ablation on macOS 27 with the real `-m model` download: DNS and TCP
+# need nothing extra; `huggingface_hub` -> `httpx2` verifies TLS through `truststore` (the
+# Security framework), which fails with OSStatus -26276 unless `trustd.agent` is reachable.
+# Not allowed (download works without): trustd, SecurityServer, configd, nsurlsessiond.
+FETCH_MACH_ALLOW: tuple[str, ...] = ("com.apple.trustd.agent",)
 
 
 class ModelFetchError(RunnerError):
@@ -93,9 +116,13 @@ class ModelFetchError(RunnerError):
         retryable: bool = True,
         release: bool = False,
         blocked_by_in_use: bool = False,
+        local: bool = False,
     ) -> None:
         super().__init__(code, message, retryable=retryable)
         self.release = release
+        # Executor-local condition that will recur for this model on this Mac (cache cap,
+        # disk full, hub access without a token): the cache remembers it and releases fast.
+        self.local = local
         # MODEL_CACHE_FULL only because the protected in-use model occupies the space; the
         # caller may free it (unload the worker) and retry once.
         self.blocked_by_in_use = blocked_by_in_use
@@ -167,29 +194,64 @@ class FetchSpec:
 
 
 # fetch(spec, conn) runs in the child. Protocol over `conn`:
-#   child  -> ("plan", total_bytes, {rel: [size, sha256 | None]})
+#   child  -> ("plan", total_bytes, {rel: [size, sha256 | None, git_blob_sha1 | None]})
 #   parent -> "go"          (after making room; anything else / a kill aborts)
 #   child  -> ("done",)     (files are in spec.staging)
-#   child  -> ("err", code, message, retryable, release)   at any point
+#   child  -> ("err", code, message, retryable, release, local)   at any point
 FetchFn = Callable[[FetchSpec, Connection], None]
+
+
+def _is_enospc(exc: BaseException | None) -> bool:
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 def _send_err(conn: Connection, exc: BaseException) -> None:
     if isinstance(exc, ModelFetchError):
-        conn.send(("err", exc.code, exc.message, exc.retryable, exc.release))
-        return
-    # Hub verdict (HTTP status) -> retryable failure; anything else is network/local -> release.
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status is not None:
-        conn.send(("err", MODEL_DOWNLOAD_FAILED, f"hub error {status}", True, False))
+        conn.send(("err", exc.code, exc.message, exc.retryable, exc.release, exc.local))
+    elif _is_enospc(exc):
+        conn.send(("err", MODEL_CACHE_FULL, "disk full", True, True, True))
+    elif isinstance(exc, RunnerError):  # e.g. SANDBOX_FAILED: this Mac cannot fetch at all
+        conn.send(("err", exc.code, exc.message, False, True, True))
     else:
-        conn.send(("err", MODEL_DOWNLOAD_FAILED, type(exc).__name__, True, True))
+        # Hub verdict (HTTP status) -> failure, except 401/403 which only mean this Mac has no
+        # (valid) token: local, released. Anything else is network/local -> release.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            conn.send(
+                ("err", MODEL_DOWNLOAD_FAILED, f"hub access denied {status}", True, True, True)
+            )
+        elif status is not None:
+            conn.send(("err", MODEL_DOWNLOAD_FAILED, f"hub error {status}", True, False, False))
+        else:
+            conn.send(("err", MODEL_DOWNLOAD_FAILED, type(exc).__name__, True, True, False))
 
 
-def _child_main(fetch: FetchFn, spec: FetchSpec, conn: Connection) -> None:
+def _child_main(
+    fetch: FetchFn,
+    spec: FetchSpec,
+    conn: Connection,
+    parent_pid: int | None = None,
+    nice: int = 0,
+    confine: dict[str, Any] | None = None,
+) -> None:
+    from minion_executor.worker.process import _watch_parent
+
+    if parent_pid is not None:  # the control process died: never keep downloading
+        threading.Thread(target=_watch_parent, args=(parent_pid, 1.0), daemon=True).start()
+    if nice:
+        with contextlib.suppress(OSError):
+            os.nice(nice)
     os.environ.clear()
     os.environ.update(spec.env)
     try:
+        if confine is not None:  # fail closed: any error is reported, fetch never runs
+            seatbelt.apply_from_spec(confine)
         fetch(spec, conn)
     except BaseException as exc:
         with contextlib.suppress(Exception):
@@ -210,7 +272,7 @@ def _hf_fetch(spec: FetchSpec, conn: Connection) -> None:
     for sib in info.siblings or []:
         if allowed_file(sib.rfilename):
             sha = sib.lfs.sha256 if sib.lfs is not None else None
-            files[sib.rfilename] = [sib.size, sha]
+            files[sib.rfilename] = [sib.size, sha, None if sha else sib.blob_id]
     if not any(name.endswith(".safetensors") for name in files):
         raise ModelFetchError(MODEL_UNSUPPORTED, "no safetensors weights", retryable=False)
     total = sum(int(v[0] or 0) for v in files.values())
@@ -233,17 +295,36 @@ def _revision(model: ModelEntry) -> str:
     return model.revision
 
 
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
+class _HashCancelledError(Exception):
+    """The awaiting task was cancelled; stop hashing (the thread cannot be interrupted)."""
+
+
+def _hash_file(path: Path, cancel: threading.Event, *, git_blob: bool) -> tuple[str, str | None]:
+    """`(sha256, git blob sha1 | None)` of a file, checking `cancel` per chunk.
+
+    Runs in a worker thread (`asyncio.to_thread`) at the default scheduling priority: a
+    per-thread `nice` is not possible on macOS (`setpriority` applies per process), so the
+    chunked read plus the cancel flag is what keeps the Mac responsive.
+    """
+    sha = hashlib.sha256()
+    blob = None
+    if git_blob:
+        blob = hashlib.sha1(usedforsecurity=False)
+        blob.update(b"blob %d\0" % path.stat().st_size)
     with path.open("rb") as f:
         while chunk := f.read(_HASH_CHUNK):
-            h.update(chunk)
-    return h.hexdigest()
+            if cancel.is_set():
+                raise _HashCancelledError
+            sha.update(chunk)
+            if blob is not None:
+                blob.update(chunk)
+    return sha.hexdigest(), None if blob is None else blob.hexdigest()
 
 
 def _tree_files(root: Path) -> Iterator[tuple[str, Path]]:
-    for dirpath, _dirs, names in os.walk(root):
-        for name in names:
+    """Every file under `root`, plus symlinked directories (listed so callers reject them)."""
+    for dirpath, dirs, names in os.walk(root):
+        for name in [*names, *(d for d in dirs if (Path(dirpath) / d).is_symlink())]:
             p = Path(dirpath) / name
             yield p.relative_to(root).as_posix(), p
 
@@ -262,12 +343,21 @@ def _rmtree(path: Path) -> None:
     shutil.rmtree(trash, ignore_errors=True)
 
 
+def _has_key(obj: Any, key: str) -> bool:
+    if isinstance(obj, dict):
+        return key in obj or any(_has_key(v, key) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_key(v, key) for v in obj)
+    return False
+
+
 class ModelCache:
     """Pinned, verified, LRU-bounded on-disk cache of Hugging Face model snapshots.
 
     Layout: `<root>/hf/<org>--<name>/<revision>/` with `.minion-manifest.json`. Mutations are
     serialised by an `fcntl.flock` on `<root>/.lock` (plus an in-process asyncio lock). The
-    most recently ensured model is the "in-use" one and is never evicted.
+    most recently ensured model is the "in-use" one: this process keeps a shared `flock` on its
+    manifest, so neither this nor another executor process sharing the cache evicts it.
     """
 
     def __init__(
@@ -279,6 +369,10 @@ class ModelCache:
         fetch: FetchFn = _hf_fetch,
         download_timeout_s: float = 3600.0,
         mp_context: str = "spawn",
+        min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+        nice: int = 0,
+        sandbox: bool = True,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._root = root
         self._cap = cap_bytes
@@ -288,6 +382,15 @@ class ModelCache:
         self._ctx: Any = mp.get_context(mp_context)
         self._alock = asyncio.Lock()
         self._in_use: Path | None = None
+        self._pin_fd: int | None = None
+        self._min_free = min_free_bytes
+        self._nice = nice
+        self._sandbox = sandbox
+        self._clock = clock
+        # (repo, revision) -> (expires_at, code, message); bounded, oldest first
+        self._local: collections.OrderedDict[tuple[str, str], tuple[float, str, str]] = (
+            collections.OrderedDict()
+        )
 
     @property
     def root(self) -> Path:
@@ -304,22 +407,35 @@ class ModelCache:
         if model.engine not in (Engine.MLX, Engine.HF):
             return None
         final = self.path_for(model)
-        async with self._alock:
-            self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            async with self._flock():
-                if self.verify(final):
-                    self.touch(final)
-                else:
-                    if final.exists():
-                        log.warning("model_cache_entry_invalid", repo=model.ref)
-                        await asyncio.to_thread(_rmtree, final)
-                    await self._fetch_into(model, final)
-                self._in_use = final
+        key = (model.ref, _revision(model))
+        known = self._recall(key)
+        if known is not None and not self.verify(final):
+            log.info("model_cache_local_failure_recalled", repo=model.ref, code=known[0])
+            raise ModelFetchError(known[0], known[1], release=True, local=True)
+        try:
+            async with self._alock:
+                self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                async with self._flock():
+                    await asyncio.to_thread(self._sweep)
+                    if self.verify(final):
+                        self.touch(final)
+                    else:
+                        if final.exists():
+                            log.warning("model_cache_entry_invalid", repo=model.ref)
+                            await asyncio.to_thread(_rmtree, final)
+                        await self._fetch_into(model, final)
+                    self._pin(final)
+        except ModelFetchError as exc:
+            if exc.local:
+                self._remember(key, exc)
+            raise
         return final
 
     def release_in_use(self) -> None:
-        """Forget the protected in-use model (call after the worker holding it was unloaded)."""
+        """Forget the protected in-use model (call after the worker holding it was unloaded)
+        and drop the cross-process pin."""
         self._in_use = None
+        self._unpin()
 
     def verify(self, path: Path) -> bool:
         """Cheap check: manifest present and every listed file exists with the recorded size."""
@@ -347,33 +463,112 @@ class ModelCache:
     def evict_for(self, needed: int, keep: Path | None = None) -> list[Path]:
         """Delete least-recently-used entries until `needed` more bytes fit under the cap.
 
-        Never deletes `keep`. Raises `MODEL_CACHE_FULL` (deleting nothing) if that is impossible.
+        Never deletes `keep`, nor an entry some process pins (shared `flock` on its manifest).
+        Raises `MODEL_CACHE_FULL` (deleting nothing) if that is impossible.
         """
         entries = sorted(self._entries(), key=lambda e: e[2])  # oldest manifest mtime first
-        protected = sum(s for p, s, _m in entries if p == keep)
-        if needed + protected > self._cap:
-            blocked = protected > 0 and needed <= self._cap
-            log.error("model_cache_too_small", needed=needed, cap=self._cap, in_use=blocked)
-            raise ModelFetchError(
-                MODEL_CACHE_FULL,
-                "model does not fit the configured cache size",
-                retryable=True,
-                blocked_by_in_use=blocked,
-            )
-        used = sum(s for _p, s, _m in entries)
-        evicted: list[Path] = []
-        for path, size, _mtime in entries:
-            if used + needed <= self._cap:
-                break
-            if path == keep:
-                continue
-            _rmtree(path)
-            used -= size
-            evicted.append(path)
-            log.info("model_cache_evicted", entry=path.parent.name)
-        return evicted
+        locks: dict[Path, int] = {}
+        try:
+            pinned = 0
+            for path, size, _m in entries:
+                if path == keep:
+                    continue
+                fd = self._try_exclusive(path)
+                if fd is None:
+                    pinned += size
+                else:
+                    locks[path] = fd
+            kept = sum(s for p, s, _m in entries if p == keep)
+            if needed + kept + pinned > self._cap:
+                blocked = kept > 0 and needed + pinned <= self._cap
+                log.error("model_cache_too_small", needed=needed, cap=self._cap, in_use=blocked)
+                raise ModelFetchError(
+                    MODEL_CACHE_FULL,
+                    "model does not fit the configured cache size",
+                    retryable=True,
+                    # Nothing more to try on this Mac unless unloading our own model helps:
+                    # then the caller retries; otherwise hand the subtask back.
+                    release=not blocked,
+                    blocked_by_in_use=blocked,
+                    local=not blocked and pinned == 0,
+                )
+            used = sum(s for _p, s, _m in entries)
+            evicted: list[Path] = []
+            for path, size, _mtime in entries:
+                if used + needed <= self._cap:
+                    break
+                if path not in locks:
+                    continue
+                _rmtree(path)
+                used -= size
+                evicted.append(path)
+                log.info("model_cache_evicted", entry=path.parent.name)
+            return evicted
+        finally:
+            for fd in locks.values():
+                os.close(fd)
 
     # -- internals --
+
+    def _recall(self, key: tuple[str, str]) -> tuple[str, str] | None:
+        hit = self._local.get(key)
+        if hit is None:
+            return None
+        if hit[0] <= self._clock():
+            del self._local[key]
+            return None
+        return hit[1], hit[2]
+
+    def _remember(self, key: tuple[str, str], exc: ModelFetchError) -> None:
+        ttl = _DISK_FULL_TTL_S if exc.code == MODEL_CACHE_FULL else _LOCAL_TTL_S
+        self._local.pop(key, None)
+        self._local[key] = (self._clock() + ttl, exc.code, exc.message)
+        while len(self._local) > _LOCAL_MEMORY_MAX:
+            self._local.popitem(last=False)
+
+    def _pin(self, path: Path) -> None:
+        """Hold a shared flock on `path`'s manifest and drop the previous pin."""
+        self._in_use = path
+        try:
+            fd = os.open(path / MANIFEST_NAME, os.O_RDONLY)
+        except OSError:
+            self._unpin()
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            log.warning("model_cache_pin_failed")
+            return
+        self._unpin()
+        self._pin_fd = fd
+
+    def _unpin(self) -> None:
+        if self._pin_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._pin_fd)
+            self._pin_fd = None
+
+    @staticmethod
+    def _try_exclusive(entry: Path) -> int | None:
+        try:
+            fd = os.open(entry / MANIFEST_NAME, os.O_RDONLY)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def _sweep(self) -> None:
+        """Under the root flock: remove leftovers of crashed fetches / half-done deletes."""
+        shutil.rmtree(self._root / ".staging", ignore_errors=True)
+        base = self._root / "hf"
+        if base.is_dir():
+            for trash in base.glob("*/.trash-*"):
+                shutil.rmtree(trash, ignore_errors=True)
 
     def _read_manifest(self, path: Path) -> dict[str, Any] | None:
         try:
@@ -390,9 +585,11 @@ class ModelCache:
         if not base.is_dir():
             return out
         for repo_dir in base.iterdir():
-            if not repo_dir.is_dir():
+            if repo_dir.name.startswith(".") or not repo_dir.is_dir():
                 continue
             for rev_dir in repo_dir.iterdir():
+                if rev_dir.name.startswith("."):
+                    continue
                 m = rev_dir / MANIFEST_NAME
                 try:
                     mtime = m.stat().st_mtime
@@ -416,32 +613,83 @@ class ModelCache:
         finally:
             os.close(fd)  # closing releases the flock
 
-    def _child_env(self, root: Path) -> dict[str, str]:
+    def _child_env(self, staging: Path) -> dict[str, str]:
         env = {k: os.environ[k] for k in _BASE_CHILD_NAMES if k in os.environ}
         env.update({k: v for k, v in os.environ.items() if k.startswith("LC_")})
         env.update(self._fetch_env.to_env())
-        env["HF_HOME"] = str(root / ".hf-home")
+        # Everything the hub client caches lives inside the staging dir (the only writable
+        # place for the sandboxed child) and is deleted with it: nothing persists outside
+        # sealed entries.
+        env["HF_HOME"] = str(staging / ".hf-home")
+        env["HF_XET_CACHE"] = str(staging / ".hf-home" / "xet")
+        env["TMPDIR"] = str(staging / ".tmp")
         env["HF_HUB_DISABLE_TELEMETRY"] = "1"
         env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         return env
 
+    def _confine_spec(self, staging: Path) -> dict[str, Any] | None:
+        if not self._sandbox:
+            return None
+        read: list[str] = seatbelt.python_read_paths()
+        for name in _CA_NAMES:  # a CA bundle under HOME must stay readable
+            value = self._fetch_env.values.get(name)
+            if value is not None and value.get_secret_value():
+                read.append(value.get_secret_value())
+        return {
+            "read": read,
+            "write": [str(staging)],
+            "engines": ["fetch"],
+            "network": True,
+            "metal": False,
+            "mach_extra": list(FETCH_MACH_ALLOW),
+        }
+
     async def _fetch_into(self, model: ModelEntry, final: Path) -> None:
         staging_root = self._root / ".staging"
-        shutil.rmtree(staging_root, ignore_errors=True)  # under the lock: all leftovers are stale
         staging = staging_root / uuid.uuid4().hex
         staging.mkdir(parents=True, mode=0o700)
-        spec = FetchSpec(model.ref, _revision(model), str(staging), self._child_env(self._root))
+        (staging / ".tmp").mkdir(mode=0o700)
+        spec = FetchSpec(model.ref, _revision(model), str(staging), self._child_env(staging))
+        cancel = threading.Event()
         try:
             plan = await self._run_child(spec, final)
-            await asyncio.to_thread(self._verify_and_seal, staging, plan, model)
+            await asyncio.to_thread(self._verify_and_seal, staging, plan, model, cancel)
             final.parent.mkdir(parents=True, exist_ok=True)
             staging.rename(final)
+        except OSError as exc:
+            if _is_enospc(exc):
+                log.error("model_cache_disk_full", repo=model.ref)
+                raise ModelFetchError(
+                    MODEL_CACHE_FULL, "disk full", release=True, local=True
+                ) from None
+            raise
         finally:
+            cancel.set()  # a hashing thread still running after a cancel stops at its next chunk
             await asyncio.to_thread(shutil.rmtree, staging_root, True)
+
+    def _check_disk(self, needed: int) -> None:
+        usage = shutil.disk_usage(self._root)
+        reserve = max(self._min_free, int(usage.total * _DISK_RESERVE_FRACTION))
+        if usage.free - needed < reserve:
+            log.error("model_cache_disk_reserve", needed=needed, free=usage.free, reserve=reserve)
+            raise ModelFetchError(
+                MODEL_CACHE_FULL, "not enough free disk space", release=True, local=True
+            )
 
     async def _run_child(self, spec: FetchSpec, final: Path) -> dict[str, list[Any]]:
         parent, child = self._ctx.Pipe()
-        proc = self._ctx.Process(target=_child_main, args=(self._fetch, spec, child), daemon=True)
+        proc = self._ctx.Process(
+            target=_child_main,
+            args=(
+                self._fetch,
+                spec,
+                child,
+                os.getpid(),
+                self._nice,
+                self._confine_spec(Path(spec.staging)),
+            ),
+            daemon=True,
+        )
         proc.start()
         child.close()
         loop = asyncio.get_running_loop()
@@ -467,16 +715,23 @@ class ModelCache:
                 kind = msg[0]
                 if kind == "plan":
                     plan = msg[2]
-                    self.evict_for(int(msg[1]), keep=self._in_use)
+                    needed = int(msg[1])
+                    await asyncio.to_thread(self.evict_for, needed, self._in_use)
+                    self._check_disk(needed)
                     parent.send("go")
                 elif kind == "done":
                     if plan is None:
                         raise ModelFetchError(MODEL_DOWNLOAD_FAILED, "protocol error")
                     return plan
                 elif kind == "err":
-                    _, code, message, retryable, release = msg
+                    code, message, retryable, release = msg[1:5]
+                    local = bool(msg[5]) if len(msg) > 5 else False
                     raise ModelFetchError(
-                        str(code)[:64], str(message)[:200], retryable=retryable, release=release
+                        str(code)[:64],
+                        str(message)[:200],
+                        retryable=retryable,
+                        release=release,
+                        local=local,
                     )
         finally:  # also on CancelledError: stop/cancel must kill the download (invariant 6)
             parent.close()
@@ -485,9 +740,14 @@ class ModelCache:
             proc.join(5)
 
     def _verify_and_seal(
-        self, staging: Path, plan: dict[str, list[Any]], model: ModelEntry
+        self,
+        staging: Path,
+        plan: dict[str, list[Any]],
+        model: ModelEntry,
+        cancel: threading.Event,
     ) -> None:
-        shutil.rmtree(staging / ".cache", ignore_errors=True)  # huggingface_hub bookkeeping
+        for bookkeeping in (".cache", ".hf-home", ".tmp"):  # hub client scratch, never an entry
+            shutil.rmtree(staging / bookkeeping, ignore_errors=True)
         found: dict[str, Path] = {}
         for rel, p in _tree_files(staging):
             if p.is_symlink():
@@ -499,22 +759,28 @@ class ModelCache:
             raise ModelFetchError(MODEL_INTEGRITY, "downloaded files differ from hub listing")
         files: dict[str, dict[str, Any]] = {}
         for rel, p in found.items():
-            size, want = plan[rel]
-            digest = _sha256(p)
-            if (size is not None and p.stat().st_size != size) or (
-                want is not None and digest != want
+            size, want, *rest = plan[rel]
+            blob_id = rest[0] if rest else None
+            if want is None and blob_id is None:  # nothing from the hub to check against
+                raise ModelFetchError(MODEL_INTEGRITY, "no digest for file")
+            digest, blob = _hash_file(p, cancel, git_blob=want is None)
+            if (
+                (size is not None and p.stat().st_size != size)
+                or (want is not None and digest != want)
+                or (want is None and blob != blob_id)
             ):
                 log.error("model_integrity_failed", repo=model.ref, file=rel)
                 raise ModelFetchError(MODEL_INTEGRITY, "sha256/size mismatch")
             files[rel] = {"size": p.stat().st_size, "sha256": digest}
-        cfg = found.get("config.json")
-        if cfg is not None:
+        for rel, p in found.items():
+            if not rel.endswith(".json"):
+                continue
+            if cancel.is_set():
+                raise _HashCancelledError
             try:
-                has_auto_map = "auto_map" in json.loads(cfg.read_text())
+                has_auto_map = _has_key(json.loads(p.read_text()), "auto_map")
             except (OSError, ValueError):
-                raise ModelFetchError(
-                    MODEL_UNSUPPORTED, "bad config.json", retryable=False
-                ) from None
+                raise ModelFetchError(MODEL_UNSUPPORTED, "bad json", retryable=False) from None
             if has_auto_map:  # would need trust_remote_code
                 raise ModelFetchError(
                     MODEL_UNSUPPORTED, "model requires remote code", retryable=False

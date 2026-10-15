@@ -144,7 +144,8 @@ async def _run(
     budget = budget_for(profile)
     settings = ExecutorSettings()
     try:
-        # Before restrict_environ(): HF_TOKEN / proxy / CA go to the fetch subprocess only.
+        # Before restrict_environ(). FetchEnv keeps HF_TOKEN / proxy / CA values in this
+        # process's memory (not in os.environ) and hands them to the fetch subprocess only.
         fetch_env = FetchEnv.capture()
     except ValueError as exc:
         raise StartupError(str(exc)) from exc
@@ -199,6 +200,9 @@ async def _run(
                 int(settings.model_cache_gb * 1024**3),
                 fetch_env=fetch_env,
                 download_timeout_s=settings.download_timeout_s,
+                min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
+                nice=PROFILES[profile].nice,
+                sandbox=settings.fetch_sandbox,
             ),
         )
         for sig in (signal.SIGTERM, signal.SIGINT):

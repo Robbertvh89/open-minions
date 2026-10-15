@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
+import shutil
+import threading
 import time
+from collections import namedtuple
 from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Any
 
 import pytest
 from minion_common.enums import Engine, TaskType
@@ -25,6 +30,8 @@ from minion_executor.model_cache import (
     FetchSpec,
     ModelCache,
     ModelFetchError,
+    _hash_file,
+    _HashCancelledError,
     allowed_file,
 )
 from minion_executor.worker.process import FORCED_WORKER_ENV, scrub_env
@@ -32,6 +39,16 @@ from minion_executor.worker.process import FORCED_WORKER_ENV, scrub_env
 REV = "a" * 40
 
 pytestmark = pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+
+
+_Usage = namedtuple("_Usage", "total used free")
+TB = 1024**4
+
+
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dev machine's real free space must not decide unit tests."""
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(2 * TB, 0, 2 * TB))
 
 
 def _model(name: str = "m", engine: Engine = Engine.MLX, rev: str = REV) -> ModelEntry:
@@ -77,11 +94,20 @@ def fake_fetch(
 
 
 def _cache(
-    tmp_path: Path, fetch: FetchFn, cap: int = 10_000, download_timeout_s: float = 3600.0
+    tmp_path: Path,
+    fetch: FetchFn,
+    cap: int = 10_000,
+    download_timeout_s: float = 3600.0,
+    **kw: Any,
 ) -> ModelCache:
     # fork: the fake fetch is a closure (not picklable); production uses spawn.
     return ModelCache(
-        tmp_path / "c", cap, fetch=fetch, mp_context="fork", download_timeout_s=download_timeout_s
+        tmp_path / "c",
+        cap,
+        fetch=fetch,
+        mp_context="fork",
+        download_timeout_s=download_timeout_s,
+        **{"min_free_bytes": 0, "sandbox": False, **kw},
     )
 
 
@@ -162,7 +188,8 @@ async def test_model_larger_than_cap_is_cache_full(tmp_path: Path) -> None:
     cache = _cache(tmp_path, fake_fetch(), cap=50)
     with pytest.raises(ModelFetchError) as ei:
         await cache.ensure(_model())
-    assert ei.value.code == MODEL_CACHE_FULL and ei.value.retryable and not ei.value.release
+    # nothing to evict on this Mac can ever make it fit: hand the subtask back, remember it
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release and ei.value.local
 
 
 async def test_lru_eviction_under_cap_keeps_in_use_model(tmp_path: Path) -> None:
@@ -207,6 +234,7 @@ async def test_lru_order_oldest_first(tmp_path: Path) -> None:
     for i, p in enumerate([paths[2], paths[0], paths[1]]):  # c oldest, then a, then b
         assert p is not None
         os.utime(p / MANIFEST_NAME, (10 + i, 10 + i))
+    cache.release_in_use()  # c was pinned as the last ensured model
     evicted = cache.evict_for(150, keep=paths[1])
     assert evicted == [paths[2], paths[0]]
 
@@ -252,8 +280,7 @@ async def test_cancel_kills_the_fetch_process(tmp_path: Path) -> None:
     pid = int(pidfile.read_text())
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
-    await asyncio.sleep(0.2)
+        await task  # _run_child's finally already killed and joined the child
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     assert not (tmp_path / "c" / ".staging").exists()
@@ -313,7 +340,9 @@ async def test_child_env_has_fetch_env_and_parent_does_not(
 
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leak")
     fe = FetchEnv.capture({"HF_TOKEN": "hf_s3cret", "HTTPS_PROXY": "http://u:p@px:1"})
-    cache = ModelCache(tmp_path / "c", 10**6, fetch_env=fe, fetch=dump, mp_context="fork")
+    cache = ModelCache(
+        tmp_path / "c", 10**6, fetch_env=fe, fetch=dump, mp_context="fork", sandbox=False
+    )
     with pytest.raises(ModelFetchError):
         await cache.ensure(_model())
     env = json.loads(out.read_text())
@@ -362,3 +391,382 @@ def test_safe_patterns_exclude_code_and_pickles() -> None:
     for good in ("model.safetensors", "config.json", "tokenizer.model", "1_Pooling/config.json"):
         assert allowed_file(good)
     assert not any(p.endswith((".py", ".bin", ".pt", ".pkl", ".gguf")) for p in SAFE_PATTERNS)
+
+
+# --- TASK-4.2 review fixes ---
+
+
+def _spawn_counter(tmp_path: Path) -> tuple[Path, FetchFn]:
+    """A fetch that records every spawn, then runs the normal fake."""
+    spawned = tmp_path / "spawned"
+    inner = fake_fetch()
+
+    def fetch(spec: FetchSpec, conn: Connection) -> None:
+        with spawned.open("a") as f:
+            f.write("x\n")
+        inner(spec, conn)
+
+    return spawned, fetch
+
+
+async def test_free_disk_reserve_releases_without_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned, fetch = _spawn_counter(tmp_path)
+    gib = 1024**3
+    # 100 GiB disk, 20 GiB free: reserve = max(10 GiB, 10% = 10 GiB); model of 102 bytes fits
+    # unless the configured floor is raised above what is left.
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(100 * gib, 80 * gib, 20 * gib))
+    ok = _cache(tmp_path, fetch, min_free_bytes=10 * gib)
+    assert await ok.ensure(_model("fits")) is not None
+    assert not (tmp_path / "c" / ".staging").exists()
+
+    tight = _cache(tmp_path, fetch, min_free_bytes=20 * gib)
+    with pytest.raises(ModelFetchError) as ei:
+        await tight.ensure(_model("big"))
+    e = ei.value
+    assert e.code == MODEL_CACHE_FULL and e.release and e.local and not e.blocked_by_in_use
+    assert spawned.read_text().count("x") == 2  # ok + the failed attempt (spawned, no "go")
+    assert not (tmp_path / "c" / ".staging").exists()
+    assert not (tmp_path / "c" / "hf" / "org--big").exists()
+    # remembered: the next assignment is released without even spawning a fetch child
+    with pytest.raises(ModelFetchError) as ei2:
+        await tight.ensure(_model("big"))
+    assert ei2.value.release and ei2.value.code == MODEL_CACHE_FULL
+    assert spawned.read_text().count("x") == 2
+
+
+async def test_free_disk_reserve_is_ten_percent_of_disk_when_larger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 10% of 1 TB = ~100 GB beats the 1-byte floor: 50 GB free is not enough
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(10**12, 95 * 10**10, 5 * 10**10))
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, fake_fetch(), min_free_bytes=1).ensure(_model())
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release
+
+
+async def test_disk_full_memory_expires(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    spawned, fetch = _spawn_counter(tmp_path)
+    cache = _cache(tmp_path, fetch, clock=lambda: now[0])
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(10**12, 0, 0))
+    with pytest.raises(ModelFetchError):
+        await cache.ensure(_model())
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(2 * TB, 0, 2 * TB))
+    with pytest.raises(ModelFetchError):  # still remembered
+        await cache.ensure(_model())
+    assert spawned.read_text().count("x") == 1
+    now[0] += 3601
+    assert await cache.ensure(_model()) is not None  # space freed, memory expired
+
+
+async def test_enospc_in_child_cleans_staging_and_releases(tmp_path: Path) -> None:
+    spawned = tmp_path / "spawned"
+
+    def full(spec: FetchSpec, conn: Connection) -> None:
+        with spawned.open("a") as f:
+            f.write("x\n")
+        conn.send(("plan", 1, {"w.safetensors": [1, "0" * 64, None]}))
+        conn.recv()
+        (Path(spec.staging) / "partial").write_bytes(b"x")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    cache = _cache(tmp_path, full)
+    with pytest.raises(ModelFetchError) as ei:
+        await cache.ensure(_model())
+    e = ei.value
+    assert e.code == MODEL_CACHE_FULL and e.release and e.local and e.retryable is not False
+    assert not (tmp_path / "c" / ".staging").exists()
+    with pytest.raises(ModelFetchError):  # fast release from memory, no second download
+        await cache.ensure(_model())
+    assert spawned.read_text().count("x") == 1
+
+
+async def test_enospc_while_sealing_in_parent_is_mapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("minion_executor.model_cache._hash_file", boom)
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, fake_fetch()).ensure(_model())
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release
+    assert not (tmp_path / "c" / ".staging").exists()
+
+
+@pytest.mark.parametrize(("status", "release"), [(401, True), (403, True), (500, False)])
+async def test_hub_auth_errors_are_local_and_remembered(
+    tmp_path: Path, status: int, release: bool
+) -> None:
+    spawned = tmp_path / "spawned"
+
+    class Resp:
+        status_code = status
+
+    class HubError(Exception):
+        response = Resp()
+
+    def hub(spec: FetchSpec, conn: Connection) -> None:
+        with spawned.open("a") as f:
+            f.write("x\n")
+        raise HubError("detail")
+
+    cache = _cache(tmp_path, hub)
+    with pytest.raises(ModelFetchError) as ei:
+        await cache.ensure(_model())
+    assert ei.value.code == MODEL_DOWNLOAD_FAILED and ei.value.release is release
+    with pytest.raises(ModelFetchError):
+        await cache.ensure(_model())
+    assert spawned.read_text().count("x") == (1 if release else 2)
+
+
+async def test_local_memory_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(10**12, 0, 0))
+    cache = _cache(tmp_path, fake_fetch())
+    for i in range(80):
+        with pytest.raises(ModelFetchError):
+            await cache.ensure(_model(f"m{i}"))
+    assert len(cache._local) <= 64
+
+
+async def test_pinned_model_survives_eviction_by_another_process(tmp_path: Path) -> None:
+    fetch = fake_fetch({"w.safetensors": b"x" * 100})
+    proc_a = _cache(tmp_path, fetch, cap=150)
+    proc_b = _cache(tmp_path, fetch, cap=150)  # same root, "another executor process"
+    pa = await proc_a.ensure(_model("a"))
+    assert pa is not None
+    with pytest.raises(ModelFetchError) as ei:  # a is loaded in A: B may not evict it
+        await proc_b.ensure(_model("b"))
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release
+    assert not ei.value.blocked_by_in_use and not ei.value.local  # unloading B's own would not help
+    assert pa.exists()
+    proc_a.release_in_use()  # A unloaded
+    pb = await proc_b.ensure(_model("b"))
+    assert pb is not None and pb.exists() and not pa.exists()
+
+
+async def test_switching_pin_unpins_previous_entry(tmp_path: Path) -> None:
+    fetch = fake_fetch({"w.safetensors": b"x" * 100})
+    a = _cache(tmp_path, fetch, cap=250)
+    other = _cache(tmp_path, fetch, cap=250)
+    pa = await a.ensure(_model("a"))
+    pb = await a.ensure(_model("b"))
+    assert pa is not None and pb is not None
+    os.utime(pa / MANIFEST_NAME, (1, 1))
+    pc = await other.ensure(_model("c"))  # a is no longer pinned and oldest; b is pinned
+    assert pc is not None and not pa.exists() and pb.exists()
+
+
+def test_hash_file_cancels_between_chunks(tmp_path: Path) -> None:
+    f = tmp_path / "f"
+    f.write_bytes(b"x" * 10)
+    ev = threading.Event()
+    assert _hash_file(f, ev, git_blob=False)[0] == _sha(b"x" * 10)
+    ev.set()
+    with pytest.raises(_HashCancelledError):
+        _hash_file(f, ev, git_blob=False)
+
+
+async def test_cancel_during_hashing_sets_event_and_stops_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started, stopped = threading.Event(), threading.Event()
+
+    def slow_hash(path: Path, cancel: threading.Event, *, git_blob: bool) -> tuple[str, None]:
+        started.set()
+        cancel.wait(10)
+        stopped.set()
+        raise _HashCancelledError
+
+    monkeypatch.setattr("minion_executor.model_cache._hash_file", slow_hash)
+    task = asyncio.create_task(_cache(tmp_path, fake_fetch()).ensure(_model()))
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(stopped.wait, 5)
+
+
+async def test_child_gets_nice_parent_watch_and_staging_scoped_hub_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.worker.process as proc
+
+    watched = tmp_path / "watched"
+    monkeypatch.setattr(
+        proc, "_watch_parent", lambda pid, interval: watched.write_text(f"{pid} {interval}")
+    )
+    out = tmp_path / "env.json"
+    inner = fake_fetch()
+
+    def dump(spec: FetchSpec, conn: Connection) -> None:
+        out.write_text(json.dumps({"nice": os.nice(0), **dict(os.environ), "s": spec.staging}))
+        inner(spec, conn)
+
+    path = await _cache(tmp_path, dump, nice=7).ensure(_model())
+    assert path is not None
+    d = json.loads(out.read_text())
+    assert d["nice"] >= 7
+    assert d["HF_HOME"].startswith(d["s"]) and d["HF_XET_CACHE"].startswith(d["s"])
+    assert d["TMPDIR"].startswith(d["s"])
+    assert not (path / ".hf-home").exists() and not (path / ".tmp").exists()
+    for _ in range(100):
+        if watched.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert watched.read_text().split()[0] == str(os.getpid())
+
+
+async def test_sweep_removes_stale_staging_and_trash_and_entries_skip_dotnames(
+    tmp_path: Path,
+) -> None:
+    cache = _cache(tmp_path, fake_fetch())
+    root = tmp_path / "c"
+    stale_stage = root / ".staging" / "dead"
+    trash = root / "hf" / "org--x" / ".trash-abc"
+    for d in (stale_stage, trash):
+        d.mkdir(parents=True)
+        (d / "w.safetensors").write_bytes(b"x" * 5)
+    (trash / MANIFEST_NAME).write_text(json.dumps({"files": {"w.safetensors": {"size": 5}}}))
+    assert cache.used_bytes() == 0  # dot-named dirs are not entries
+    assert await cache.ensure(_model()) is not None
+    assert not stale_stage.exists() and not trash.exists()
+
+
+async def test_leftover_trash_is_removed_after_eviction(tmp_path: Path) -> None:
+    cache = _cache(tmp_path, fake_fetch({"w.safetensors": b"x" * 100}), cap=150)
+    await cache.ensure(_model("a"))
+    cache.release_in_use()
+    await cache.ensure(_model("b"))
+    assert not list((tmp_path / "c" / "hf").glob("*/.trash-*"))
+
+
+def _git_blob(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data, usedforsecurity=False).hexdigest()
+
+
+def _blob_fetch(files: dict[str, bytes], blob_ids: dict[str, str | None]) -> FetchFn:
+    def fetch(spec: FetchSpec, conn: Connection) -> None:
+        plan = {
+            k: [len(v), _sha(v) if k.endswith(".safetensors") else None, blob_ids.get(k)]
+            for k, v in files.items()
+        }
+        conn.send(("plan", sum(len(v) for v in files.values()), plan))
+        conn.recv()
+        for k, v in files.items():
+            (Path(spec.staging) / k).write_bytes(v)
+        conn.send(("done",))
+
+    return fetch
+
+
+async def test_non_lfs_files_are_verified_against_git_blob_sha1(tmp_path: Path) -> None:
+    cfg = b'{"a": 1}'
+    files = {"w.safetensors": b"x" * 10, "config.json": cfg}
+    good = _blob_fetch(files, {"config.json": _git_blob(cfg)})
+    assert await _cache(tmp_path, good).ensure(_model("g")) is not None
+    bad = _blob_fetch(files, {"config.json": _git_blob(b"other")})
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, bad).ensure(_model("b"))
+    assert ei.value.code == MODEL_INTEGRITY
+    none = _blob_fetch(files, {})  # non-LFS file with no digest from the hub: fail closed
+    with pytest.raises(ModelFetchError) as ei2:
+        await _cache(tmp_path, none).ensure(_model("n"))
+    assert ei2.value.code == MODEL_INTEGRITY
+
+
+async def test_symlinked_directory_is_rejected(tmp_path: Path) -> None:
+    inner = fake_fetch()
+
+    def fetch(spec: FetchSpec, conn: Connection) -> None:
+        inner(spec, conn)
+
+    def with_link(spec: FetchSpec, conn: Connection) -> None:
+        # hook into the "done" step: add a directory symlink after the files are written
+        class Wrap:
+            def send(self, m: Any) -> None:
+                if m[0] == "done":
+                    (Path(spec.staging) / "linkdir").symlink_to("/")
+                conn.send(m)
+
+            def recv(self) -> Any:
+                return conn.recv()
+
+        inner(spec, Wrap())  # type: ignore[arg-type]
+
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, with_link).ensure(_model())
+    assert ei.value.code == MODEL_INTEGRITY
+    assert not (tmp_path / "c" / "hf" / "org--m" / REV).exists()
+
+
+@pytest.mark.parametrize(
+    "name", ["tokenizer_config.json", "preprocessor_config.json", "sub/processor.json"]
+)
+async def test_auto_map_in_any_json_is_unsupported(tmp_path: Path, name: str) -> None:
+    files = {
+        "w.safetensors": b"x",
+        "config.json": b"{}",
+        name: b'{"x": {"auto_map": {"AutoTokenizer": ["m.T", null]}}}',
+    }
+    fetch = fake_fetch(files)
+    # sub/ needs a directory in staging: fake_fetch creates parents
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, fetch).ensure(_model())
+    assert ei.value.code == MODEL_UNSUPPORTED and not ei.value.retryable
+
+
+async def test_spawn_context_pickles_spec_and_replaces_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real `spawn` (production path): FetchSpec and the fetch function must pickle, the
+    child imports the module-level fake, and its env is exactly the explicit one."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    import exec_fetch_helpers as h
+
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leak")
+    fe = FetchEnv.capture({"HF_TOKEN": "hf_s3cret"})
+    cache = ModelCache(
+        tmp_path / "c",
+        10**6,
+        fetch_env=fe,
+        fetch=h.env_probe_fetch,
+        mp_context="spawn",
+        min_free_bytes=0,
+        sandbox=False,
+        nice=3,
+    )
+    path = await cache.ensure(_model())
+    assert path is not None
+    seen = json.loads((path / "config.json").read_text())
+    assert seen["has_token"] is True and seen["leak"] is False
+    assert seen["repo"] == "org/m" and seen["nice"] >= 3
+    assert seen["hf_home"].startswith(seen["staging"]) and seen["xet"].startswith(seen["staging"])
+
+
+async def test_sandbox_failure_fails_closed_and_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.runners.base import RunnerError
+    from minion_executor.worker import sandbox as seatbelt
+
+    ran = tmp_path / "ran"
+
+    def deny(_spec: dict[str, Any]) -> None:
+        raise RunnerError("SANDBOX_FAILED", "nope")
+
+    monkeypatch.setattr(seatbelt, "apply_from_spec", deny)
+
+    def fetch(spec: FetchSpec, conn: Connection) -> None:
+        ran.write_text("x")
+
+    cache = _cache(tmp_path, fetch, sandbox=True)
+    with pytest.raises(ModelFetchError) as ei:
+        await cache.ensure(_model())
+    assert ei.value.code == "SANDBOX_FAILED" and ei.value.release and ei.value.local
+    assert not ran.exists()  # the fetch never ran unconfined

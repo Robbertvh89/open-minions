@@ -29,6 +29,12 @@ in the worker. It calls `snapshot_download(repo, revision=<40-hex sha>, allow_pa
 (`MODEL_UNSUPPORTED`). Every LFS file's sha256 and size are checked against hub metadata; a manifest
 is written; the staging directory is renamed atomically into `<root>/hf/<org>--<name>/<sha>/`.
 The cache is LRU-bounded by `MINION_EXECUTOR_MODEL_CACHE_GB`. A stop or cancel kills the fetch.
+The fetch subprocess is itself confined with the same Seatbelt helpers (network allowed; writes only
+to its staging dir, where `HF_HOME`, `HF_XET_CACHE` and `TMPDIR` also live; HOME reads, exec,
+LaunchServices and AppleEvents denied; Mach lookups limited to the worker list plus
+`com.apple.trustd.agent`, which `truststore` needs for TLS; a CA bundle under HOME is re-allowed).
+It fails closed; `MINION_EXECUTOR_FETCH_SANDBOX=0` exists for development only. Non-LFS files are
+checked against the hub's git blob sha1, and a download must leave `max(MIN_FREE_DISK_GB, 10%)` free.
 
 **D7. Credentials reach only the fetch process; the worker is offline.**
 `HF_TOKEN`, proxy URLs, CA settings and `HF_ENDPOINT` are captured before `restrict_environ()` and

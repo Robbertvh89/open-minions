@@ -115,6 +115,24 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
 **M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
 
+**M3 update (TASK-4.2, model cache; FR-12).** MLX/HF models are fetched by the control side in a killable, Seatbelt-sandboxed `spawn` subprocess (network allowed; writes only to its staging dir; no HOME reads, exec, LaunchServices or AppleEvents), pinned to `ModelEntry.revision` and verified (LFS sha256, git blob sha1 for non-LFS files, no symlinks, no `auto_map` in any JSON) before the worker, which is offline and sandboxed (ADR-0009), loads it. Settings: `MINION_EXECUTOR_MODEL_CACHE_DIR` (absolute, `~` expanded), `MINION_EXECUTOR_MODEL_CACHE_GB` (LRU cap, default 50), `MINION_EXECUTOR_MIN_FREE_DISK_GB` (default 10: a download must leave at least max(this, 10% of the disk) free), `MINION_EXECUTOR_DOWNLOAD_TIMEOUT_S`; `MINION_EXECUTOR_FETCH_SANDBOX=0` is dev-only (needs `MINION_EXECUTOR_DEV=1`). A model that is loaded is pinned with a shared `flock`, so no executor process sharing the cache evicts it. Provisioning outcomes (release = `release` call, no retry budget burnt; fail = `fail` with the code):
+
+| Code | Outcome | When |
+|---|---|---|
+| `MODEL_DOWNLOAD_FAILED` | release | network down, proxy error, fetch process died, download timeout |
+| `MODEL_DOWNLOAD_FAILED` | fail, retryable | hub answered with another HTTP error (404, 5xx) |
+| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 401/403 (this Mac has no valid token) |
+| `MODEL_INTEGRITY` | fail, retryable | sha256/blob-sha1/size mismatch, file set differs from the hub listing, symlink, hub returned another revision |
+| `MODEL_UNSUPPORTED` | fail, non-retryable | no safetensors, disallowed file type, `auto_map` / bad JSON (would need remote code) |
+| `MODEL_CACHE_FULL` | release, remembered 1 h | model larger than `MODEL_CACHE_GB` |
+| `MODEL_CACHE_FULL` | release (not remembered) | the space is held by models other executor processes have loaded |
+| `MODEL_CACHE_FULL` | release, remembered 10 min | free-disk reserve not met, or `ENOSPC` while downloading/sealing (staging is deleted first) |
+| `MODEL_CACHE_FULL` | internal retry once | the only blocker is this executor's own loaded model: the worker is unloaded and the fetch retried |
+| `SANDBOX_FAILED` | release, remembered 1 h | the fetch sandbox could not be applied (fail closed: nothing is downloaded unconfined) |
+| `LOCAL_IO_ERROR` | release | the cache directory itself is unreadable or unwritable (`OSError` from the cache) |
+
+"Remembered" means the executor keeps a bounded in-memory (model, revision) to reason map, so repeated assignments of that model are released immediately without network or disk work; the server's `MINION_RELEASE_LIMIT` still bounds how often one subtask bounces. A full or unusable local disk is a property of this Mac, not of the subtask, which is why it is a release and not a (retry-burning) failure.
+
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 
 ### 4.3 Acquisition protocol **[paper]**

@@ -278,6 +278,8 @@ class ExecutorLoop:
         self._unloaded = True
         try:
             await asyncio.to_thread(self._worker.unload)
+            if self._cache is not None:
+                self._cache.release_in_use()  # unpin: the model is no longer in memory
             log.info("worker_unloaded_idle")
         except Exception as exc:  # a failed unload must not stop the loop
             log.warning("idle_unload_failed", error=type(exc).__name__)
@@ -324,6 +326,8 @@ class ExecutorLoop:
                 if stopper.done():
                     # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
                     await asyncio.to_thread(self._worker.kill)
+                    if self._cache is not None:
+                        self._cache.release_in_use()
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
                     await self._release(a, bound)
@@ -498,16 +502,19 @@ class ExecutorLoop:
         if self._cache is None:
             return None
         try:
+            try:
+                return await self._cache.ensure(model)
+            except ModelFetchError as exc:
+                if not (exc.code == MODEL_CACHE_FULL and exc.blocked_by_in_use):
+                    raise
+            # The new model fits the cap only if the loaded model's files may go: drop the warm
+            # worker (frees its memory too), unprotect that model and retry once.
+            log.info("model_cache_unload_for_space")
+            await asyncio.to_thread(self._worker.unload)
+            self._cache.release_in_use()
             return await self._cache.ensure(model)
-        except ModelFetchError as exc:
-            if not (exc.code == MODEL_CACHE_FULL and exc.blocked_by_in_use):
-                raise
-        # The new model fits the cap only if the loaded model's files may go: drop the warm
-        # worker (frees its memory too), unprotect that model and retry once.
-        log.info("model_cache_unload_for_space")
-        await asyncio.to_thread(self._worker.unload)
-        self._cache.release_in_use()
-        return await self._cache.ensure(model)
+        except OSError as exc:  # cache dir unreadable / unwritable: local, not the subtask's fault
+            raise _FailureError(True, "LOCAL_IO_ERROR", type(exc).__name__, release=True) from None
 
     async def _run_batches(
         self, a: Assignment, records: list[Record], hb: Heartbeater, params: TaskParams

@@ -1322,3 +1322,70 @@ async def test_cache_full_that_unloading_cannot_fix_fails_without_looping(
     client2, _ = await _run_one(tmp_path, _asn(), worker2, model_cache=cache2)
     assert cache2.ensures == 2 and worker2.unloads == 1
     assert next(r for k, r in client2.calls if k == "fail").code == MODEL_CACHE_FULL
+
+
+async def test_stop_during_ensure_cancels_it_releases_once_and_reports_stopped(
+    tmp_path: Path,
+) -> None:
+    from minion_executor.loop import _Outcome
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class HangingCache(_StubCache):
+        async def ensure(self, model: ModelEntry) -> Path | None:
+            self.ensures += 1
+            entered.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return None
+
+    worker, cache = FakeWorker(), HangingCache()
+    client = FakeClient([assignment()])
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], model_cache=cache)
+    outcomes: list[Any] = []
+    handle = loop._handle
+
+    async def spy(a: Assignment, tmp: Path) -> Any:
+        outcomes.append(await handle(a, tmp))
+        return outcomes[-1]
+
+    loop._handle = spy  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert cancelled.is_set()
+    assert outcomes == [_Outcome.STOPPED]
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert cache.released == 1  # pin dropped together with the killed worker
+    assert worker.ensured == []
+
+
+async def test_local_oserror_from_ensure_is_released_as_local_io_error(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    cache = _StubCache(PermissionError("cache dir"))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert worker.ensured == []
+
+
+async def test_idle_unload_releases_the_cache_pin(tmp_path: Path) -> None:
+    now = [0.0]
+    worker, client = FakeWorker(), FakeClient([])
+    cache = _StubCache()
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], idle_unload_s=60, clock=lambda: now[0],
+        model_cache=cache,
+    )  # fmt: skip
+
+    def tick() -> None:
+        now[0] += 100
+        if worker.unloads:
+            loop.stop()
+
+    client.on_empty = tick
+    await loop.run()
+    assert worker.unloads == 1 and cache.released == 1

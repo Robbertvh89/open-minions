@@ -126,15 +126,20 @@ def build_profile(
     ollama_port: int | None = None,
     *,
     metal_cache: str | None = None,
+    allow_network: bool = False,
+    mach_extra: Sequence[str] = (),
 ) -> str:
     """SBPL profile text. Pure: paths must already be absolute and symlink-resolved (Seatbelt
     matches resolved paths); see `resolve_paths`. `metal_cache` is the per-user cache dir
-    (`DARWIN_USER_CACHE_DIR`) whose `com.apple.metal` subdirectories may be written."""
+    (`DARWIN_USER_CACHE_DIR`) whose `com.apple.metal` subdirectories may be written.
+    `allow_network` keeps outbound network (the model-fetch child; everything else is still
+    confined) and `mach_extra` adds Mach services to the allow list."""
     homes = [home] if isinstance(home, str) else list(home)
     homes = list(dict.fromkeys(h for h in homes if h and h != "/"))
     lines = ["(version 1)", "(allow default)"]
 
-    lines.append("(deny network*)")
+    if not allow_network:
+        lines.append("(deny network*)")
     if ollama_port is not None:
         if not 0 < ollama_port < 65536:
             raise ValueError("bad ollama port")
@@ -148,7 +153,7 @@ def build_profile(
     lines += ["(deny signal)", "(allow signal (target self))"]
 
     lines.append("(deny mach-lookup)")
-    names = " ".join(f"(global-name {sbpl_quote(n)})" for n in MACH_ALLOW)
+    names = " ".join(f"(global-name {sbpl_quote(n)})" for n in (*MACH_ALLOW, *mach_extra))
     names += "".join(f" (global-name-prefix {sbpl_quote(n)})" for n in MACH_ALLOW_PREFIXES)
     lines.append(f"(allow mach-lookup {names})")
 
@@ -343,7 +348,13 @@ def apply_from_spec(spec: dict[str, Any]) -> None:
     writes = resolve_paths(spec.get("write", []), home=homes)
     try:
         profile = build_profile(
-            homes, reads, writes, spec.get("ollama_port"), metal_cache=user_cache_dir()
+            homes,
+            reads,
+            writes,
+            spec.get("ollama_port"),
+            metal_cache=user_cache_dir() if spec.get("metal", True) else None,
+            allow_network=bool(spec.get("network", False)),
+            mach_extra=[str(n) for n in spec.get("mach_extra", [])],
         )
     except (ValueError, TypeError) as exc:
         raise RunnerError(SANDBOX_FAILED, f"bad profile: {type(exc).__name__}") from None
