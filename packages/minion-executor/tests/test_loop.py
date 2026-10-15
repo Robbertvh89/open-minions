@@ -308,7 +308,8 @@ async def test_complete_gives_up_after_retries_without_fail(tmp_path: Path) -> N
     client.on_empty = loop.stop
     assert await loop.run() == 0
     assert client.kinds().count("complete") == 3
-    assert "fail" not in client.kinds()  # leave it to the watchdog
+    assert "fail" not in client.kinds()
+    assert client.kinds().count("release") == 1  # best-effort hand-back, watchdog is the backstop
     assert len(sleeps) == 2 + 1 + 1  # 2 complete waits, 1 post-failure backoff, 1 idle
 
 
@@ -349,23 +350,46 @@ async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     ("s3", "code"),
     [
+        (FakeS3(get_status=403), "INPUT_UNAVAILABLE"),
         (FakeS3(get_status=500), "INPUT_UNAVAILABLE"),
         (FakeS3(get_status=200), "INPUT_UNAVAILABLE"),  # Range ignored
         (FakeS3(body=INPUT[:-3]), "INPUT_UNAVAILABLE"),  # short read
-        (FakeS3(put_status=403), "UPLOAD_FAILED"),
+        (FakeS3(put_status=403), "UPLOAD_FAILED"),  # e.g. expired presigned PUT
     ],
 )
-async def test_local_transport_errors_release_not_fail(
+async def test_s3_verdicts_fail_retryable_not_release(
     tmp_path: Path, s3: FakeS3, code: str
 ) -> None:
     client = FakeClient([assignment()])
     loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
     client.on_empty = loop.stop
     await loop.run()
-    assert "fail" not in client.kinds()  # retry budget not burned by one broken Mac
+    req = _fail_req(client)  # counts against max_attempts: no fleet-wide livelock
+    assert (req.retryable, req.code) == (True, code)
+    assert "release" not in client.kinds()
+    assert "complete" not in client.kinds()
+
+
+@pytest.mark.parametrize("phase", ["get", "put"])
+@pytest.mark.parametrize("exc", [httpx.ConnectError("x"), httpx.ReadTimeout("x")])
+async def test_connectivity_errors_release_not_fail(
+    tmp_path: Path, phase: str, exc: Exception
+) -> None:
+    s3 = FakeS3()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (req.method == "GET") == (phase == "get"):
+            raise exc
+        return s3.handler(req)
+
+    client = FakeClient([assignment()])
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    loop._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client.on_empty = loop.stop
+    await loop.run()
+    assert "fail" not in client.kinds()
     assert "release" in client.kinds()
     assert "complete" not in client.kinds()
-    assert not s3.puts or code == "UPLOAD_FAILED"
 
 
 async def test_failures_back_off_and_pause_after_streak(tmp_path: Path) -> None:
@@ -498,3 +522,48 @@ def test_cleanup_stale_tmp_only_removes_dead_owner_dirs(tmp_path: Path) -> None:
     assert cleanup_stale_tmp(tmp_path) == 1
     assert not stale.exists()
     assert mine.exists() and other.exists() and legacy.exists()
+
+
+async def test_failure_pause_is_interruptible_by_stop(tmp_path: Path) -> None:
+    client = FakeClient([assignment()])
+    loop = ExecutorLoop(
+        client,  # type: ignore[arg-type]
+        FakeWorker(WorkerCrashed("x")),
+        BUDGET,
+        [Engine.MLX],
+        http=httpx.AsyncClient(transport=httpx.MockTransport(FakeS3().handler)),
+        tmp_root=tmp_path,
+        max_consecutive_failures=1,
+        failure_pause_s=3600.0,
+    )
+    task = asyncio.create_task(loop.run())
+    for _ in range(500):
+        await asyncio.sleep(0.01)
+        if "fail" in client.kinds():
+            break
+    await asyncio.sleep(0.1)  # now inside the hour-long pause
+    loop.stop()
+    assert await asyncio.wait_for(task, 3) == 0
+
+
+async def test_register_retry_pause_is_interruptible_by_stop(tmp_path: Path) -> None:
+    client = FakeClient([])
+    client.register_excs = [httpx.ConnectError("x")] * 50
+    loop = ExecutorLoop(
+        client,  # type: ignore[arg-type]
+        FakeWorker(),
+        BUDGET,
+        [Engine.MLX],
+        http=httpx.AsyncClient(transport=httpx.MockTransport(FakeS3().handler)),
+        register=object(),  # type: ignore[arg-type]
+        tmp_root=tmp_path,
+        backoff=(3600.0, 3600.0),
+    )
+    task = asyncio.create_task(loop.run())
+    for _ in range(500):
+        await asyncio.sleep(0.01)
+        if "register" in client.kinds():
+            break
+    await asyncio.sleep(0.1)
+    loop.stop()
+    assert await asyncio.wait_for(task, 3) == 0

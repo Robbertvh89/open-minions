@@ -2,8 +2,8 @@
 
 The control process talks to it over a `multiprocessing.Pipe` using length-framed
 messages (`send_bytes`/`recv_bytes`, bounded by `max_message_bytes`) carrying JSON. The child is
-started with the `spawn` context so no Metal/GPU state is inherited via fork, receives a scrubbed
-environment (no tokens/secrets), and exits on its own if the control process dies.
+started with the `spawn` context so no Metal/GPU state is inherited via fork, receives an
+allowlisted environment (no tokens/secrets), and exits on its own if the control process dies.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from typing import Any
@@ -24,16 +24,47 @@ from minion_common.schemas import Budget, ModelEntry
 from minion_executor.runners.base import Record, RunnerError
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
-_SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "KEY", "AWS_")
+# Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
+# macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
+_ALLOWED_NAMES = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "HF_HOME",
+        "TOKENIZERS_PARALLELISM",
+        "MINION_EXECUTOR_DEV",
+        "MINION_EXECUTOR_TEST_HOOKS",
+        "__PYVENV_LAUNCHER__",
+    }
+)
+_ALLOWED_PREFIXES = ("LC_", "MLX_")
 
 
 class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
     """The worker process died or its pipe closed unexpectedly."""
 
 
+def env_allowed(name: str) -> bool:
+    return name in _ALLOWED_NAMES or name.startswith(_ALLOWED_PREFIXES)
+
+
 def scrub_env(env: Mapping[str, str]) -> dict[str, str]:
-    """Copy of `env` without anything that looks like a credential (names only; never values)."""
-    return {k: v for k, v in env.items() if not any(m in k.upper() for m in _SECRET_MARKERS)}
+    """Copy of `env` keeping only allowlisted names (so unknown secrets never leak by default)."""
+    return {k: v for k, v in env.items() if env_allowed(k)}
+
+
+def restrict_environ() -> None:
+    """Reduce this process's own `os.environ` to the worker allowlist.
+
+    The `spawn` start method hands the parent's environment to the child before `worker_main`
+    runs, so the control process must not hold secrets (HF_TOKEN, AWS_*, DATABASE_URL, ...) in
+    its environ when it spawns. Call after everything that reads env at construction time
+    (httpx proxy / SSL_CERT_* settings are read when the client is built) and before any spawn.
+    """
+    for name in [k for k in os.environ if not env_allowed(k)]:
+        del os.environ[name]
 
 
 def _send(conn: Connection, msg: dict[str, Any]) -> None:
@@ -138,6 +169,7 @@ class WorkerHandle:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
+        self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
 
     @property
     def pid(self) -> int | None:
@@ -169,7 +201,12 @@ class WorkerHandle:
             )
             proc.start()
             child.close()
+            if self._after_spawn_hook is not None:
+                self._after_spawn_hook(proc)
             self._proc, self._conn = proc, parent
+            if self._closed:  # kill() ran between the check above and the assignment
+                self._reset()
+                raise WorkerCrashed("worker handle is stopped")
         return self._conn
 
     def _call(self, msg: dict[str, Any], timeout_s: float) -> dict[str, Any]:
@@ -181,7 +218,10 @@ class WorkerHandle:
             try:
                 _send(conn, msg)
                 deadline = time.monotonic() + timeout_s
+                abortable = msg.get("op") != "shutdown"
                 while not conn.poll(0.1):
+                    if abortable and self._closed:
+                        raise WorkerCrashed("worker handle is stopped")
                     if not proc.is_alive():
                         if conn.poll(0):
                             break

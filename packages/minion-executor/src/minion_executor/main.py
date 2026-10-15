@@ -21,7 +21,7 @@ from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profil
 from minion_executor.loop import ExecutorLoop
 from minion_executor.runners import create_runner
 from minion_executor.secrets import ENV_VAR, load_token
-from minion_executor.worker.process import WorkerHandle
+from minion_executor.worker.process import WorkerHandle, restrict_environ
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
 
@@ -81,6 +81,9 @@ async def _run(server: str, profile: CapacityProfile, runner: str, token: Secret
             register=reg,
             allow_http_loopback=_is_loopback(server),
         )
+        # httpx read proxy/SSL_CERT_* env when the clients were built (client + loop above); from
+        # here on the control process holds no secrets, so spawned workers inherit none.
+        restrict_environ()
         aloop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, loop.stop)

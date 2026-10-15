@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,13 @@ from minion_common.schemas import Budget, ModelEntry
 from minion_executor.capacity.profiles import budget_for, parse_profile
 from minion_executor.runners import create_runner
 from minion_executor.runners.base import Runner, RunnerError
-from minion_executor.worker.process import WorkerCrashed, WorkerHandle, scrub_env
+from minion_executor.worker.process import (
+    WorkerCrashed,
+    WorkerHandle,
+    env_allowed,
+    restrict_environ,
+    scrub_env,
+)
 
 
 def _model(t: TaskType = TaskType.EMBEDDING, mid: str = "fake-embed") -> ModelEntry:
@@ -194,26 +201,74 @@ def test_oversize_message_is_a_crash() -> None:
         w.close()
 
 
-def test_scrub_env_drops_credentials() -> None:
+def test_scrub_env_is_an_allowlist() -> None:
     env = {
         "PATH": "/bin",
-        "MINION_EXECUTOR_TOKEN": "t",
-        "AWS_ACCESS_KEY_ID": "a",
-        "MY_SECRET": "s",
         "HOME": "/h",
+        "LC_ALL": "C",
+        "MLX_X": "1",
+        "HF_HOME": "/hf",
+        "HF_TOKEN": "t",
+        "DATABASE_URL": "postgres://u:p@h/db",
+        "FOO_PASS": "p",
+        "AWS_ACCESS_KEY_ID": "a",
+        "MINION_EXECUTOR_TOKEN": "t",
     }
-    assert scrub_env(env) == {"PATH": "/bin", "HOME": "/h"}
+    assert scrub_env(env) == {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "LC_ALL": "C",
+        "MLX_X": "1",
+        "HF_HOME": "/hf",
+    }
 
 
-def test_worker_env_has_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "super-secret")
+def test_worker_env_has_no_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HF_TOKEN", "DATABASE_URL", "FOO_PASS", "MINION_EXECUTOR_TOKEN"):
+        monkeypatch.setenv(name, "super-secret")
+    saved = dict(os.environ)
+    restrict_environ()  # what main does before any spawn: closes the spawn-inheritance window
     w = WorkerHandle("fake", test_hooks=True)
     try:
         w.ensure_model(_model(), BUDGET)
-        out = w.run([{"id": 1, "echo_env": "MINION_EXECUTOR_TOKEN"}, {"id": 2, "echo_env": "PATH"}])
-        assert [o["present"] for o in out] == [False, True]
+        names = ["HF_TOKEN", "DATABASE_URL", "FOO_PASS", "MINION_EXECUTOR_TOKEN", "PATH", "HOME"]
+        out = w.run([{"id": i, "echo_env": n} for i, n in enumerate(names)])
+        assert [o["present"] for o in out] == [False, False, False, False, True, True]
     finally:
         w.close()
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_restrict_environ_keeps_only_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "x")
+    monkeypatch.setenv("MLX_FOO", "1")
+    saved = dict(os.environ)
+    try:
+        restrict_environ()
+        assert "HF_TOKEN" not in os.environ and os.environ["MLX_FOO"] == "1"
+        assert all(env_allowed(k) for k in os.environ)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_kill_between_check_and_assignment_leaves_no_worker() -> None:
+    w = WorkerHandle("fake")
+    spawned: list[BaseProcess] = []
+
+    def hook(proc: BaseProcess) -> None:
+        spawned.append(proc)
+        w.kill()  # lands after the _closed check, before self._proc is assigned
+
+    w._after_spawn_hook = hook
+    t0 = time.monotonic()
+    with pytest.raises(WorkerCrashed):
+        w.ensure_model(_model(), BUDGET)
+    assert w.pid is None
+    assert spawned and not spawned[0].is_alive()
+    w.close()
+    assert time.monotonic() - t0 < 10
 
 
 HARNESS = """

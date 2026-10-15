@@ -47,6 +47,14 @@ log = structlog.get_logger("minion_executor.loop")
 BAD_INPUT = "BAD_INPUT"
 TMP_PREFIX = "minion-exec-"
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
+# Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
+# (HTTP status errors, unexpected bodies) is a retryable `fail` so max_attempts bounds it.
+LOCAL_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
 
 
 class _Outcome(enum.Enum):
@@ -282,7 +290,8 @@ class ExecutorLoop:
                 await self._release(a, bound)
                 return _Outcome.STOPPED
             if attempt >= self._complete_retries:
-                bound.error("complete_gave_up")  # watchdog reclaims it
+                bound.error("complete_gave_up")  # best effort hand-back; else watchdog reclaims
+                await self._release(a, bound)
                 return _Outcome.FAILED
             await self._pause(self._delay(attempt - 1))
 
@@ -307,7 +316,10 @@ class ExecutorLoop:
                 raise _FailureError(False, BAD_INPUT, str(exc)) from None
             except (io.InputUnavailableError, httpx.HTTPError) as exc:
                 msg = type(exc).__name__
-                raise _FailureError(True, "INPUT_UNAVAILABLE", msg, release=True) from None
+                # Only plain connectivity trouble is released; a server verdict (403/404/5xx), a
+                # backend ignoring Range or a short body would livelock if released: fail it.
+                local = isinstance(exc, LOCAL_TRANSPORT_ERRORS)
+                raise _FailureError(True, "INPUT_UNAVAILABLE", msg, release=local) from None
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
@@ -323,7 +335,8 @@ class ExecutorLoop:
                 await io.upload_file(self._http, a.output_url, out_path)
             except (httpx.HTTPError, OSError) as exc:
                 msg = type(exc).__name__
-                raise _FailureError(True, "UPLOAD_FAILED", msg, release=True) from None
+                local = isinstance(exc, (*LOCAL_TRANSPORT_ERRORS, OSError))
+                raise _FailureError(True, "UPLOAD_FAILED", msg, release=local) from None
             return CompleteRequest(record_count=len(outputs), byte_size=size, sha256=digest)
         finally:
             in_path.unlink(missing_ok=True)

@@ -138,21 +138,24 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
   temp dir → presigned PUT → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
   unlinked in `finally`.
-- **Error → report mapping.** Executor-local trouble is `release`d (immediate requeue, no retry
-  budget burned) so one broken Mac cannot exhaust a subtask's attempts; subtask-level problems are
-  `fail`ed:
+- **Error → report mapping.** Only executor-local connectivity trouble (connect/timeout/network/
+  remote-protocol errors, local `OSError`) is `release`d (immediate requeue, no retry budget burned).
+  Anything S3 actually answered (403/404/5xx), a backend ignoring `Range`, or a short body is a
+  retryable `fail`, so `max_attempts` bounds it (a `release` would livelock the fleet):
   | Condition | Action | Code | Retryable |
   |---|---|---|---|
   | input lines do not match `record_count` / not JSON / nested too deeply | fail | `BAD_INPUT` | no |
-  | input GET fails, is not `206`, or returns != requested bytes | release | `INPUT_UNAVAILABLE` | n/a |
+  | input GET: connect/timeout/network error | release | `INPUT_UNAVAILABLE` | n/a |
+  | input GET: HTTP error status, not `206`, or != requested bytes | fail | `INPUT_UNAVAILABLE` | yes |
   | temp-file I/O error | release | `LOCAL_IO_ERROR` | n/a |
-  | output PUT fails | release | `UPLOAD_FAILED` | n/a |
+  | output PUT: connect/timeout/network error | release | `UPLOAD_FAILED` | n/a |
+  | output PUT: HTTP error status (e.g. expired presigned URL) | fail | `UPLOAD_FAILED` | yes |
   | presigned URL not https (http only if the server URL is loopback) | fail | `INSECURE_URL` | yes |
   | worker died / timed out (per-op: load 900 s, run 600 s → kill) | fail | `WORKER_CRASHED` | yes |
   | `RunnerError` from worker | fail | runner's code (≤64 chars) | yes |
   | runner returned a different number of records than the input | fail | `OUTPUT_MISMATCH` | yes |
   | any other exception in the handler (poison pill) | fail (type name only in logs) | `EXECUTOR_ERROR` | yes |
-  | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: not reported, watchdog reclaims | — | — |
+  | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: best-effort `release`, else the watchdog reclaims | — | — |
   | `complete`: 4xx other than 409 | fail | `COMPLETE_REJECTED` | yes |
   | `complete` or `fail` returns 409 | discard, no retry | — | — |
 - **Failure back-off.** After any failed subtask the loop sleeps (same jittered exponential delay,
@@ -166,7 +169,11 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
 - **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
   worker is kept warm across subtasks of the same model, killed and restarted on a model switch,
   and killed on stop. Calls are serialised by a lock; `kill()` is lock-free, marks the handle
-  stopped and never respawns. The child gets a scrubbed environment (no token/secret-like names),
+  stopped and never respawns. The child gets an allowlisted environment (`PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `HF_HOME`, `MLX_*`,
+  `TOKENIZERS_PARALLELISM`, `MINION_EXECUTOR_DEV`/`_TEST_HOOKS`); because `spawn` hands the parent's
+  environ to the child before `worker_main` runs, `main` calls `restrict_environ()` after the httpx
+  clients are built (they read proxy/`SSL_CERT_*` at construction) and before any spawn, so the control
+  process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
   bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
   process dies (parent-pid watch). Only the fake runner exists in M1 (`runners/fake.py`, engine
   `fake`, never advertised as a real engine); its `fail` / `sleep_s` / `echo_env` per-record hooks
