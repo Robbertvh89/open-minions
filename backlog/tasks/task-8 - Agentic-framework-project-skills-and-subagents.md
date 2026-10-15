@@ -1,10 +1,10 @@
 ---
 id: TASK-8
 title: 'Agentic framework: project skills and subagents'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:08'
-updated_date: '2026-10-15 14:11'
+updated_date: '2026-10-15 14:13'
 labels:
   - tooling
 dependencies: []
