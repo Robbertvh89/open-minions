@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "minion-dev",
+      "credentials": [{ "accessKey": "minion", "secretKey": "minion-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

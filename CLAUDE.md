@@ -27,11 +27,11 @@ stop sending heartbeats.
 | Packaging | `uv` workspace, one package per component under `packages/` |
 | Server | FastAPI + Pydantic v2, SQLAlchemy 2.x (async) + asyncpg, Alembic migrations |
 | Database | PostgreSQL 16 |
-| Object storage | S3 API (MinIO for local dev) via `boto3`; executors use presigned URLs only |
+| Object storage | S3 API (SeaweedFS for local dev) via `boto3`; executors use presigned URLs only |
 | Executor inference | **MLX by default**: `mlx-lm` (batched generation) for completions, `mlx-embeddings` for embeddings. Fallback engines: Ollama HTTP API, HF `transformers` on `mps` — [ADR-0005](docs/adr/0005-mlx-default-inference-engine.md) |
 | Executor host integration | `pyobjc` (IOKit / Foundation) for user-idle time, power source, thermal state, memory pressure |
 | Observability | Grafana reading PostgreSQL; structured JSON logs (`structlog`) |
-| Tests | `pytest`, `pytest-asyncio`, `testcontainers` (Postgres, MinIO) |
+| Tests | `pytest`, `pytest-asyncio`, `testcontainers` (Postgres, S3) |
 | Lint/format/types | `ruff check`, `ruff format`, `mypy --strict` |
 
 ## Repository layout (target)
@@ -43,7 +43,7 @@ packages/
   minion-executor/   # macOS agent: poll → acquire → run → upload → report
   minion-watchdog/   # heartbeat monitor; requeues orphaned subtasks
 migrations/          # Alembic
-deploy/              # docker-compose (postgres, minio, grafana, server, watchdog), launchd plist
+deploy/              # docker-compose (postgres, s3, grafana, server, watchdog), launchd plist
 docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
 ```
 
@@ -51,7 +51,7 @@ docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
 
 ```bash
 uv sync                                   # install workspace
-docker compose -f deploy/compose.yml up -d  # postgres + minio + grafana
+docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana
 uv run alembic upgrade head               # migrate
 uv run minion-server                      # API on :8080
 uv run minion-watchdog

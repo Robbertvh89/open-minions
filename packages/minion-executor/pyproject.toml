@@ -1,0 +1,20 @@
+[project]
+name = "minion-executor"
+version = "0.1.0"
+description = "open-minions executor: macOS agent that pulls and runs inference subtasks"
+requires-python = ">=3.12"
+dependencies = [
+    "minion-common",
+    "httpx>=0.28",
+    "typer>=0.15",
+]
+
+[project.scripts]
+minion-executor = "minion_executor.main:app"
+
+[tool.uv.sources]
+minion-common = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
