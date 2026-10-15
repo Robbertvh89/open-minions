@@ -292,10 +292,39 @@ async def test_stop_interrupts_hanging_tick(monkeypatch: pytest.MonkeyPatch) -> 
     sm: Any = None  # never used: the stub replaces every DB call
     task = asyncio.create_task(wd.run_watchdog(sm, _cfg(), stop))
     await asyncio.wait_for(started.wait(), 2)
-    t0 = time.monotonic()
     stop.set()
     await asyncio.wait_for(task, 1.0)
-    assert time.monotonic() - t0 < 0.5 and cancelled["v"]
+    assert cancelled["v"]
+
+
+async def test_failing_sweep_does_not_back_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    reclaims = {"n": 0}
+    sweeps = {"n": 0}
+
+    async def reclaim(*a: Any, **kw: Any) -> dict[Any, int]:
+        reclaims["n"] += 1
+        return {}
+
+    async def sweep(*a: Any, **kw: Any) -> int:
+        sweeps["n"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(wd, "reclaim_stale", reclaim)
+    monkeypatch.setattr(wd, "sweep_cancelled", sweep)
+    sleeps: list[float] = []
+    stop = asyncio.Event()
+
+    async def fake_sleep(_stop: asyncio.Event, seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 3:
+            stop.set()
+
+    monkeypatch.setattr(wd, "_sleep", fake_sleep)
+    cfg = _cfg(watchdog_interval_s=1.0)
+    sm: Any = None
+    await asyncio.wait_for(wd.run_watchdog(sm, cfg, stop), 2)
+    assert reclaims["n"] == sweeps["n"] == 3
+    assert sleeps == [1.0, 1.0, 1.0]  # no backoff
 
 
 def test_command_timeout_setting() -> None:

@@ -328,13 +328,17 @@ async def cancel_pending_subtasks(
     return int(result.rowcount)  # type: ignore[attr-defined]
 
 
-async def sweep_cancelled(session: AsyncSession, window_s: float = 3600) -> int:
-    """Heal PENDING subtasks left under tasks cancelled in the last `window_s` seconds.
+async def sweep_cancelled(
+    session: AsyncSession, window_s: float = 3600, batch: int = CANCEL_BATCH
+) -> int:
+    """One batch (<= `batch` rows) of PENDING subtasks under tasks cancelled in the last `window_s`.
 
     A requeue that read the task status just before cancel committed can leave one behind. They
     are never acquired (candidates and `try_acquire` both require a PENDING/RUNNING task); this
-    keeps the counts consistent. Locks subtask rows only, so it cannot deadlock with acquire
-    (subtask -> task). Stragglers older than the window are healed only by re-cancelling.
+    keeps the counts consistent. Locks subtask rows only (SKIP LOCKED, bounded), so it cannot
+    deadlock with acquire (subtask -> task). The caller loops, one transaction per call, until
+    fewer than `batch` rows come back. Stragglers older than the window are healed only by
+    re-cancelling.
     """
     recent = (
         select(Task.team, Task.project, Task.task_name)
@@ -344,13 +348,27 @@ async def sweep_cancelled(session: AsyncSession, window_s: float = 3600) -> int:
         )
         .subquery()
     )
-    result = await session.execute(
-        update(Subtask)
+    ids = (
+        select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
         .where(
             Subtask.status == SubtaskStatus.PENDING.value,
             tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
                 select(recent.c.team, recent.c.project, recent.c.task_name)
             ),
+        )
+        .order_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+        .limit(batch)
+        .with_for_update(skip_locked=True)
+        .cte("batch")
+        .prefix_with("MATERIALIZED")  # evaluate LIMIT/SKIP LOCKED once, not per outer row
+    )
+    result = await session.execute(
+        update(Subtask)
+        .where(
+            tuple_(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id).in_(
+                select(ids.c.team, ids.c.project, ids.c.task_name, ids.c.subtask_id)
+            ),
+            Subtask.status == SubtaskStatus.PENDING.value,
         )
         .values(status=SubtaskStatus.CANCELLED.value)
     )

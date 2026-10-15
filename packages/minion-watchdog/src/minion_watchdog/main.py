@@ -49,7 +49,11 @@ async def tick(
         expired = sum(n for r, n in results.items() if r in _EXPIRED)
         if expired < cfg.watchdog_batch_size or stop.is_set():
             break
-    await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)
+    # Housekeeping: a failing sweep must not stall reclaim nor trigger tick backoff.
+    try:
+        await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)
+    except Exception as exc:
+        log.error("watchdog_sweep_failed", error_class=type(exc).__name__)
 
 
 async def _sleep(stop: asyncio.Event, seconds: float) -> None:

@@ -187,7 +187,7 @@ async def cancel_task(
     while True:  # batched: bounded row locks per transaction; also heals a re-cancel
         async with session.begin():
             n = await tasks_repo.cancel_pending_subtasks(session, team, project, task_name)
-        if n == 0:
+        if n < tasks_repo.CANCEL_BATCH:
             break
     return await _get(session, team, project, task_name)
 

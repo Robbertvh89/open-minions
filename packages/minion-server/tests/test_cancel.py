@@ -15,6 +15,7 @@ from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.app import create_app
 from minion_server.repositories import acquisition as acq_repo
 from minion_server.repositories import tasks as tasks_repo
+from minion_server.services.acquisition import _LostRaceError
 from minion_server.services.reclaim import (
     ReclaimResult,
     reclaim_one,
@@ -412,9 +413,8 @@ async def test_acquire_update_guard_rolls_back(
             preference=None,
         )
     async with sm() as s:
-        await s.begin()
-        # The INSERT sees PENDING (our snapshot); cancel commits via another session in between
-        # by flipping the task inside this same transaction right before try_acquire's UPDATE.
+        # Simulate a cancel landing between the INSERT and the subtask UPDATE: flip the task
+        # inside this same transaction right after the INSERT (first execute) wins.
         real_execute = s.execute
         calls = {"n": 0}
 
@@ -422,12 +422,16 @@ async def test_acquire_update_guard_rolls_back(
             res = await real_execute(stmt, *a, **kw)
             calls["n"] += 1
             if calls["n"] == 1:  # after the INSERT won
-                await real_execute(text("UPDATE minion_task SET status='CANCELLED'"))
+                await real_execute(
+                    text("UPDATE minion_task SET status='CANCELLED' WHERE task_name='ug'")
+                )
             return res
 
         s.execute = execute
-        assert await acq_repo.try_acquire(s, cand, ex.executor_id) is None
-        await s.rollback()
+        with pytest.raises(_LostRaceError):  # same txn shape as services.acquisition.acquire
+            async with s.begin():
+                if await acq_repo.try_acquire(s, cand, ex.executor_id) is None:
+                    raise _LostRaceError
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
     assert (await _task_state(sm, "ug"))[2] == ["PENDING"]
 
@@ -491,3 +495,17 @@ async def test_heartbeat_rate_limit(fresh_url: str, s3: S3Env, tmp_path: Path) -
         await _backdate(sm, "heartbeat")
         assert (await _call(c, a, tok, "heartbeat")).status_code == 200
         assert (await _call(c, a, tok, "heartbeat")).status_code == 429
+
+
+@pytest.mark.integration
+async def test_sweep_cancelled_batches(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm = app.state.sessionmaker
+    await seed_task(sm, "sb", 5)
+    await _cancel(c, "sb")
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET status='PENDING'"))
+    async with sm() as s, s.begin():
+        assert await tasks_repo.sweep_cancelled(s, 3600, 2) == 2  # bounded per call
+    assert await sweep_cancelled(sm, window_s=3600, batch=2) == 3  # loops 2,1
+    assert (await _task_state(sm, "sb"))[2] == ["CANCELLED"] * 5

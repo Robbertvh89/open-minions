@@ -98,10 +98,23 @@ async def reclaim_stale(
     return results
 
 
-async def sweep_cancelled(sm: async_sessionmaker[AsyncSession], *, window_s: float = 3600) -> int:
-    """PENDING subtasks of recently cancelled tasks -> CANCELLED (plan D4 healing sweep)."""
-    async with sm() as s, s.begin():
-        n = await tasks_repo.sweep_cancelled(s, window_s)
-    if n:
-        log.info("cancelled_pending_swept", count=n)
-    return n
+async def sweep_cancelled(
+    sm: async_sessionmaker[AsyncSession],
+    *,
+    window_s: float = 3600,
+    batch: int = tasks_repo.CANCEL_BATCH,
+) -> int:
+    """PENDING subtasks of recently cancelled tasks -> CANCELLED (plan D4 healing sweep).
+
+    Batched: one short transaction per `batch` rows, until a batch comes back short.
+    """
+    total = 0
+    while True:
+        async with sm() as s, s.begin():
+            n = await tasks_repo.sweep_cancelled(s, window_s, batch)
+        total += n
+        if n < batch:
+            break
+    if total:
+        log.info("cancelled_pending_swept", count=total)
+    return total
