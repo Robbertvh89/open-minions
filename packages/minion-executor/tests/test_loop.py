@@ -923,14 +923,37 @@ async def test_pre_upload_refresh_cancel_releases_without_upload(tmp_path: Path)
     a.expires_at = datetime.now(UTC)
     client, s3 = FakeClient([a]), FakeS3()
     client.hb_script = [hb_resp(cancel=True)]
+    worker = FakeWorker()
     loop = make_loop(
-        client, FakeWorker(), s3, tmp_path, [],
+        client, worker, s3, tmp_path, [],
         heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
     )  # fmt: skip
     client.on_empty = loop.stop
     assert await loop.run() == 0
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire"]
     assert s3.puts == []
+    assert not worker.interrupted  # work had finished: the warm worker is kept
+
+
+async def test_pre_upload_beat_retries_once_after_429(tmp_path: Path) -> None:
+    a = assignment()
+    a.expires_at = datetime.now(UTC)
+    client, s3 = FakeClient([a]), FakeS3()
+    client.hb_script = [ApiError(429, "RATE_LIMITED", "x", retry_after=1.0)]
+    delays: list[float] = []
+
+    async def sleep(d: float) -> None:
+        delays.append(d)
+        if d != 1.0:  # the background beat never fires; only the retry wait returns
+            await asyncio.Event().wait()
+
+    loop = make_loop(
+        client, FakeWorker(), s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=sleep,
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert client.kinds().count("heartbeat") == 2 and 1.0 in delays
 
 
 async def test_refreshed_url_for_another_object_is_ignored(tmp_path: Path) -> None:

@@ -249,8 +249,9 @@ class WorkerHandle:
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
         """Load `model`; no-op if already warm, kill+restart on a model switch."""
         with self._lock:
-            if self._interrupt_gen != self._seen_gen:
-                self._seen_gen = self._interrupt_gen  # re-arm: later interrupts abort this call
+            g = self._interrupt_gen  # read once: an interrupt landing now must not be swallowed
+            if g != self._seen_gen:
+                self._seen_gen = g  # re-arm: later interrupts abort this call
                 self._reset()
             if self._model_id == model.model_id and self._proc and self._proc.is_alive():
                 return

@@ -376,3 +376,23 @@ def test_interrupt_aborts_inflight_call_then_respawns() -> None:
         assert h.run([{"id": 2, "text": "ok"}]) == [{"id": 2, "completion": "ok"}]
     finally:
         h.close()
+
+
+def test_ensure_model_reads_interrupt_generation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads = iter([1, 2, 2, 2])
+
+    class Racy(WorkerHandle):
+        @property
+        def _interrupt_gen(self) -> int:
+            return next(reads)
+
+        @_interrupt_gen.setter
+        def _interrupt_gen(self, value: int) -> None:
+            pass
+
+    h = Racy("fake")
+    monkeypatch.setattr(h, "_reset", lambda: None)
+    monkeypatch.setattr(h, "_call", lambda *a, **k: {})
+    h.ensure_model(_model(), BUDGET)
+    # armed with the generation seen at the check; the later interrupt (2) stays unconsumed
+    assert h._seen_gen == 1

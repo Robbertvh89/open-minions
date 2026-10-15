@@ -119,7 +119,7 @@ class Assignment(_Model):
     byte_end: int = Field(gt=0, description="Exclusive end offset")
     record_count: int = Field(ge=1)
     output_url: str
-    expires_at: datetime
+    expires_at: AwareDatetime
 
     @model_validator(mode="after")
     def _check_range(self) -> Self:

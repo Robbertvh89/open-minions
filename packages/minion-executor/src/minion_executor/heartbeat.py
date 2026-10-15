@@ -78,6 +78,8 @@ class Heartbeater:
         self.expires_at: datetime | None = initial_expires_at
         self.records_done = 0
         self.output_url = initial_output_url
+        self._lock = asyncio.Lock()  # one beat in flight: no self-inflicted 429
+        self._rate_limit_wait: float | None = None
 
     def _jittered(self, base: float) -> float:
         # Upward only: a beat must never come sooner than the interval (server minimum spacing).
@@ -99,8 +101,22 @@ class Heartbeater:
             return False
         return (exp - datetime.now(exp.tzinfo)).total_seconds() > margin_s
 
-    async def beat(self) -> tuple[HeartbeatSignal | None, float | None]:
-        """One heartbeat. Returns (stop signal or None, delay override for the next beat)."""
+    async def beat(
+        self, *, retry_rate_limited: bool = False
+    ) -> tuple[HeartbeatSignal | None, float | None]:
+        """One heartbeat, serialized with all others. Returns (stop signal or None, delay override
+        for the next beat). With `retry_rate_limited`, a 429 waits `retry_after` (capped) and the
+        beat is retried once."""
+        async with self._lock:
+            self._rate_limit_wait = None
+            result = await self._beat_once()
+            if retry_rate_limited and self._rate_limit_wait is not None:
+                await self._sleep(self._rate_limit_wait)
+                self._rate_limit_wait = None
+                result = await self._beat_once()
+            return result
+
+    async def _beat_once(self) -> tuple[HeartbeatSignal | None, float | None]:
         bound = log.bind(acquirement_id=str(self._aid))
         try:
             resp = await self._client.heartbeat(self._aid, self._request())
@@ -115,7 +131,9 @@ class Heartbeater:
             if exc.status_code == 429:
                 wait = exc.retry_after if exc.retry_after is not None else self._interval
                 cap = min(MAX_RETRY_AFTER_S, self._interval)
-                return None, min(max(wait, MIN_INTERVAL_S), cap)
+                wait = min(max(wait, MIN_INTERVAL_S), cap)
+                self._rate_limit_wait = wait
+                return None, wait
             if exc.status_code >= 500:
                 return None, self._jittered(min(MAX_ERROR_RETRY_S, self._interval))
             return None, None

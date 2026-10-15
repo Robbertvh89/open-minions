@@ -287,7 +287,7 @@ class ExecutorLoop:
             try:
                 result = work.result()
             except _SignalledError as s:
-                return await self._on_signal(a, work, s.signal, bound)
+                return await self._on_signal(a, work, s.signal, bound, interrupt=False)
             except _FailureError as f:
                 await self._report_failure(a, f, bound)
                 return _Outcome.FAILED
@@ -315,7 +315,13 @@ class ExecutorLoop:
         return tmp / f"{a.acquirement_id}.in.jsonl", tmp / f"{a.acquirement_id}.out.jsonl"
 
     async def _on_signal(
-        self, a: Assignment, work: asyncio.Task[CompleteRequest], sig: HeartbeatSignal, bound: Any
+        self,
+        a: Assignment,
+        work: asyncio.Task[CompleteRequest],
+        sig: HeartbeatSignal,
+        bound: Any,
+        *,
+        interrupt: bool = True,
     ) -> _Outcome:
         """Cancel/409 from a heartbeat: stop the work now and free the GPU (invariant 6).
 
@@ -323,7 +329,8 @@ class ExecutorLoop:
         nothing is uploaded or completed. Cancel is released (server records CANCELLED); a stale
         acquirement reports nothing.
         """
-        await asyncio.to_thread(self._worker.interrupt)
+        if interrupt:  # a signal after the work finished leaves the warm worker alone
+            await asyncio.to_thread(self._worker.interrupt)
         work.cancel()
         await asyncio.gather(work, return_exceptions=True)
         if sig is HeartbeatSignal.CANCEL:
@@ -410,7 +417,7 @@ class ExecutorLoop:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
             if not hb.url_fresh(UPLOAD_URL_MARGIN_S):  # long run or unknown expiry: refresh now
-                signal, _ = await hb.beat()
+                signal, _ = await hb.beat(retry_rate_limited=True)
                 if signal is not None:
                     raise _SignalledError(signal)
             output_url = hb.output_url  # refreshed by heartbeats; same attempt-scoped key
