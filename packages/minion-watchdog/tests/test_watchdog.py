@@ -43,7 +43,7 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         60.0,
         500,
     )
-    assert cfg.max_lease_s == 6 * 3600 and cfg.db_pool_size == 2
+    assert cfg.max_lease_s == 6 * 3600 and cfg.watchdog_db_pool_size == 2
 
 
 def test_database_url_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -59,7 +59,7 @@ def test_database_url_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         {"heartbeat_timeout_s": 0},
         {"watchdog_interval_s": 0},
         {"watchdog_batch_size": 0},
-        {"db_pool_size": 0},
+        {"watchdog_db_pool_size": 0},
         {"heartbeat_timeout_s": 900, "max_lease_s": 900},  # lease must exceed the timeout
     ],
 )

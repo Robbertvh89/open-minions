@@ -71,7 +71,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   Written to an attempt-scoped key first and promoted on completion (idempotency).
 - FR-7. Users can query task status, per-subtask status, progress counts, and the output location **[paper]**.
 - FR-8. Users can cancel a task; pending subtasks become `CANCELLED`, running ones are told to stop on
-  their next heartbeat **[ours]**.
+  their next heartbeat **[ours]**. Status: implemented (TASK-3.2).
 
 ### 4.2 Execution (Executor)
 - FR-10. Executor registers with the server using a pre-issued token and reports host capabilities
@@ -88,7 +88,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   - Inference runs in a worker subprocess; the loaded model is kept warm across consecutive subtasks
     of the same model and unloaded when the budget drops or the executor idles > 10 min.
 - FR-14. Heartbeat every **5 minutes** while running a subtask **[paper]**. Heartbeat response may carry
-  `cancel=true`.
+  `cancel=true`. Status: implemented (TASK-3.3); interval `--heartbeat-interval` / `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (default 300 s, min 1 s).
 - FR-15. Executor processes one subtask at a time by default (`concurrency=1`) **[ours]**.
 - FR-16. Executor only acquires subtasks whose model `memory_gb` fits its **current** memory budget
   (§4.6) and whose engine it has installed **[ours]**.
@@ -103,8 +103,10 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 only), FR-15 (one subtask at a time), FR-17 partially (SIGTERM/SIGINT stop, release of the in-flight
 subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, which conflicts with the
 "finish-or-release within grace" wording). Not yet implemented: FR-12 model cache, FR-13 MLX/Ollama/HF
-runners, FR-14 heartbeat, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
+runners, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
 governor (M4). ARCHITECTURE §2.2 describes the executor as built.
+
+**M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 
 ### 4.3 Acquisition protocol **[paper]**
 - FR-20. Ownership is claimed by inserting into `minion_subtask_acquirement`, which has a UNIQUE
@@ -130,6 +132,8 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 - FR-33. Executor-reported errors: retryable (OOM, download failure) → requeue; non-retryable (bad
   input) → `FAILED` immediately **[ours]**.
 - FR-34. A late result from a reclaimed owner is rejected (`409 STALE_ACQUIREMENT`) **[ours]**.
+
+**Implementation status (M2, TASK-3.1–3.3).** Implemented: FR-30, FR-31, FR-31a, FR-32, FR-34, and FR-8 cancel. Reclaim uses `SKIP LOCKED` + re-check, not `DELETE ... RETURNING`; deviations are recorded in ADR-0008. Reclaim codes: `HEARTBEAT_TIMEOUT`, `MAX_LEASE_EXCEEDED` (both `EXPIRED`, retryable). Settings: `MINION_HEARTBEAT_TIMEOUT_S` (900), `MINION_MAX_LEASE_S` (21600), `MINION_WATCHDOG_INTERVAL_S` (60), `MINION_WATCHDOG_BATCH_SIZE` (500), `MINION_WATCHDOG_MAX_BACKOFF_S` (300), `MINION_DB_COMMAND_TIMEOUT_S` (30), `MINION_WATCHDOG_DB_POOL_SIZE` (2), `MINION_CANCEL_SWEEP_WINDOW_S` (3600), `MINION_RELEASE_LIMIT` (10), `MINION_HEARTBEAT_MIN_INTERVAL_S` (1), `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (300, executor). Keep `MINION_HEARTBEAT_TIMEOUT_S` at least 2–3× the heartbeat interval.
 
 ### 4.5 Observability
 - FR-40. Grafana dashboards over PostgreSQL: tasks by status, subtask throughput, active executors,

@@ -271,6 +271,27 @@ def test_kill_between_check_and_assignment_leaves_no_worker() -> None:
     assert time.monotonic() - t0 < 10
 
 
+def test_interrupt_between_spawn_and_assignment_aborts_and_leaves_no_worker() -> None:
+    w = WorkerHandle("fake")
+    spawned: list[BaseProcess] = []
+
+    def hook(proc: BaseProcess) -> None:
+        spawned.append(proc)
+        w.interrupt()  # lands before self._proc is assigned: nothing to kill yet
+
+    w._after_spawn_hook = hook
+    with pytest.raises(WorkerCrashed):
+        w.ensure_model(_model(), BUDGET)
+    assert w.pid is None and w.loaded_model_id is None
+    assert spawned and not spawned[0].is_alive()
+    w._after_spawn_hook = None
+    w.ensure_model(_model(), BUDGET)  # the handle stays usable (unlike kill())
+    try:
+        assert w.pid is not None
+    finally:
+        w.close()
+
+
 HARNESS = """
 import threading
 import time
@@ -324,3 +345,54 @@ def test_worker_exits_when_control_process_is_killed(tmp_path: Path) -> None:
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_interrupt_kills_worker_but_allows_respawn() -> None:
+    h = WorkerHandle("fake")
+    try:
+        h.ensure_model(_model(), BUDGET)
+        first = h.pid
+        assert first is not None
+        h.interrupt()
+        h.interrupt()  # idempotent
+        h.ensure_model(_model(), BUDGET)  # dead idle worker: respawned, model reloaded
+        assert h.pid is not None and h.pid != first
+        assert h.run([{"id": 1, "text": "a"}])[0]["id"] == 1
+    finally:
+        h.close()
+
+
+def test_interrupt_aborts_inflight_call_then_respawns() -> None:
+    h = WorkerHandle("fake", test_hooks=True)
+    try:
+        h.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        t = threading.Timer(0.5, h.interrupt)
+        t.start()
+        t0 = time.monotonic()
+        with pytest.raises(WorkerCrashed):
+            h.run([{"id": 1, "text": "x", "sleep_s": 30}])
+        assert time.monotonic() - t0 < 10
+        h.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        assert h.run([{"id": 2, "text": "ok"}]) == [{"id": 2, "completion": "ok"}]
+    finally:
+        h.close()
+
+
+def test_ensure_model_reads_interrupt_generation_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads = iter([1, 2, 2, 2])
+
+    class Racy(WorkerHandle):
+        @property
+        def _interrupt_gen(self) -> int:
+            return next(reads)
+
+        @_interrupt_gen.setter
+        def _interrupt_gen(self, value: int) -> None:
+            pass
+
+    h = Racy("fake")
+    monkeypatch.setattr(h, "_reset", lambda: None)
+    monkeypatch.setattr(h, "_call", lambda *a, **k: {})
+    h.ensure_model(_model(), BUDGET)
+    # armed with the generation seen at the check; the later interrupt (2) stays unconsumed
+    assert h._seen_gen == 1

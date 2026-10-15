@@ -128,7 +128,7 @@ minion_executor/
 
 #### Executor implementation (M1, TASK-2.3)
 Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
-`runners/{base,fake}.py`, `worker/process.py`. Not yet: heartbeat, governor/signals, MLX/Ollama/HF
+`runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Not yet: governor/signals, MLX/Ollama/HF
 runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
 
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
@@ -190,14 +190,34 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   currently exits 2); `--runner fake` is refused unless `MINION_EXECUTOR_DEV=1`, and then registers
   with engines `[fake]` only, so it can only be served tasks whose model uses engine `fake`.
   `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
+- **Heartbeater** (`heartbeat.py`, TASK-3.3, FR-14): an asyncio task beside the work coroutine.
+  Interval `--heartbeat-interval` / `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (default 300 s, min 1 s),
+  each sleep jittered ×U(0.9, 1.1). Each beat sends progress, budget and pause reason, and keeps the
+  latest `output_url` from the response (the upload uses the refreshed URL, same attempt-scoped key).
+  `429` waits `Retry-After` (capped at 600 s) and is non-fatal; `5xx` and transport errors retry with
+  a jittered delay (≤30 s); other errors are logged and the beat continues.
+  `cancel=true` returns `CANCEL` → interrupt worker, `release` (server records `CANCELLED`).
+  `409` (`TASK_FINISHED`, stale acquirement) returns `STALE` → interrupt worker, report nothing.
+  Logs carry ids only. Running with `--heartbeat-interval` such that `MINION_HEARTBEAT_TIMEOUT_S` < 2× the interval is
+  rejected only when the operator exports `MINION_HEARTBEAT_TIMEOUT_S`; keep the timeout ≥ 2–3×
+  the interval (3× recommended) so one lost beat does not get a live executor reclaimed.
 - **Housekeeping**: temp dirs are `minion-exec-<pid>-*`; at startup dirs of dead pids owned by the
   user are removed. File I/O in the data path runs in threads (`asyncio.to_thread`).
 - **Logging**: `structlog`, ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
 
 ### 2.3 minion-watchdog
-- Single loop every 60 s. Multiple replicas are safe: each reclaim is a single transaction guarded by
-  `DELETE ... RETURNING` on the acquirement row.
-- Only examines rows in `minion_executor_heartbeat` (i.e., executors *currently running* work) **[paper]**.
+- Separate process (`minion_watchdog.main:main`, `uv run minion-watchdog`) that reuses the server's
+  repositories and services; it never talks to executors. Only `MINION_DATABASE_URL` is required;
+  its DB pool is `MINION_WATCHDOG_DB_POOL_SIZE` (default 2; the server uses `MINION_DB_POOL_SIZE`, 10) and each statement has
+  `MINION_DB_COMMAND_TIMEOUT_S`.
+- Loop every `MINION_WATCHDOG_INTERVAL_S` (60 s). A tick reclaims in batches of
+  `MINION_WATCHDOG_BATCH_SIZE` (repeats while batches come back full, max 100 rounds), then runs the
+  cancel sweep. Sweep failures are logged and do not stall reclaim. DB errors back off exponentially,
+  capped at `MINION_WATCHDOG_MAX_BACKOFF_S` (300 s). SIGTERM abandons the tick; each step is its own
+  transaction and rolls back.
+- Replicas are safe: candidates are locked with `SKIP LOCKED` and re-checked (§3.4, ADR-0008).
+- Scans heartbeat rows (executors *currently running* work) **[paper]**, plus acquirements older than
+  `MINION_MAX_LEASE_S` **[ours]**.
 
 ### 2.4 minion-common
 Pydantic request/response models, enums (`TaskType`, `SubtaskStatus`, ...), typed `httpx` API client
@@ -282,25 +302,30 @@ Server:   verify acquirement is current (else 409)
 
 ### 3.4 Heartbeat & reclaim
 ```
-Executor (every 300 s while running): POST /heartbeat {progress}
-  Server: UPSERT minion_executor_heartbeat.last_seen_at = now()
-          respond {cancel: task.status == CANCELLED, refreshed_urls?}
+Executor (every heartbeat interval, 300 s by default, while running): POST /heartbeat {progress, budget, paused_reason}
+  Server: owner check under lock (acquirement, else 409); 429 if closer than MINION_HEARTBEAT_MIN_INTERVAL_S
+          UPDATE minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
+          respond {cancel: task.status == CANCELLED, output_url (fresh presigned PUT), expires_at}
 
 Watchdog (every 60 s; also reclaims acquirements older than MINION_MAX_LEASE_S regardless of beats,
-then sweeps PENDING subtasks of recently cancelled tasks to CANCELLED; the implementation uses
-FOR UPDATE SKIP LOCKED + re-check, see plan D3):
-  FOR each heartbeat row WHERE last_seen_at < now() - heartbeat_timeout:
+then sweeps PENDING subtasks of recently cancelled tasks to CANCELLED). Implemented as
+SKIP LOCKED + re-check (ADR-0008), not DELETE ... RETURNING:
+  candidates = unlocked scan: heartbeat rows WHERE last_seen_at < now() - heartbeat_timeout
+               ∪ acquirements WHERE acquired_at < now() - max_lease
+  FOR each candidate:
     BEGIN
-      DELETE FROM minion_subtask_acquirement WHERE acquirement_id = $1 RETURNING *
-      -- if nothing returned, someone else already handled it → skip
-      DELETE heartbeat row
-      INSERT minion_subtask_attempt(outcome=EXPIRED)
-      UPDATE minion_subtask SET status = CASE WHEN <FAILED+EXPIRED attempts> >= max_attempts
-                                              THEN 'FAILED' ELSE 'PENDING' END
+      SELECT ... FROM minion_subtask_acquirement WHERE acquirement_id = $1 FOR UPDATE SKIP LOCKED
+      -- no row (gone) or locked by an owner op / other replica → SKIPPED
+      re-check: heartbeat still stale? else max lease exceeded? else → NOT_STALE
+      finish_failed: INSERT minion_subtask_attempt(outcome=EXPIRED, code HEARTBEAT_TIMEOUT | MAX_LEASE_EXCEEDED)
+                     DELETE acquirement (cascades heartbeat row)
+                     UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
+      UPDATE task counters / status
     COMMIT
 ```
 **Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
-(`fail` already counts the attempt being recorded). A voluntary `release` does not consume it.
+(`fail` already counts the attempt being recorded). A voluntary `release` does not consume it, up to
+`MINION_RELEASE_LIMIT` releases per subtask (then recorded as a retryable `FAILED`).
 `attempt` itself keeps counting every acquisition (it keys the output object), so it is *not* the
 budget; the watchdog (M2) must use the same count, not `attempt >= max_attempts`.
 Because the acquirement row is deleted, the unique constraint frees up and any executor can re-acquire.
@@ -360,12 +385,19 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Hazard | Guard |
 |---|---|
 | Two executors acquire same subtask | UNIQUE constraint on acquirement; only one INSERT returns a row |
-| Watchdog reclaims while owner completes | Both paths start by deleting/validating the same acquirement row inside a txn; Postgres row lock serializes them; loser sees 0 rows → no-op / 409 |
+| Watchdog reclaims while owner completes | Both paths lock the same acquirement row (`FOR UPDATE`; reclaim uses `SKIP LOCKED`, so a busy row is skipped); reclaim re-checks staleness under the lock; loser sees 0 rows → no-op / 409 |
 | Reclaimed owner uploads late | Writes go to attempt-scoped key; promotion only on accepted `/complete` |
-| Two watchdog replicas | `DELETE ... RETURNING` is idempotent per row |
+| Two watchdog replicas | `SKIP LOCKED` per row + re-check under the lock; a skipped row is handled on the next tick |
+| Cancel of a large task | Lazy two-phase: txn 1 task only; txn 2 in batches of 10 000 PENDING rows; RUNNING owners learn via `heartbeat.cancel`; watchdog sweep heals stragglers |
+| Live executor reclaimed between beats | `MINION_HEARTBEAT_TIMEOUT_S` ≥ 2–3× heartbeat interval (checked only when the timeout is exported to the executor); 429 keeps beats bounded |
 | Server crash mid-split | Splitter is resumable: subtasks inserted with deterministic ids + `ON CONFLICT DO NOTHING` |
 | Budget downgrade mid-subtask | Executor `release`s (same txn path as complete/reclaim); output of partial run discarded (attempt-scoped key) |
 | Worker crash (Metal / OOM) | Control process survives, reports `fail(retryable)`; attempt counter bounds retries |
+
+**Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → task. The
+executor row (`minion_executor`) is written after the acquirement lock, never before it. Cancel txn 1
+locks the task only; txn 2 locks PENDING subtask rows (`SKIP LOCKED`, bounded) and never a running
+acquirement, so it cannot deadlock with owner ops.
 
 Required tests: concurrent-acquire race (≥50 parallel acquires, assert unique owners), complete-vs-reclaim
 race, stale-acquirement rejection, splitter restart.
@@ -404,7 +436,7 @@ token in macOS Keychain.
 
 1. **M0 – Scaffolding:** uv workspace, compose stack, Alembic baseline with 7 tables, CI (ruff, mypy, pytest).
 2. **M1 – Core protocol:** task create + splitter, acquire/complete/fail, executor loop + worker subprocess with a fake runner. Race tests green.
-3. **M2 – Fault tolerance:** heartbeats, watchdog, release, cancel, stale-acquirement handling.
+3. **M2 – Fault tolerance:** heartbeats, watchdog, release, cancel, stale-acquirement handling. Implemented (TASK-3.1–3.3, ADR-0008).
 4. **M3 – Real inference + benchmark:** MLX completion (batched) and MLX embedding runners, Ollama/HF
    fallback runners, model cache, `models.yaml` admission. `minion-executor bench`: same model on
    mlx-lm batched vs Ollama(MLX) vs HF/mps — tokens/s, records/h, peak memory. Confirms/adjusts ADR-0005 defaults.
@@ -422,4 +454,5 @@ token in macOS Keychain.
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
 - [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
+- [ADR-0008](adr/0008-fault-tolerance-reclaim-and-cancel.md): Fault-tolerance deviations: SKIP LOCKED reclaim, budget, lazy cancel, max lease, executor interrupt — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*

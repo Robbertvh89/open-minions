@@ -55,13 +55,13 @@ cp .env.example .env                      # dev settings (database_url is requir
 docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana
 uv run alembic upgrade head               # migrate
 uv run minion-server                      # API on :8080
-uv run minion-watchdog
+uv run minion-watchdog                    # reclaim + cancel sweep; DB only, no S3
 uv run minion-server-admin --help          # operator CLI (typer); subcommands below
 uv run minion-server-admin generate-api-key --name <who> --teams a,b   # prints key once + keys-file entry
 uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]  # prints token once
 uv run minion-server-admin revoke-executor-token --executor-id <uuid>
-uv run minion-executor run --server http://localhost:8080 --profile balanced   # token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (until M3 the default mlx runner exits 2: use `MINION_EXECUTOR_DEV=1 uv run minion-executor run --runner fake ...`; profiles: light|balanced|full)
-uv run minion-executor bench --model <id>  # engine/throughput benchmark on this Mac (not implemented yet, M3)
+uv run minion-executor run --server http://localhost:8080 --profile balanced [--heartbeat-interval SECONDS]  # heartbeat default 300 s (server timeout >= 2-3x); token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (until M3 the default mlx runner exits 2: use `MINION_EXECUTOR_DEV=1 uv run minion-executor run --runner fake ...`; profiles: light|balanced|full)
+# uv run minion-executor bench --model <id>  # not implemented yet (M3); was: engine/throughput benchmark on this Mac (not implemented yet, M3)
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only
 uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py

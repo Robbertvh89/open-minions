@@ -168,6 +168,8 @@ class WorkerHandle:
         self._ctx = mp.get_context("spawn")
         self._lock = threading.RLock()
         self._closed = False
+        self._seen_gen = 0  # last generation ensure_model() reset for
+        self._interrupt_gen = 0  # bumped by interrupt(); a change means 'abort what you started'
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
@@ -186,6 +188,7 @@ class WorkerHandle:
         if self._proc is None or self._conn is None:
             if self._closed:
                 raise WorkerCrashed("worker handle is stopped")
+            gen = self._seen_gen
             parent, child = self._ctx.Pipe()
             proc = self._ctx.Process(
                 target=worker_main,
@@ -206,13 +209,14 @@ class WorkerHandle:
             if self._after_spawn_hook is not None:
                 self._after_spawn_hook(proc)
             self._proc, self._conn = proc, parent
-            if self._closed:  # kill() ran between the check above and the assignment
+            if self._closed or self._interrupt_gen != gen:  # kill()/interrupt() raced the spawn
                 self._reset()
                 raise WorkerCrashed("worker handle is stopped")
         return self._conn
 
     def _call(self, msg: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         with self._lock:
+            gen = self._seen_gen
             conn = self._ensure_started()
             proc = self._proc
             if proc is None:  # pragma: no cover - _ensure_started guarantees it
@@ -222,7 +226,7 @@ class WorkerHandle:
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
                 while not conn.poll(0.1):
-                    if abortable and self._closed:
+                    if abortable and (self._closed or self._interrupt_gen != gen):
                         raise WorkerCrashed("worker handle is stopped")
                     if not proc.is_alive():
                         if conn.poll(0):
@@ -245,6 +249,10 @@ class WorkerHandle:
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
         """Load `model`; no-op if already warm, kill+restart on a model switch."""
         with self._lock:
+            g = self._interrupt_gen  # read once: an interrupt landing now must not be swallowed
+            if g != self._seen_gen:
+                self._seen_gen = g  # re-arm: later interrupts abort this call
+                self._reset()
             if self._model_id == model.model_id and self._proc and self._proc.is_alive():
                 return
             if self._model_id is not None:
@@ -270,6 +278,19 @@ class WorkerHandle:
         Lock-free so it can interrupt a call that holds the lock; safe from any thread.
         """
         self._closed = True
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                proc.kill()
+
+    def interrupt(self) -> None:
+        """Abort the current work: hard-kill the worker but allow a respawn on the next call.
+
+        Unlike `kill()` this leaves the handle open. An in-flight call fails with `WorkerCrashed`
+        and resets; a dead idle worker is replaced by `ensure_model` (which reloads the model).
+        Lock-free, safe from any thread.
+        """
+        self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):

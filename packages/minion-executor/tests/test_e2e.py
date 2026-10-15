@@ -22,6 +22,7 @@ from minion_executor.loop import ExecutorLoop
 from minion_executor.worker.process import WorkerHandle
 from minion_server.admin import issue_executor_token
 from minion_server.app import create_app
+from minion_server.services.reclaim import reclaim_stale
 from pydantic import SecretStr
 from sqlalchemy import text
 
@@ -76,6 +77,17 @@ class Live:
     async def rows(self, sql: str, **p: Any) -> list[Any]:
         async with self.sm() as s:
             return list((await s.execute(text(sql), p)).all())
+
+
+async def spawned(worker: WorkerHandle) -> int:
+    """Wait until the worker process exists (acquire precedes download + spawn)."""
+
+    async def up() -> bool:
+        return worker.pid is not None
+
+    await eventually(up, 30)
+    assert worker.pid is not None
+    return worker.pid
 
 
 async def eventually(cond: Callable[[], Awaitable[bool]], limit_s: float = 60.0) -> None:
@@ -274,3 +286,209 @@ async def test_sigterm_releases_inflight_subtask(live: Live, tmp_path: Path) -> 
     sub = (await live.rows("SELECT status FROM minion_subtask WHERE task_name='term'"))[0][0]
     assert sub == "PENDING"
     assert (await live.rows("SELECT count(*) FROM minion_subtask_acquirement"))[0][0] == 0
+
+
+# --- fault tolerance (TASK-3.3 S7). Heartbeat interval floor is 1 s, so beats are 1 s. ---
+
+HB_S = 1.0  # executor heartbeat interval (floor)
+TIMEOUT_S = 4.0  # server heartbeat timeout (>= 2x the interval, as documented)
+SLOW = b'{"id":"slow0","text":"x","sleep_s":60}\n'
+
+
+def _spawn_cmd(*args: str) -> tuple[str, ...]:
+    return (sys.executable, "-c", "from minion_executor.main import app; app()", *args)
+
+
+async def _inflight(lv: Live, n: int = 1) -> bool:
+    return bool((await lv.rows("SELECT count(*) FROM minion_subtask_acquirement"))[0][0] == n)
+
+
+async def _spawn_executor(lv: Live, tmp: Path, owner: str) -> asyncio.subprocess.Process:
+    env = {
+        **os.environ,
+        "MINION_EXECUTOR_TOKEN": await lv.token(owner),
+        "MINION_EXECUTOR_DEV": "1",
+        "MINION_EXECUTOR_TEST_HOOKS": "1",
+        "MINION_EXECUTOR_HEARTBEAT_INTERVAL_S": str(HB_S),
+        "MINION_HEARTBEAT_TIMEOUT_S": str(TIMEOUT_S),
+    }
+    return await asyncio.create_subprocess_exec(
+        *_spawn_cmd("run", "--server", lv.url, "--runner", "fake"), env=env, cwd=str(tmp)
+    )
+
+
+async def _spawn_watchdog(db_url: str, tmp: Path) -> asyncio.subprocess.Process:
+    env = {
+        **os.environ,
+        "MINION_DATABASE_URL": db_url,
+        "MINION_HEARTBEAT_TIMEOUT_S": str(TIMEOUT_S),
+        "MINION_WATCHDOG_INTERVAL_S": "0.5",
+    }
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "from minion_watchdog.main import main; main()",
+        env=env,
+        cwd=str(tmp),
+    )
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), 15)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+
+def _in_process_loop(
+    lv: Live, token: str, worker: WorkerHandle, tmp: Path
+) -> tuple[ExecutorClient, ExecutorLoop]:
+    client = ExecutorClient(lv.url, SecretStr(token))
+    loop = ExecutorLoop(
+        client,
+        worker,
+        BUDGET,
+        [Engine.FAKE],
+        backoff=FAST,
+        tmp_root=tmp,
+        allow_http_loopback=True,
+        heartbeat_interval_s=HB_S,
+    )
+    return client, loop
+
+
+async def test_killed_executor_subtask_is_reclaimed_and_rerun(
+    live: Live, fresh_url: str, tmp_path: Path
+) -> None:
+    """AC #2: SIGKILL of executor A -> watchdog EXPIRES it -> B re-runs it, exactly once."""
+    live.put_input("kill", "a.jsonl", SLOW + _records("k", 4))
+    await live.submit("kill", rps=10)
+    a = await _spawn_executor(live, tmp_path, "exec-a")
+    wd = await _spawn_watchdog(fresh_url, tmp_path)
+    b_client: ExecutorClient | None = None
+    b_task: asyncio.Task[int] | None = None
+    b_loop: ExecutorLoop | None = None
+    try:
+        await eventually(lambda: _inflight(live))
+        a.send_signal(signal.SIGKILL)  # no release, no complete: only the watchdog can recover
+        assert await asyncio.wait_for(a.wait(), 10) == -signal.SIGKILL
+
+        async def expired() -> bool:
+            rows = await live.rows("SELECT outcome FROM minion_subtask_attempt")
+            return [r[0] for r in rows] == ["EXPIRED"]
+
+        await eventually(expired, 30)
+        b_client, b_loop = _in_process_loop(
+            live, await live.token("exec-b"), WorkerHandle("fake"), tmp_path
+        )
+        b_task = asyncio.create_task(b_loop.run())
+
+        async def done() -> bool:
+            return await live.task_status("kill") == "SUCCEEDED"
+
+        await eventually(done, 60)
+    finally:
+        if b_loop is not None and b_task is not None:
+            b_loop.stop()
+            await asyncio.wait_for(b_task, 30)
+        if b_client is not None:
+            await b_client.aclose()
+        await _reap(a)
+        await _reap(wd)
+
+    att = await live.rows(
+        "SELECT attempt, outcome, error->>'code' FROM minion_subtask_attempt ORDER BY attempt"
+    )
+    assert [(r[0], r[1]) for r in att] == [(1, "EXPIRED"), (2, "SUCCEEDED")]
+    assert att[0][2] == "HEARTBEAT_TIMEOUT"
+    ids = sorted(r["id"] for r in _out_rows(live, "kill"))
+    assert ids == sorted(["slow0", *(f"k{i}" for i in range(4))])
+    assert _final_keys(live, "kill") == ["outputs/e2e/kill/000000.jsonl"]
+    assert (await live.rows("SELECT count(*) FROM minion_subtask_acquirement"))[0][0] == 0
+
+
+async def test_cancel_interrupts_worker_and_executor_keeps_running(
+    live: Live, tmp_path: Path
+) -> None:
+    """Cancel -> next beat sees cancel=true -> worker killed, release CANCELLED, loop idles."""
+    live.put_input("cxl", "a.jsonl", SLOW + _records("c", 4))
+    await live.submit("cxl", rps=10)
+    worker = WorkerHandle("fake", test_hooks=True)
+    client, loop = _in_process_loop(live, await live.token("exec-c"), worker, tmp_path)
+    run = asyncio.create_task(loop.run())
+    try:
+        await eventually(lambda: _inflight(live))
+        pid = await spawned(worker)
+        async with UserClient(live.url, SecretStr(live.api_key)) as uc:
+            await uc.cancel_task("e2e", "p", "cxl")
+
+        async def released() -> bool:
+            return await _inflight(live, 0)
+
+        await eventually(released, 30)
+        assert not run.done()  # executor idles instead of crashing
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)  # the worker (and its model memory) is gone
+    finally:
+        loop.stop()
+        await asyncio.wait_for(run, 30)
+        await client.aclose()
+
+    assert await live.task_status("cxl") == "CANCELLED"
+    att = await live.rows("SELECT outcome FROM minion_subtask_attempt WHERE task_name='cxl'")
+    assert [r[0] for r in att] == ["CANCELLED"]
+    sub = await live.rows("SELECT status FROM minion_subtask WHERE task_name='cxl'")
+    assert [r[0] for r in sub] == ["CANCELLED"]
+    assert _final_keys(live, "cxl") == []
+
+
+async def test_stale_acquirement_409_stops_work_sends_nothing_and_continues(
+    live: Live, tmp_path: Path
+) -> None:
+    """Forced reclaim -> next beat gets 409 -> worker killed, nothing reported, keeps polling."""
+    live.put_input("stale", "a.jsonl", SLOW + _records("s", 4))
+    await live.submit("stale", rps=10)
+    worker = WorkerHandle("fake", test_hooks=True)
+    client, loop = _in_process_loop(live, await live.token("exec-s"), worker, tmp_path)
+    run = asyncio.create_task(loop.run())
+    try:
+        await eventually(lambda: _inflight(live))
+        first = (await live.rows("SELECT acquirement_id FROM minion_subtask_acquirement"))[0][0]
+        pid = await spawned(worker)
+
+        async def expired() -> bool:
+            # A live 1 s beat can land between backdate and reclaim and refresh the lease, so
+            # backdate + reclaim repeat until the attempt is really EXPIRED.
+            async with live.sm() as s, s.begin():
+                await s.execute(
+                    text(
+                        "UPDATE minion_executor_heartbeat"
+                        " SET last_seen_at = now() - interval '1 hour'"
+                    )
+                )
+            await reclaim_stale(live.sm, timeout_s=TIMEOUT_S, batch_size=10)
+            rows = await live.rows("SELECT outcome FROM minion_subtask_attempt")
+            return [r[0] for r in rows] == ["EXPIRED"]
+
+        await eventually(expired, 30)
+
+        async def reacquired() -> bool:
+            rows = await live.rows("SELECT acquirement_id FROM minion_subtask_acquirement")
+            return len(rows) == 1 and rows[0][0] != first
+
+        await eventually(reacquired, 30)  # 409 -> discarded -> polls again -> attempt 2
+        assert not run.done()
+    finally:
+        loop.stop()
+        await asyncio.wait_for(run, 30)
+        await client.aclose()
+
+    att = await live.rows("SELECT attempt, outcome FROM minion_subtask_attempt ORDER BY attempt")
+    # attempt 1 stays EXPIRED (the stale owner reported nothing); attempt 2 released by shutdown
+    assert [(r[0], r[1]) for r in att] == [(1, "EXPIRED"), (2, "RELEASED")]
+    assert _final_keys(live, "stale") == []
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

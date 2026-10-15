@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from minion_common.enums import CapacityProfile, Engine, TaskStatus, TaskType
 
@@ -119,7 +119,7 @@ class Assignment(_Model):
     byte_end: int = Field(gt=0, description="Exclusive end offset")
     record_count: int = Field(ge=1)
     output_url: str
-    expires_at: datetime
+    expires_at: AwareDatetime
 
     @model_validator(mode="after")
     def _check_range(self) -> Self:
@@ -162,7 +162,7 @@ class HeartbeatRequest(_Model):
 class HeartbeatResponse(_Model):
     cancel: bool
     output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
-    expires_at: datetime
+    expires_at: AwareDatetime
 
 
 class ErrorBody(_Model):
