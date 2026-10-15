@@ -21,8 +21,8 @@ class Budget(_Model):
     """Capacity budget the Mac's owner granted (SPEC §4.6)."""
 
     profile: CapacityProfile
-    memory_gb: float = Field(gt=0)
-    gpu_duty_cycle: float = Field(gt=0, le=1)
+    memory_gb: float = Field(gt=0, le=1024, allow_inf_nan=False)
+    gpu_duty_cycle: float = Field(gt=0, le=1, allow_inf_nan=False)
     max_batch_size: int = Field(ge=1, le=4096)
 
 
@@ -140,6 +140,31 @@ class FailRequest(_Model):
     message: str = Field(max_length=1000, description="Diagnostic only; never payload content")
 
 
+class Progress(_Model):
+    records_done: int = Field(ge=0, le=2**31 - 1)
+    records_total: int = Field(ge=0, le=2**31 - 1)
+
+    @model_validator(mode="after")
+    def _done_le_total(self) -> Self:
+        if self.records_done > self.records_total:
+            raise ValueError("records_done must not exceed records_total")
+        return self
+
+
+class HeartbeatRequest(_Model):
+    """Liveness beat (SPEC §6.2). Bounded fields only: no free-form payload."""
+
+    progress: Progress | None = None
+    budget: Budget | None = None
+    paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
+
+
+class HeartbeatResponse(_Model):
+    cancel: bool
+    output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
+    expires_at: datetime
+
+
 class ErrorBody(_Model):
     code: str
     message: str
@@ -153,8 +178,11 @@ __all__ = [
     "CompleteRequest",
     "ErrorBody",
     "FailRequest",
+    "HeartbeatRequest",
+    "HeartbeatResponse",
     "ModelEntry",
     "PreferenceRequest",
+    "Progress",
     "RegisterRequest",
     "RegisterResponse",
     "TaskCounts",

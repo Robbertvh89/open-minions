@@ -117,11 +117,15 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 ### 4.4 Fault tolerance (Watchdog)
 - FR-30. Watchdog monitors heartbeats **only for executors currently running subtasks** **[paper]**.
 - FR-31. If no heartbeat for `heartbeat_timeout` (default 15 min = 3 missed beats) **[ours]**, the
-  watchdog deletes the acquirement, archives it as `EXPIRED`, increments `attempt`, and sets the
-  subtask back to `PENDING` **[paper semantics]**.
+  watchdog deletes the acquirement, archives it as `EXPIRED`, and sets the subtask back to
+  `PENDING` (or `FAILED` once the budget is spent) **[paper semantics]**. Reclaim does not touch
+  `attempt`: the next acquire increments it, so attempt-scoped output keys stay unique.
 - FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts; once it reaches
   `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or `PARTIAL`
-  depending on policy. A voluntary `release` does not consume the budget **[ours]**.
+  depending on policy. A voluntary `release` does not consume the budget **[ours]**, but a
+  subtask already released `MINION_RELEASE_LIMIT` times (default 10) records further releases as
+  a retryable `FAILED` attempt (`RELEASE_LIMIT`), so a misclassified error cannot livelock the
+  fleet.
 - FR-33. Executor-reported errors: retryable (OOM, download failure) → requeue; non-retryable (bad
   input) → `FAILED` immediately **[ours]**.
 - FR-34. A late result from a reclaimed owner is rejected (`409 STALE_ACQUIREMENT`) **[ours]**.
@@ -215,7 +219,7 @@ changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_
 without finishing).
 
 **Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
-and all of §6.2 except `heartbeat` and `presence`. The other rows are not yet implemented.
+and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog reclaim. The other rows are not yet implemented.
 
 ### 6.1 User-facing
 | Method | Path | Purpose |
@@ -233,7 +237,7 @@ and all of §6.2 except `heartbeat` and `presence`. The other rows are not yet i
 | `POST` | `/executor/register` | Report host capabilities + engines + capacity profile; returns `executor_id` |
 | `PUT` | `/executor/preference` | Set/clear `(team?, project?, task_name?)` preference |
 | `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb`, engine and `allowed_pool`. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
-| `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state; response `{cancel: bool}` |
+| `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state. Body (all optional, unknown fields rejected): `progress? {records_done, records_total}` (ints 0..2^31-1, `done ≤ total`; `total` above the subtask's `record_count` → `422 INVALID_PROGRESS`), `budget?` (`memory_gb` 0..1024 finite, `gpu_duty_cycle` 0..1, `max_batch_size` 1..4096), `paused_reason?` (`[a-z_]{1,64}`). Response `200 {cancel: bool, output_url, expires_at}` (`output_url` is a refreshed presigned PUT for the same attempt key); stale/foreign `acquirement_id` → `409 STALE_ACQUIREMENT` |
 | `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (fleet view only) |
 | `POST` | `/executor/subtasks/{acquirement_id}/complete` | Report success + output metadata (record count, checksum) |
 | `POST` | `/executor/subtasks/{acquirement_id}/fail` | Report error `{retryable, code, message}` |

@@ -9,6 +9,8 @@ from minion_common.schemas import (
     Assignment,
     CompleteRequest,
     FailRequest,
+    HeartbeatRequest,
+    HeartbeatResponse,
     ModelEntry,
     PreferenceRequest,
     RegisterRequest,
@@ -21,6 +23,7 @@ from minion_server.db.session import get_session
 from minion_server.errors import api_error
 from minion_server.repositories import executors as executors_repo
 from minion_server.services import acquisition, completion
+from minion_server.services import heartbeat as heartbeat_service
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 
@@ -99,6 +102,20 @@ async def acquire(
     return Response(content=assignment.model_dump_json(), media_type="application/json")
 
 
+@router.post("/subtasks/{acquirement_id}/heartbeat")
+async def heartbeat(
+    acquirement_id: uuid.UUID,
+    body: HeartbeatRequest,
+    principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[ServerSettings, Depends(_settings)],
+    storage: Annotated[S3Storage, Depends(_storage)],
+) -> HeartbeatResponse:
+    return await heartbeat_service.heartbeat(
+        session, principal, acquirement_id, body, settings=settings, storage=storage
+    )
+
+
 @router.post("/subtasks/{acquirement_id}/complete", status_code=204)
 async def complete(
     acquirement_id: uuid.UUID,
@@ -130,6 +147,7 @@ async def release(
     acquirement_id: uuid.UUID,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[ServerSettings, Depends(_settings)],
 ) -> Response:
-    await completion.release(session, principal, acquirement_id)
+    await completion.release(session, principal, acquirement_id, settings=settings)
     return Response(status_code=204)
