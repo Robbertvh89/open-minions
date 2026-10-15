@@ -44,7 +44,7 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
-from minion_executor.runners.base import Record, RunnerError
+from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
 log = structlog.get_logger("minion_executor.loop")
@@ -151,7 +151,6 @@ class ExecutorLoop:
         heartbeat_interval_s: float = 300.0,
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         idle_unload_s: float = 600.0,
-        release_limit: int = 10,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
@@ -174,11 +173,9 @@ class ExecutorLoop:
         self._idle = 0
         self._fails = 0
         self._idle_unload_s = idle_unload_s
-        self._release_limit = release_limit
         self._clock = clock
         self._last_work = clock()
         self._unloaded = False
-        self._admission_releases: dict[tuple[str, str, str, int], int] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -244,6 +241,7 @@ class ExecutorLoop:
                     if isinstance(exc, ApiError) and exc.status_code < 500:
                         raise
                     log.warning("acquire_failed", error=type(exc).__name__)
+                    await self._maybe_unload()  # a warm model must not outlive a server outage
                     await self._sleep()
                     continue
                 if assignment is None:
@@ -280,19 +278,14 @@ class ExecutorLoop:
             log.warning("idle_unload_failed", error=type(exc).__name__)
 
     def _check_admission(self, a: Assignment) -> None:
-        """Release (not fail) a subtask this executor cannot run; bounded per subtask."""
+        """Release (not fail) a subtask this executor cannot run. The server's RELEASE_LIMIT
+        bounds how often one subtask can bounce; the reason is logged here only (release carries
+        no reason body)."""
         m = a.model
         if m.engine in self._engines and m.memory_gb <= self._budget.memory_gb:
             return
-        key = (a.team, a.project, a.task_name, a.subtask_id)
-        n = self._admission_releases.get(key, 0) + 1
-        if len(self._admission_releases) < 1024:
-            self._admission_releases[key] = n
         raise _FailureError(
-            True,
-            MODEL_NOT_ADMISSIBLE,
-            "model not admissible on this executor",
-            release=n <= self._release_limit,
+            True, MODEL_NOT_ADMISSIBLE, "model not admissible on this executor", release=True
         )
 
     async def _handle(self, a: Assignment, tmp: Path) -> _Outcome:
@@ -526,7 +519,10 @@ class ExecutorLoop:
             raise _FailureError(True, "WORKER_CRASHED", "worker process died") from None
         except RunnerError as exc:
             code = exc.code[:64] or "RUNNER_ERROR"
-            raise _FailureError(exc.retryable, code, "runner failed") from None
+            # Engine missing on this Mac is executor-local: release, don't burn an attempt.
+            raise _FailureError(
+                exc.retryable, code, "runner failed", release=exc.code == ENGINE_UNAVAILABLE
+            ) from None
         return outputs
 
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:

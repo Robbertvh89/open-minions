@@ -222,6 +222,20 @@ def test_bad_refs_rejected() -> None:
         _entry(engine="ollama", ref="Bad Tag", revision=SHA256)
 
 
+def test_ref_and_revision_bypasses_rejected() -> None:
+    for ref in ("o/m\n", "\u043e/m", "o/\u043c", "o/.", "./m", "o//m"):
+        with pytest.raises(ValidationError, match="ref"):
+            _entry(ref=ref)
+    for ref in ("qwen\n", "q\u0435n:1b", "a/./b:1", "a//b:1", "a/../b:1", "a:\u0663"):
+        with pytest.raises(ValidationError, match="ref"):
+            _entry(engine="ollama", ref=ref, revision=SHA256)
+    for rev in (SHA1 + "\n", "\uff10" * 40):
+        with pytest.raises(ValidationError, match="revision"):
+            _entry(revision=rev)
+    with pytest.raises(ValidationError, match="revision"):
+        _entry(engine="ollama", ref="qwen2.5:0.5b", revision=SHA256 + "\n")
+
+
 def test_memory_gb_bounds() -> None:
     for bad in (0, 1025, float("inf"), float("nan")):
         with pytest.raises(ValidationError):

@@ -99,8 +99,14 @@ def test_fake_memory_in_use_zeros() -> None:
 
 
 def test_unavailable_engine_and_unknown() -> None:
-    with pytest.raises(ValueError):
-        create_runner(Engine.MLX, TaskType.EMBEDDING)  # real engines land in M3.3
+    with pytest.raises(RunnerError) as ei:
+        create_runner(Engine.MLX, TaskType.EMBEDDING)  # real engines land in TASK-4.3
+    assert ei.value.code == "ENGINE_UNAVAILABLE"
+    from minion_executor.runners import probe_engines
+
+    # not implemented => never advertised, even if the module imports / the daemon answers
+    probed = probe_engines([Engine.MLX, Engine.OLLAMA, Engine.HF, Engine.FAKE], EngineConfig())
+    assert probed == {"mlx": None, "ollama": None, "hf": None, "fake": "fake"}
     with pytest.raises(ValueError):
         Engine("nope")
 
@@ -132,16 +138,30 @@ def test_duty_cycle_pacer_sleeps_proportionally() -> None:
     assert c2.slept == [pytest.approx(3.0)]
 
 
-def test_duty_cycle_pacer_full_duty_never_sleeps_and_caps() -> None:
+def test_duty_cycle_pacer_full_duty_never_sleeps_and_long_steps_not_capped() -> None:
     c = _Clock()
     p = DutyCyclePacer(1.0, c, c.sleep)
     c.now += 5.0
     assert p.step_done() == 0.0 and c.slept == []
-    capped = DutyCyclePacer(0.1, c, c.sleep, max_sleep_s=7.0)
-    c.now += 10.0
-    assert capped.step_done() == 7.0
+    long = DutyCyclePacer(0.1, c, c.sleep)
+    c.now += 1000.0  # 1000 s step at d=0.1 -> 9000 s pause, not clamped
+    assert long.step_done() == pytest.approx(9000.0)
     with pytest.raises(ValueError):
         DutyCyclePacer(0.0, c, c.sleep)
+
+
+def test_pacer_ticks_carry_records_done_midbatch() -> None:
+    """With duty < 1 the pacer's own ticks must not swallow the records_done update."""
+    b = Budget(profile=CapacityProfile.BALANCED, memory_gb=8, gpu_duty_cycle=0.5, max_batch_size=8)
+    w = WorkerHandle([Engine.FAKE], test_hooks=True, tick_interval_s=0.1)
+    seen: list[int] = []
+    try:
+        w.ensure_model(_model(TaskType.COMPLETION, "c"), b)
+        batch = [{"id": i, "sleep_s": 0.3, "text": "x"} for i in range(6)]
+        w.run(batch, on_progress=seen.append)
+    finally:
+        w.close()
+    assert seen == sorted(seen) and len(set(seen)) >= 3 and max(seen) >= 3
 
 
 def test_worker_round_trip_in_subprocess() -> None:
@@ -531,7 +551,7 @@ def test_engine_outside_set_is_refused_non_retryable() -> None:
     try:
         with pytest.raises(RunnerError) as ei:
             w.ensure_model(_model(), BUDGET)  # fake model on an ollama-only worker
-        assert ei.value.code == "ENGINE_NOT_ALLOWED" and not ei.value.retryable
+        assert ei.value.code == "ENGINE_NOT_ALLOWED" and ei.value.retryable
     finally:
         w.close()
 

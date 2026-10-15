@@ -48,11 +48,21 @@ def test_fake_runner_refused_without_dev_flag(monkeypatch: pytest.MonkeyPatch) -
     assert "MINION_EXECUTOR_DEV" in result.output
 
 
+def _no_restrict(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub restrict_environ (it would strip the test process' env) and record call order."""
+    import minion_executor.main as m
+
+    order: list[str] = []
+    monkeypatch.setattr(m, "restrict_environ", lambda: order.append("restrict"))
+    return order
+
+
 def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyPatch) -> None:
     import minion_executor.main as m
 
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")  # dev mode must not make fake implicit
+    _no_restrict(monkeypatch)
     asked: list[list[Engine]] = []
 
     def none_available(requested: list[Engine]) -> list[Engine]:
@@ -66,24 +76,75 @@ def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyP
     assert asked == [[Engine.MLX, Engine.OLLAMA, Engine.HF]]
 
 
-def test_auto_advertises_probed_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_probe_runs_after_environ_restricted_with_short_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import minion_executor.main as m
 
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    order = _no_restrict(monkeypatch)
     seen: dict[str, object] = {}
 
     class FakeProbe:
         def __init__(self, engines: list[Engine]) -> None:
             seen["requested"] = list(engines)
 
-        def probe(self) -> dict[str, str | None]:
-            return {"mlx": "0.1", "ollama": None, "hf": "4.0"}
-
-    async def fake_run(server: str, profile: object, engines: list[Engine], *a: object) -> None:
-        seen["engines"] = engines
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            order.append("probe")
+            seen["timeout"] = timeout_s
+            return {"mlx": None, "ollama": None, "hf": None}
 
     monkeypatch.setattr(m, "WorkerHandle", FakeProbe)
-    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 2, result.output
+    assert order == ["restrict", "probe"] and seen["timeout"] == m.PROBE_TIMEOUT_S <= 90
+
+
+def test_probe_runner_error_exits_2_without_traceback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+    from minion_executor.runners.base import RunnerError
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
+
+    def boom(requested: list[Engine]) -> list[Engine]:
+        raise RunnerError("PROBE_FAILED", "x")
+
+    monkeypatch.setattr(m, "probe_available", boom)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 2 and "PROBE_FAILED" in result.output
+
+
+def test_auto_advertises_probed_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
+    seen: dict[str, object] = {}
+
+    class FakeProbe:
+        def __init__(self, engines: list[Engine], *a: object, **k: object) -> None:
+            seen.setdefault("requested", list(engines))
+            seen["last"] = list(engines)
+
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            return {"mlx": "0.1", "ollama": None, "hf": "4.0"}
+
+        def close(self) -> None:
+            pass
+
+    class StopLoop:
+        def __init__(self, *a: object, **k: object) -> None:
+            seen["engines"] = a[3]
+
+        async def run(self) -> int:
+            return 0
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(m, "WorkerHandle", FakeProbe)
+    monkeypatch.setattr(m, "ExecutorLoop", StopLoop)
     result = runner.invoke(app, ["run"])
     assert result.exit_code == 0, result.output
     assert seen["engines"] == [Engine.MLX, Engine.HF]
@@ -93,13 +154,21 @@ def test_explicit_engines_are_intersected_with_probe(monkeypatch: pytest.MonkeyP
     import minion_executor.main as m
 
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
     seen: dict[str, object] = {}
 
-    async def fake_run(server: str, profile: object, engines: list[Engine], *a: object) -> None:
-        seen["engines"] = engines
+    class StopLoop:
+        def __init__(self, *a: object, **k: object) -> None:
+            seen["engines"] = a[3]
+
+        async def run(self) -> int:
+            return 0
+
+        def stop(self) -> None:
+            pass
 
     monkeypatch.setattr(m, "probe_available", lambda req: [e for e in req if e is Engine.OLLAMA])
-    monkeypatch.setattr(m, "_run", fake_run)
+    monkeypatch.setattr(m, "ExecutorLoop", StopLoop)
     result = runner.invoke(app, ["run", "--engines", "mlx,ollama"])
     assert result.exit_code == 0, result.output
     assert seen["engines"] == [Engine.OLLAMA]

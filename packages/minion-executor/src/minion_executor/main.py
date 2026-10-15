@@ -11,6 +11,7 @@ import subprocess
 from typing import Annotated
 from urllib.parse import urlsplit
 
+import httpx
 import typer
 from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
@@ -20,6 +21,7 @@ from pydantic import SecretStr
 from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
+from minion_executor.runners.base import RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
@@ -85,10 +87,14 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
     return out
 
 
+PROBE_TIMEOUT_S = 90.0
+
+
 def probe_available(requested: list[Engine]) -> list[Engine]:
     """Ask a worker subprocess which of `requested` work here (engines are never imported in
-    the control process, invariant 7)."""
-    found = WorkerHandle(requested).probe()
+    the control process, invariant 7). Call after `restrict_environ()` so the probe worker
+    inherits no secrets."""
+    found = WorkerHandle(requested).probe(PROBE_TIMEOUT_S)
     return [e for e in requested if found.get(e.value)]
 
 
@@ -113,38 +119,45 @@ def _validate_heartbeat(interval_s: float) -> None:
 async def _run(
     server: str,
     profile: CapacityProfile,
-    engines: list[Engine],
+    requested: list[Engine],
     token: SecretStr,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
 ) -> None:
     budget = budget_for(profile)
-    reg = RegisterRequest(
-        hostname=socket.gethostname(),
-        chip=_chip(),
-        total_memory_gb=total_memory_gb(),
-        os_version=platform.platform()[:100],
-        engines=engines,
-        profile=profile,
-        budget=budget,
-    )
-    hooks = os.environ.get(DEV_ENV) == "1" and os.environ.get(TEST_HOOKS_ENV) == "1"
-    worker = WorkerHandle(engines, nice=PROFILES[profile].nice, test_hooks=hooks)
     settings = ExecutorSettings()
-    async with ExecutorClient(server, token) as client:
+    hooks = os.environ.get(DEV_ENV) == "1" and os.environ.get(TEST_HOOKS_ENV) == "1"
+    async with (
+        ExecutorClient(server, token) as client,
+        httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as http,
+    ):
+        # httpx reads proxy env when the clients are built (above); from here on the control
+        # process holds no secrets, so neither the probe nor the workers inherit any.
+        restrict_environ()
+        available = await asyncio.to_thread(probe_available, requested)
+        if not available:
+            raise ValueError(NO_ENGINE_MSG)
+        typer.echo(f"engines: {','.join(e.value for e in available)}")
+        reg = RegisterRequest(
+            hostname=socket.gethostname(),
+            chip=_chip(),
+            total_memory_gb=total_memory_gb(),
+            os_version=platform.platform()[:100],
+            engines=available,
+            profile=profile,
+            budget=budget,
+        )
+        worker = WorkerHandle(available, nice=PROFILES[profile].nice, test_hooks=hooks)
         loop = ExecutorLoop(
             client,
             worker,
             budget,
-            engines,
+            available,
+            http=http,
             register=reg,
             allow_http_loopback=_is_loopback(server),
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
-            release_limit=settings.release_limit,
         )
-        # httpx reads proxy env when the clients were built (client + loop above); from
-        # here on the control process holds no secrets, so spawned workers inherit none.
-        restrict_environ()
         aloop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, loop.stop)
@@ -186,15 +199,15 @@ def run(
         _validate_heartbeat(heartbeat_interval_s)
         ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
         token = load_token()  # fail fast, before starting anything
-        available = probe_available(requested)
-        if not available:
-            raise ValueError(NO_ENGINE_MSG)
-    except (ValueError, RuntimeError, WorkerCrashed) as exc:
+    except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
-    typer.echo(f"engines: {','.join(e.value for e in available)}")
-    asyncio.run(_run(server, prof, available, token, heartbeat_interval_s))
+    try:
+        asyncio.run(_run(server, prof, requested, token, heartbeat_interval_s))
+    except (ValueError, RunnerError, WorkerCrashed) as exc:  # e.g. no engine / probe failure
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
 
 
 @app.command()

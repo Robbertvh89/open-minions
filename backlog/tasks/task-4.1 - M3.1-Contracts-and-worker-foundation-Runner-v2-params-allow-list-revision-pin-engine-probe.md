@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-15 20:42'
+updated_date: '2026-10-15 22:28'
 labels:
   - M3
 dependencies: []
@@ -23,8 +23,8 @@ Plan steps S1-S3 of TASK-4 (D1-D4, D9, D10, D14 idle unload). Delivers TASK-9 #1
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 ModelEntry requires revision (40-hex mlx/hf, 64-hex digest ollama); unknown task params rejected with 422 INVALID_PARAMS
-- [ ] #2 Runner v2: StepControl ticks keep long runs alive past step timeout; no ticks -> WorkerCrashed; RunnerError.retryable round-trips
-- [ ] #3 run --engines auto probes engines in a worker subprocess; none available -> exit 2; fake never implicit
-- [ ] #4 Output lines carry model and model_revision; idle worker unloaded after MINION_EXECUTOR_IDLE_UNLOAD_S
+- [x] #1 ModelEntry requires revision (40-hex mlx/hf, 64-hex digest ollama); unknown task params rejected with 422 INVALID_PARAMS
+- [x] #2 Runner v2: StepControl ticks keep long runs alive past step timeout; no ticks -> WorkerCrashed; RunnerError.retryable round-trips
+- [x] #3 run --engines auto probes engines in a worker subprocess; none available -> exit 2; fake never implicit
+- [x] #4 Output lines carry model and model_revision; idle worker unloaded after MINION_EXECUTOR_IDLE_UNLOAD_S
 <!-- AC:END -->

@@ -13,10 +13,16 @@ from minion_common.enums import CapacityProfile, Engine, TaskStatus, TaskType
 
 SLUG_PATTERN = r"^[a-z0-9]([a-z0-9_-]{0,62}[a-z0-9])?$"
 
-_HF_REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
-_OLLAMA_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*(:[\w.-]+)?$")
-_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_HF_REPO_RE = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+", re.ASCII)
+_OLLAMA_TAG_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*(:[\w.-]+)?", re.ASCII)
+_SHA1_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _bad_segments(ref: str) -> bool:
+    """True for '.', '..' or empty path segments (and a bare '..' anywhere)."""
+    name = ref.split(":", 1)[0]
+    return ".." in ref or any(seg in ("", ".") for seg in name.split("/"))
 
 
 class _Model(BaseModel):
@@ -51,15 +57,15 @@ class ModelEntry(_Model):
     def _check_ref_and_revision(self) -> Self:
         ref, rev = self.ref, self.revision
         if self.engine in (Engine.MLX, Engine.HF):
-            if not _HF_REPO_RE.match(ref) or ".." in ref:
+            if not _HF_REPO_RE.fullmatch(ref) or _bad_segments(ref):
                 raise ValueError("ref must be a Hugging Face repo id 'owner/name'")
-            if rev is None or not _SHA1_RE.match(rev):
+            if rev is None or not _SHA1_RE.fullmatch(rev):
                 raise ValueError("revision must be a 40-hex commit SHA for mlx/hf models")
         elif self.engine == Engine.OLLAMA:
-            if not _OLLAMA_TAG_RE.match(ref) or ".." in ref:
+            if not _OLLAMA_TAG_RE.fullmatch(ref) or _bad_segments(ref):
                 raise ValueError("ref must be an Ollama tag like 'name:tag'")
             digest = rev.removeprefix("sha256:") if rev is not None else None
-            if digest is None or not _SHA256_RE.match(digest):
+            if digest is None or not _SHA256_RE.fullmatch(digest):
                 raise ValueError("revision must be a 64-hex manifest digest for ollama models")
             self.revision = digest
         return self

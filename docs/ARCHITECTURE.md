@@ -106,7 +106,9 @@ minion_executor/
     process.py         # spawns + supervises inference subprocess; IPC via multiprocessing Pipe
     throttle.py        # duty-cycle pacer used inside the worker between steps/batches
   runners/             # run INSIDE the worker subprocess only
-    base.py            # Runner protocol: load(model, budget) / run(batch) -> results / unload()
+    base.py            # Runner protocol v2: load(model, path, budget, EngineConfig) /
+                       # run(batch, params, StepControl) -> results / memory_in_use() / unload();
+                       # worker ops also include probe (engine versions) and stats
     mlx_completion.py  # mlx-lm BatchGenerator (default)
     mlx_embedding.py   # mlx-embeddings (default)
     ollama.py          # fallback: Ollama HTTP (localhost:11434)
@@ -186,9 +188,12 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   Keychain item `open-minions-executor` via `/usr/bin/security`. Token is never logged. `run` exits 2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
   missing token or unknown runner. The token is removed from `os.environ` right after loading, before
-  any child process. `--runner` (hidden) defaults to the real engine `mlx` (arrives in M3, so `run`
-  currently exits 2); `--runner fake` is refused unless `MINION_EXECUTOR_DEV=1`, and then registers
-  with engines `[fake]` only, so it can only be served tasks whose model uses engine `fake`.
+  any child process. `--engines auto` (default) or a list such as `mlx,ollama`: after the environ is
+  restricted, a short-lived worker subprocess (90 s timeout) probes which engines work (only engines
+  `create_runner` implements, see `runners.SUPPORTED`) and the executor registers with those; none
+  available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden
+  `--runner fake`) needs `MINION_EXECUTOR_DEV=1`. Subtasks whose engine/memory is not admissible, or
+  whose engine turns out unavailable at load (`ENGINE_UNAVAILABLE`), are released, not failed.
   `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
 - **Heartbeater** (`heartbeat.py`, TASK-3.3, FR-14): an asyncio task beside the work coroutine.
   Interval `--heartbeat-interval` / `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (default 300 s, min 1 s),

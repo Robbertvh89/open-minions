@@ -7,7 +7,11 @@ from collections.abc import Collection
 
 from minion_common.enums import Engine, TaskType
 
-from minion_executor.runners.base import EngineConfig, Runner, RunnerError
+from minion_executor.runners.base import ENGINE_UNAVAILABLE, EngineConfig, Runner, RunnerError
+
+# Engines `create_runner` can build. TASK-4.3 adds MLX/Ollama/HF here together with their
+# runners; until then they probe as unavailable so they are never advertised.
+SUPPORTED: frozenset[Engine] = frozenset({Engine.FAKE})
 
 
 def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = False) -> Runner:
@@ -17,11 +21,11 @@ def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = Fal
         from minion_executor.runners.fake import FakeRunner
 
         return FakeRunner(test_hooks=test_hooks)
-    raise ValueError(f"engine not available: {engine.value!r}")  # mlx/ollama/hf land in M3.3
+    raise RunnerError(ENGINE_UNAVAILABLE, engine.value)  # mlx/ollama/hf land in TASK-4.3
 
 
 _PROBE_MODULES: dict[Engine, tuple[str, ...]] = {
-    Engine.MLX: ("mlx.core", "mlx_lm"),
+    Engine.MLX: ("mlx.core", "mlx_lm", "mlx_embeddings"),
     Engine.HF: ("torch", "transformers"),
 }
 
@@ -36,6 +40,8 @@ def probe_engines(engines: Collection[Engine], cfg: EngineConfig) -> dict[str, s
 
 
 def _probe(engine: Engine, cfg: EngineConfig) -> str | None:
+    if engine not in SUPPORTED:
+        return None
     if engine is Engine.FAKE:
         return "fake"
     if engine is Engine.OLLAMA:
@@ -55,6 +61,7 @@ def _probe(engine: Engine, cfg: EngineConfig) -> str | None:
 
 
 __all__ = [
+    "SUPPORTED",
     "EngineConfig",
     "Runner",
     "RunnerError",

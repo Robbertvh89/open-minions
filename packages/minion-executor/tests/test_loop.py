@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1092,22 +1093,40 @@ async def test_prompt_too_long_records_count_and_subtask_completes(tmp_path: Pat
 
 
 class TickingWorker(FakeWorker):
-    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
-        import time
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
 
+    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
         on_progress(1)  # one record done mid-batch
-        time.sleep(0.3)  # let a heartbeat observe it
+        self.release.wait(10)  # held until a heartbeat has observed it
         return super().run(batch, params, None)
 
 
 async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
-    client, _ = await _run_one(
+    worker = TickingWorker()
+    client = FakeClient([_asn()])
+    s3 = FakeS3()
+    loop = make_loop(
+        client,
+        worker,
+        s3,
         tmp_path,
-        _asn(),
-        TickingWorker(),
+        [],
         heartbeat_interval_s=1.0,
         heartbeat_sleep=gated_sleep(1, []),
     )
+    client.on_empty = loop.stop
+    orig = client.heartbeat
+
+    async def hb(*a: Any, **k: Any) -> Any:
+        try:
+            return await orig(*a, **k)
+        finally:
+            worker.release.set()
+
+    client.heartbeat = hb  # type: ignore[method-assign]
+    await loop.run()
     beats = [r for k, r in client.calls if k == "heartbeat"]
     assert beats and beats[0].progress.records_done == 1
 
@@ -1118,14 +1137,41 @@ async def test_budget_duty_cycle_reaches_worker(tmp_path: Path) -> None:
     assert worker.ensured and worker.ensured[0][1].gpu_duty_cycle == BUDGET.gpu_duty_cycle
 
 
-async def test_engine_not_advertised_is_released_then_failed_after_limit(tmp_path: Path) -> None:
+async def test_engine_not_advertised_or_too_big_is_always_released(tmp_path: Path) -> None:
     worker = FakeWorker()
     a = _asn(model={**MODEL, "engine": "ollama", "revision": "sha256:" + "b" * 64})
-    client, _ = await _run_one(tmp_path, a, worker, release_limit=1)
-    assert client.kinds().count("release") == 1 and worker.ensured == []
+    client, _ = await _run_one(tmp_path, a, worker)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert worker.ensured == []
     big = _asn(model={**MODEL, "memory_gb": 64})
     client, _ = await _run_one(tmp_path, big, worker)
-    assert client.kinds().count("release") == 1
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
+async def test_engine_unavailable_runner_error_is_released_not_failed(tmp_path: Path) -> None:
+    worker = FakeWorker(RunnerError("ENGINE_UNAVAILABLE", "mlx"))
+    client, _ = await _run_one(tmp_path, _asn(), worker)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
+async def test_idle_unload_also_while_acquire_keeps_failing(tmp_path: Path) -> None:
+    now = [0.0]
+    worker = FakeWorker()
+    client = FakeClient([httpx.ConnectError("down")] * 4)
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], idle_unload_s=60.0, clock=lambda: now[0]
+    )
+    orig = client.acquire
+
+    async def acquire(req: AcquireRequest) -> Assignment | None:
+        now[0] += 40.0
+        if len(client.calls) >= 4:
+            loop.stop()
+        return await orig(req)
+
+    client.acquire = acquire  # type: ignore[method-assign]
+    await loop.run()
+    assert worker.unloads == 1
 
 
 async def test_idle_worker_unloaded_once_after_idle_period(tmp_path: Path) -> None:

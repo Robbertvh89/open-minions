@@ -26,7 +26,13 @@ from typing import Any
 from minion_common.enums import Engine
 from minion_common.schemas import Budget, ModelEntry, TaskParams, parse_params
 
-from minion_executor.runners.base import EngineConfig, Record, Runner, RunnerError
+from minion_executor.runners.base import (
+    ENGINE_UNAVAILABLE,
+    EngineConfig,
+    Record,
+    Runner,
+    RunnerError,
+)
 from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -99,6 +105,7 @@ class _Ctl:
         self._conn = conn
         self._tick_s = tick_interval_s
         self._last_tick = 0.0
+        self._done: int | None = None  # last records_done seen; re-sent on pacer ticks
         self._pacer = DutyCyclePacer(duty, time.monotonic, self._sleep)
 
     def start(self) -> None:
@@ -115,11 +122,13 @@ class _Ctl:
         end = time.monotonic() + seconds
         while (left := end - time.monotonic()) > 0:
             time.sleep(min(left, self._tick_s))
-            self._tick(None)
+            self._tick(self._done)
 
     def checkpoint(self, records_done: int | None = None) -> None:
+        if records_done is not None:
+            self._done = records_done
+        self._tick(self._done)  # before pacing: the pacer's own ticks share the rate limit
         self._pacer.step_done()
-        self._tick(records_done)
 
 
 def _maxrss_bytes() -> int:
@@ -177,10 +186,13 @@ def worker_main(
                 budget = Budget(**msg["budget"])
                 cfg = EngineConfig(**msg.get("cfg", {}))
                 if model.engine not in allowed:
-                    raise RunnerError("ENGINE_NOT_ALLOWED", model.engine.value, retryable=False)
-                new_runner = create_runner(model.engine, model.type, test_hooks=test_hooks)
+                    raise RunnerError("ENGINE_NOT_ALLOWED", model.engine.value)
                 path = Path(msg["model_path"]) if msg.get("model_path") else None
-                new_runner.load(model, path, budget, cfg)
+                try:
+                    new_runner = create_runner(model.engine, model.type, test_hooks=test_hooks)
+                    new_runner.load(model, path, budget, cfg)
+                except ImportError:  # extra not installed in this venv
+                    raise RunnerError(ENGINE_UNAVAILABLE, model.engine.value) from None
                 runner = new_runner
             elif op == "run":
                 if runner is None or model is None or budget is None:
@@ -198,9 +210,6 @@ def worker_main(
                 }
             elif op == "probe":
                 result = probe_engines(allowed, EngineConfig(**msg.get("cfg", {})))
-            elif op == "unload":
-                if runner is not None:
-                    runner.unload()
             else:
                 raise RunnerError("bad_op", op)
             _send(conn, {"ok": True, "result": result})
@@ -389,12 +398,12 @@ class WorkerHandle:
         stats: dict[str, int] = self._call({"op": "stats"}, self._step_timeout_s)["result"]
         return stats
 
-    def probe(self) -> dict[str, str | None]:
+    def probe(self, timeout_s: float = 90.0) -> dict[str, str | None]:
         """Spawn a worker, report `{engine: version | None}` for this handle's engines (imports
         happen in the child only), then shut it down. Do not call with a model loaded."""
         with self._lock:
             try:
-                reply = self._call({"op": "probe", "cfg": asdict(self._cfg)}, self._load_timeout_s)
+                reply = self._call({"op": "probe", "cfg": asdict(self._cfg)}, timeout_s)
                 result: dict[str, str | None] = reply["result"]
                 return result
             finally:

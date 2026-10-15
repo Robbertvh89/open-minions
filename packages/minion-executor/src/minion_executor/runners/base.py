@@ -11,6 +11,11 @@ from minion_common.schemas import Budget, ModelEntry, TaskParams
 Record = dict[str, Any]
 
 
+# Engine cannot run here (extra missing, no runner implemented yet). Executor-local: the loop
+# releases the subtask instead of burning an attempt.
+ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
+
+
 class RunnerError(Exception):
     """A runner failed on a batch (e.g. OOM). `code` is short and never contains payload.
 
