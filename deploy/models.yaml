@@ -1,0 +1,17 @@
+# Model allow-list (MINION_MODELS_FILE). memory_gb = approximate resident size for admission.
+models:
+  - model_id: qwen2.5-0.5b-instruct
+    type: completion
+    engine: mlx
+    ref: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+    memory_gb: 1.0
+  - model_id: bge-small-en
+    type: embedding
+    engine: mlx
+    ref: mlx-community/bge-small-en-v1.5-bf16
+    memory_gb: 0.5
+  - model_id: fake-embed # test entry for the fake runner
+    type: embedding
+    engine: mlx
+    ref: fake
+    memory_gb: 0.1

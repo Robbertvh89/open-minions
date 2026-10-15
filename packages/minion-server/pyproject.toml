@@ -12,10 +12,13 @@ dependencies = [
     "structlog>=24.4",
     "uvicorn[standard]>=0.32",
     "boto3>=1.43.114",
+    "pyyaml>=6.0",
+    "typer>=0.12",
 ]
 
 [project.scripts]
 minion-server = "minion_server.app:main"
+minion-server-admin = "minion_server.admin:app"
 
 [tool.uv.sources]
 minion-common = { workspace = true }
@@ -23,8 +26,3 @@ minion-common = { workspace = true }
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
-
-[dependency-groups]
-dev = [
-    "boto3-stubs>=1.43.114",
-]

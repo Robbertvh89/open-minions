@@ -60,7 +60,7 @@ uv run minion-executor run --server http://localhost:8080 --profile balanced   #
 uv run minion-executor bench --model <id>  # engine/throughput benchmark on this Mac
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only
-uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations
+uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py
 ```
 
 (Commands become valid as the scaffolding lands; keep this section accurate.)
