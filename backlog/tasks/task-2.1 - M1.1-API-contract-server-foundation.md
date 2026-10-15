@@ -1,10 +1,10 @@
 ---
 id: TASK-2.1
 title: 'M1.1: API contract + server foundation'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 14:52'
+updated_date: '2026-10-15 15:07'
 labels:
   - M1
 dependencies: []
