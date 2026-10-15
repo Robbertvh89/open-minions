@@ -22,6 +22,8 @@ class ServerSettings(BaseSettings):
     database_url: SecretStr  # required; see .env.example
     host: str = "127.0.0.1"
     port: int = 8080
+    db_pool_size: int = Field(default=20, ge=1)
+    db_max_overflow: int = Field(default=40, ge=0)
 
     # Object storage (S3 API). Executors get presigned URLs built against the public endpoint.
     s3_endpoint_url: str = "http://localhost:9000"
