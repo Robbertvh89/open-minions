@@ -1,5 +1,6 @@
 """S3 URI validation: configured bucket only, allowed prefixes, no traversal."""
 
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -15,9 +16,12 @@ class S3Uri:
 
 
 def parse_s3_uri(uri: str, *, bucket: str, prefixes: tuple[str, ...]) -> S3Uri:
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in uri):
-        raise InvalidUriError("control characters not allowed")
-    parts = urlsplit(uri)
+    if any(c.isspace() or unicodedata.category(c).startswith("C") for c in uri):
+        raise InvalidUriError("whitespace and control characters not allowed")
+    try:
+        parts = urlsplit(uri)
+    except ValueError as exc:
+        raise InvalidUriError("malformed uri") from exc
     if parts.scheme != "s3":
         raise InvalidUriError("scheme must be s3")
     if parts.query or parts.fragment:

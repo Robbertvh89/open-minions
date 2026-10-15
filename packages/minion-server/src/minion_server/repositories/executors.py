@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from minion_common.enums import ExecutorStatus
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.db.models import Executor
@@ -60,3 +60,13 @@ async def insert_unregistered(
     )
     await session.flush()
     return executor_id
+
+
+async def revoke(session: AsyncSession, executor_id: uuid.UUID) -> bool:
+    """Mark the executor REVOKED; returns False if it does not exist."""
+    result = await session.execute(
+        update(Executor)
+        .where(Executor.executor_id == executor_id)
+        .values(status=ExecutorStatus.REVOKED.value)
+    )
+    return bool(result.rowcount)  # type: ignore[attr-defined]

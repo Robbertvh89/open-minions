@@ -2,39 +2,47 @@
 
 import asyncio
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
 
 from minion_server.settings import ServerSettings
 
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
 MAX_PRESIGN_TTL_S = 3600
+COPY_READ_TIMEOUT_S = 300
 
 
 class S3Storage:
     def __init__(self, settings: ServerSettings) -> None:
         self._bucket = settings.s3_bucket
         self._ttl = min(settings.presign_ttl_s, MAX_PRESIGN_TTL_S)
-        cfg = Config(
-            signature_version="s3v4",
-            s3={"addressing_style": "path"},
-            connect_timeout=10,
-            read_timeout=10,
-            retries={"max_attempts": 2},
-        )
 
-        def make(endpoint: str) -> Any:
+        def cfg(read_timeout: int) -> Config:
+            return Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+                connect_timeout=10,
+                read_timeout=read_timeout,
+                retries={"max_attempts": 2},
+            )
+
+        def make(endpoint: str, read_timeout: int = 10) -> "S3Client":
             return boto3.client(
                 "s3",
                 endpoint_url=endpoint,
-                aws_access_key_id=settings.s3_access_key,
-                aws_secret_access_key=settings.s3_secret_key,
+                aws_access_key_id=settings.s3_access_key.get_secret_value(),
+                aws_secret_access_key=settings.s3_secret_key.get_secret_value(),
                 region_name=settings.s3_region,
-                config=cfg,
+                config=cfg(read_timeout),
             )
 
         self._client = make(settings.s3_endpoint_url)
+        # Server-side copies of large objects can run long; give them their own timeout.
+        self._copy_client = make(settings.s3_endpoint_url, COPY_READ_TIMEOUT_S)
         # Presigning is local; it uses the endpoint executors can reach.
         self._signer = make(settings.public_s3_endpoint_url)
 
@@ -92,7 +100,7 @@ class S3Storage:
 
     async def copy(self, src_key: str, dst_key: str) -> None:
         def _copy() -> None:
-            self._client.copy_object(
+            self._copy_client.copy_object(
                 Bucket=self._bucket,
                 Key=dst_key,
                 CopySource={"Bucket": self._bucket, "Key": src_key},

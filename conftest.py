@@ -6,7 +6,7 @@ import urllib.request
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import boto3
 import pytest
@@ -14,6 +14,9 @@ from alembic import command
 from alembic.config import Config
 from botocore.config import Config as BotoConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
 
 REPO_ROOT = Path(__file__).resolve().parent
 S3_IMAGE = "chrislusf/seaweedfs:4.05"  # keep in sync with deploy/compose.yml
@@ -53,7 +56,7 @@ class S3Env:
     secret_key: str
     bucket: str
     region: str
-    client: Any  # boto3 S3 client
+    client: "S3Client"
 
 
 def _wait_http(url: str, timeout_s: float = 60.0) -> None:

@@ -1,4 +1,5 @@
 import json
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -25,8 +26,9 @@ from pydantic import SecretStr
 
 BUDGET = Budget(profile=CapacityProfile.LIGHT, memory_gb=4, gpu_duty_cycle=0.25, max_batch_size=4)
 REQ = AcquireRequest(engines=[Engine.MLX], budget=BUDGET)
+AID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 ASSIGNMENT = {
-    "acquirement_id": 7,
+    "acquirement_id": str(AID),
     "attempt": 1,
     "team": "ml",
     "project": "p",
@@ -89,7 +91,7 @@ async def test_acquire_200_and_204() -> None:
 
     async with _client(handler) as c:
         a = await c.acquire(REQ)
-        assert a is not None and a.acquirement_id == 7
+        assert a is not None and a.acquirement_id == AID
         assert await c.acquire(REQ) is None
     assert seen[0].url.path == "/api/v1/executor/acquire"
     assert seen[0].headers["authorization"] == "Bearer tok123"
@@ -99,7 +101,7 @@ async def test_acquire_200_and_204() -> None:
 async def test_register_and_preference() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("register"):
-            return httpx.Response(200, json={"executor_id": 5})
+            return httpx.Response(200, json={"executor_id": str(AID)})
         assert req.method == "PUT"
         return httpx.Response(204)
 
@@ -115,7 +117,7 @@ async def test_register_and_preference() -> None:
                 budget=BUDGET,
             )
         )
-        assert r.executor_id == 5
+        assert r.executor_id == AID
         await c.set_preference(PreferenceRequest(team="ml"))
 
 
@@ -129,11 +131,11 @@ async def test_409_raises_stale(op: str) -> None:
     async with _client(handler) as c:
         with pytest.raises(StaleAcquirementError) as ei:
             if op == "complete":
-                await c.complete(7, CompleteRequest(record_count=1, byte_size=1, sha256="a" * 64))
+                await c.complete(AID, CompleteRequest(record_count=1, byte_size=1, sha256="a" * 64))
             elif op == "fail":
-                await c.fail(7, FailRequest(retryable=True, code="X", message="m"))
+                await c.fail(AID, FailRequest(retryable=True, code="X", message="m"))
             else:
-                await c.release(7)
+                await c.release(AID)
     assert ei.value.code == "STALE_ACQUIREMENT"
     assert ei.value.status_code == 409
 
@@ -141,7 +143,7 @@ async def test_409_raises_stale(op: str) -> None:
 async def test_other_errors_raise_api_error() -> None:
     async with _client(lambda r: httpx.Response(401, text="nope")) as c:
         with pytest.raises(ApiError) as ei:
-            await c.release(1)
+            await c.release(AID)
     assert not isinstance(ei.value, StaleAcquirementError)
     assert ei.value.status_code == 401
 
@@ -186,3 +188,30 @@ async def test_user_client_tasks() -> None:
 def test_insecure_client_rejected() -> None:
     with pytest.raises(ValueError):
         ExecutorClient("http://example.com", SecretStr("t"))
+
+
+async def test_other_409_is_plain_api_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": {"code": "CONFLICT", "message": "x"}})
+
+    async with _client(handler) as c:
+        with pytest.raises(ApiError) as ei:
+            await c.release(AID)
+    assert not isinstance(ei.value, StaleAcquirementError)
+    assert ei.value.code == "CONFLICT"
+
+
+@pytest.mark.parametrize("bad", ["../x", "a/b", "A", "a?b", ""])
+async def test_get_task_rejects_bad_segments(bad: str) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        called.append(req)
+        return httpx.Response(200)
+
+    async with UserClient(
+        "http://localhost", SecretStr("k"), transport=httpx.MockTransport(handler)
+    ) as u:
+        with pytest.raises(ValueError):
+            await u.get_task("ml", bad, "t")
+    assert not called

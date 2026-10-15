@@ -5,14 +5,17 @@ Executors use :class:`ExecutorClient` only — they never touch PostgreSQL (inva
 
 from __future__ import annotations
 
+import re
+import uuid
 from types import TracebackType
 from typing import Self
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, SecretStr
 
 from minion_common.schemas import (
+    SLUG_PATTERN,
     AcquireRequest,
     Assignment,
     Budget,
@@ -68,7 +71,8 @@ def _error_from(resp: httpx.Response) -> ApiError:
             message = detail
     except ValueError:
         pass
-    cls = StaleAcquirementError if resp.status_code == 409 else ApiError
+    stale = resp.status_code == 409 and code == "STALE_ACQUIREMENT"
+    cls = StaleAcquirementError if stale else ApiError
     return cls(resp.status_code, code, message)
 
 
@@ -130,13 +134,13 @@ class ExecutorClient(_BaseClient):
             return None
         return Assignment.model_validate_json(resp.content)
 
-    async def complete(self, acquirement_id: int, req: CompleteRequest) -> None:
+    async def complete(self, acquirement_id: uuid.UUID, req: CompleteRequest) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/complete", req)
 
-    async def fail(self, acquirement_id: int, req: FailRequest) -> None:
+    async def fail(self, acquirement_id: uuid.UUID, req: FailRequest) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/fail", req)
 
-    async def release(self, acquirement_id: int) -> None:
+    async def release(self, acquirement_id: uuid.UUID) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/release")
 
 
@@ -146,7 +150,12 @@ class UserClient(_BaseClient):
         return TaskOut.model_validate_json(resp.content)
 
     async def get_task(self, team: str, project: str, task_name: str) -> TaskOut:
-        resp = await self._send("GET", f"/tasks/{team}/{project}/{task_name}")
+        segments = []
+        for seg in (team, project, task_name):
+            if not re.fullmatch(SLUG_PATTERN, seg):
+                raise ValueError(f"invalid path segment {seg!r}")
+            segments.append(quote(seg, safe=""))
+        resp = await self._send("GET", "/tasks/" + "/".join(segments))
         return TaskOut.model_validate_json(resp.content)
 
 

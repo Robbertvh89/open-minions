@@ -25,6 +25,12 @@ def test_valid() -> None:
         "s3://minion/inputs/a?x=1",
         "s3://minion/inputs/./a",
         "s3://minion/inputs\\a",
+        "s3://minion/inputs/a b",
+        " s3://minion/inputs/a",
+        "s3://minion/inputs/a ",
+        "s3://minion/inputs/a\u200bb",
+        "s3://minion/inputs/a\u202eb",
+        "s3://[minion/inputs/a",
     ],
 )
 def test_rejected(uri: str) -> None:

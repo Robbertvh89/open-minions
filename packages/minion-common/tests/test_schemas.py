@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -93,7 +94,7 @@ def test_complete_sha256_format() -> None:
 
 def test_assignment_roundtrip() -> None:
     a = Assignment(
-        acquirement_id=1,
+        acquirement_id=uuid.uuid4(),
         attempt=1,
         team="ml",
         project="p",
@@ -111,5 +112,15 @@ def test_assignment_roundtrip() -> None:
         expires_at=datetime.now(UTC),
     )
     assert Assignment.model_validate_json(a.model_dump_json()) == a
+    for end in (0, 10):  # byte_end must exceed byte_start
+        with pytest.raises(ValidationError):
+            Assignment.model_validate({**a.model_dump(), "byte_start": 10, "byte_end": end})
+
+
+def test_allowed_pool_and_priority_bounds() -> None:
+    assert _task(allowed_pool="x" * 64).allowed_pool == "x" * 64
     with pytest.raises(ValidationError):
-        a.model_copy(update={"byte_end": 0}).model_validate({**a.model_dump(), "byte_end": 0})
+        _task(allowed_pool="x" * 65)
+    for bad in (-1001, 1001):
+        with pytest.raises(ValidationError):
+            _task(priority=bad)

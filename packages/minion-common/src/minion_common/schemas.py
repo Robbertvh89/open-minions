@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from minion_common.enums import CapacityProfile, Engine, TaskStatus, TaskType
 
@@ -43,8 +44,8 @@ class TaskCreate(_Model):
     output_uri: str = Field(min_length=1, max_length=2048)
     params: dict[str, Any] = Field(default_factory=dict)
     records_per_subtask: int = Field(default=500, ge=1, le=100_000)
-    priority: int = 0
-    allowed_pool: str | None = Field(default=None, min_length=1, max_length=200)
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    allowed_pool: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class TaskCounts(_Model):
@@ -87,7 +88,7 @@ class RegisterRequest(_Model):
 
 
 class RegisterResponse(_Model):
-    executor_id: int
+    executor_id: uuid.UUID
 
 
 class PreferenceRequest(_Model):
@@ -104,7 +105,7 @@ class AcquireRequest(_Model):
 
 
 class Assignment(_Model):
-    acquirement_id: int
+    acquirement_id: uuid.UUID
     attempt: int = Field(ge=1)
     team: str
     project: str
@@ -119,6 +120,12 @@ class Assignment(_Model):
     record_count: int = Field(ge=1)
     output_url: str
     expires_at: datetime
+
+    @model_validator(mode="after")
+    def _check_range(self) -> Self:
+        if self.byte_end <= self.byte_start:
+            raise ValueError("byte_end must be greater than byte_start")
+        return self
 
 
 class CompleteRequest(_Model):
