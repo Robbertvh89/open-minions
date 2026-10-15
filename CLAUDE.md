@@ -98,10 +98,27 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy packages
 
 ## Workflow
 
+Follow the **`feature-workflow`** skill for every feature or fix:
+
 1. Every feature or bugfix starts with a backlog item: `backlog task create "<title>"`.
-2. Work via plan → code → test → review; use the project skills (verifieer-feature, security-audit,
-   code-quality) where applicable.
-3. One branch per feature/fix off `main`, one PR per branch. Conventional Commits.
+2. One branch per feature/fix off `main`, one PR per branch. Conventional Commits. Squash-merge after
+   CI is green and review/security verdicts pass.
+3. The main session orchestrates; work is delegated to project subagents (`.claude/agents/`):
+
+| Agent | Model | Role | Skill |
+|---|---|---|---|
+| `planner` | Opus | Backlog task → file-level plan | — |
+| `implementer` | Sonnet | Code + unit tests per plan step; applies fixes | `db-migration` when schema changes |
+| `test-engineer` | Sonnet | Integration, concurrency, fault-injection tests | — |
+| `verifier` | Sonnet | Evidence per acceptance criterion, live run | `verifieer-feature` |
+| `reviewer` | Opus | Correctness, invariants, spec conformance | `code-quality` |
+| `security-auditor` | Opus | Threat-model audit | `security-audit` |
+| `docs-keeper` | Haiku | Sync docs, ADR stubs, backlog notes | — |
+
+Pipeline: plan → implement → test → verify → (review ∥ security) → fix loop → docs → PR → CI → merge.
+
+Project skills (`.claude/skills/`): `feature-workflow`, `verifieer-feature`, `code-quality`,
+`security-audit`, `db-migration`.
 
 ## Security notes
 
