@@ -1,10 +1,10 @@
 ---
 id: TASK-2.2
 title: 'M1.2: Protocol endpoints: tasks, splitter, acquire, complete/fail/release'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 16:46'
+updated_date: '2026-10-15 16:51'
 labels:
   - M1
 dependencies:
