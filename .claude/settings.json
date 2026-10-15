@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+      "Bash(uv:*)",
+      "Bash(uvx:*)",
+      "Bash(git:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh run:*)",
+      "Bash(gh repo view:*)",
+      "Bash(backlog:*)",
+      "Bash(docker compose:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker manifest inspect:*)",
+      "Bash(curl:*)",
+      "Bash(rtk:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(gh repo delete:*)",
+      "Bash(docker compose down -v:*)"
+    ]
+  }
+}
