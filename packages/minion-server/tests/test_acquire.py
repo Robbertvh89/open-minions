@@ -323,3 +323,80 @@ async def test_revoked_executor_cannot_register(http: tuple[AsyncClient, Any]) -
             )
         ).one()
     assert tuple(row) == ("REVOKED", "(unregistered)")
+
+
+@pytest.mark.integration
+async def test_removed_model_does_not_starve_valid_work(
+    sm: async_sessionmaker[AsyncSession], fresh_url: str
+) -> None:
+    """16+ head candidates whose model left the allow-list must not hide lower-priority work."""
+    cfg = _settings(fresh_url)
+    await seed_task(sm, "gone", 20, model_id="removed-model", priority=10)  # > CANDIDATE_LIMIT
+    await seed_task(sm, "valid", 2, priority=0)
+    ((p, _),) = await make_executors(sm, 1)
+    got = await _acquire(sm, p, cfg)
+    assert got is not None and got.task_name == "valid"
+    async with sm() as s:
+        gone_rows = (
+            await s.execute(
+                text("SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='gone'")
+            )
+        ).scalar_one()
+    assert gone_rows == 0
+
+
+@pytest.mark.integration
+async def test_stale_candidate_cannot_reacquire_finished_subtask(
+    sm: async_sessionmaker[AsyncSession],
+) -> None:
+    """Deterministic D5 re-check: a candidate read before another owner finished is rejected."""
+    from minion_server.repositories import acquisition as repo
+
+    await seed_task(sm, "stale", 2)
+    (a, _), (b, _) = await make_executors(sm, 2)
+
+    async def read() -> list[repo.Candidate]:
+        async with sm() as s, s.begin():
+            return await repo.candidates(
+                s,
+                engines=[Engine.MLX],
+                model_ids=["fake-embed"],
+                memory_gb=8,
+                pool="default",
+                preference=None,
+            )
+
+    stale = await read()
+    c0, c1 = stale[0], stale[1]
+    async with sm() as s, s.begin():
+        won = await repo.try_acquire(s, c0, a.executor_id)
+        assert won is not None
+    # owner finishes (what complete does): acquirement dropped, subtask terminal
+    async with sm() as s, s.begin():
+        await s.execute(text("DELETE FROM minion_subtask_acquirement WHERE subtask_id=0"))
+        await s.execute(
+            text(
+                "UPDATE minion_subtask SET status='SUCCEEDED'"
+                " WHERE subtask_id=0 AND task_name='stale'"
+            )
+        )
+    async with sm() as s, s.begin():
+        assert await repo.try_acquire(s, c0, b.executor_id) is None
+    # terminal failure likewise
+    async with sm() as s, s.begin():
+        assert await repo.try_acquire(s, c1, a.executor_id) is not None
+        await s.execute(text("DELETE FROM minion_subtask_acquirement WHERE subtask_id=1"))
+        await s.execute(
+            text(
+                "UPDATE minion_subtask SET status='FAILED' WHERE subtask_id=1 AND task_name='stale'"
+            )
+        )
+    async with sm() as s, s.begin():
+        assert await repo.try_acquire(s, c1, b.executor_id) is None
+    async with sm() as s:
+        n = (
+            await s.execute(
+                text("SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='stale'")
+            )
+        ).scalar_one()
+    assert n == 0  # the rejected acquires left no acquirement rows behind

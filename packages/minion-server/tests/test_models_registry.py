@@ -8,8 +8,12 @@ REPO = Path(__file__).resolve().parents[3]
 
 def test_default_file_loads() -> None:
     reg = load_models(REPO / "deploy" / "models.yaml")
-    assert "fake-embed" in reg
-    assert reg["fake-embed"].type == "embedding"
+    assert "bge-small-en" in reg
+    assert "fake-embed" not in reg  # test-only entry lives in tests/models.test.yaml
+
+
+def test_test_file_loads() -> None:
+    assert load_models(Path(__file__).with_name("models.test.yaml"))["fake-embed"].memory_gb == 0.1
 
 
 def test_duplicate_rejected(tmp_path: Path) -> None:

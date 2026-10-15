@@ -11,7 +11,7 @@ from minion_server.errors import api_error
 from minion_server.repositories import completion as repo
 from minion_server.services.acquisition import attempt_key
 from minion_server.settings import ServerSettings
-from minion_server.storage import S3Storage
+from minion_server.storage import PreconditionFailedError, S3Storage
 from minion_server.uris import parse_s3_uri
 
 STALE_MESSAGE = "acquirement is not current"
@@ -61,12 +61,18 @@ async def complete(
         out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
         src = attempt_key(out.key, o.subtask_id, o.attempt)
         dst = f"{out.key.rstrip('/')}/{o.subtask_id:06d}.jsonl"
-        size = await storage.head(src)
-        if size is None:
+        stat = await storage.stat(src)
+        if stat is None:
             raise api_error(422, "OUTPUT_MISSING", "attempt output object not found")
-        if size != req.byte_size:
+        if stat.size != req.byte_size:
             raise api_error(422, "OUTPUT_SIZE_MISMATCH", "attempt output size differs")
-        await storage.copy(src, dst)  # CopyObject is idempotent: safe if the commit fails
+        try:
+            # If-Match on the HEAD ETag closes the check-then-copy window (TOCTOU).
+            await storage.copy(src, dst, if_match=stat.etag)  # idempotent if the commit fails
+        except PreconditionFailedError as exc:
+            raise api_error(
+                422, "OUTPUT_CHANGED", "attempt output changed while being verified"
+            ) from exc
         await repo.finish_attempt(
             session,
             o,

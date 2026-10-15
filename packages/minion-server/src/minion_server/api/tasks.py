@@ -114,19 +114,24 @@ async def create_task(
     if model.type != body.type:
         raise api_error(422, "MODEL_TYPE_MISMATCH", "model type does not match task type")
     in_uri, out_uri, in_key = validate_uris(body, settings)
-    if not await storage.list_keys(in_key):
+    if not await storage.any_key(in_key):
         raise api_error(422, "EMPTY_INPUT", "no objects under the input prefix")
-    async with session.begin():
-        created = await tasks_repo.insert_task(
-            session,
-            body,
-            model=model,
-            input_uri=in_uri,
-            output_uri=out_uri,
-            created_by=user.name,
-        )
-        if not created:
-            raise api_error(409, "TASK_EXISTS", "a task with this name already exists")
+    try:
+        async with session.begin():
+            created = await tasks_repo.insert_task(
+                session,
+                body,
+                model=model,
+                input_uri=in_uri,
+                output_uri=out_uri,
+                created_by=user.name,
+            )
+            if not created:
+                raise api_error(409, "TASK_EXISTS", "a task with this name already exists")
+    except tasks_repo.OutputUriInUseError as exc:
+        raise api_error(
+            409, "OUTPUT_URI_IN_USE", "another task already writes to this output prefix"
+        ) from exc
     return await _get(session, body.team, body.project, body.task_name)
 
 

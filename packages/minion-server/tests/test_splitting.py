@@ -71,3 +71,21 @@ def test_start_offset_shifts_ranges() -> None:
 def test_invalid_n() -> None:
     with pytest.raises(ValueError):
         list(slice_jsonl([b"x\n"], 0, 0))
+
+
+def test_line_cap_across_chunks() -> None:
+    from minion_server.splitting import LineTooLongError
+
+    with pytest.raises(LineTooLongError):
+        list(slice_jsonl(_chunked(b"x" * 5000, 100), 0, 2, max_line_bytes=1024))
+    with pytest.raises(LineTooLongError):  # terminated, but too long
+        list(slice_jsonl([b"x" * 2000 + b"\n"], 0, 2, max_line_bytes=1024))
+    ok = b"y" * 1024 + b"\n" + b"z" * 1024  # exactly at the cap (newline excluded)
+    assert [s.record_count for s in slice_jsonl(_chunked(ok, 7), 0, 5, max_line_bytes=1024)] == [2]
+
+
+@pytest.mark.parametrize("size", [1, 5, 64])
+def test_cap_does_not_change_slicing(size: int) -> None:
+    data = _recs(30) + b"\n \n" + _recs(3, "t").rstrip(b"\n")
+    capped = list(slice_jsonl(_chunked(data, size), 0, 4, max_line_bytes=100))
+    assert capped == list(slice_jsonl([data], 0, 4))

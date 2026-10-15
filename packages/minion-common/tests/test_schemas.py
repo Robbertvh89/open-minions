@@ -124,3 +124,14 @@ def test_allowed_pool_and_priority_bounds() -> None:
     for bad in (-1001, 1001):
         with pytest.raises(ValidationError):
             _task(priority=bad)
+
+
+def test_engines_list_is_bounded() -> None:
+    import pytest
+    from minion_common.schemas import AcquireRequest
+    from pydantic import ValidationError
+
+    budget = {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 8}
+    AcquireRequest.model_validate({"engines": ["mlx"] * 16, "budget": budget})
+    with pytest.raises(ValidationError):
+        AcquireRequest.model_validate({"engines": ["mlx"] * 17, "budget": budget})

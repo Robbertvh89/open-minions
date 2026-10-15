@@ -142,10 +142,18 @@ used by the executor and by tests, shared settings base.
 User ─POST /tasks─▶ Server: validate (team membership, model allow-list + type, team-scoped S3 URIs
                     `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output)
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
-Splitter (async):   list input objects → scan JSONL → emit slices of N records
-                    bulk INSERT minion_subtask(status=PENDING, attempt=0)
+Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
+                    list input objects → scan JSONL → stream batches of slices of N records
+                    per batch: compare with existing rows (key, byte range; mismatch → INPUT_CHANGED),
+                    INSERT minion_subtask(status=PENDING, attempt=0) ON CONFLICT DO NOTHING
                     UPDATE minion_task SET status=PENDING, total_subtasks=k
 ```
+Splitting is bounded (line length, total bytes, objects, subtasks per task; see `MINION_SPLIT_*`)
+and no transaction is held open while reading S3. Deterministic problems (bad URI, empty input,
+limit exceeded, `LINE_TOO_LONG`, `INPUT_CHANGED`, S3 `AccessDenied`/`NoSuchKey`/`InvalidObjectState`)
+mark the task `FAILED` with `error`. Anything else backs off exponentially via `next_split_at` and
+fails the task after `split_max_attempts`, so one bad task never blocks the queue. `output_uri` is
+unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it.
 
 ### 3.2 Acquire (the core protocol)
 ```
@@ -207,10 +215,14 @@ Watchdog (every 60 s):
       -- if nothing returned, someone else already handled it → skip
       DELETE heartbeat row
       INSERT minion_subtask_attempt(outcome=EXPIRED)
-      UPDATE minion_subtask SET status = CASE WHEN attempt >= max_attempts
+      UPDATE minion_subtask SET status = CASE WHEN <FAILED+EXPIRED attempts> >= max_attempts
                                               THEN 'FAILED' ELSE 'PENDING' END
     COMMIT
 ```
+**Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
+(`fail` already counts the attempt being recorded). A voluntary `release` does not consume it.
+`attempt` itself keeps counting every acquisition (it keys the output object), so it is *not* the
+budget; the watchdog (M2) must use the same count, not `attempt >= max_attempts`.
 Because the acquirement row is deleted, the unique constraint frees up and any executor can re-acquire.
 A zombie executor that wakes up later gets `409 STALE_ACQUIREMENT` on its next call and discards its work.
 

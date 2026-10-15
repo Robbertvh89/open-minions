@@ -8,8 +8,9 @@ from minion_server.api import executor as executor_api
 from minion_server.api import tasks as tasks_api
 from minion_server.auth import load_api_keys
 from minion_server.db.session import create_engine, create_sessionmaker
+from minion_server.limits import BodyLimitMiddleware
 from minion_server.models_registry import load_models
-from minion_server.services.splitter import run_splitter
+from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 
@@ -31,8 +32,14 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         app.state.storage = S3Storage(cfg)
         app.state.models = load_models(cfg.models_file)
         splitter = asyncio.create_task(
-            run_splitter(app.state.sessionmaker, app.state.storage, cfg.splitter_poll_s)
+            run_splitter(
+                app.state.sessionmaker,
+                app.state.storage,
+                cfg.splitter_poll_s,
+                SplitLimits.from_settings(cfg),
+            )
         )
+        app.state.splitter_task = splitter
         try:
             yield
         finally:
@@ -42,6 +49,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 
     app = FastAPI(title="open-minions server", version="0.1.0", lifespan=lifespan)
 
+    app.add_middleware(BodyLimitMiddleware)
     app.include_router(tasks_api.router)
     app.include_router(executor_api.router)
 

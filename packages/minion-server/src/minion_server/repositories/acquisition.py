@@ -5,6 +5,7 @@ Ownership is decided solely by `INSERT ... ON CONFLICT DO NOTHING` into
 """
 
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -39,7 +40,6 @@ class Candidate:
     record_count: int
     output_uri: str
     params: dict[str, Any]
-    task_type: str
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ async def candidates(
     session: AsyncSession,
     *,
     engines: list[Engine],
+    model_ids: Collection[str],
     memory_gb: float,
     pool: str,
     preference: tuple[str | None, str | None, str | None] | None,
@@ -61,6 +62,8 @@ async def candidates(
 
     `preference` filters (None entries are wildcards); `None` means no preference filter.
     """
+    if not model_ids:
+        return []
     stmt = (
         select(
             Subtask.team,
@@ -74,7 +77,6 @@ async def candidates(
             Subtask.record_count,
             Task.output_uri,
             Task.params,
-            Task.type,
         )
         .join(
             Task,
@@ -85,6 +87,7 @@ async def candidates(
         .where(
             Subtask.status == SubtaskStatus.PENDING.value,
             Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+            Task.model_id.in_(list(model_ids)),  # removed models must not occupy the head
             Task.engine.in_([e.value for e in engines]),
             Task.model_memory_gb <= Decimal(str(memory_gb)),
             (Task.allowed_pool.is_(None)) | (Task.allowed_pool == pool),
@@ -119,7 +122,6 @@ async def candidates(
             record_count=r[8],
             output_uri=r[9],
             params=r[10],
-            task_type=str(r[11].value if hasattr(r[11], "value") else r[11]),
         )
         for r in rows
     ]

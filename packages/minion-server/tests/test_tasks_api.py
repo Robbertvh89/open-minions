@@ -13,7 +13,7 @@ from minion_server.app import create_app
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.splitter import split_one
+from minion_server.services.splitter import SplitLimits, split_one
 from minion_server.settings import ServerSettings
 from minion_server.splitting import slice_jsonl
 from minion_server.storage import S3Storage
@@ -21,7 +21,7 @@ from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from conftest import S3Env
+from conftest import TEST_MODELS_FILE, S3Env
 
 KEY = "k-tasks-secret"
 
@@ -35,8 +35,8 @@ def _settings(url: str, s3: S3Env | None = None, keys: Path | None = None) -> Se
         s3_bucket=s3.bucket if s3 else "minion",
         s3_region=s3.region if s3 else "us-east-1",
         api_keys_file=str(keys) if keys else None,
-        models_file=str(Path(__file__).resolve().parents[3] / "deploy" / "models.yaml"),
-        splitter_poll_s=0.05,
+        models_file=TEST_MODELS_FILE,
+        splitter_poll_s=60,  # tests drive split_one directly
     )
 
 
@@ -106,6 +106,9 @@ async def app_client(
     keys.write_text(f"keys:\n  - name: alice\n    sha256: {digest}\n    teams: [api1, api2]\n")
     app = create_app(_settings(migrated_url, s3, keys))
     async with app.router.lifespan_context(app):
+        # Tests drive split_one themselves; a live background splitter would race for the lease.
+        app.state.splitter_task.cancel()
+        await asyncio.gather(app.state.splitter_task, return_exceptions=True)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://t") as c:
             c.headers["Authorization"] = f"Bearer {KEY}"
@@ -127,18 +130,16 @@ def _payload(team: str, name: str, **kw: Any) -> dict[str, Any]:
 
 @pytest.mark.integration
 async def test_create_split_and_get(app_client: tuple[AsyncClient, FastAPI], s3: S3Env) -> None:
-    c, _ = app_client
+    c, app = app_client
     _put(s3, "inputs/api1/e2e/a.jsonl", _jsonl(25, "a"))
     _put(s3, "inputs/api1/e2e/b.jsonl", _jsonl(10, "b"))
     r = await c.post("/api/v1/tasks", json=_payload("api1", "e2e"))
     assert r.status_code == 202, r.text
     assert r.json()["status"] == "SPLITTING"
 
-    for _ in range(100):
-        got = (await c.get("/api/v1/tasks/api1/p/e2e")).json()
-        if got["status"] != "SPLITTING":
-            break
-        await asyncio.sleep(0.05)
+    while await split_one(app.state.sessionmaker, app.state.storage):
+        pass
+    got = (await c.get("/api/v1/tasks/api1/p/e2e")).json()
     assert got["status"] == "PENDING"
     assert got["counts"]["total"] == 4 == got["counts"]["pending"]  # 10+10+5, then 10
 
@@ -281,14 +282,14 @@ async def test_split_resumes_after_crash(
         await real(session, task, rows)
 
     monkeypatch.setattr(tasks_repo, "insert_subtasks", flaky)
+    lim = SplitLimits(backoff_base_s=0)  # retry immediately
     # claim picks the oldest SPLITTING task; "resume" was inserted first
-    with pytest.raises(RuntimeError):
-        await split_one(sm, storage, batch_size=3)
+    assert await split_one(sm, storage, lim, batch_size=3)  # crash is absorbed and retried
     partial = await _subtasks(engine, "resume")
     assert len(partial) == 3  # first batch committed, task still SPLITTING
 
     monkeypatch.setattr(tasks_repo, "insert_subtasks", real)
-    while await split_one(sm, storage, batch_size=3):
+    while await split_one(sm, storage, lim, batch_size=3):
         pass
     resumed = await _subtasks(engine, "resume")
     clean = await _subtasks(engine, "clean")
@@ -317,3 +318,201 @@ async def test_empty_input_fails_task(engine: AsyncEngine, storage: S3Storage, s
     assert row[0] == "FAILED"
     assert "no records" in row[1]
     assert row[2] is not None
+
+
+# --- splitter hardening ----------------------------------------------------------------------
+
+
+async def _task_row(engine: AsyncEngine, name: str) -> tuple[Any, ...]:
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT status, error, split_attempts, total_subtasks FROM minion_task"
+                    " WHERE task_name=:n"
+                ),
+                {"n": name},
+            )
+        ).one()
+    return tuple(row)
+
+
+@pytest.mark.integration
+async def test_line_too_long_fails_task(engine: AsyncEngine, storage: S3Storage, s3: S3Env) -> None:
+    _put(s3, "inputs/hd1/long/a.jsonl", b"x" * 5000)  # no newline at all, > cap
+    await _insert_task(engine, "hd1", "long")
+    sm = create_sessionmaker(engine)
+    lim = SplitLimits(max_line_bytes=1024)
+    while await split_one(sm, storage, lim):
+        pass
+    status, error, attempts, _ = await _task_row(engine, "long")
+    assert status == "FAILED" and error.startswith("LINE_TOO_LONG") and attempts == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("limits", "needle"),
+    [
+        (SplitLimits(max_objects=1), "objects"),
+        (SplitLimits(max_input_bytes=100), "larger than"),
+        (SplitLimits(max_subtasks=2), "subtasks"),
+    ],
+)
+async def test_input_limits_fail_task(
+    engine: AsyncEngine, storage: S3Storage, s3: S3Env, limits: SplitLimits, needle: str
+) -> None:
+    name = f"lim-{needle.split()[0]}"
+    _put(s3, f"inputs/hd2/{name}/a.jsonl", _jsonl(10, "a"))
+    _put(s3, f"inputs/hd2/{name}/b.jsonl", _jsonl(10, "b"))
+    await _insert_task(engine, "hd2", name, 2)
+    sm = create_sessionmaker(engine)
+    while await split_one(sm, storage, limits):
+        pass
+    status, error, _, _ = await _task_row(engine, name)
+    assert status == "FAILED" and needle in error
+
+
+@pytest.mark.integration
+async def test_bad_task_does_not_block_queue(
+    engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task A's input is unreadable (transient error); the later task B is still split."""
+    _put(s3, "inputs/hd3/bad/a.jsonl", _jsonl(5, "a"))
+    _put(s3, "inputs/hd3/good/a.jsonl", _jsonl(5, "g"))
+    await _insert_task(engine, "hd3", "bad", 2)
+    await _insert_task(engine, "hd3", "good", 2)
+    sm = create_sessionmaker(engine)
+
+    real = S3Storage.iter_object
+
+    def broken(self: S3Storage, key: str, chunk_size: int = 1 << 20) -> Any:
+        if "/bad/" in key:
+            raise ConnectionError("simulated outage")
+        return real(self, key, chunk_size)
+
+    monkeypatch.setattr(S3Storage, "iter_object", broken)
+    lim = SplitLimits(backoff_base_s=1000, max_attempts=3)
+    assert await split_one(sm, storage, lim)  # A: fails, backs off
+    assert (await _task_row(engine, "bad"))[:3] == ("SPLITTING", None, 1)
+    assert await split_one(sm, storage, lim)  # B is next although A is older
+    assert (await _task_row(engine, "good"))[0] == "PENDING"
+    assert not await split_one(sm, storage, lim)  # A is backing off: nothing due
+
+    lim0 = SplitLimits(backoff_base_s=0, max_attempts=3)
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE minion_task SET next_split_at=now() WHERE task_name='bad'"))
+    while await split_one(sm, storage, lim0):
+        pass
+    status, error, attempts, _ = await _task_row(engine, "bad")
+    assert (status, attempts) == ("FAILED", 3) and "3 attempts" in error
+    assert "outage" not in error  # error text never echoes exception details
+
+
+@pytest.mark.integration
+async def test_deterministic_s3_error_fails_immediately(
+    engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from botocore.exceptions import ClientError
+
+    _put(s3, "inputs/hd4/denied/a.jsonl", _jsonl(2, "a"))
+    await _insert_task(engine, "hd4", "denied")
+
+    def denied(self: S3Storage, key: str, chunk_size: int = 1 << 20) -> Any:
+        raise ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetObject")
+
+    monkeypatch.setattr(S3Storage, "iter_object", denied)
+    sm = create_sessionmaker(engine)
+    while await split_one(sm, storage):
+        pass
+    status, error, attempts, _ = await _task_row(engine, "denied")
+    assert (status, attempts) == ("FAILED", 1) and "AccessDenied" in error
+
+
+@pytest.mark.integration
+async def test_resume_detects_changed_input(
+    engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put(s3, "inputs/hd5/chg/a.jsonl", _jsonl(20, "r"))
+    _put(s3, "inputs/hd5/shrunk/a.jsonl", _jsonl(20, "r"))
+    await _insert_task(engine, "hd5", "chg", 2)
+    await _insert_task(engine, "hd5", "shrunk", 2)
+    sm = create_sessionmaker(engine)
+    real = tasks_repo.insert_subtasks
+    state = {"fail": True}
+
+    async def flaky(session: Any, task: Any, rows: Any) -> None:
+        if state["fail"] and rows[0].subtask_id > 0:
+            raise RuntimeError("crash mid-split")
+        await real(session, task, rows)
+
+    monkeypatch.setattr(tasks_repo, "insert_subtasks", flaky)
+    lim = SplitLimits(backoff_base_s=0)
+    assert await split_one(sm, storage, lim, batch_size=3)  # "chg": first batch only
+    assert await split_one(sm, storage, lim, batch_size=3)  # "shrunk": first batch only
+    state["fail"] = False
+    _put(s3, "inputs/hd5/chg/a.jsonl", _jsonl(2, "DIFFERENT-PREFIX-LONGER") + _jsonl(18, "r"))
+    _put(s3, "inputs/hd5/shrunk/a.jsonl", _jsonl(4, "r"))  # same prefix bytes, fewer records
+    while await split_one(sm, storage, lim, batch_size=3):
+        pass
+    assert (await _task_row(engine, "chg"))[:2] == (
+        "FAILED",
+        "INPUT_CHANGED: input differs from a previous split attempt",
+    )
+    status, error, _, _ = await _task_row(engine, "shrunk")
+    assert status == "FAILED" and error.startswith("INPUT_CHANGED")
+
+
+@pytest.mark.integration
+async def test_output_uri_collision_and_nesting(
+    app_client: tuple[AsyncClient, FastAPI], s3: S3Env
+) -> None:
+    c, _ = app_client
+    _put(s3, "inputs/api1/oc/a.jsonl", _jsonl(1, "x"))
+    first = _payload(
+        "api1",
+        "oc1",
+        input_uri="s3://minion/inputs/api1/oc",
+        output_uri="s3://minion/outputs/api1/shared",
+    )
+    assert (await c.post("/api/v1/tasks", json=first)).status_code == 202
+    other = first | {"task_name": "oc2", "output_uri": "s3://minion/outputs/api1/shared/"}
+    r = await c.post("/api/v1/tasks", json=other)  # same normalized prefix
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "OUTPUT_URI_IN_USE"
+    same_name = await c.post("/api/v1/tasks", json=first)
+    assert same_name.json()["detail"]["code"] == "TASK_EXISTS"
+    # nested prefixes cannot collide: keys are {prefix}NNNNNN.jsonl and {prefix}_attempts/...
+    nested = first | {"task_name": "oc3", "output_uri": "s3://minion/outputs/api1/shared/inner"}
+    assert (await c.post("/api/v1/tasks", json=nested)).status_code == 202
+    bad = first | {"task_name": "oc4", "output_uri": "s3://minion/outputs/api1/shared/_attempts"}
+    assert (await c.post("/api/v1/tasks", json=bad)).status_code == 422
+
+
+def test_nested_output_prefixes_have_disjoint_keys() -> None:
+    from minion_server.services.acquisition import attempt_key
+
+    outer, inner = "outputs/t/a/", "outputs/t/a/b/"
+    keys_outer = {f"{outer}{i:06d}.jsonl" for i in range(50)} | {
+        attempt_key(outer, i, 1) for i in range(50)
+    }
+    keys_inner = {f"{inner}{i:06d}.jsonl" for i in range(50)} | {
+        attempt_key(inner, i, 1) for i in range(50)
+    }
+    assert keys_outer.isdisjoint(keys_inner)  # holds because `_attempts` segments are rejected
+
+
+@pytest.mark.integration
+async def test_oversize_body_rejected_before_auth(app_client: tuple[AsyncClient, FastAPI]) -> None:
+    c, _ = app_client
+    big = b"{" + b" " * (2 << 20) + b"}"
+    unauth = {"Authorization": "Bearer nope"}
+    r = await c.post("/api/v1/tasks", content=big, headers=unauth)
+    assert r.status_code == 413 and r.json()["detail"]["code"] == "PAYLOAD_TOO_LARGE"
+
+    async def chunks() -> Any:  # chunked: no Content-Length
+        for _ in range(4):
+            yield b" " * (512 << 10)
+
+    r = await c.post("/api/v1/tasks", content=chunks(), headers=unauth)
+    assert r.status_code == 413
+    ok = await c.post("/api/v1/tasks", json={}, headers=unauth)
+    assert ok.status_code == 401  # small bodies still reach auth

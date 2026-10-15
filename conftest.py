@@ -41,6 +41,7 @@ S3_ACCESS_KEY = "minion"  # matches deploy/seaweedfs/s3.json
 S3_SECRET_KEY = "minion-secret"  # noqa: S105
 S3_BUCKET = "minion"
 S3_REGION = "us-east-1"
+TEST_MODELS_FILE = str(REPO_ROOT / "packages" / "minion-server" / "tests" / "models.test.yaml")
 
 
 @pytest.fixture(scope="session")
@@ -75,17 +76,17 @@ async def fresh_url(postgres_url: str) -> AsyncIterator[str]:
     name = f"t_{uuid.uuid4().hex[:16]}"
     base = make_url(postgres_url)
     admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
-    async with admin.connect() as conn:
-        await conn.execute(text(f'CREATE DATABASE "{name}"'))
-    url = base.set(database=name).render_as_string(hide_password=False)
-    cfg = Config(str(REPO_ROOT / "alembic.ini"))
-    cfg.set_main_option("sqlalchemy.url", url)
-    await asyncio.to_thread(command.upgrade, cfg, "head")
     try:
+        async with admin.connect() as conn:
+            await conn.execute(text(f'CREATE DATABASE "{name}"'))
+        url = base.set(database=name).render_as_string(hide_password=False)
+        cfg = Config(str(REPO_ROOT / "alembic.ini"))
+        cfg.set_main_option("sqlalchemy.url", url)
+        await asyncio.to_thread(command.upgrade, cfg, "head")
         yield url
     finally:
         async with admin.connect() as conn:
-            await conn.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+            await conn.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
         await admin.dispose()
 
 
@@ -156,7 +157,7 @@ def _settings(url: str) -> ServerSettings:
         database_url=SecretStr(url),
         s3_access_key=SecretStr("ak"),
         s3_secret_key=SecretStr("sk"),
-        models_file="deploy/models.yaml",
+        models_file=TEST_MODELS_FILE,
         splitter_poll_s=60,
     )
 
@@ -182,6 +183,7 @@ async def seed_task(
     priority: int = 0,
     status: str = "PENDING",
     team: str = "acq",
+    model_id: str = "fake-embed",
 ) -> None:
     body = TaskCreate.model_validate(
         {
@@ -189,7 +191,7 @@ async def seed_task(
             "project": "p",
             "task_name": name,
             "type": "embedding",
-            "model": "fake-embed",
+            "model": model_id,
             "input_uri": f"s3://minion/inputs/{team}/{name}/",
             "output_uri": f"s3://minion/outputs/{team}/{name}/",
             "priority": priority,
@@ -197,7 +199,7 @@ async def seed_task(
         }
     )
     model = ModelEntry(
-        model_id="fake-embed", type="embedding", engine=engine, ref="f", memory_gb=memory_gb
+        model_id=model_id, type="embedding", engine=engine, ref="f", memory_gb=memory_gb
     )
     async with sm() as s, s.begin():
         inserted = await tasks_repo.insert_task(

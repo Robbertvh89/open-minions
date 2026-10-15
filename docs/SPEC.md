@@ -111,8 +111,9 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 - FR-31. If no heartbeat for `heartbeat_timeout` (default 15 min = 3 missed beats) **[ours]**, the
   watchdog deletes the acquirement, archives it as `EXPIRED`, increments `attempt`, and sets the
   subtask back to `PENDING` **[paper semantics]**.
-- FR-32. After `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or
-  `PARTIAL` depending on policy **[ours]**.
+- FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts; once it reaches
+  `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or `PARTIAL`
+  depending on policy. A voluntary `release` does not consume the budget **[ours]**.
 - FR-33. Executor-reported errors: retryable (OOM, download failure) → requeue; non-retryable (bad
   input) → `FAILED` immediately **[ours]**.
 - FR-34. A late result from a reclaimed owner is rejected (`409 STALE_ACQUIREMENT`) **[ours]**.
@@ -187,12 +188,19 @@ client. The schemas and typed client exist (TASK-2.1); the endpoints themselves 
 **Error body.** Every error is `{"detail": {"code": "<CODE>", "message": "<text>"}}`. Messages are
 diagnostic only and never echo payload content. Codes: `UNAUTHORIZED` (401: missing, invalid, expired
 or revoked credential) and `STALE_ACQUIREMENT` (409, below). Other 4xx responses (403 team not in the
-key's teams, 422 invalid input or URI, 404) carry the same shape with their own code.
+key's teams, 422 invalid input or URI, 404) carry the same shape with their own code. Also:
+`TASK_EXISTS` and `OUTPUT_URI_IN_USE` (409, task create: the name, respectively the normalized
+output prefix, belongs to another task), `PAYLOAD_TOO_LARGE` (413: request body above
+`MINION_MAX_REQUEST_BODY_BYTES`, default 1 MiB, enforced before authentication), and
+`OUTPUT_CHANGED` (422, complete: the attempt object changed during verification). A task whose
+splitting fails becomes `FAILED` with `error` set to a short code-prefixed message, for example
+`LINE_TOO_LONG` (a JSONL line above `MINION_SPLIT_MAX_LINE_BYTES`, default 16 MiB) or
+`INPUT_CHANGED` (the input differs from rows written by an earlier split attempt).
 
 ### 6.1 User-facing
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/tasks` | Create task. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
+| `POST` | `/tasks` | Create task. `input_uri` and `output_uri` are prefixes: a missing trailing `/` is added, and `output_uri` must be unique across tasks. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
 | `GET` | `/tasks?team=&project=&status=` | List tasks |
 | `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts (`TaskOut`, below) |
 | `GET` | `/tasks/{team}/{project}/{task_name}/subtasks` | Paginated subtasks |
@@ -213,6 +221,9 @@ key's teams, 422 invalid input or URI, 404) carry the same shape with their own 
 
 Errors: `409 STALE_ACQUIREMENT` if `acquirement_id` is no longer current (or belongs to another
 executor; the response is identical for both, so ids cannot be probed); `401` auth.
+`complete` is idempotent for the same owner: a retry after a lost response returns `204` again. A
+retried `fail` or `release` after a lost response returns `409` (the acquirement is already gone),
+so executors must treat `409` on those two as "already handled".
 Executors should back off with jitter on `204` (default 10–30 s).
 
 **Identifiers.** `acquirement_id` and `executor_id` are UUIDs. `subtask_id` is a non-negative integer,
@@ -228,7 +239,7 @@ short diagnostic), `counts: {total, pending, running, succeeded, failed, cancell
 
 The paper states 7 tables and names `minion_subtask_acquirement` and a heartbeat table. Proposed set **[ours]**:
 
-1. `minion_task` — `(team, project, task_name)` PK/unique; type, model_id (→ allow-list; engine and memory_gb snapshotted at create), input_uri, output_uri, params jsonb, status, priority, counts, created_by, timestamps.
+1. `minion_task` — `(team, project, task_name)` PK/unique; type, model_id (→ allow-list; engine and memory_gb snapshotted at create), input_uri, output_uri, params jsonb, status, priority, counts, created_by, timestamps. `output_uri` is UNIQUE; `split_attempts` and `next_split_at` implement the splitter lease and retry backoff.
 2. `minion_subtask` — `(team, project, task_name, subtask_id)` unique; input slice, status, attempt, max_attempts, error, output_uri, timestamps.
 3. `minion_subtask_acquirement` — **UNIQUE `(team, project, task_name, subtask_id)`** **[paper]**; `acquirement_id` uuid, executor_id, attempt, acquired_at.
 4. `minion_executor_heartbeat` — acquirement_id (the executor is reached by joining `minion_subtask_acquirement`), last_seen_at, progress jsonb (one row per active acquirement, upserted).

@@ -56,6 +56,7 @@ async def acquire(
                 cands = await repo.candidates(
                     session,
                     engines=req.engines,
+                    model_ids=list(models),
                     memory_gb=req.budget.memory_gb,
                     pool=principal.pool,
                     preference=pref,
@@ -65,9 +66,7 @@ async def acquire(
             head = cands[:shuffle_head]
             rng.shuffle(head)
             for c in head + cands[shuffle_head:]:
-                model = models.get(c.model_id)
-                if model is None:  # removed from the allow-list since task creation
-                    continue
+                model = models[c.model_id]  # candidates are filtered to registry keys in SQL
                 try:
                     async with session.begin():
                         won = await repo.try_acquire(session, c, principal.executor_id)

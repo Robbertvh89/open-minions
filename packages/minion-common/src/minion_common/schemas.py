@@ -82,7 +82,7 @@ class RegisterRequest(_Model):
     chip: str = Field(min_length=1, max_length=100)
     total_memory_gb: float = Field(gt=0)
     os_version: str = Field(min_length=1, max_length=100)
-    engines: list[Engine] = Field(min_length=1)
+    engines: list[Engine] = Field(min_length=1, max_length=16)
     profile: CapacityProfile
     budget: Budget
 
@@ -100,7 +100,7 @@ class PreferenceRequest(_Model):
 
 
 class AcquireRequest(_Model):
-    engines: list[Engine] = Field(min_length=1)
+    engines: list[Engine] = Field(min_length=1, max_length=16)
     budget: Budget
 
 

@@ -34,7 +34,7 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import S3Env, _auth, _budget, _req, make_executors, seed_task
+from conftest import TEST_MODELS_FILE, S3Env, _auth, _budget, _req, make_executors, seed_task
 
 pytestmark = pytest.mark.integration
 
@@ -53,7 +53,7 @@ def _cfg(url: str, s3: S3Env, keys: Path | None = None) -> ServerSettings:
         s3_bucket=s3.bucket,
         s3_region=s3.region,
         api_keys_file=str(keys) if keys else None,
-        models_file=str(Path(__file__).resolve().parents[3] / "deploy" / "models.yaml"),
+        models_file=TEST_MODELS_FILE,
         splitter_poll_s=3600,  # tests drive split_one themselves
         db_pool_size=60,
     )

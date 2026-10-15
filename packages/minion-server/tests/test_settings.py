@@ -55,3 +55,25 @@ def test_prefixes_validated(monkeypatch: pytest.MonkeyPatch, value: str) -> None
 def test_prefixes_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_S3_OUTPUT_PREFIXES", '["o1/", "o2/"]')
     assert ServerSettings(_env_file=None).s3_output_prefixes == ["o1/", "o2/"]
+
+
+def test_pool_defaults() -> None:
+    s = ServerSettings(_env_file=None)
+    assert (s.db_pool_size, s.db_max_overflow) == (10, 10)
+
+
+@pytest.mark.parametrize(
+    ("inputs", "outputs"),
+    [
+        ('["data/"]', '["data/out/"]'),  # output inside input
+        ('["data/in/"]', '["data/"]'),  # input inside output
+        ('["a/"]', '["a/"]'),  # identical
+    ],
+)
+def test_overlapping_prefixes_refused(
+    monkeypatch: pytest.MonkeyPatch, inputs: str, outputs: str
+) -> None:
+    monkeypatch.setenv("MINION_S3_INPUT_PREFIXES", inputs)
+    monkeypatch.setenv("MINION_S3_OUTPUT_PREFIXES", outputs)
+    with pytest.raises(ValidationError, match="overlap"):
+        ServerSettings(_env_file=None)
