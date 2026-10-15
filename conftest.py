@@ -149,6 +149,18 @@ def s3(request: pytest.FixtureRequest) -> Iterator[S3Env]:
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.5)
+        # Warm-up: the first PutObject triggers volume growth, which can take >30 s to settle;
+        # absorb that here (bounded) so no test's first raw PUT times out.
+        deadline = time.monotonic() + 90
+        while True:
+            try:
+                client.put_object(Bucket=S3_BUCKET, Key="_warmup", Body=b"x")
+                client.delete_object(Bucket=S3_BUCKET, Key="_warmup")
+                break
+            except Exception:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
         try:
             yield S3Env(endpoint, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, client)
         finally:

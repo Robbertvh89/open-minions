@@ -42,8 +42,12 @@ def _chip() -> str:
     return platform.machine() or "unknown"
 
 
+MIN_HEARTBEAT_INTERVAL_S = 1.0
+DEFAULT_HEARTBEAT_INTERVAL_S = 300.0
 DEV_ENV = "MINION_EXECUTOR_DEV"
 TEST_HOOKS_ENV = "MINION_EXECUTOR_TEST_HOOKS"
+SERVER_TIMEOUT_ENV = "MINION_HEARTBEAT_TIMEOUT_S"  # server/watchdog setting; optional sanity check
+MIN_TIMEOUT_FACTOR = 2.0
 DEFAULT_RUNNER = "mlx"  # real engines land in M3; until then only `--runner fake` (dev) works
 
 
@@ -58,7 +62,31 @@ def _validate_runner(name: str) -> None:
     create_runner(name)  # raises ValueError for unknown names; engine imports are lazy
 
 
-async def _run(server: str, profile: CapacityProfile, runner: str, token: SecretStr) -> None:
+def _validate_heartbeat(interval_s: float) -> None:
+    """The server's heartbeat timeout must exceed the interval with margin (>= 2x), else live
+    executors get reclaimed between beats. Checked only when the operator exports the timeout."""
+    if interval_s < MIN_HEARTBEAT_INTERVAL_S:
+        raise ValueError(f"heartbeat interval must be >= {MIN_HEARTBEAT_INTERVAL_S:g}s")
+    raw = os.environ.get(SERVER_TIMEOUT_ENV)
+    if raw:
+        try:
+            timeout = float(raw)
+        except ValueError:
+            raise ValueError(f"{SERVER_TIMEOUT_ENV} is not a number") from None
+        if timeout < MIN_TIMEOUT_FACTOR * interval_s:
+            raise ValueError(
+                f"{SERVER_TIMEOUT_ENV} ({timeout:g}s) must be >= {MIN_TIMEOUT_FACTOR:g}x the "
+                f"heartbeat interval ({interval_s:g}s)"
+            )
+
+
+async def _run(
+    server: str,
+    profile: CapacityProfile,
+    runner: str,
+    token: SecretStr,
+    heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+) -> None:
     budget = budget_for(profile)
     engines = [Engine.FAKE] if runner == "fake" else [Engine.MLX]
     reg = RegisterRequest(
@@ -80,6 +108,7 @@ async def _run(server: str, profile: CapacityProfile, runner: str, token: Secret
             engines,
             register=reg,
             allow_http_loopback=_is_loopback(server),
+            heartbeat_interval_s=heartbeat_interval_s,
         )
         # httpx reads proxy env when the clients were built (client + loop above); from
         # here on the control process holds no secrets, so spawned workers inherit none.
@@ -101,18 +130,27 @@ def run(
     runner: Annotated[
         str, typer.Option(hidden=True, help="Runner name (`fake` needs MINION_EXECUTOR_DEV=1)")
     ] = DEFAULT_RUNNER,
+    heartbeat_interval_s: Annotated[
+        float,
+        typer.Option(
+            "--heartbeat-interval",
+            envvar="MINION_EXECUTOR_HEARTBEAT_INTERVAL_S",
+            help="Seconds between heartbeats (>= 1). Server timeout must be >= 2x this.",
+        ),
+    ] = DEFAULT_HEARTBEAT_INTERVAL_S,
 ) -> None:
     """Poll the server and run subtasks. Token: $MINION_EXECUTOR_TOKEN or Keychain."""
     try:
         require_secure_url(server)
         prof = parse_profile(profile)
         _validate_runner(runner)
+        _validate_heartbeat(heartbeat_interval_s)
         token = load_token()  # fail fast, before starting anything
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
-    asyncio.run(_run(server, prof, runner, token))
+    asyncio.run(_run(server, prof, runner, token, heartbeat_interval_s))
 
 
 @app.command()
