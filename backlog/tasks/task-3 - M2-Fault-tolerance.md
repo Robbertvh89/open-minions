@@ -4,7 +4,7 @@ title: 'M2: Fault tolerance'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-15 18:02'
+updated_date: '2026-10-15 19:48'
 labels:
   - milestone
   - M2
@@ -333,3 +333,9 @@ Carry-over from M1 (TASK-2.x reviews): (1) watchdog must count EXPIRED attempts 
 
 Orchestrator decisions on plan open questions (2026-10-15): (1) complete after cancel is ACCEPTED (work done, harmless); (2) cancel returns 200 (synchronous phase 1); (3) release cap MINION_RELEASE_LIMIT=10, overflow counts as retryable FAILED attempt; (4) heartbeat refreshes output_url NOW (schemas are extra=forbid, adding later breaks executors); (5) on cancel/409 the executor KILLS the worker via new WorkerHandle.interrupt() that allows respawn (invariant 6: no GPU on cancelled work), not abandon-and-continue.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+M2 fault tolerance: heartbeat endpoint, reclaim service and retry budget (TASK-3.1); cancel endpoint, minion-watchdog process, max lease and heartbeat 429 (TASK-3.2); executor heartbeater, cancel/409 worker interrupt and fault e2e (TASK-3.3). Reclaim uses SKIP LOCKED + re-check, a deviation from the paper's DELETE RETURNING (ADR-0008). Open: FR-17 grace period; test_heartbeat presigned-PUT timeout in isolation (TASK-3.3 notes).
+<!-- SECTION:FINAL_SUMMARY:END -->
