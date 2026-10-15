@@ -1,10 +1,10 @@
 ---
 id: TASK-3.3
 title: 'M2.3: Executor heartbeats, cancel/stale handling, fault e2e, docs'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 18:02'
-updated_date: '2026-10-15 18:49'
+updated_date: '2026-10-15 19:17'
 labels:
   - M2
 dependencies:

@@ -1,10 +1,10 @@
 ---
 id: TASK-3.2
 title: 'M2.2: Task cancel and watchdog process'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 18:02'
-updated_date: '2026-10-15 18:54'
+updated_date: '2026-10-15 19:17'
 labels:
   - M2
 dependencies:
