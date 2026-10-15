@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from minion_common.enums import CapacityProfile, Engine, TaskType
@@ -8,10 +9,13 @@ from minion_common.schemas import (
     Assignment,
     Budget,
     CompleteRequest,
+    CompletionParams,
+    EmbeddingParams,
     FailRequest,
     ModelEntry,
     PreferenceRequest,
     TaskCreate,
+    parse_params,
 )
 from pydantic import ValidationError
 
@@ -102,7 +106,12 @@ def test_assignment_roundtrip() -> None:
         subtask_id=0,
         type=TaskType.EMBEDDING,
         model=ModelEntry(
-            model_id="m", type=TaskType.EMBEDDING, engine=Engine.MLX, ref="r", memory_gb=1
+            model_id="m",
+            type=TaskType.EMBEDDING,
+            engine=Engine.MLX,
+            ref="o/m",
+            revision="a" * 40,
+            memory_gb=1,
         ),
         input_url="http://x",
         byte_start=0,
@@ -164,3 +173,102 @@ def test_budget_and_progress_hardening() -> None:
     with pytest.raises(ValidationError):
         Progress(records_done=3, records_total=2)
     Progress(records_done=2, records_total=2)
+
+
+SHA1 = "a" * 40
+SHA256 = "b" * 64
+
+
+def _entry(**kw: Any) -> ModelEntry:
+    base: dict[str, Any] = {
+        "model_id": "m",
+        "type": "embedding",
+        "engine": "mlx",
+        "ref": "o/m",
+        "revision": SHA1,
+        "memory_gb": 1,
+    }
+    return ModelEntry.model_validate(base | kw)
+
+
+def test_revision_required_per_engine() -> None:
+    assert _entry().revision == SHA1
+    assert _entry(engine="hf").revision == SHA1
+    for engine in ("mlx", "hf"):
+        for bad in (None, "main", SHA256, "A" * 40, SHA1[:-1]):
+            with pytest.raises(ValidationError, match="revision"):
+                _entry(engine=engine, revision=bad)
+    with pytest.raises(ValidationError, match="revision"):
+        _entry(engine="mlx", revision="sha256:" + SHA256)
+
+
+def test_ollama_digest_prefix_normalised() -> None:
+    for rev in (SHA256, "sha256:" + SHA256):
+        assert _entry(engine="ollama", ref="qwen2.5:0.5b", revision=rev).revision == SHA256
+    for bad in (None, SHA1, "sha256:" + SHA1):
+        with pytest.raises(ValidationError, match="revision"):
+            _entry(engine="ollama", ref="qwen2.5:0.5b", revision=bad)
+
+
+def test_fake_engine_revision_optional() -> None:
+    assert _entry(engine="fake", ref="fake", revision=None).revision is None
+
+
+def test_bad_refs_rejected() -> None:
+    for ref in ("noslash", "o/m/x", "../x/y", "o/..", "-o/m", "o/m a"):
+        with pytest.raises(ValidationError, match="ref"):
+            _entry(ref=ref)
+    with pytest.raises(ValidationError, match="ref"):
+        _entry(engine="ollama", ref="Bad Tag", revision=SHA256)
+
+
+def test_memory_gb_bounds() -> None:
+    for bad in (0, 1025, float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            _entry(memory_gb=bad)
+
+
+def test_parse_params_defaults_and_valid() -> None:
+    c = parse_params(TaskType.COMPLETION, {})
+    assert isinstance(c, CompletionParams)
+    assert (c.temperature, c.top_p, c.max_tokens, c.seed, c.system) == (0.0, 1.0, 256, None, None)
+    e = parse_params(TaskType.EMBEDDING, {"normalize": False})
+    assert isinstance(e, EmbeddingParams) and e.normalize is False
+    assert parse_params(TaskType.EMBEDDING, {}) == EmbeddingParams()
+
+
+def test_parse_params_rejects_unknown_and_cross_type() -> None:
+    for t, raw in (
+        (TaskType.COMPLETION, {"stop": ["x"]}),
+        (TaskType.COMPLETION, {"trust_remote_code": True}),
+        (TaskType.COMPLETION, {"normalize": True}),
+        (TaskType.EMBEDDING, {"temperature": 0.1}),
+        (TaskType.EMBEDDING, {"x": 1}),
+    ):
+        with pytest.raises(ValidationError):
+            parse_params(t, raw)
+
+
+def test_parse_params_bounds() -> None:
+    bad: list[dict[str, Any]] = [
+        {"temperature": -0.1},
+        {"temperature": 2.1},
+        {"temperature": float("nan")},
+        {"top_p": 0},
+        {"top_p": 1.1},
+        {"max_tokens": 0},
+        {"max_tokens": 4097},
+        {"max_tokens": 1.5},
+        {"max_tokens": True},
+        {"seed": -1},
+        {"seed": "1"},
+        {"system": "x" * 8001},
+    ]
+    for raw in bad:
+        with pytest.raises(ValidationError):
+            parse_params(TaskType.COMPLETION, raw)
+    ok = parse_params(
+        TaskType.COMPLETION,
+        {"temperature": 2, "top_p": 1, "max_tokens": 4096, "seed": 0, "system": "x" * 8000},
+    )
+    assert isinstance(ok, CompletionParams) and ok.max_tokens == 4096

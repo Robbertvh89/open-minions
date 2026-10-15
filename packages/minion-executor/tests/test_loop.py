@@ -30,7 +30,14 @@ from minion_executor.worker.process import WorkerCrashed
 BUDGET = Budget.model_validate(
     {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 2}
 )
-MODEL = {"model_id": "m", "type": "embedding", "engine": "mlx", "ref": "r", "memory_gb": 0.1}
+MODEL = {
+    "model_id": "m",
+    "type": "embedding",
+    "engine": "mlx",
+    "ref": "o/m",
+    "revision": "a" * 40,
+    "memory_gb": 0.1,
+}
 INPUT = b'{"id":"a","text":"x"}\n{"id":"b","text":"y"}\n{"id":"c","text":"z"}\n'
 
 

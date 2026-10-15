@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Self
@@ -11,6 +12,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from minion_common.enums import CapacityProfile, Engine, TaskStatus, TaskType
 
 SLUG_PATTERN = r"^[a-z0-9]([a-z0-9_-]{0,62}[a-z0-9])?$"
+
+_HF_REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
+_OLLAMA_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*(:[\w.-]+)?$")
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class _Model(BaseModel):
@@ -31,7 +37,61 @@ class ModelEntry(_Model):
     type: TaskType
     engine: Engine
     ref: str = Field(min_length=1, max_length=500)
-    memory_gb: float = Field(gt=0)
+    memory_gb: float = Field(gt=0, le=1024, allow_inf_nan=False)
+    revision: str | None = Field(
+        default=None,
+        max_length=71,
+        description=(
+            "Pinned model revision: 40-hex commit SHA (mlx/hf) or 64-hex manifest digest, "
+            "optional 'sha256:' prefix (ollama). Optional only for the fake engine."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_ref_and_revision(self) -> Self:
+        ref, rev = self.ref, self.revision
+        if self.engine in (Engine.MLX, Engine.HF):
+            if not _HF_REPO_RE.match(ref) or ".." in ref:
+                raise ValueError("ref must be a Hugging Face repo id 'owner/name'")
+            if rev is None or not _SHA1_RE.match(rev):
+                raise ValueError("revision must be a 40-hex commit SHA for mlx/hf models")
+        elif self.engine == Engine.OLLAMA:
+            if not _OLLAMA_TAG_RE.match(ref) or ".." in ref:
+                raise ValueError("ref must be an Ollama tag like 'name:tag'")
+            digest = rev.removeprefix("sha256:") if rev is not None else None
+            if digest is None or not _SHA256_RE.match(digest):
+                raise ValueError("revision must be a 64-hex manifest digest for ollama models")
+            self.revision = digest
+        return self
+
+
+class CompletionParams(_Model):
+    """Allow-listed completion parameters (SPEC FR-4)."""
+
+    temperature: float = Field(default=0.0, ge=0, le=2, allow_inf_nan=False)
+    top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
+    max_tokens: int = Field(default=256, ge=1, le=4096, strict=True)
+    seed: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
+    system: str | None = Field(default=None, max_length=8000)
+
+
+class EmbeddingParams(_Model):
+    """Allow-listed embedding parameters (SPEC FR-4)."""
+
+    normalize: bool = Field(default=True, strict=True)
+
+
+TaskParams = CompletionParams | EmbeddingParams
+
+
+def parse_params(task_type: TaskType, raw: dict[str, Any]) -> TaskParams:
+    """Validate raw task params against the allow-list for `task_type`.
+
+    Raises `pydantic.ValidationError` on unknown keys or out-of-range values.
+    """
+    if task_type == TaskType.COMPLETION:
+        return CompletionParams.model_validate(raw)
+    return EmbeddingParams.model_validate(raw)
 
 
 class TaskCreate(_Model):
@@ -176,6 +236,8 @@ __all__ = [
     "Assignment",
     "Budget",
     "CompleteRequest",
+    "CompletionParams",
+    "EmbeddingParams",
     "ErrorBody",
     "FailRequest",
     "HeartbeatRequest",
@@ -188,4 +250,6 @@ __all__ = [
     "TaskCounts",
     "TaskCreate",
     "TaskOut",
+    "TaskParams",
+    "parse_params",
 ]

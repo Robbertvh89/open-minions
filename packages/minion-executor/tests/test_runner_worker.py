@@ -25,7 +25,9 @@ from minion_executor.worker.process import (
 
 
 def _model(t: TaskType = TaskType.EMBEDDING, mid: str = "fake-embed") -> ModelEntry:
-    return ModelEntry(model_id=mid, type=t, engine=Engine.MLX, ref="x", memory_gb=1)
+    return ModelEntry(
+        model_id=mid, type=t, engine=Engine.MLX, ref="o/m", revision="a" * 40, memory_gb=1
+    )
 
 
 BUDGET = Budget(profile=CapacityProfile.BALANCED, memory_gb=8, gpu_duty_cycle=0.5, max_batch_size=8)

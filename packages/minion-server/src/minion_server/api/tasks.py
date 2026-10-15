@@ -5,7 +5,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from minion_common.enums import SubtaskStatus, TaskStatus
-from minion_common.schemas import SLUG_PATTERN, ModelEntry, TaskCounts, TaskCreate, TaskOut
+from minion_common.schemas import (
+    SLUG_PATTERN,
+    ModelEntry,
+    TaskCounts,
+    TaskCreate,
+    TaskOut,
+    parse_params,
+)
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import User, current_user
@@ -86,6 +94,12 @@ def to_out(task: Task, counts: dict[SubtaskStatus, int]) -> TaskOut:
     )
 
 
+def _params_message(exc: ValidationError) -> str:
+    """Field paths and reasons only; never echo submitted values."""
+    parts = [f"{'.'.join(str(p) for p in e['loc']) or 'params'}: {e['msg']}" for e in exc.errors()]
+    return "invalid params: " + "; ".join(parts)[:500]
+
+
 def _settings(request: Request) -> ServerSettings:
     s: ServerSettings = request.app.state.settings
     return s
@@ -117,6 +131,10 @@ async def create_task(
         raise api_error(422, "UNKNOWN_MODEL", "model is not in the allow-list")
     if model.type != body.type:
         raise api_error(422, "MODEL_TYPE_MISMATCH", "model type does not match task type")
+    try:
+        parse_params(body.type, body.params)
+    except ValidationError as exc:
+        raise api_error(422, "INVALID_PARAMS", _params_message(exc)) from exc
     in_uri, out_uri, in_key = validate_uris(body, settings)
     if not await storage.any_key(in_key):
         raise api_error(422, "EMPTY_INPUT", "no objects under the input prefix")

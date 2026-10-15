@@ -22,7 +22,12 @@ from conftest import _auth, _budget, _req, _settings, make_executors, seed_task
 N = 60
 MODELS = {
     "fake-embed": ModelEntry(
-        model_id="fake-embed", type="embedding", engine=Engine.MLX, ref="f", memory_gb=0.1
+        model_id="fake-embed",
+        type="embedding",
+        engine=Engine.MLX,
+        ref="o/m",
+        revision="a" * 40,
+        memory_gb=0.1,
     )
 }
 
@@ -174,6 +179,7 @@ async def test_http_assignment_shape_and_204(http: tuple[AsyncClient, Any]) -> N
     assert r.status_code == 200
     a = r.json()
     assert a["attempt"] == 1 and a["model"]["model_id"] == "fake-embed"
+    assert a["model"]["revision"] == "a" * 40
     assert "inputs/acq/shape/a.jsonl" in a["input_url"] and "X-Amz-Signature" in a["input_url"]
     sid = a["subtask_id"]
     assert f"outputs/acq/shape/_attempts/{sid:06d}/1.jsonl" in a["output_url"]
