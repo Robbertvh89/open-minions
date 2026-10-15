@@ -113,6 +113,8 @@ subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, whi
 runners, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
 governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
+**M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`, bounded by `MINION_RELEASE_LIMIT`), honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
+
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 
 ### 4.3 Acquisition protocol **[paper]**

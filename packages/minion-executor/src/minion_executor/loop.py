@@ -14,6 +14,7 @@ import random
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -36,7 +37,10 @@ from minion_common.schemas import (
     FailRequest,
     ModelEntry,
     RegisterRequest,
+    TaskParams,
+    parse_params,
 )
+from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
@@ -46,6 +50,8 @@ from minion_executor.worker.process import WorkerCrashed
 log = structlog.get_logger("minion_executor.loop")
 
 BAD_INPUT = "BAD_INPUT"
+BAD_PARAMS = "BAD_PARAMS"
+MODEL_NOT_ADMISSIBLE = "MODEL_NOT_ADMISSIBLE"
 TMP_PREFIX = "minion-exec-"
 # Refresh the output URL with one synchronous heartbeat when it expires within this margin.
 UPLOAD_URL_MARGIN_S = 60.0
@@ -97,7 +103,13 @@ def cleanup_stale_tmp(root: Path | None = None) -> int:
 
 class Worker(Protocol):
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None: ...
-    def run(self, batch: list[Record]) -> list[Record]: ...
+    def run(
+        self,
+        batch: list[Record],
+        params: TaskParams | None = None,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> list[Record]: ...
+    def unload(self) -> None: ...
     def interrupt(self) -> None: ...
     def kill(self) -> None: ...
     def close(self) -> None: ...
@@ -138,6 +150,9 @@ class ExecutorLoop:
         allow_http_loopback: bool = False,
         heartbeat_interval_s: float = 300.0,
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        idle_unload_s: float = 600.0,
+        release_limit: int = 10,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = client
         self._worker = worker
@@ -158,6 +173,12 @@ class ExecutorLoop:
         self._stop = asyncio.Event()
         self._idle = 0
         self._fails = 0
+        self._idle_unload_s = idle_unload_s
+        self._release_limit = release_limit
+        self._clock = clock
+        self._last_work = clock()
+        self._unloaded = False
+        self._admission_releases: dict[tuple[str, str, str, int], int] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -226,10 +247,13 @@ class ExecutorLoop:
                     await self._sleep()
                     continue
                 if assignment is None:
+                    await self._maybe_unload()
                     await self._sleep()
                     continue
                 self._idle = 0
+                self._unloaded = False
                 outcome = await self._handle(assignment, tmp)
+                self._last_work = self._clock()
                 if outcome is _Outcome.DONE:
                     self._fails = 0
                     done += 1
@@ -241,6 +265,35 @@ class ExecutorLoop:
             if self._owns_http:
                 await self._http.aclose()
         return done
+
+    async def _maybe_unload(self) -> None:
+        """Free model memory once idle for `idle_unload_s` (invariant 6); 0 disables."""
+        if self._unloaded or self._idle_unload_s <= 0:
+            return
+        if self._clock() - self._last_work < self._idle_unload_s:
+            return
+        self._unloaded = True
+        try:
+            await asyncio.to_thread(self._worker.unload)
+            log.info("worker_unloaded_idle")
+        except Exception as exc:  # a failed unload must not stop the loop
+            log.warning("idle_unload_failed", error=type(exc).__name__)
+
+    def _check_admission(self, a: Assignment) -> None:
+        """Release (not fail) a subtask this executor cannot run; bounded per subtask."""
+        m = a.model
+        if m.engine in self._engines and m.memory_gb <= self._budget.memory_gb:
+            return
+        key = (a.team, a.project, a.task_name, a.subtask_id)
+        n = self._admission_releases.get(key, 0) + 1
+        if len(self._admission_releases) < 1024:
+            self._admission_releases[key] = n
+        raise _FailureError(
+            True,
+            MODEL_NOT_ADMISSIBLE,
+            "model not admissible on this executor",
+            release=n <= self._release_limit,
+        )
 
     async def _handle(self, a: Assignment, tmp: Path) -> _Outcome:
         bound = log.bind(
@@ -390,6 +443,11 @@ class ExecutorLoop:
         in_path, out_path = self._paths(a, tmp)
         write: asyncio.Future[tuple[int, str]] | None = None
         try:
+            self._check_admission(a)
+            try:
+                params = parse_params(a.model.type, a.params)
+            except ValidationError:
+                raise _FailureError(False, BAD_PARAMS, "invalid task params") from None
             self._check_url(a.input_url)
             self._check_url(a.output_url)
             try:
@@ -406,9 +464,12 @@ class ExecutorLoop:
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
-            outputs = await self._run_batches(a, records, hb)
+            outputs = await self._run_batches(a, records, hb, params)
             if len(outputs) != len(records):
                 raise _FailureError(True, "OUTPUT_MISMATCH", "runner returned wrong record count")
+            for out in outputs:  # stamp provenance on every line (incl. per-record errors)
+                out["model"] = a.model.model_id
+                out["model_revision"] = a.model.revision
             try:
                 # Shielded: a cancel must not leave the thread writing after cleanup (see finally).
                 write = asyncio.ensure_future(asyncio.to_thread(io.write_jsonl, out_path, outputs))
@@ -436,19 +497,36 @@ class ExecutorLoop:
             out_path.unlink(missing_ok=True)
 
     async def _run_batches(
-        self, a: Assignment, records: list[Record], hb: Heartbeater
+        self, a: Assignment, records: list[Record], hb: Heartbeater, params: TaskParams
     ) -> list[Record]:
         step = self._budget.max_batch_size
         outputs: list[Record] = []
+        aloop = asyncio.get_running_loop()
+
+        def progress(base: int) -> Callable[[int], None]:
+            def on_progress(done: int) -> None:  # runs in the worker-call thread
+                total = min(base + done, len(records))
+                with contextlib.suppress(RuntimeError):  # loop already closed
+                    aloop.call_soon_threadsafe(_set_done, total)
+
+            return on_progress
+
+        def _set_done(n: int) -> None:
+            hb.records_done = max(hb.records_done, n)
+
         try:
             await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
             for i in range(0, len(records), step):
-                outputs.extend(await asyncio.to_thread(self._worker.run, records[i : i + step]))
+                batch = records[i : i + step]
+                outputs.extend(
+                    await asyncio.to_thread(self._worker.run, batch, params, progress(i))
+                )
                 hb.records_done = len(outputs)
         except WorkerCrashed:
             raise _FailureError(True, "WORKER_CRASHED", "worker process died") from None
         except RunnerError as exc:
-            raise _FailureError(True, exc.code[:64] or "RUNNER_ERROR", "runner failed") from None
+            code = exc.code[:64] or "RUNNER_ERROR"
+            raise _FailureError(exc.retryable, code, "runner failed") from None
         return outputs
 
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:

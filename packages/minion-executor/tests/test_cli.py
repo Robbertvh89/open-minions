@@ -1,4 +1,5 @@
 import pytest
+from minion_common.enums import Engine
 from minion_executor.main import app
 from typer.testing import CliRunner
 
@@ -47,12 +48,76 @@ def test_fake_runner_refused_without_dev_flag(monkeypatch: pytest.MonkeyPatch) -
     assert "MINION_EXECUTOR_DEV" in result.output
 
 
-def test_default_runner_is_real_engine_not_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")  # dev mode must not make fake implicit
+    asked: list[list[Engine]] = []
+
+    def none_available(requested: list[Engine]) -> list[Engine]:
+        asked.append(requested)
+        return []
+
+    monkeypatch.setattr(m, "probe_available", none_available)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 2
+    assert "no inference engine available" in result.output
+    assert asked == [[Engine.MLX, Engine.OLLAMA, Engine.HF]]
+
+
+def test_auto_advertises_probed_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    seen: dict[str, object] = {}
+
+    class FakeProbe:
+        def __init__(self, engines: list[Engine]) -> None:
+            seen["requested"] = list(engines)
+
+        def probe(self) -> dict[str, str | None]:
+            return {"mlx": "0.1", "ollama": None, "hf": "4.0"}
+
+    async def fake_run(server: str, profile: object, engines: list[Engine], *a: object) -> None:
+        seen["engines"] = engines
+
+    monkeypatch.setattr(m, "WorkerHandle", FakeProbe)
+    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 0, result.output
+    assert seen["engines"] == [Engine.MLX, Engine.HF]
+
+
+def test_explicit_engines_are_intersected_with_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    seen: dict[str, object] = {}
+
+    async def fake_run(server: str, profile: object, engines: list[Engine], *a: object) -> None:
+        seen["engines"] = engines
+
+    monkeypatch.setattr(m, "probe_available", lambda req: [e for e in req if e is Engine.OLLAMA])
+    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run", "--engines", "mlx,ollama"])
+    assert result.exit_code == 0, result.output
+    assert seen["engines"] == [Engine.OLLAMA]
+
+
+def test_engines_fake_needs_dev_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
-    result = runner.invoke(app, ["run"])  # no real engine until M3: refuses, never runs fake
+    result = runner.invoke(app, ["run", "--engines", "fake"])
     assert result.exit_code == 2
-    assert "fake" not in result.output.replace("unknown runner: 'mlx'", "")
+    assert "MINION_EXECUTOR_DEV" in result.output
+
+
+def test_unknown_engine_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    result = runner.invoke(app, ["run", "--engines", "cuda"])
+    assert result.exit_code == 2
+    assert "unknown engine" in result.output
 
 
 def test_token_removed_from_environment_before_start(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -65,7 +130,7 @@ def test_token_removed_from_environment_before_start(monkeypatch: pytest.MonkeyP
     seen: dict[str, object] = {}
 
     async def fake_run(
-        server: str, profile: object, runner_name: str, token: object, hb: float
+        server: str, profile: object, engines: list[Engine], token: object, hb: float
     ) -> None:
         seen["env"] = os.environ.get("MINION_EXECUTOR_TOKEN")
         seen["token"] = token.get_secret_value()  # type: ignore[attr-defined]

@@ -13,16 +13,16 @@ from urllib.parse import urlsplit
 
 import typer
 from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
-from minion_common.enums import CapacityProfile, Engine, TaskType
+from minion_common.enums import CapacityProfile, Engine
 from minion_common.schemas import RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
-from minion_executor.runners import create_runner
 from minion_executor.secrets import ENV_VAR, load_token
-from minion_executor.worker.process import WorkerHandle, restrict_environ
+from minion_executor.settings import ExecutorSettings
+from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
 
@@ -48,22 +48,48 @@ DEV_ENV = "MINION_EXECUTOR_DEV"
 TEST_HOOKS_ENV = "MINION_EXECUTOR_TEST_HOOKS"
 SERVER_TIMEOUT_ENV = "MINION_HEARTBEAT_TIMEOUT_S"  # server/watchdog setting; optional sanity check
 MIN_TIMEOUT_FACTOR = 2.0
-DEFAULT_RUNNER = "mlx"  # real engines land in M3; until then only `--runner fake` (dev) works
+REAL_ENGINES = [Engine.MLX, Engine.OLLAMA, Engine.HF]
+NO_ENGINE_MSG = "no inference engine available (install extras: uv sync --extra mlx)"
 
 
 def _is_loopback(url: str) -> bool:
     return (urlsplit(url).hostname or "").lower() in LOCAL_HOSTS
 
 
-def _validate_runner(name: str) -> None:
-    """Fail fast (exit 2 via ValueError) on unknown runners; `fake` needs MINION_EXECUTOR_DEV=1."""
-    if name == "fake" and os.environ.get(DEV_ENV) != "1":
-        raise ValueError(f"runner 'fake' serves no real work; set {DEV_ENV}=1 to use it (dev only)")
-    try:
-        engine = Engine(name)
-    except ValueError:
-        raise ValueError(f"unknown runner: {name!r}") from None
-    create_runner(engine, TaskType.EMBEDDING)  # ValueError if not available yet; imports lazy
+def _require_dev_for_fake() -> None:
+    if os.environ.get(DEV_ENV) != "1":
+        raise ValueError("engine 'fake' serves no real work; set MINION_EXECUTOR_DEV=1 (dev only)")
+
+
+def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
+    """Engines to probe. `auto` is the real engines only: `fake` is never implicit."""
+    if runner is not None:  # hidden dev override
+        if runner != "fake":
+            raise ValueError(f"unknown runner: {runner!r}")
+        _require_dev_for_fake()
+        return [Engine.FAKE]
+    if engines.strip().lower() == "auto":
+        return list(REAL_ENGINES)
+    out: list[Engine] = []
+    for name in (n.strip().lower() for n in engines.split(",")):
+        try:
+            engine = Engine(name)
+        except ValueError:
+            raise ValueError(f"unknown engine: {name!r}") from None
+        if engine is Engine.FAKE:
+            _require_dev_for_fake()
+        if engine not in out:
+            out.append(engine)
+    if not out:
+        raise ValueError("no engines requested")
+    return out
+
+
+def probe_available(requested: list[Engine]) -> list[Engine]:
+    """Ask a worker subprocess which of `requested` work here (engines are never imported in
+    the control process, invariant 7)."""
+    found = WorkerHandle(requested).probe()
+    return [e for e in requested if found.get(e.value)]
 
 
 def _validate_heartbeat(interval_s: float) -> None:
@@ -87,12 +113,11 @@ def _validate_heartbeat(interval_s: float) -> None:
 async def _run(
     server: str,
     profile: CapacityProfile,
-    runner: str,
+    engines: list[Engine],
     token: SecretStr,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
 ) -> None:
     budget = budget_for(profile)
-    engines = [Engine.FAKE] if runner == "fake" else [Engine.MLX]
     reg = RegisterRequest(
         hostname=socket.gethostname(),
         chip=_chip(),
@@ -104,6 +129,7 @@ async def _run(
     )
     hooks = os.environ.get(DEV_ENV) == "1" and os.environ.get(TEST_HOOKS_ENV) == "1"
     worker = WorkerHandle(engines, nice=PROFILES[profile].nice, test_hooks=hooks)
+    settings = ExecutorSettings()
     async with ExecutorClient(server, token) as client:
         loop = ExecutorLoop(
             client,
@@ -113,6 +139,8 @@ async def _run(
             register=reg,
             allow_http_loopback=_is_loopback(server),
             heartbeat_interval_s=heartbeat_interval_s,
+            idle_unload_s=settings.idle_unload_s,
+            release_limit=settings.release_limit,
         )
         # httpx reads proxy env when the clients were built (client + loop above); from
         # here on the control process holds no secrets, so spawned workers inherit none.
@@ -131,9 +159,16 @@ def run(
     profile: Annotated[
         str, typer.Option(help="Capacity profile: light, balanced or full (SPEC §4.6)")
     ] = "balanced",
+    engines: Annotated[
+        str,
+        typer.Option(
+            help="Engines to offer: auto (probe mlx, ollama, hf) or a list such as mlx,ollama"
+        ),
+    ] = "auto",
     runner: Annotated[
-        str, typer.Option(hidden=True, help="Runner name (`fake` needs MINION_EXECUTOR_DEV=1)")
-    ] = DEFAULT_RUNNER,
+        str | None,
+        typer.Option(hidden=True, help="Dev only: `fake` (needs MINION_EXECUTOR_DEV=1)"),
+    ] = None,
     heartbeat_interval_s: Annotated[
         float,
         typer.Option(
@@ -147,14 +182,19 @@ def run(
     try:
         require_secure_url(server)
         prof = parse_profile(profile)
-        _validate_runner(runner)
+        requested = _requested_engines(engines, runner)
         _validate_heartbeat(heartbeat_interval_s)
+        ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
         token = load_token()  # fail fast, before starting anything
-    except (ValueError, RuntimeError) as exc:
+        available = probe_available(requested)
+        if not available:
+            raise ValueError(NO_ENGINE_MSG)
+    except (ValueError, RuntimeError, WorkerCrashed) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
-    asyncio.run(_run(server, prof, runner, token, heartbeat_interval_s))
+    typer.echo(f"engines: {','.join(e.value for e in available)}")
+    asyncio.run(_run(server, prof, available, token, heartbeat_interval_s))
 
 
 @app.command()
