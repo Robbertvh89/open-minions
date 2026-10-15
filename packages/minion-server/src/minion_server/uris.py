@@ -22,8 +22,10 @@ def parse_s3_uri(uri: str, *, bucket: str, prefixes: tuple[str, ...]) -> S3Uri:
         parts = urlsplit(uri)
     except ValueError as exc:
         raise InvalidUriError("malformed uri") from exc
-    if parts.scheme != "s3":
-        raise InvalidUriError("scheme must be s3")
+    # urlsplit lowercases the scheme, so check the raw string: `S3://` must not slip through
+    # (stored URIs are canonicalized, and a differently-cased duplicate would dodge uniqueness).
+    if parts.scheme != "s3" or not uri.startswith("s3://"):
+        raise InvalidUriError("scheme must be lowercase s3")
     if parts.query or parts.fragment:
         raise InvalidUriError("query/fragment not allowed")
     if parts.netloc != bucket:

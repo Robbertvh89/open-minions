@@ -39,7 +39,7 @@ async def test_only_one_acquirement_insert_wins(engine: AsyncEngine) -> None:
                 "INSERT INTO minion_task (team, project, task_name, type, model_id, engine, "
                 "model_memory_gb, input_uri, output_uri, created_by) VALUES "
                 "(:team, :project, :task_name, 'embedding', 'm', 'mlx', 1, 's3://in', "
-                "'s3://out', 'test')"
+                "'s3://out/' || CAST(:task_name AS varchar), 'test')"
             ),
             key,
         )
@@ -79,7 +79,8 @@ async def test_only_one_acquirement_insert_wins(engine: AsyncEngine) -> None:
 TASK_INSERT = (
     "INSERT INTO minion_task (team, project, task_name, type, model_id, engine, "
     "model_memory_gb, input_uri, output_uri, created_by{extra_cols}) VALUES "
-    "('t', 'p', :name, 'embedding', 'm', 'mlx', 1, 's3://in', 's3://out', 'test'{extra_vals})"
+    "('t', 'p', :name, 'embedding', 'm', 'mlx', 1, 's3://in', "
+    "'s3://out/' || CAST(:name AS varchar), 'test'{extra_vals})"
 )
 SUBTASK_INSERT = (
     "INSERT INTO minion_subtask (team, project, task_name, subtask_id, input_object_key, "

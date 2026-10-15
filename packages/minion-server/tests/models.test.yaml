@@ -1,0 +1,7 @@
+# Test-only allow-list (never deploy): includes the entry served by the fake runner.
+models:
+  - model_id: fake-embed
+    type: embedding
+    engine: mlx
+    ref: fake
+    memory_gb: 0.1

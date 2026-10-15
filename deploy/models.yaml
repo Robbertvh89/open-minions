@@ -10,8 +10,3 @@ models:
     engine: mlx
     ref: mlx-community/bge-small-en-v1.5-bf16
     memory_gb: 0.5
-  - model_id: fake-embed # test entry for the fake runner
-    type: embedding
-    engine: mlx
-    ref: fake
-    memory_gb: 0.1

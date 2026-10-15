@@ -62,6 +62,32 @@ def test_0002_downgrade_removes_token_expiry_only(fresh_url: str) -> None:
     command.upgrade(cfg, "head")
 
 
+async def _has_column(url: str, table: str, column: str) -> bool:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ),
+                {"t": table, "c": column},
+            )
+            return int(res.scalar_one()) == 1
+    finally:
+        await eng.dispose()
+
+
+def test_0003_task_error_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "error"))
+    command.downgrade(cfg, "0002")
+    assert not asyncio.run(_has_column(fresh_url, "minion_task", "error"))
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "error"))
+
+
 def test_downgrade_upgrade_round_trip(fresh_url: str) -> None:
     cfg = alembic_config(fresh_url)
     command.upgrade(cfg, "head")
@@ -70,3 +96,28 @@ def test_downgrade_upgrade_round_trip(fresh_url: str) -> None:
     assert asyncio.run(_table_count(fresh_url)) == 0
     command.upgrade(cfg, "head")
     assert asyncio.run(_table_count(fresh_url)) == 7
+
+
+async def _has_constraint(url: str, name: str) -> bool:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text("SELECT count(*) FROM pg_constraint WHERE conname = :n"), {"n": name}
+            )
+            return int(res.scalar_one()) == 1
+    finally:
+        await eng.dispose()
+
+
+def test_0004_splitter_backoff_and_unique_output_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "split_attempts"))
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "next_split_at"))
+    assert asyncio.run(_has_constraint(fresh_url, "uq_minion_task_output_uri"))
+    command.downgrade(cfg, "0003")
+    assert not asyncio.run(_has_column(fresh_url, "minion_task", "split_attempts"))
+    assert not asyncio.run(_has_column(fresh_url, "minion_task", "next_split_at"))
+    assert not asyncio.run(_has_constraint(fresh_url, "uq_minion_task_output_uri"))
+    command.upgrade(cfg, "head")

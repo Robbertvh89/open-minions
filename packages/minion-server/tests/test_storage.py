@@ -52,3 +52,30 @@ def test_presigned_host_uses_public_endpoint() -> None:
     url = st._presign("get_object", "inputs/a", None)
     assert urlsplit(url).netloc == "s3.public.example.com"
     assert urlsplit(url).scheme == "https"
+
+
+@pytest.mark.integration
+async def test_any_key_stat_and_conditional_copy(s3: S3Env) -> None:
+    from minion_server.storage import PreconditionFailedError
+
+    cfg = ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+    st = S3Storage(cfg)
+    assert not await st.any_key("cond/")
+    s3.client.put_object(Bucket=s3.bucket, Key="cond/src", Body=b"one")
+    assert await st.any_key("cond/")
+    stat = await st.stat("cond/src")
+    assert stat is not None and stat.size == 3 and stat.etag
+    await st.copy("cond/src", "cond/dst", if_match=stat.etag)
+    s3.client.put_object(Bucket=s3.bucket, Key="cond/src", Body=b"changed")  # TOCTOU
+    with pytest.raises(PreconditionFailedError):
+        await st.copy("cond/src", "cond/dst2", if_match=stat.etag)
+    assert not await st.any_key("cond/dst2")
+    big = await st.list_keys("cond/", max_keys=1)
+    assert len(big) > 1  # truncated listing signals "more than max_keys"

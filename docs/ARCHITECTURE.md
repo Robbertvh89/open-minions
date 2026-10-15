@@ -139,12 +139,30 @@ used by the executor and by tests, shared settings base.
 
 ### 3.1 Task submission
 ```
-User ─POST /tasks─▶ Server: validate (model allow-list, S3 prefix readable, params schema)
+User ─POST /tasks─▶ Server: validate (team membership, model allow-list + type, team-scoped S3 URIs
+                    `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output;
+                    at least one object under the input prefix, else `422 EMPTY_INPUT`)
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
-Splitter (async):   list input objects → scan JSONL → emit slices of N records
-                    bulk INSERT minion_subtask(status=PENDING, attempt=0)
+Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
+                    list input objects → scan JSONL → stream batches of slices of N records
+                    per batch: renew the lease, compare with existing rows (key, byte range;
+                    mismatch → INPUT_CHANGED), GET pinned by listed ETag + size (change → INPUT_CHANGED),
+                    INSERT minion_subtask(status=PENDING, attempt=0) ON CONFLICT DO NOTHING
                     UPDATE minion_task SET status=PENDING, total_subtasks=k
 ```
+Splitting is bounded (line length, total bytes, objects, subtasks per task; see `MINION_SPLIT_*`)
+and no transaction is held open while reading S3. Deterministic problems (bad URI, empty input,
+limit exceeded, `LINE_TOO_LONG`, `INPUT_CHANGED`, S3 `AccessDenied`/`NoSuchKey`/`InvalidObjectState`)
+mark the task `FAILED` with `error`. Anything else backs off exponentially via `next_split_at` and
+fails the task after `split_max_attempts`, so one bad task never blocks the queue. `output_uri` is
+unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it. Stored
+URIs are canonical (`s3://{bucket}/{key}/`); a non-lowercase scheme is `422 INVALID_URI`.
+
+The claim is a lease fenced by `split_attempts`: lease renewal (once per batch), done, failed and
+retry all match on the claimed value, so a splitter whose lease expired and was re-claimed becomes
+a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
+default 3600; exceeding it backs off like any transient error). A claim never hands out a task with
+`split_attempts >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED` (crash loop).
 
 ### 3.2 Acquire (the core protocol)
 ```
@@ -156,7 +174,7 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
                  AND (matches preference)            -- pass 1
                ORDER BY task.priority DESC, task.created_at, subtask_id
                LIMIT 16
-  if empty: candidates = same query without preference filter (engine + memory filters stay) -- pass 2 (global FIFO)
+  if empty: candidates = same query without preference filter (engine, memory and allowed_pool filters stay) -- pass 2 (global FIFO)
   for c in shuffle_head(candidates):          -- light shuffle reduces contention
       INSERT INTO minion_subtask_acquirement (...) VALUES (...)
         ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
@@ -165,7 +183,7 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
           UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ...  (same txn)
           INSERT minion_executor_heartbeat(...)                           (same txn)
           COMMIT → return assignment + presigned URLs
-  return 204
+  return 204   (the whole round repeats up to MAX_ROUNDS=10 when every candidate lost its insert race; then 204)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
@@ -184,10 +202,11 @@ Worker:   load model (or reuse warm one) with MLX memory/cache limits from budge
                 throttle.pace()   ← duty-cycle sleep + check governor events
           stream results back to control process
 Executor: write results to local temp JSONL
-          PUT to presigned URL  outputs/_attempts/{subtask_id}/{attempt}.jsonl
+          PUT to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
           POST /complete {record_count, sha256}
 Server:   verify acquirement is current (else 409)
-          S3 CopyObject → outputs/{subtask_id:06d}.jsonl   (promotion = idempotency)
+          S3 CopyObject → {output_prefix}/{subtask_id:06d}.jsonl   (promotion = idempotency;
+                          CopySourceIfMatch on the ETag verified at HEAD, mismatch → 422 OUTPUT_CHANGED)
           txn: DELETE acquirement, DELETE heartbeat row,
                UPDATE subtask SUCCEEDED, INSERT minion_subtask_attempt,
                UPDATE task counters / status
@@ -206,10 +225,14 @@ Watchdog (every 60 s):
       -- if nothing returned, someone else already handled it → skip
       DELETE heartbeat row
       INSERT minion_subtask_attempt(outcome=EXPIRED)
-      UPDATE minion_subtask SET status = CASE WHEN attempt >= max_attempts
+      UPDATE minion_subtask SET status = CASE WHEN <FAILED+EXPIRED attempts> >= max_attempts
                                               THEN 'FAILED' ELSE 'PENDING' END
     COMMIT
 ```
+**Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
+(`fail` already counts the attempt being recorded). A voluntary `release` does not consume it.
+`attempt` itself keeps counting every acquisition (it keys the output object), so it is *not* the
+budget; the watchdog (M2) must use the same count, not `attempt >= max_attempts`.
 Because the acquirement row is deleted, the unique constraint frees up and any executor can re-acquire.
 A zombie executor that wakes up later gets `409 STALE_ACQUIREMENT` on its next call and discards its work.
 

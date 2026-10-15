@@ -22,6 +22,10 @@ class ServerSettings(BaseSettings):
     database_url: SecretStr  # required; see .env.example
     host: str = "127.0.0.1"
     port: int = 8080
+    # Sizing: pool_size + max_overflow bounds concurrent DB connections per server process.
+    db_pool_size: int = Field(default=10, ge=1)
+    db_max_overflow: int = Field(default=10, ge=0)
+    max_request_body_bytes: int = Field(default=1 << 20, gt=0)  # 413 above this
 
     # Object storage (S3 API). Executors get presigned URLs built against the public endpoint.
     s3_endpoint_url: str = "http://localhost:9000"
@@ -40,10 +44,30 @@ class ServerSettings(BaseSettings):
     splitter_poll_s: float = Field(default=2.0, gt=0)
     executor_token_ttl_days: int = Field(default=90, gt=0)
 
+    # Splitter bounds (memory/DoS protection) and retry policy.
+    split_max_line_bytes: int = Field(default=16 << 20, gt=0)  # LINE_TOO_LONG above this
+    split_max_input_bytes: int = Field(default=50 << 30, gt=0)  # total per task
+    split_max_objects: int = Field(default=10_000, gt=0)  # input objects per task
+    split_max_subtasks: int = Field(default=100_000, gt=0)  # subtasks per task
+    split_max_attempts: int = Field(default=5, gt=0)  # transient failures before FAILED
+    split_backoff_base_s: float = Field(default=2.0, ge=0)  # doubles per attempt
+    split_backoff_max_s: float = Field(default=300.0, ge=0)
+    split_lease_s: float = Field(default=900.0, gt=0)  # claim lease; crashed splits retry after
+    split_max_seconds: float = Field(default=3600.0, gt=0)  # wall-clock budget per split attempt
+
     @field_validator("s3_input_prefixes", "s3_output_prefixes")
     @classmethod
     def _prefixes(cls, v: list[str]) -> list[str]:
         return _check_prefixes(v)
+
+    @model_validator(mode="after")
+    def _prefixes_disjoint(self) -> Self:
+        # Outputs written under an input prefix would be re-split as input (and vice versa).
+        for i in self.s3_input_prefixes:
+            for o in self.s3_output_prefixes:
+                if i.startswith(o) or o.startswith(i):
+                    raise ValueError(f"input prefix {i!r} and output prefix {o!r} overlap")
+        return self
 
     @model_validator(mode="after")
     def _public_endpoint_secure(self) -> Self:
