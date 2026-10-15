@@ -51,7 +51,14 @@ TEST_HOOKS_ENV = "MINION_EXECUTOR_TEST_HOOKS"
 SERVER_TIMEOUT_ENV = "MINION_HEARTBEAT_TIMEOUT_S"  # server/watchdog setting; optional sanity check
 MIN_TIMEOUT_FACTOR = 2.0
 REAL_ENGINES = [Engine.MLX, Engine.OLLAMA, Engine.HF]
-NO_ENGINE_MSG = "no inference engine available (install extras: uv sync --extra mlx)"
+NO_ENGINE_MSG = (
+    "no inference engine available (mlx/ollama/hf runners land in a later release; "
+    "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
+)
+
+
+class StartupError(Exception):
+    """Startup failed (no engine, probe failure); the CLI maps it to exit 2."""
 
 
 def _is_loopback(url: str) -> bool:
@@ -133,9 +140,16 @@ async def _run(
         # httpx reads proxy env when the clients are built (above); from here on the control
         # process holds no secrets, so neither the probe nor the workers inherit any.
         restrict_environ()
-        available = await asyncio.to_thread(probe_available, requested)
+        stop_requested = asyncio.Event()
+        aloop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            aloop.add_signal_handler(sig, stop_requested.set)  # also covers the probe
+        try:
+            available = await asyncio.to_thread(probe_available, requested)
+        except (RunnerError, WorkerCrashed) as exc:
+            raise StartupError(str(exc)) from exc
         if not available:
-            raise ValueError(NO_ENGINE_MSG)
+            raise StartupError(NO_ENGINE_MSG)
         typer.echo(f"engines: {','.join(e.value for e in available)}")
         reg = RegisterRequest(
             hostname=socket.gethostname(),
@@ -158,9 +172,10 @@ async def _run(
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
         )
-        aloop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, loop.stop)
+        if stop_requested.is_set():
+            loop.stop()
         await loop.run()
 
 
@@ -205,7 +220,7 @@ def run(
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
         asyncio.run(_run(server, prof, requested, token, heartbeat_interval_s))
-    except (ValueError, RunnerError, WorkerCrashed) as exc:  # e.g. no engine / probe failure
+    except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
 

@@ -21,8 +21,8 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 def _bad_segments(ref: str) -> bool:
     """True for '.', '..' or empty path segments (and a bare '..' anywhere)."""
-    name = ref.split(":", 1)[0]
-    return ".." in ref or any(seg in ("", ".") for seg in name.split("/"))
+    name, _, tag = ref.partition(":")
+    return ".." in ref or tag == "." or any(seg in ("", ".") for seg in name.split("/"))
 
 
 class _Model(BaseModel):

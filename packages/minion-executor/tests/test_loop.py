@@ -1096,9 +1096,11 @@ class TickingWorker(FakeWorker):
     def __init__(self) -> None:
         super().__init__()
         self.release = threading.Event()
+        self.progressed = threading.Event()
 
     def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
         on_progress(1)  # one record done mid-batch
+        self.progressed.set()
         self.release.wait(10)  # held until a heartbeat has observed it
         return super().run(batch, params, None)
 
@@ -1107,6 +1109,12 @@ async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
     worker = TickingWorker()
     client = FakeClient([_asn()])
     s3 = FakeS3()
+    inner = gated_sleep(1, [])
+
+    async def hb_sleep(d: float) -> None:
+        await asyncio.to_thread(worker.progressed.wait, 10)  # first beat only after progress
+        await inner(d)
+
     loop = make_loop(
         client,
         worker,
@@ -1114,7 +1122,7 @@ async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
         tmp_path,
         [],
         heartbeat_interval_s=1.0,
-        heartbeat_sleep=gated_sleep(1, []),
+        heartbeat_sleep=hb_sleep,
     )
     client.on_empty = loop.stop
     orig = client.heartbeat

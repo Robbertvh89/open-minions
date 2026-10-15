@@ -72,7 +72,7 @@ def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(m, "probe_available", none_available)
     result = runner.invoke(app, ["run"])
     assert result.exit_code == 2
-    assert "no inference engine available" in result.output
+    assert "no inference engine available" in result.output  # NO_ENGINE_MSG
     assert asked == [[Engine.MLX, Engine.OLLAMA, Engine.HF]]
 
 
@@ -237,3 +237,34 @@ def test_run_rejects_non_finite_or_huge_heartbeat_interval(
     result = runner.invoke(app, ["run", "--runner", "fake", "--heartbeat-interval", value])
     assert result.exit_code == 2
     assert "heartbeat interval" in result.output
+
+
+def test_runtime_errors_are_not_mapped_to_exit_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+    from minion_executor.worker.process import WorkerCrashed
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
+    monkeypatch.setattr(m, "probe_available", lambda requested: list(requested))
+
+    async def boom(self: object) -> None:
+        raise WorkerCrashed("died mid-run")
+
+    monkeypatch.setattr("minion_executor.loop.ExecutorLoop.run", boom)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code != 2
+    assert isinstance(result.exception, WorkerCrashed)
+
+
+def test_probe_failure_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+    from minion_executor.worker.process import WorkerCrashed
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
+
+    def crash(requested: list[Engine]) -> list[Engine]:
+        raise WorkerCrashed("probe died")
+
+    monkeypatch.setattr(m, "probe_available", crash)
+    assert runner.invoke(app, ["run"]).exit_code == 2

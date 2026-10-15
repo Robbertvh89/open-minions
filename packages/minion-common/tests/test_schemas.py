@@ -226,7 +226,7 @@ def test_ref_and_revision_bypasses_rejected() -> None:
     for ref in ("o/m\n", "\u043e/m", "o/\u043c", "o/.", "./m", "o//m"):
         with pytest.raises(ValidationError, match="ref"):
             _entry(ref=ref)
-    for ref in ("qwen\n", "q\u0435n:1b", "a/./b:1", "a//b:1", "a/../b:1", "a:\u0663"):
+    for ref in ("qwen\n", "q\u0435n:1b", "a/./b:1", "a//b:1", "a/../b:1", "a:\u0663", "a:."):
         with pytest.raises(ValidationError, match="ref"):
             _entry(engine="ollama", ref=ref, revision=SHA256)
     for rev in (SHA1 + "\n", "\uff10" * 40):

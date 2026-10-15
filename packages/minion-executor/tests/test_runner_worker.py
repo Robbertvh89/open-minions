@@ -546,7 +546,7 @@ def test_runner_error_retryable_round_trips() -> None:
         w.close()
 
 
-def test_engine_outside_set_is_refused_non_retryable() -> None:
+def test_engine_outside_set_is_refused_retryable() -> None:
     w = WorkerHandle([Engine.OLLAMA])
     try:
         with pytest.raises(RunnerError) as ei:
