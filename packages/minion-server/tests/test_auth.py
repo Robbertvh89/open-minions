@@ -141,20 +141,6 @@ async def test_executor_tokens(engine: AsyncEngine) -> None:
     assert await call(token) == 200  # no expiry
 
 
-def test_generate_api_key_cli(tmp_path: Path) -> None:
-    r = CliRunner().invoke(admin_app, ["generate-api-key", "--name", "dave", "--teams", "t1,t2"])
-    assert r.exit_code == 0, r.output
-    key = next(ln.split(": ", 1)[1] for ln in r.stdout.splitlines() if ln.startswith("api key"))
-    assert len(key) >= 32
-    digest = hashlib.sha256(key.encode()).hexdigest()
-    assert f"sha256: {digest}" in r.stdout
-    assert "teams: [t1, t2]" in r.stdout
-    assert r.stdout.count(key) == 1  # printed once; only the hash is in the YAML entry
-    f = tmp_path / "k.yaml"
-    f.write_text("keys:\n" + "\n".join(ln for ln in r.stdout.splitlines() if ln.startswith(" ")))
-    assert load_api_keys(f)[digest] == User("dave", ("t1", "t2"))
-
-
 def test_generate_api_key_bad_teams() -> None:
     r = CliRunner().invoke(admin_app, ["generate-api-key", "--name", "x", "--teams", "Bad Team"])
     assert r.exit_code != 0

@@ -14,9 +14,10 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or ServerSettings()
+        api_keys = load_api_keys(cfg.api_keys_file) if cfg.api_keys_file else None
         engine = create_engine(cfg.database_url)
         app.state.settings = cfg
-        app.state.api_keys = load_api_keys(cfg.api_keys_file) if cfg.api_keys_file else None
+        app.state.api_keys = api_keys
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         try:

@@ -56,7 +56,8 @@ def require_secure_url(url: str) -> str:
         return url
     if parts.scheme == "http" and host in LOCAL_HOSTS:
         return url
-    raise ValueError(f"insecure or invalid server URL {url!r}: https required (except localhost)")
+    shown = f"{parts.scheme}://{parts.hostname or ''}"
+    raise ValueError(f"insecure or invalid server URL {shown!r}: https required (except localhost)")
 
 
 def _error_from(resp: httpx.Response) -> ApiError:
