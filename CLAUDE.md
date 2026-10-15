@@ -60,8 +60,8 @@ uv run minion-server-admin --help          # operator CLI (typer); subcommands b
 uv run minion-server-admin generate-api-key --name <who> --teams a,b   # prints key once + keys-file entry
 uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]  # prints token once
 uv run minion-server-admin revoke-executor-token --executor-id <uuid>
-uv run minion-executor run --server http://localhost:8080 --profile balanced   # token from Keychain / $MINION_EXECUTOR_TOKEN
-uv run minion-executor bench --model <id>  # engine/throughput benchmark on this Mac
+uv run minion-executor run --server http://localhost:8080 --profile balanced   # token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (M1: fake runner only)
+uv run minion-executor bench --model <id>  # engine/throughput benchmark on this Mac (not implemented yet, M3)
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only
 uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py

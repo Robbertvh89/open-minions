@@ -126,6 +126,46 @@ minion_executor/
 - Uses `caffeinate`-free design: it does **not** prevent sleep. If the Mac sleeps, heartbeats stop and
   the watchdog reclaims — this is intended **[paper]**.
 
+#### Executor implementation (M1, TASK-2.3)
+Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
+`runners/{base,fake}.py`, `worker/process.py`. Not yet: heartbeat, governor/signals, MLX/Ollama/HF
+runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
+
+- **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
+  `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
+  if 4xx, raise (exit non-zero); if no assignment, backoff; else handle one subtask.
+- **Per subtask** (`_execute`): ranged GET of `[byte_start, byte_end)` → parse exactly `record_count`
+  records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
+  temp dir → presigned PUT → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
+  unlinked in `finally`.
+- **Error → report mapping** (`fail(retryable, code)`):
+  | Condition | Code | Retryable |
+  |---|---|---|
+  | input lines do not match `record_count` / not JSON | `BAD_INPUT` | no |
+  | input GET fails (HTTP error) | `INPUT_UNAVAILABLE` | yes |
+  | worker process died / timed out (600 s call timeout → kill) | `WORKER_CRASHED` | yes |
+  | `RunnerError` from worker | runner's code (≤64 chars) | yes |
+  | output PUT fails | `UPLOAD_FAILED` | yes |
+  | `complete` or `fail` returns 409 (stale acquirement) | — discard, no retry | — |
+  | `complete` fails on transport/5xx | — logged, not reported; watchdog reclaims | — |
+- **Stop** (SIGTERM / SIGINT → `loop.stop`, exit 0): an in-flight subtask is cancelled, the worker is
+  killed to reclaim memory, and the subtask is `release`d (immediate requeue, not a failure). The
+  loop does not wait for a grace period (see SPEC §4.2 FR-17 status).
+- **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
+  not a fixed 10–30 s band. Resets on the first assignment.
+- **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
+  worker is kept warm across subtasks of the same model, killed and restarted on a model switch,
+  and killed on stop. Only the fake runner exists in M1 (`runners/fake.py`, test aid; honours
+  `oom` admission and a capped `sleep_s`). Inference never runs in the control process (invariant 7).
+- **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
+  Memory is `min(fraction, 75 %) × RAM`, sent in `Budget`. CPU priority is applied only as a POSIX
+  `nice` value in the worker (15 / 10 / 0); there is no `Budget` field for it and no `taskpolicy`.
+- **Token and CLI** (`secrets.py`, `main.py`): token from `$MINION_EXECUTOR_TOKEN`, else the macOS
+  Keychain item `open-minions-executor` via `/usr/bin/security`. Token is never logged. `run` exits 2
+  on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
+  missing token. The `--runner` option is hidden and defaults to `fake`.
+- **Logging**: `structlog`, ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
+
 ### 2.3 minion-watchdog
 - Single loop every 60 s. Multiple replicas are safe: each reclaim is a single transaction guarded by
   `DELETE ... RETURNING` on the acquirement row.
@@ -349,7 +389,7 @@ token in macOS Keychain.
 - [ADR-0001](adr/0001-python-for-all-components.md): Python for all components — **Accepted**
 - ADR-0002: Unique-constraint acquisition over `SKIP LOCKED` *(to write)*
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
-- ADR-0004: Byte-range input slicing *(to write)*
+- [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
-- [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Proposed**
+- [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*

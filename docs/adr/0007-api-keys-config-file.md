@@ -1,6 +1,6 @@
 # ADR-0007: User API keys from a config file, not a database table
 
-- Status: **Proposed**
+- Status: **Accepted** (implemented in TASK-2.1; `auth.lookup_user` full-scan and startup load verified)
 - Date: 2026-10-15
 - Deciders: project owner
 - Deviates from paper: **no** — internal design choice; the paper does not specify user authentication.
