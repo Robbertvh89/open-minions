@@ -1,8 +1,8 @@
 """ORM models for the 7 PostgreSQL tables (SPEC §7, ARCHITECTURE §5).
 
-Subtasks are identified by the natural key `(team, project, task_name, subtask_id)`, as in the paper.
-The UNIQUE constraint on `minion_subtask_acquirement` is the only mutual-exclusion mechanism for
-subtask ownership (CLAUDE.md invariant 2) — do not weaken it.
+Subtasks are identified by the natural key `(team, project, task_name, subtask_id)`, as in the
+paper. The UNIQUE constraint on `minion_subtask_acquirement` is the only mutual-exclusion mechanism
+for subtask ownership (CLAUDE.md invariant 2) — do not weaken it.
 """
 
 import uuid

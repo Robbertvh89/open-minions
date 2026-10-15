@@ -67,7 +67,7 @@ async def test_only_one_acquirement_insert_wins(engine: AsyncEngine) -> None:
         "ON CONFLICT ON CONSTRAINT uq_minion_subtask_acquirement_subtask DO NOTHING "
         "RETURNING acquirement_id"
     )
-    winners = []
+    winners: list[uuid.UUID] = []
     for ex in executors:
         async with engine.begin() as conn:
             res = await conn.execute(insert, {**key, "aid": uuid.uuid4(), "ex": ex})
