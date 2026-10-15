@@ -92,3 +92,14 @@ def test_run_rejects_server_timeout_below_twice_interval(monkeypatch: pytest.Mon
     result = runner.invoke(app, ["run", "--runner", "fake", "--heartbeat-interval", "200"])
     assert result.exit_code == 2
     assert "MINION_HEARTBEAT_TIMEOUT_S" in result.output
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "3601", "1e9"])
+def test_run_rejects_non_finite_or_huge_heartbeat_interval(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    result = runner.invoke(app, ["run", "--runner", "fake", "--heartbeat-interval", value])
+    assert result.exit_code == 2
+    assert "heartbeat interval" in result.output

@@ -198,7 +198,7 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   a jittered delay (≤30 s); other errors are logged and the beat continues.
   `cancel=true` returns `CANCEL` → interrupt worker, `release` (server records `CANCELLED`).
   `409` (`TASK_FINISHED`, stale acquirement) returns `STALE` → interrupt worker, report nothing.
-  Logs carry ids only. Running with `--heartbeat-interval` ≥ `MINION_HEARTBEAT_TIMEOUT_S` / 2 is
+  Logs carry ids only. Running with `--heartbeat-interval` such that `MINION_HEARTBEAT_TIMEOUT_S` < 2× the interval is
   rejected only when the operator exports `MINION_HEARTBEAT_TIMEOUT_S`; keep the timeout ≥ 2–3×
   the interval (3× recommended) so one lost beat does not get a live executor reclaimed.
 - **Housekeeping**: temp dirs are `minion-exec-<pid>-*`; at startup dirs of dead pids owned by the
@@ -208,7 +208,7 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
 ### 2.3 minion-watchdog
 - Separate process (`minion_watchdog.main:main`, `uv run minion-watchdog`) that reuses the server's
   repositories and services; it never talks to executors. Only `MINION_DATABASE_URL` is required;
-  its DB pool is `MINION_DB_POOL_SIZE` (default 2 here, 10 for the server) and each statement has
+  its DB pool is `MINION_WATCHDOG_DB_POOL_SIZE` (default 2; the server uses `MINION_DB_POOL_SIZE`, 10) and each statement has
   `MINION_DB_COMMAND_TIMEOUT_S`.
 - Loop every `MINION_WATCHDOG_INTERVAL_S` (60 s). A tick reclaims in batches of
   `MINION_WATCHDOG_BATCH_SIZE` (repeats while batches come back full, max 100 rounds), then runs the
@@ -304,7 +304,7 @@ Server:   verify acquirement is current (else 409)
 ```
 Executor (every heartbeat interval, 300 s by default, while running): POST /heartbeat {progress, budget, paused_reason}
   Server: owner check under lock (acquirement, else 409); 429 if closer than MINION_HEARTBEAT_MIN_INTERVAL_S
-          UPSERT minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
+          UPDATE minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
           respond {cancel: task.status == CANCELLED, output_url (fresh presigned PUT), expires_at}
 
 Watchdog (every 60 s; also reclaims acquirements older than MINION_MAX_LEASE_S regardless of beats,

@@ -47,6 +47,8 @@ log = structlog.get_logger("minion_executor.loop")
 
 BAD_INPUT = "BAD_INPUT"
 TMP_PREFIX = "minion-exec-"
+# Refresh the output URL with one synchronous heartbeat when it expires within this margin.
+UPLOAD_URL_MARGIN_S = 60.0
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
 # Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
 # (HTTP status errors, unexpected bodies) is a retryable `fail` so max_attempts bounds it.
@@ -99,6 +101,14 @@ class Worker(Protocol):
     def interrupt(self) -> None: ...
     def kill(self) -> None: ...
     def close(self) -> None: ...
+
+
+class _SignalledError(Exception):
+    """A synchronous pre-upload heartbeat returned a stop signal (cancel / stale)."""
+
+    def __init__(self, signal: HeartbeatSignal) -> None:
+        super().__init__(signal.name)
+        self.signal = signal
 
 
 class _FailureError(Exception):
@@ -248,24 +258,36 @@ class ExecutorLoop:
             budget=self._budget,
             total=a.record_count,
             initial_output_url=a.output_url,
+            initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
         work = asyncio.create_task(self._execute(a, tmp, hb))
         stopper = asyncio.create_task(self._stop.wait())
         beat = asyncio.create_task(hb.run())
         try:
-            await asyncio.wait({work, stopper, beat}, return_when=asyncio.FIRST_COMPLETED)
-            if not work.done():
-                if not stopper.done():
-                    return await self._on_signal(a, work, beat.result(), bound)
-                # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
-                await asyncio.to_thread(self._worker.kill)
-                work.cancel()
-                await asyncio.gather(work, return_exceptions=True)
-                await self._release(a, bound)
-                return _Outcome.STOPPED
+            pending: set[asyncio.Future[Any]] = {work, stopper, beat}
+            while not work.done():
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                if work.done():
+                    break
+                if stopper.done():
+                    # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
+                    await asyncio.to_thread(self._worker.kill)
+                    work.cancel()
+                    await asyncio.gather(work, return_exceptions=True)
+                    await self._release(a, bound)
+                    return _Outcome.STOPPED
+                if beat.cancelled() or beat.exception() is not None:
+                    # A broken heartbeater is "no signal": the work carries on.
+                    exc = None if beat.cancelled() else beat.exception()
+                    bound.warning("heartbeat_task_error", error=type(exc).__name__)
+                    pending.discard(beat)
+                    continue
+                return await self._on_signal(a, work, beat.result(), bound)
             try:
                 result = work.result()
+            except _SignalledError as s:
+                return await self._on_signal(a, work, s.signal, bound)
             except _FailureError as f:
                 await self._report_failure(a, f, bound)
                 return _Outcome.FAILED
@@ -281,7 +303,16 @@ class ExecutorLoop:
         finally:
             stopper.cancel()
             beat.cancel()  # also during _complete: the lease is kept alive until we return
-            await asyncio.gather(beat, return_exceptions=True)
+            if not work.done():
+                work.cancel()
+            await asyncio.gather(stopper, beat, work, return_exceptions=True)
+            # The work task has truly finished (incl. a shielded file write): nothing may linger.
+            for p in self._paths(a, tmp):
+                p.unlink(missing_ok=True)
+
+    @staticmethod
+    def _paths(a: Assignment, tmp: Path) -> tuple[Path, Path]:
+        return tmp / f"{a.acquirement_id}.in.jsonl", tmp / f"{a.acquirement_id}.out.jsonl"
 
     async def _on_signal(
         self, a: Assignment, work: asyncio.Task[CompleteRequest], sig: HeartbeatSignal, bound: Any
@@ -349,8 +380,8 @@ class ExecutorLoop:
             raise _FailureError(True, "INSECURE_URL", "presigned URL is not https") from None
 
     async def _execute(self, a: Assignment, tmp: Path, hb: Heartbeater) -> CompleteRequest:
-        in_path = tmp / f"{a.acquirement_id}.in.jsonl"
-        out_path = tmp / f"{a.acquirement_id}.out.jsonl"
+        in_path, out_path = self._paths(a, tmp)
+        write: asyncio.Future[tuple[int, str]] | None = None
         try:
             self._check_url(a.input_url)
             self._check_url(a.output_url)
@@ -372,10 +403,16 @@ class ExecutorLoop:
             if len(outputs) != len(records):
                 raise _FailureError(True, "OUTPUT_MISMATCH", "runner returned wrong record count")
             try:
-                size, digest = await asyncio.to_thread(io.write_jsonl, out_path, outputs)
+                # Shielded: a cancel must not leave the thread writing after cleanup (see finally).
+                write = asyncio.ensure_future(asyncio.to_thread(io.write_jsonl, out_path, outputs))
+                size, digest = await asyncio.shield(write)
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
+            if not hb.url_fresh(UPLOAD_URL_MARGIN_S):  # long run or unknown expiry: refresh now
+                signal, _ = await hb.beat()
+                if signal is not None:
+                    raise _SignalledError(signal)
             output_url = hb.output_url  # refreshed by heartbeats; same attempt-scoped key
             self._check_url(output_url)
             try:
@@ -386,6 +423,8 @@ class ExecutorLoop:
                 raise _FailureError(True, "UPLOAD_FAILED", msg, release=local) from None
             return CompleteRequest(record_count=len(outputs), byte_size=size, sha256=digest)
         finally:
+            if write is not None and not write.done():
+                await asyncio.wait({write})  # let the writer thread finish before unlinking
             in_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
 

@@ -125,7 +125,7 @@ async def _amain() -> None:
     cfg = WatchdogSettings()
     engine = create_engine(
         cfg.database_url,
-        pool_size=cfg.db_pool_size,
+        pool_size=cfg.watchdog_db_pool_size,
         max_overflow=0,
         connect_args={"command_timeout": cfg.db_command_timeout_s},
     )

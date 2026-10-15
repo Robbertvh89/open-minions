@@ -11,7 +11,7 @@ class WatchdogSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MINION_", env_file=".env", extra="ignore")
 
     database_url: SecretStr  # required; see .env.example
-    db_pool_size: int = Field(default=2, ge=1)
+    watchdog_db_pool_size: int = Field(default=2, ge=1)
     heartbeat_timeout_s: float = Field(default=900.0, gt=0)  # silent this long -> reclaimed
     # Hard cap on one acquirement, however fresh its heartbeat (a looping executor cannot hold a
     # subtask forever). Must exceed the slowest legitimate subtask.

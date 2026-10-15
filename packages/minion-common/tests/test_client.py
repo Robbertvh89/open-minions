@@ -18,6 +18,8 @@ from minion_common.schemas import (
     Budget,
     CompleteRequest,
     FailRequest,
+    HeartbeatRequest,
+    HeartbeatResponse,
     PreferenceRequest,
     RegisterRequest,
     TaskCreate,
@@ -286,3 +288,29 @@ async def test_cancel_task() -> None:
     assert calls[0].method == "POST"
     assert calls[0].url.path.endswith("/tasks/ml/p/t/cancel")
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("30", 30.0), (" 7 ", 7.0), ("\u00b2", None), ("-5", None), ("1.5", None),
+     ("Wed, 21 Oct 2026 07:28:00 GMT", None), ("1234567", None), ("", None)],
+)  # fmt: skip
+async def test_retry_after_parsing_is_strict_ascii_seconds(
+    raw: str, expected: float | None
+) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, headers=[(b"Retry-After", raw.encode("latin-1"))], json={"detail": "slow"}
+        )
+
+    async with _client(handler) as c:
+        with pytest.raises(ApiError) as ei:
+            await c.heartbeat(AID, HeartbeatRequest())
+    assert ei.value.retry_after == expected
+
+
+def test_heartbeat_response_requires_aware_expires_at() -> None:
+    with pytest.raises(ValueError):
+        HeartbeatResponse.model_validate(
+            {"cancel": False, "output_url": "http://s3/out", "expires_at": "2026-01-01T00:00:00"}
+        )

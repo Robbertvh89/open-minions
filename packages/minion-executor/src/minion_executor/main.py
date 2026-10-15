@@ -18,6 +18,7 @@ from minion_common.schemas import RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
+from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.runners import create_runner
 from minion_executor.secrets import ENV_VAR, load_token
@@ -42,7 +43,6 @@ def _chip() -> str:
     return platform.machine() or "unknown"
 
 
-MIN_HEARTBEAT_INTERVAL_S = 1.0
 DEFAULT_HEARTBEAT_INTERVAL_S = 300.0
 DEV_ENV = "MINION_EXECUTOR_DEV"
 TEST_HOOKS_ENV = "MINION_EXECUTOR_TEST_HOOKS"
@@ -63,10 +63,10 @@ def _validate_runner(name: str) -> None:
 
 
 def _validate_heartbeat(interval_s: float) -> None:
-    """The server's heartbeat timeout must exceed the interval with margin (>= 2x), else live
-    executors get reclaimed between beats. Checked only when the operator exports the timeout."""
-    if interval_s < MIN_HEARTBEAT_INTERVAL_S:
-        raise ValueError(f"heartbeat interval must be >= {MIN_HEARTBEAT_INTERVAL_S:g}s")
+    """The interval must be finite and within [1 s, 1 h] (the upper bound keeps the refreshed
+    presigned URL valid between beats). The server's heartbeat timeout must be >= 2x the interval,
+    else live executors get reclaimed between beats; checked only when the operator exports it."""
+    check_interval(interval_s)
     raw = os.environ.get(SERVER_TIMEOUT_ENV)
     if raw:
         try:
@@ -135,7 +135,7 @@ def run(
         typer.Option(
             "--heartbeat-interval",
             envvar="MINION_EXECUTOR_HEARTBEAT_INTERVAL_S",
-            help="Seconds between heartbeats (>= 1). Server timeout must be >= 2x this.",
+            help="Seconds between heartbeats (1 to 3600). Server timeout must be >= 2x this.",
         ),
     ] = DEFAULT_HEARTBEAT_INTERVAL_S,
 ) -> None:

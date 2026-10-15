@@ -81,7 +81,7 @@ def _error_from(resp: httpx.Response) -> ApiError:
     cls = StaleAcquirementError if stale else ApiError
     retry_after: float | None = None
     raw = resp.headers.get("Retry-After")
-    if raw is not None and raw.strip().isdigit():
+    if raw is not None and re.fullmatch(r"[0-9]{1,6}", raw.strip()):  # ASCII delta-seconds only
         retry_after = float(raw.strip())
     return cls(resp.status_code, code, message, retry_after=retry_after)
 

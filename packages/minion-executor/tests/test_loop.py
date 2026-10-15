@@ -52,7 +52,7 @@ def assignment(
             "byte_end": size,
             "record_count": count,
             "output_url": "https://s3.test/out",
-            "expires_at": datetime.now(UTC).isoformat(),
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         }
     )
 
@@ -630,7 +630,7 @@ async def test_heartbeats_sent_with_progress_and_interval(tmp_path: Path) -> Non
     await loop.run()
     beats = [r for k, r in client.calls if k == "heartbeat"]
     assert len(beats) == 2
-    assert all(90.0 <= d <= 110.0 for d in delays[:2])
+    assert all(100.0 <= d <= 110.0 for d in delays[:2])  # jitter is upward only
     assert beats[0].progress.records_total == 3 and beats[0].progress.records_done == 0
     assert beats[0].budget == BUDGET
 
@@ -658,12 +658,8 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
         client, worker, s3, tmp_path, sleeps,
         heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
     )  # fmt: skip
-
-    def after_first_cancel() -> None:
-        loop.stop()
-
-    client.on_empty = after_first_cancel
-    # second assignment: worker is no longer blocking after interrupt reset
+    client.on_empty = loop.stop
+    # the second assignment must run normally: the worker stops blocking once interrupted
     orig_run = worker.run
 
     def run(batch: list[Record]) -> list[Record]:
@@ -672,14 +668,11 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
         return orig_run(batch)
 
     worker.run = run  # type: ignore[method-assign]
-    await loop.run()
+    assert await loop.run() == 1
     assert worker.interrupted and not worker.killed
-    kinds = client.kinds()
-    assert kinds.index("release") > kinds.index("heartbeat")
-    assert "fail" not in kinds
-    assert s3.puts == [] or len(s3.puts) == 1  # only the second subtask may upload
-    assert kinds.count("acquire") >= 2  # kept polling after the cancel
-    assert sleeps == [] or all(d >= 5.0 for d in sleeps)  # no failure backoff for CANCELLED
+    assert client.kinds() == ["acquire", "heartbeat", "release", "acquire", "complete", "acquire"]
+    assert len(s3.puts) == 1  # only the second subtask uploads
+    assert len(sleeps) == 1  # only the final empty-queue sleep: no failure backoff for CANCELLED
 
 
 async def test_cancel_has_no_failure_backoff_and_no_upload(tmp_path: Path) -> None:
@@ -755,7 +748,7 @@ async def test_transport_error_in_heartbeat_does_not_fail_subtask(tmp_path: Path
 
 async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
     client, s3 = FakeClient([assignment()]), FakeS3()
-    client.hb_script = [hb_resp(url="https://s3.test/out-refreshed", minutes=10)]
+    client.hb_script = [hb_resp(url="https://s3.test/out?sig=new", minutes=10)]
     urls: list[str] = []
     orig_handler = s3.handler
 
@@ -781,7 +774,7 @@ async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
     )  # fmt: skip
     client.on_empty = loop.stop
     assert await loop.run() == 1
-    assert urls == ["https://s3.test/out-refreshed"]
+    assert urls == ["https://s3.test/out?sig=new"]
 
 
 async def test_stop_during_heartbeat_wait_is_prompt(tmp_path: Path) -> None:
@@ -792,3 +785,202 @@ async def test_stop_during_heartbeat_wait_is_prompt(tmp_path: Path) -> None:
     await asyncio.wait_for(loop.run(), timeout=5)
     assert worker.killed
     assert client.kinds().count("release") == 1
+
+
+def _slow_worker(worker: FakeWorker, secs: float) -> None:
+    import time
+
+    orig = worker.run
+
+    def slow(batch: list[Record]) -> list[Record]:
+        time.sleep(secs)
+        return orig(batch)
+
+    worker.run = slow  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    "retry_after,interval,expected", [(9999.0, 100.0, 100.0), (9999.0, 1000.0, 600.0)]
+)
+async def test_retry_after_is_capped_by_interval_and_max(
+    tmp_path: Path, retry_after: float, interval: float, expected: float
+) -> None:
+    client, delays = FakeClient([assignment()]), list[float]()
+    client.hb_script = [ApiError(429, "RATE_LIMITED", "slow", retry_after=retry_after)]
+    loop = make_loop(
+        client, FakeWorker(block=True), FakeS3(), tmp_path, [],
+        heartbeat_interval_s=interval, heartbeat_sleep=gated_sleep(2, delays),
+    )  # fmt: skip
+    asyncio.get_running_loop().call_later(0.4, loop.stop)
+    await loop.run()
+    assert delays[1] == expected
+
+
+async def test_task_finished_409_is_handled_like_stale(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.hb_script = [ApiError(409, "TASK_FINISHED", "done")]
+    worker = FakeWorker(block=True)
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await loop.run()
+    assert worker.interrupted
+    assert client.kinds() == ["acquire", "heartbeat", "acquire"]
+    assert s3.puts == []
+
+
+@pytest.mark.parametrize("sig", ["cancel", "stale"])
+async def test_beat_signal_during_inflight_upload(tmp_path: Path, sig: str) -> None:
+    s3 = FakeS3()
+    started = asyncio.Event()
+    orig = s3.handler
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            started.set()
+            await asyncio.Event().wait()  # the upload never finishes on its own
+        return orig(req)
+
+    s3.handler = handler  # type: ignore[method-assign, assignment]
+    client = FakeClient([assignment()])
+    client.hb_script = [
+        hb_resp(cancel=True)
+        if sig == "cancel"
+        else StaleAcquirementError(409, "STALE_ACQUIREMENT", "x")
+    ]
+
+    async def hb_sleep(_: float) -> None:
+        await started.wait()
+
+    worker = FakeWorker()
+    loop = make_loop(
+        client, worker, s3, tmp_path, [], heartbeat_interval_s=100.0, heartbeat_sleep=hb_sleep
+    )
+    client.on_empty = loop.stop
+    assert await asyncio.wait_for(loop.run(), 10) == 0
+    expected = ["acquire", "heartbeat", "acquire"]
+    if sig == "cancel":
+        expected.insert(2, "release")
+    assert client.kinds() == expected
+    assert worker.interrupted
+
+
+async def test_failing_heartbeater_task_is_no_signal_and_work_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(self: Any) -> None:
+        raise RuntimeError("secret detail")
+
+    monkeypatch.setattr("minion_executor.loop.Heartbeater.run", boom)
+    client, s3, worker = FakeClient([assignment()]), FakeS3(), FakeWorker()
+    _slow_worker(worker, 0.2)
+    loop = make_loop(client, worker, s3, tmp_path, [])
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert client.kinds() == ["acquire", "complete", "acquire"]
+
+
+async def test_stop_cancels_work_when_loop_task_is_cancelled(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], heartbeat_interval_s=100.0)
+    task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    worker.killed = True  # unblock the fake's thread
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [t for t in asyncio.all_tasks() if "_execute" in repr(t)] == []
+
+
+async def test_upload_refreshes_url_synchronously_when_expiring(tmp_path: Path) -> None:
+    a = assignment()
+    a.expires_at = datetime.now(UTC) + timedelta(seconds=5)  # inside the 60 s margin
+    client, s3 = FakeClient([a]), FakeS3()
+    client.hb_script = [hb_resp(url="https://s3.test/out?sig=2", minutes=10)]
+    urls: list[str] = []
+    orig = s3.handler
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            urls.append(str(req.url))
+        return orig(req)
+
+    s3.handler = handler  # type: ignore[method-assign]
+    loop = make_loop(
+        client, FakeWorker(), s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert client.kinds() == ["acquire", "heartbeat", "complete", "acquire"]
+    assert urls == ["https://s3.test/out?sig=2"]
+
+
+async def test_pre_upload_refresh_cancel_releases_without_upload(tmp_path: Path) -> None:
+    a = assignment()
+    a.expires_at = datetime.now(UTC)
+    client, s3 = FakeClient([a]), FakeS3()
+    client.hb_script = [hb_resp(cancel=True)]
+    loop = make_loop(
+        client, FakeWorker(), s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    assert client.kinds() == ["acquire", "heartbeat", "release", "acquire"]
+    assert s3.puts == []
+
+
+async def test_refreshed_url_for_another_object_is_ignored(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.hb_script = [hb_resp(url="https://evil.test/out", minutes=10)]
+    urls: list[str] = []
+    orig = s3.handler
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            urls.append(str(req.url))
+        return orig(req)
+
+    s3.handler = handler  # type: ignore[method-assign]
+    worker = FakeWorker()
+    _slow_worker(worker, 0.3)
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert urls == ["https://s3.test/out"]
+
+
+async def test_cancel_during_output_write_leaves_no_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    def slow_write(path: Path, outputs: list[Record]) -> tuple[int, str]:
+        time.sleep(0.5)
+        path.write_bytes(b"partial")  # lands after the cancel
+        return 7, "d"
+
+    monkeypatch.setattr("minion_executor.loop.io.write_jsonl", slow_write)
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.hb_script = [hb_resp(cancel=True)]
+    loop = make_loop(
+        client, FakeWorker(), s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    seen: list[list[Path]] = []
+
+    async def nap(_: float) -> None:
+        await asyncio.sleep(0.3)  # the writer thread has long finished by now
+        seen.append(await asyncio.to_thread(lambda: list(tmp_path.glob("*/*"))))
+        loop.stop()
+
+    loop._sleep_fn = nap
+    await loop.run()
+    assert seen == [[]]
+    assert "release" in client.kinds() and s3.puts == []

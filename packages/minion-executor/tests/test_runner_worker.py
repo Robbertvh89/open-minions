@@ -271,6 +271,27 @@ def test_kill_between_check_and_assignment_leaves_no_worker() -> None:
     assert time.monotonic() - t0 < 10
 
 
+def test_interrupt_between_spawn_and_assignment_aborts_and_leaves_no_worker() -> None:
+    w = WorkerHandle("fake")
+    spawned: list[BaseProcess] = []
+
+    def hook(proc: BaseProcess) -> None:
+        spawned.append(proc)
+        w.interrupt()  # lands before self._proc is assigned: nothing to kill yet
+
+    w._after_spawn_hook = hook
+    with pytest.raises(WorkerCrashed):
+        w.ensure_model(_model(), BUDGET)
+    assert w.pid is None and w.loaded_model_id is None
+    assert spawned and not spawned[0].is_alive()
+    w._after_spawn_hook = None
+    w.ensure_model(_model(), BUDGET)  # the handle stays usable (unlike kill())
+    try:
+        assert w.pid is not None
+    finally:
+        w.close()
+
+
 HARNESS = """
 import threading
 import time
