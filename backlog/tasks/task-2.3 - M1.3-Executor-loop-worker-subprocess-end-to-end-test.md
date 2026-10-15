@@ -4,7 +4,7 @@ title: 'M1.3: Executor loop, worker subprocess, end-to-end test'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 17:07'
+updated_date: '2026-10-15 17:13'
 labels:
   - M1
 dependencies:
@@ -22,10 +22,12 @@ Plan steps C1, C2, E1 of TASK-2: Runner protocol + fake runner, spawned worker s
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 E2E: task submitted -> split -> 2 executors with fake runner -> all outputs promoted in S3, no duplicates
-- [ ] #2 Worker crash reported as retryable fail; SIGTERM releases current subtask
-- [ ] #3 ADR-0004 and ADR-0007 written; docs match code
+- [x] #1 E2E: task submitted -> split -> 2 executors with fake runner -> all outputs promoted in S3, no duplicates
+- [x] #2 Worker crash reported as retryable fail; SIGTERM releases current subtask
+- [x] #3 ADR-0004 and ADR-0007 written; docs match code
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 
