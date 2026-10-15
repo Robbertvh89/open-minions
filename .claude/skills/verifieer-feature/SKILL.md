@@ -34,12 +34,15 @@ Record pass/fail/skip counts. Any skip of an integration test = NOT VERIFIED for
 docker compose -f deploy/compose.yml up -d --wait postgres s3 && docker compose -f deploy/compose.yml up s3-init
 uv run alembic upgrade head
 uv run alembic downgrade -1 && uv run alembic upgrade head      # if a migration was added
-uv run minion-server &  SERVER_PID=$!                            # then curl the affected endpoints
+# Shell state does not persist between tool calls: start, exercise and stop in ONE command.
+(uv run minion-server > /tmp/minion-server.log 2>&1 & echo $! > /tmp/minion-server.pid)
+sleep 3 && curl -sf http://localhost:8080/healthz   # ...then curl the affected endpoints
+kill "$(cat /tmp/minion-server.pid)"
 ```
 Exercise the feature the way a user/executor would (curl the API, run `minion-executor` against the
 server, inspect S3 with the aws-cli container or boto3, query Postgres with
 `docker compose -f deploy/compose.yml exec postgres psql -U minion -c "..."`).
-Always stop what you started (`kill $SERVER_PID`).
+Always stop what you started (`kill "$(cat /tmp/minion-server.pid)"`, or `pkill -f minion-server`).
 
 macOS/Metal-only features (MLX runners, capacity governor signals): run them natively on this Mac;
 if hardware/permissions prevent it, mark NOT VERIFIABLE HERE with the reason.

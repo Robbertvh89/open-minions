@@ -22,7 +22,8 @@ their conclusions in context. Model allocation is defined in each agent's frontm
 
 1. **Backlog item** (always first). Existing task, or
    `backlog task create "<title>" -d "..." --ac "..." -l <label>`; then
-   `backlog task edit <id> -s "In Progress"`.
+   `backlog task edit <id> -s "In Progress"`. Commit the new/changed task file on main
+   (`chore(backlog): add TASK-<id>`) and push before branching.
 2. **Branch** from up-to-date main: `git switch main && git pull --ff-only && git switch -c <type>/task-<id>-<slug>`
    (`feat|fix|chore|docs|test|refactor`). One task = one branch = one PR.
 3. **Plan** → `planner` with the task id. Read its summary. If it proposes sub-tasks, create them and
@@ -45,6 +46,11 @@ their conclusions in context. Model allocation is defined in each agent's frontm
     `gh pr merge --squash --delete-branch`, then `git switch main && git pull --ff-only`.
 12. **Close**: `backlog task edit <id> -s Done`; commit the backlog change on main
     (`chore(backlog): close TASK-<id>`) and push.
+
+## If project agents are not loaded
+Agent types in `.claude/agents/` load at session start. If `subagent_type: "planner"` (etc.) is
+rejected, use `subagent_type: "general-purpose"` with the agent's `model` (opus/sonnet/haiku) and a
+prompt starting: "First read `.claude/agents/<name>.md` and act exactly as that agent."
 
 ## Rules
 - Never commit directly to main except backlog bookkeeping (steps 1 and 12).

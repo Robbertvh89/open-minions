@@ -24,7 +24,8 @@ grep -rnE "sqlalchemy|asyncpg|psycopg" packages/minion-executor/src
 # no duplicated API models: request/response schemas live in minion-common
 grep -rn "class .*(BaseModel)" packages/minion-server/src packages/minion-executor/src
 ```
-Any hit is a finding unless clearly justified.
+Any hit is a finding unless clearly justified. The first grep also matches `dict.update(` and
+similar; check each hit before reporting it.
 
 ## 3. Conventions (CLAUDE.md)
 - Type hints everywhere; no `Any` leaking through public interfaces without reason.

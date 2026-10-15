@@ -11,7 +11,8 @@ only DB client and hands out S3 access; models come from the internet.
 ## 1. Automated scans
 ```bash
 uv run ruff check --select S .                              # bandit rules
-uvx pip-audit --strict -r <(uv export --no-hashes --no-dev --format requirements-txt) || true
+uv export --no-hashes --no-dev --no-emit-workspace --format requirements-txt > /tmp/minion-reqs.txt
+uvx pip-audit --strict -r /tmp/minion-reqs.txt     # non-zero exit = finding (CVE or audit error)
 git diff main...HEAD | grep -nEi "(secret|password|token|api[_-]?key|BEGIN [A-Z ]*PRIVATE KEY)" || true
 ```
 Dev-only credentials in `deploy/` and `.env.example` are acceptable; anything else is a finding.

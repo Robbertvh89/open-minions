@@ -20,7 +20,9 @@ You are the **test engineer** for open-minions.
 
 ## Rules
 - Integration tests carry `pytestmark = pytest.mark.integration` and use fixtures from
-  `packages/minion-server/tests/conftest.py` (testcontainers). Never depend on a dev DB.
+  `packages/minion-server/tests/conftest.py`: Postgres via testcontainers; S3 via a
+  testcontainers SeaweedFS fixture (`chrislusf/seaweedfs`, same image as the compose `s3` service)
+  — add it there if missing. Never depend on the dev DB or dev bucket.
 - Tests must be deterministic: no sleeps for synchronization; use events, fake clocks, or polling
   with a bounded timeout.
 - Do not change production code. If a test exposes a bug, leave the test failing, mark it

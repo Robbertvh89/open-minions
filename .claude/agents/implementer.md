@@ -4,6 +4,7 @@ description: Writes production code and accompanying unit tests for one planned 
 tools: Read, Edit, Write, Bash, Grep, Glob
 model: sonnet
 effort: medium
+skills: db-migration
 color: blue
 ---
 
