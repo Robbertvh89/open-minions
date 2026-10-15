@@ -1,5 +1,6 @@
 """Repo-wide fixtures. Integration fixtures start containers via testcontainers (needs Docker)."""
 
+import asyncio
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +24,7 @@ from minion_server.repositories import tasks as tasks_repo
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -62,6 +64,29 @@ async def engine(migrated_url: str) -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine(migrated_url)
     yield eng
     await eng.dispose()
+
+
+@pytest.fixture
+async def fresh_url(postgres_url: str) -> AsyncIterator[str]:
+    """A brand-new, migrated database on the shared Postgres server, dropped after the test.
+
+    Use when a test needs an empty queue/tables regardless of what other tests left behind.
+    """
+    name = f"t_{uuid.uuid4().hex[:16]}"
+    base = make_url(postgres_url)
+    admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
+    async with admin.connect() as conn:
+        await conn.execute(text(f'CREATE DATABASE "{name}"'))
+    url = base.set(database=name).render_as_string(hide_password=False)
+    cfg = Config(str(REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+    try:
+        yield url
+    finally:
+        async with admin.connect() as conn:
+            await conn.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+        await admin.dispose()
 
 
 @dataclass(frozen=True)

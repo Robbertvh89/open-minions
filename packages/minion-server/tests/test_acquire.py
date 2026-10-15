@@ -28,19 +28,16 @@ MODELS = {
 
 
 @pytest.fixture
-async def big_engine(migrated_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_engine(SecretStr(migrated_url), pool_size=N + 5, max_overflow=0)
+async def big_engine(fresh_url: str) -> AsyncIterator[AsyncEngine]:
+    eng = create_engine(SecretStr(fresh_url), pool_size=N + 5, max_overflow=0)
     yield eng
     await eng.dispose()
 
 
 @pytest.fixture
 async def sm(big_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    s = create_sessionmaker(big_engine)
-    # Isolation: other tests' leftover work must not be acquirable.
-    async with s() as session, session.begin():
-        await session.execute(text("UPDATE minion_task SET status='FAILED'"))
-    return s
+    # Isolation: every test gets its own empty database (see `fresh_url`).
+    return create_sessionmaker(big_engine)
 
 
 async def _acquire(
@@ -106,9 +103,9 @@ def test_attempt_key() -> None:
 @pytest.mark.integration
 @pytest.mark.parametrize(("name", "n_sub"), [("hot", 1), ("twenty", 20)])
 async def test_service_race_unique_owners(
-    sm: async_sessionmaker[AsyncSession], migrated_url: str, name: str, n_sub: int
+    sm: async_sessionmaker[AsyncSession], fresh_url: str, name: str, n_sub: int
 ) -> None:
-    cfg = _settings(migrated_url)
+    cfg = _settings(fresh_url)
     await seed_task(sm, f"svc-{name}", n_sub)
     execs = await make_executors(sm, N)
     results = await asyncio.gather(*(_acquire(sm, p, cfg) for p, _ in execs))
@@ -129,8 +126,8 @@ async def test_service_race_unique_owners(
 
 
 @pytest.fixture
-async def http(migrated_url: str) -> AsyncIterator[tuple[AsyncClient, Any]]:
-    cfg = _settings(migrated_url)
+async def http(fresh_url: str) -> AsyncIterator[tuple[AsyncClient, Any]]:
+    cfg = _settings(fresh_url)
     app = create_app(cfg)
     async with (
         app.router.lifespan_context(app),
@@ -146,8 +143,6 @@ async def test_http_race_unique_owners(
 ) -> None:
     c, app = http
     sm = app.state.sessionmaker
-    async with sm() as s, s.begin():
-        await s.execute(text("UPDATE minion_task SET status='FAILED'"))
     await seed_task(sm, f"http-{name}", n_sub)
     execs = await make_executors(sm, N)
     body = _req().model_dump(mode="json")
@@ -170,8 +165,6 @@ async def test_http_race_unique_owners(
 async def test_http_assignment_shape_and_204(http: tuple[AsyncClient, Any]) -> None:
     c, app = http
     sm = app.state.sessionmaker
-    async with sm() as s, s.begin():
-        await s.execute(text("UPDATE minion_task SET status='FAILED'"))
     ((_, token),) = await make_executors(sm, 1)
     body = _req().model_dump(mode="json")
     empty = await c.post("/api/v1/executor/acquire", json=body, headers=_auth(token))
@@ -195,10 +188,8 @@ async def test_http_assignment_shape_and_204(http: tuple[AsyncClient, Any]) -> N
 
 
 @pytest.mark.integration
-async def test_preference_before_fifo(
-    sm: async_sessionmaker[AsyncSession], migrated_url: str
-) -> None:
-    cfg = _settings(migrated_url)
+async def test_preference_before_fifo(sm: async_sessionmaker[AsyncSession], fresh_url: str) -> None:
+    cfg = _settings(fresh_url)
     await seed_task(sm, "fifo-old", 2)  # older: global FIFO would serve this first
     await seed_task(sm, "fifo-pref", 2)
     ((p, _),) = await make_executors(sm, 1)
@@ -224,9 +215,9 @@ async def test_preference_before_fifo(
 
 @pytest.mark.integration
 async def test_priority_orders_before_age(
-    sm: async_sessionmaker[AsyncSession], migrated_url: str
+    sm: async_sessionmaker[AsyncSession], fresh_url: str
 ) -> None:
-    cfg = _settings(migrated_url)
+    cfg = _settings(fresh_url)
     await seed_task(sm, "prio-low", 1)
     await seed_task(sm, "prio-high", 1, priority=5)
     ((p, _),) = await make_executors(sm, 1)
@@ -235,8 +226,8 @@ async def test_priority_orders_before_age(
 
 
 @pytest.mark.integration
-async def test_filters(sm: async_sessionmaker[AsyncSession], migrated_url: str) -> None:
-    cfg = _settings(migrated_url)
+async def test_filters(sm: async_sessionmaker[AsyncSession], fresh_url: str) -> None:
+    cfg = _settings(fresh_url)
     await seed_task(sm, "f-ollama", 1, engine=Engine.OLLAMA)
     await seed_task(sm, "f-big", 1, memory_gb=16.0)
     await seed_task(sm, "f-pool", 1, pool="gold")
