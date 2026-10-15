@@ -4,6 +4,7 @@ title: 'M4: Capacity governor'
 status: To Do
 assignee: []
 created_date: '2026-10-15 14:02'
+updated_date: '2026-10-15 17:52'
 labels:
   - milestone
   - M4
@@ -22,3 +23,9 @@ Profiles, macOS signals, duty-cycle throttle, auto-pause, budget reporting, down
 - [ ] #1 NF-8 budget adherence measured
 - [ ] #2 NF-9 reaction <5s measured
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Carry-over from M1 (TASK-2.3): (1) FR-17 grace period — SIGTERM currently kills worker and releases immediately; spec wants finish-or-release within 30 s grace; (2) FR-51 executor.toml overrides + custom profile not built (parse_profile rejects custom); (3) CPU priority only via nice — add taskpolicy / Budget field.
+<!-- SECTION:NOTES:END -->

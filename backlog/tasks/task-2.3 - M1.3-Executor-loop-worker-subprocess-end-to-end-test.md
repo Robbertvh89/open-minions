@@ -1,10 +1,10 @@
 ---
 id: TASK-2.3
 title: 'M1.3: Executor loop, worker subprocess, end-to-end test'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 17:30'
+updated_date: '2026-10-15 17:52'
 labels:
   - M1
 dependencies:
