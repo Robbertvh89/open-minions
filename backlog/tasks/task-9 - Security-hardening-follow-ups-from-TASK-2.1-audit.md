@@ -4,7 +4,7 @@ title: Security hardening follow-ups from TASK-2.1 audit
 status: To Do
 assignee: []
 created_date: '2026-10-15 14:41'
-updated_date: '2026-10-15 20:42'
+updated_date: '2026-10-15 22:49'
 labels:
   - security
 dependencies: []
@@ -28,4 +28,6 @@ Deferred MEDIUM/LOW findings from TASK-2.1 security audit: (1) pin HF model revi
 
 <!-- SECTION:NOTES:BEGIN -->
 Items #1 (revision pin) and #3 (params allow-list) delivered by TASK-4.1; #2 (Range-signed GET, PUT size cap) remains.
+
+Follow-ups from TASK-4.1 review (not yet implemented): (a) absolute per-batch wall-clock cap, and count a step tick toward liveness only when records_done increases, so a stuck batch cannot be kept alive by ticks; (b) server-side cap on records_per_subtask x max_tokens for completions (reject or split before acquire).
 <!-- SECTION:NOTES:END -->
