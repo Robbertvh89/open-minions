@@ -39,6 +39,56 @@ def _text_of(rec: Record) -> str:
     return str(rec.get("text", ""))
 
 
+_SANDBOX_PROBES = ("read_path", "write_path", "connect", "exec", "mach_lookup")
+
+
+def _sandbox_probe(rec: Record) -> dict[str, object]:
+    """Test hook: attempt one OS action from inside the (possibly sandboxed) worker and report
+    whether it succeeded. Never returns file contents; only reachable with test hooks on."""
+    try:
+        if "read_path" in rec:
+            with Path(str(rec["read_path"])).open("rb") as f:
+                return {"ok": True, "bytes": len(f.read(64))}
+        if "write_path" in rec:
+            with Path(str(rec["write_path"])).open("wb") as f:
+                f.write(b"x")
+            return {"ok": True}
+        if "connect" in rec:
+            import socket
+
+            host, _, port = str(rec["connect"]).rpartition(":")
+            with socket.create_connection((host, int(port)), timeout=3):
+                return {"ok": True}
+        if "exec" in rec:
+            import subprocess
+
+            argv = [str(a) for a in rec["exec"]]
+            r = subprocess.run(argv, capture_output=True, timeout=10, check=False)  # noqa: S603
+            return {"ok": r.returncode == 0, "returncode": r.returncode}
+        if "mach_lookup" in rec:
+            return _mach_lookup(str(rec["mach_lookup"]))
+    except Exception as exc:
+        return {"ok": False, "error": type(exc).__name__}
+    return {"ok": False, "error": "unknown"}
+
+
+def _mach_lookup(name: str) -> dict[str, object]:
+    """`bootstrap_look_up(bootstrap_port, name)`; KERN_SUCCESS (0) = reachable."""
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    port = ctypes.c_uint32.in_dll(libc, "bootstrap_port")
+    out = ctypes.c_uint32(0)
+    libc.bootstrap_look_up.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    libc.bootstrap_look_up.restype = ctypes.c_int
+    rc = libc.bootstrap_look_up(port.value, name.encode(), ctypes.byref(out))
+    return {"ok": rc == 0, "kern_return": rc}
+
+
 class FakeRunner:
     """Deterministic runner. Per-record `fail` / `retryable` / `sleep_s` / `sleep_steps` /
     `echo_env` hooks are honoured only when constructed with `test_hooks=True` (tests); input
@@ -75,6 +125,10 @@ class FakeRunner:
                     for _ in range(min(int(rec["sleep_steps"]), 1000)):
                         time.sleep(min(float(rec.get("step_s", 0.1)), 10.0))
                         ctl.checkpoint(len(out))
+                if any(k in rec for k in _SANDBOX_PROBES):
+                    out.append({"id": rec.get("id"), **_sandbox_probe(rec)})
+                    ctl.checkpoint(len(out))
+                    continue
                 if rec.get("echo_env"):  # report whether an env var is visible to the worker
                     out.append({"id": rec.get("id"), "present": str(rec["echo_env"]) in os.environ})
                     ctl.checkpoint(len(out))

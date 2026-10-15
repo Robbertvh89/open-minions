@@ -22,10 +22,11 @@ from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profil
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
-from minion_executor.runners.base import RunnerError
+from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
+from minion_executor.worker.sandbox import SandboxPolicy
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
 
@@ -98,11 +99,21 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
 PROBE_TIMEOUT_S = 90.0
 
 
-def probe_available(requested: list[Engine]) -> list[Engine]:
+def sandbox_policy(settings: ExecutorSettings, engines: list[Engine]) -> SandboxPolicy | None:
+    """The worker sandbox for these settings (`None` only with the dev opt-out)."""
+    if not settings.sandbox:
+        return None
+    port = urlsplit(EngineConfig().ollama_url).port if Engine.OLLAMA in engines else None
+    return SandboxPolicy(cache_root=settings.model_cache_dir, ollama_port=port)
+
+
+def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = None) -> list[Engine]:
     """Ask a worker subprocess which of `requested` work here (engines are never imported in
     the control process, invariant 7). Call after `restrict_environ()` so the probe worker
-    inherits no secrets."""
-    found = WorkerHandle(requested).probe(PROBE_TIMEOUT_S)
+    inherits no secrets. The probe worker is sandboxed like a real one, so a broken sandbox
+    surfaces here as `SANDBOX_FAILED` (the CLI exits 2) and engine imports are proven to work
+    under the profile."""
+    found = WorkerHandle(requested, sandbox=sandbox).probe(PROBE_TIMEOUT_S)
     return [e for e in requested if found.get(e.value)]
 
 
@@ -151,7 +162,9 @@ async def _run(
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, stop_requested.set)  # also covers the probe
         try:
-            available = await asyncio.to_thread(probe_available, requested)
+            available = await asyncio.to_thread(
+                probe_available, requested, sandbox_policy(settings, requested)
+            )
         except (RunnerError, WorkerCrashed) as exc:
             raise StartupError(str(exc)) from exc
         if not available:
@@ -166,7 +179,12 @@ async def _run(
             profile=profile,
             budget=budget,
         )
-        worker = WorkerHandle(available, nice=PROFILES[profile].nice, test_hooks=hooks)
+        worker = WorkerHandle(
+            available,
+            nice=PROFILES[profile].nice,
+            test_hooks=hooks,
+            sandbox=sandbox_policy(settings, available),
+        )
         loop = ExecutorLoop(
             client,
             worker,

@@ -86,10 +86,19 @@ class ModelFetchError(RunnerError):
     credentials or payload."""
 
     def __init__(
-        self, code: str, message: str = "", *, retryable: bool = True, release: bool = False
+        self,
+        code: str,
+        message: str = "",
+        *,
+        retryable: bool = True,
+        release: bool = False,
+        blocked_by_in_use: bool = False,
     ) -> None:
         super().__init__(code, message, retryable=retryable)
         self.release = release
+        # MODEL_CACHE_FULL only because the protected in-use model occupies the space; the
+        # caller may free it (unload the worker) and retry once.
+        self.blocked_by_in_use = blocked_by_in_use
 
 
 def allowed_file(rel: str) -> bool:
@@ -308,6 +317,10 @@ class ModelCache:
                 self._in_use = final
         return final
 
+    def release_in_use(self) -> None:
+        """Forget the protected in-use model (call after the worker holding it was unloaded)."""
+        self._in_use = None
+
     def verify(self, path: Path) -> bool:
         """Cheap check: manifest present and every listed file exists with the recorded size."""
         manifest = self._read_manifest(path)
@@ -339,9 +352,13 @@ class ModelCache:
         entries = sorted(self._entries(), key=lambda e: e[2])  # oldest manifest mtime first
         protected = sum(s for p, s, _m in entries if p == keep)
         if needed + protected > self._cap:
-            log.error("model_cache_too_small", needed=needed, cap=self._cap)
+            blocked = protected > 0 and needed <= self._cap
+            log.error("model_cache_too_small", needed=needed, cap=self._cap, in_use=blocked)
             raise ModelFetchError(
-                MODEL_CACHE_FULL, "model does not fit the configured cache size", retryable=True
+                MODEL_CACHE_FULL,
+                "model does not fit the configured cache size",
+                retryable=True,
+                blocked_by_in_use=blocked,
             )
         used = sum(s for _p, s, _m in entries)
         evicted: list[Path] = []

@@ -1,6 +1,7 @@
 """Repo-wide fixtures. Integration fixtures start containers via testcontainers (needs Docker)."""
 
 import asyncio
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -37,7 +38,13 @@ if TYPE_CHECKING:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """`model` tests hit the real hub: skipped unless selected with `-m model`."""
+    """`model` tests hit the real hub: skipped unless selected with `-m model`; `macos` tests
+    (Seatbelt) are skipped on other platforms."""
+    if sys.platform != "darwin":
+        skip_mac = pytest.mark.skip(reason="needs macOS (Seatbelt)")
+        for item in items:
+            if "macos" in item.keywords:
+                item.add_marker(skip_mac)
     if "model" in (config.getoption("-m") or ""):
         return
     skip = pytest.mark.skip(reason="needs network; run with: pytest -m model")

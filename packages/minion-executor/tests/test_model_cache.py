@@ -181,6 +181,25 @@ async def test_lru_eviction_under_cap_keeps_in_use_model(tmp_path: Path) -> None
     assert cache.used_bytes() <= 250
 
 
+async def test_cache_full_flags_in_use_block_and_release_unblocks(tmp_path: Path) -> None:
+    cache = _cache(tmp_path, fake_fetch({"w.safetensors": b"x" * 100}), cap=150)
+    pa = await cache.ensure(_model("a"))
+    with pytest.raises(ModelFetchError) as ei:
+        await cache.ensure(_model("b"))
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.blocked_by_in_use
+    assert pa is not None and pa.exists()  # nothing deleted by the failed attempt
+    cache.release_in_use()
+    pb = await cache.ensure(_model("b"))
+    assert pb is not None and pb.exists() and not pa.exists()
+
+
+async def test_model_larger_than_cap_is_not_flagged_in_use_blocked(tmp_path: Path) -> None:
+    cache = _cache(tmp_path, fake_fetch({"w.safetensors": b"x" * 100}), cap=80)
+    with pytest.raises(ModelFetchError) as ei:
+        await cache.ensure(_model("a"))
+    assert not ei.value.blocked_by_in_use
+
+
 async def test_lru_order_oldest_first(tmp_path: Path) -> None:
     fetch = fake_fetch({"w.safetensors": b"x" * 100})
     cache = _cache(tmp_path, fetch, cap=300)

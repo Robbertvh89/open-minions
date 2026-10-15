@@ -13,7 +13,9 @@ import json
 import multiprocessing as mp
 import os
 import resource
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping
@@ -33,6 +35,8 @@ from minion_executor.runners.base import (
     Runner,
     RunnerError,
 )
+from minion_executor.worker import sandbox as sbx
+from minion_executor.worker.sandbox import SandboxPolicy
 from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -172,6 +176,21 @@ def worker_main(
     runner: Runner | None = None
     model: ModelEntry | None = None
     budget: Budget | None = None
+    sandboxed_reads: list[str] | None = None  # set once the sandbox is on (irreversible)
+
+    def confine(spec: dict[str, Any] | None, model_path: Path | None) -> None:
+        """Apply the sandbox before any engine import / model load (fail closed)."""
+        nonlocal sandboxed_reads
+        if sandboxed_reads is None:
+            if spec is None:
+                return
+            sbx.apply_from_spec(spec)
+            sandboxed_reads = [os.path.realpath(p) for p in spec.get("read", [])]
+        if model_path is not None:  # a later load may not reach outside what was granted
+            real = os.path.realpath(model_path)
+            if not any(real == r or real.startswith(r.rstrip("/") + "/") for r in sandboxed_reads):
+                raise RunnerError(sbx.SANDBOX_FAILED, "model path outside the sandbox grant")
+
     while True:
         try:
             msg = _recv(conn, max_message_bytes)
@@ -195,6 +214,7 @@ def worker_main(
                 if model.engine not in allowed:
                     raise RunnerError("ENGINE_NOT_ALLOWED", model.engine.value)
                 path = Path(msg["model_path"]) if msg.get("model_path") else None
+                confine(msg.get("sandbox"), path)
                 try:
                     new_runner = create_runner(model.engine, model.type, test_hooks=test_hooks)
                     new_runner.load(model, path, budget, cfg)
@@ -216,6 +236,7 @@ def worker_main(
                     "max_rss_bytes": _maxrss_bytes(),
                 }
             elif op == "probe":
+                confine(msg.get("sandbox"), None)
                 result = probe_engines(allowed, EngineConfig(**msg.get("cfg", {})))
             else:
                 raise RunnerError("bad_op", op)
@@ -251,7 +272,10 @@ class WorkerHandle:
         parent_watch_interval_s: float = 1.0,
         tick_interval_s: float = 1.0,
         engine_config: EngineConfig | None = None,
+        sandbox: SandboxPolicy | None = None,
     ) -> None:
+        self._sandbox = sandbox  # None: unsandboxed (dev/tests); main passes it unless dev opt-out
+        self._tmp_dir: Path | None = None  # per-spawn writable dir, the only one the sandbox allows
         self._engines = sorted(e.value for e in engines)
         self._nice = nice
         self._load_timeout_s = load_timeout_s
@@ -285,6 +309,10 @@ class WorkerHandle:
             if self._closed:
                 raise WorkerCrashed("worker handle is stopped")
             gen = self._seen_gen
+            env = {**scrub_env(os.environ), **FORCED_WORKER_ENV}
+            if self._sandbox is not None:
+                self._tmp_dir = Path(os.path.realpath(tempfile.mkdtemp(prefix="minion-worker-")))
+                env["TMPDIR"] = str(self._tmp_dir)
             parent, child = self._ctx.Pipe()
             proc = self._ctx.Process(
                 target=worker_main,
@@ -292,7 +320,7 @@ class WorkerHandle:
                     child,
                     self._engines,
                     self._nice,
-                    {**scrub_env(os.environ), **FORCED_WORKER_ENV},
+                    env,
                     self._test_hooks,
                     self._max_message_bytes,
                     os.getpid(),
@@ -370,11 +398,12 @@ class WorkerHandle:
                 self._reset()
             if self._model_id == model.model_id and self._proc and self._proc.is_alive():
                 return
-            if self._model_id is not None:
-                self._reset()
+            if self._model_id is not None or (self._sandbox is not None and self._proc):
+                self._reset()  # a sandboxed worker's grants are fixed: load into a fresh one
             self._call(
                 {
                     "op": "load",
+                    "sandbox": self._sandbox_spec(model_path),
                     "model": model.model_dump(mode="json"),
                     "budget": budget.model_dump(mode="json"),
                     "model_path": str(model_path) if model_path else None,
@@ -383,6 +412,14 @@ class WorkerHandle:
                 self._load_timeout_s,
             )
             self._model_id = model.model_id
+
+    def _sandbox_spec(self, model_path: Path | None) -> dict[str, Any] | None:
+        if self._sandbox is None:
+            return None
+        self._ensure_started()  # the tmp dir is created with the process
+        if self._tmp_dir is None:  # pragma: no cover - _ensure_started guarantees it
+            raise WorkerCrashed("worker tmp dir missing")
+        return sbx.sandbox_spec(self._sandbox, model_path=model_path, tmp_dir=self._tmp_dir)
 
     def run(
         self,
@@ -410,7 +447,14 @@ class WorkerHandle:
         happen in the child only), then shut it down. Do not call with a model loaded."""
         with self._lock:
             try:
-                reply = self._call({"op": "probe", "cfg": asdict(self._cfg)}, timeout_s)
+                reply = self._call(
+                    {
+                        "op": "probe",
+                        "cfg": asdict(self._cfg),
+                        "sandbox": self._sandbox_spec(None),
+                    },
+                    timeout_s,
+                )
                 result: dict[str, str | None] = reply["result"]
                 return result
             finally:
@@ -458,6 +502,9 @@ class WorkerHandle:
             conn.close()
         if proc is not None:
             proc.join(timeout=5)
+        tmp, self._tmp_dir = self._tmp_dir, None
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def close(self) -> None:
         self._closed = True

@@ -44,7 +44,7 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
-from minion_executor.model_cache import ModelCache, ModelFetchError
+from minion_executor.model_cache import MODEL_CACHE_FULL, ModelCache, ModelFetchError
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
@@ -494,6 +494,21 @@ class ExecutorLoop:
             in_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
 
+    async def _ensure_cached(self, model: ModelEntry) -> Path | None:
+        if self._cache is None:
+            return None
+        try:
+            return await self._cache.ensure(model)
+        except ModelFetchError as exc:
+            if not (exc.code == MODEL_CACHE_FULL and exc.blocked_by_in_use):
+                raise
+        # The new model fits the cap only if the loaded model's files may go: drop the warm
+        # worker (frees its memory too), unprotect that model and retry once.
+        log.info("model_cache_unload_for_space")
+        await asyncio.to_thread(self._worker.unload)
+        self._cache.release_in_use()
+        return await self._cache.ensure(model)
+
     async def _run_batches(
         self, a: Assignment, records: list[Record], hb: Heartbeater, params: TaskParams
     ) -> list[Record]:
@@ -513,7 +528,7 @@ class ExecutorLoop:
             hb.records_done = max(hb.records_done, n)
 
         try:
-            model_path = await self._cache.ensure(a.model) if self._cache is not None else None
+            model_path = await self._ensure_cached(a.model)
             if model_path is None:
                 await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
             else:

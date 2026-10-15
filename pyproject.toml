@@ -65,6 +65,7 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: needs Docker (Postgres/MinIO via testcontainers)",
+    "macos: needs macOS (Seatbelt sandbox); auto-skipped elsewhere",
     "model: downloads a real tiny model from the Hugging Face hub (opt in: pytest -m model)",
 ]
 addopts = "--import-mode=importlib"

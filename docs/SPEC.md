@@ -319,6 +319,14 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   to executors. `MINION_S3_PUBLIC_ENDPOINT_URL` (the host that presigned URLs point at) must be `https`
   unless it is a loopback host; the server refuses to start otherwise. Presigned URLs use the configured
   TTL (`MINION_PRESIGN_TTL_S`, default 900 s, max 3600 s).
+- S-10. Inference worker confinement **[ours]** (ADR-0009). Models are fetched by a separate killable
+  subprocess at a pinned revision, safetensors-only, sha256-verified; `HF_TOKEN`, proxy and CA settings
+  reach only that subprocess. The worker is offline (`HF_HUB_OFFLINE=1`) and runs inside a macOS
+  Seatbelt sandbox applied before any engine import: no HOME access (except read-only model dir, cache
+  root and Python paths, and its own tmp dir), no network (except loopback Ollama port when
+  requested), no process exec, no Keychain/securityd lookup, cache read-only. If the sandbox cannot be
+  applied the worker fails (`SANDBOX_FAILED`) and `run` exits 2. `MINION_EXECUTOR_SANDBOX=0` requires
+  `MINION_EXECUTOR_DEV=1`. Residual: the profile is allow-default outside the denied areas.
 
 ## 9. Non-functional requirements
 

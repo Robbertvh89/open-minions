@@ -1222,11 +1222,17 @@ async def test_idle_unload_disabled_with_zero(tmp_path: Path) -> None:
 class _StubCache:
     def __init__(self, exc: Exception | None = None, path: Path | None = None) -> None:
         self.exc, self.path = exc, path
+        self.ensures = 0
+        self.released = 0
 
     async def ensure(self, model: ModelEntry) -> Path | None:
+        self.ensures += 1
         if self.exc:
             raise self.exc
         return self.path
+
+    def release_in_use(self) -> None:
+        self.released += 1
 
 
 async def test_model_path_from_cache_reaches_worker(tmp_path: Path) -> None:
@@ -1267,3 +1273,52 @@ async def test_model_fetch_errors_map_to_release_or_fail(
     else:
         req = next(r for k, r in client.calls if k == "fail")
         assert (req.code, req.retryable) == (code, retryable)
+
+
+async def test_cache_full_by_loaded_model_unloads_worker_and_retries_once(tmp_path: Path) -> None:
+    from minion_executor.model_cache import MODEL_CACHE_FULL, ModelFetchError
+
+    events: list[str] = []
+
+    class W(FakeWorker):
+        def unload(self) -> None:
+            events.append("unload")
+            super().unload()
+
+    class Cache(_StubCache):
+        async def ensure(self, model: ModelEntry) -> Path | None:
+            events.append("ensure")
+            if self.ensures == 0:
+                self.ensures += 1
+                raise ModelFetchError(MODEL_CACHE_FULL, "x", blocked_by_in_use=True)
+            self.ensures += 1
+            return self.path
+
+        def release_in_use(self) -> None:
+            events.append("release")
+
+    worker = W()
+    cache = Cache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert events == ["ensure", "unload", "release", "ensure"]
+    assert "complete" in client.kinds() and "fail" not in client.kinds()
+
+
+async def test_cache_full_that_unloading_cannot_fix_fails_without_looping(
+    tmp_path: Path,
+) -> None:
+    from minion_executor.model_cache import MODEL_CACHE_FULL, ModelFetchError
+
+    worker = FakeWorker()
+    # too large for the cap regardless: not flagged, so no unload and a single ensure
+    cache = _StubCache(ModelFetchError(MODEL_CACHE_FULL, "x"))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert cache.ensures == 1 and worker.unloads == 0
+    assert next(r for k, r in client.calls if k == "fail").code == MODEL_CACHE_FULL
+
+    # flagged on both attempts: retried exactly once, then reported
+    worker2 = FakeWorker()
+    cache2 = _StubCache(ModelFetchError(MODEL_CACHE_FULL, "x", blocked_by_in_use=True))
+    client2, _ = await _run_one(tmp_path, _asn(), worker2, model_cache=cache2)
+    assert cache2.ensures == 2 and worker2.unloads == 1
+    assert next(r for k, r in client2.calls if k == "fail").code == MODEL_CACHE_FULL
