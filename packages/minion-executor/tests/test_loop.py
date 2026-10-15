@@ -148,7 +148,9 @@ class FakeWorker:
         self.ensured: list[tuple[ModelEntry, Budget]] = []
         self.unloads = 0
 
-    def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
+    def ensure_model(
+        self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+    ) -> None:
         self.ensured.append((model, budget))
 
     def unload(self) -> None:
@@ -487,7 +489,9 @@ async def test_success_resets_failure_streak(tmp_path: Path) -> None:
     class Flaky(FakeWorker):
         n = 0
 
-        def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
             Flaky.n += 1  # once per assignment
             if Flaky.n in (1, 3):  # fail, succeed, fail: never two failures in a row
                 raise WorkerCrashed("x")
@@ -1213,3 +1217,53 @@ async def test_idle_unload_disabled_with_zero(tmp_path: Path) -> None:
     client.on_empty = tick
     await loop.run()
     assert worker.unloads == 0
+
+
+class _StubCache:
+    def __init__(self, exc: Exception | None = None, path: Path | None = None) -> None:
+        self.exc, self.path = exc, path
+
+    async def ensure(self, model: ModelEntry) -> Path | None:
+        if self.exc:
+            raise self.exc
+        return self.path
+
+
+async def test_model_path_from_cache_reaches_worker(tmp_path: Path) -> None:
+    seen: list[Path | None] = []
+
+    class W(FakeWorker):
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
+            seen.append(model_path)
+
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), W(), model_cache=cache)
+    assert seen == [tmp_path / "snap"] and "complete" in client.kinds()
+
+
+@pytest.mark.parametrize(
+    ("code", "retryable", "release"),
+    [
+        ("MODEL_DOWNLOAD_FAILED", True, True),
+        ("MODEL_DOWNLOAD_FAILED", True, False),
+        ("MODEL_INTEGRITY", True, False),
+        ("MODEL_CACHE_FULL", True, False),
+        ("MODEL_UNSUPPORTED", False, False),
+    ],
+)
+async def test_model_fetch_errors_map_to_release_or_fail(
+    tmp_path: Path, code: str, retryable: bool, release: bool
+) -> None:
+    from minion_executor.model_cache import ModelFetchError
+
+    worker = FakeWorker()
+    cache = _StubCache(ModelFetchError(code, "x", retryable=retryable, release=release))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert worker.ensured == []
+    if release:
+        assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    else:
+        req = next(r for k, r in client.calls if k == "fail")
+        assert (req.code, req.retryable) == (code, retryable)

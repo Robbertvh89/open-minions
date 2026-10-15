@@ -44,6 +44,7 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
+from minion_executor.model_cache import ModelCache, ModelFetchError
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
@@ -102,7 +103,9 @@ def cleanup_stale_tmp(root: Path | None = None) -> int:
 
 
 class Worker(Protocol):
-    def ensure_model(self, model: ModelEntry, budget: Budget) -> None: ...
+    def ensure_model(
+        self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+    ) -> None: ...
     def run(
         self,
         batch: list[Record],
@@ -152,7 +155,9 @@ class ExecutorLoop:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         idle_unload_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
+        model_cache: ModelCache | None = None,
     ) -> None:
+        self._cache = model_cache
         self._client = client
         self._worker = worker
         self._budget = budget
@@ -508,7 +513,13 @@ class ExecutorLoop:
             hb.records_done = max(hb.records_done, n)
 
         try:
-            await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
+            model_path = await self._cache.ensure(a.model) if self._cache is not None else None
+            if model_path is None:
+                await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
+            else:
+                await asyncio.to_thread(
+                    self._worker.ensure_model, a.model, self._budget, model_path
+                )
             for i in range(0, len(records), step):
                 batch = records[i : i + step]
                 outputs.extend(
@@ -520,9 +531,10 @@ class ExecutorLoop:
         except RunnerError as exc:
             code = exc.code[:64] or "RUNNER_ERROR"
             # Engine missing on this Mac is executor-local: release, don't burn an attempt.
-            raise _FailureError(
-                exc.retryable, code, "runner failed", release=exc.code == ENGINE_UNAVAILABLE
-            ) from None
+            release = exc.code == ENGINE_UNAVAILABLE or (
+                isinstance(exc, ModelFetchError) and exc.release
+            )
+            raise _FailureError(exc.retryable, code, "runner failed", release=release) from None
         return outputs
 
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:

@@ -21,6 +21,7 @@ from pydantic import SecretStr
 from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
+from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
 from minion_executor.settings import ExecutorSettings
@@ -132,6 +133,11 @@ async def _run(
 ) -> None:
     budget = budget_for(profile)
     settings = ExecutorSettings()
+    try:
+        # Before restrict_environ(): HF_TOKEN / proxy / CA go to the fetch subprocess only.
+        fetch_env = FetchEnv.capture()
+    except ValueError as exc:
+        raise StartupError(str(exc)) from exc
     hooks = os.environ.get(DEV_ENV) == "1" and os.environ.get(TEST_HOOKS_ENV) == "1"
     async with (
         ExecutorClient(server, token) as client,
@@ -171,6 +177,12 @@ async def _run(
             allow_http_loopback=_is_loopback(server),
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
+            model_cache=ModelCache(
+                settings.model_cache_dir,
+                int(settings.model_cache_gb * 1024**3),
+                fetch_env=fetch_env,
+                download_timeout_s=settings.download_timeout_s,
+            ),
         )
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, loop.stop)

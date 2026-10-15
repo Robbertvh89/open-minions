@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.28",
     "structlog>=24.4",
     "typer>=0.15",
+    "huggingface-hub>=1.31,<3",
 ]
 
 [project.scripts]

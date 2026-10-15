@@ -38,8 +38,8 @@ from minion_executor.worker.throttle import DutyCyclePacer
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
-# TODO(TASK-4.2): proxy/CA/HF_HUB_* handling for real engines (credential-bearing proxy URLs
-# only ever reach the fetch subprocess, never the worker).
+# Proxy, CA and HF_TOKEN are deliberately not on it: they go only to the model-fetch subprocess
+# (`model_cache.FetchEnv`). The worker is offline and loads from the local cache.
 _ALLOWED_NAMES = frozenset(
     {
         "PATH",
@@ -54,6 +54,13 @@ _ALLOWED_NAMES = frozenset(
     }
 )
 _ALLOWED_PREFIXES = ("LC_", "MLX_")
+# Forced into every worker regardless of the parent's environment (D7).
+FORCED_WORKER_ENV: Mapping[str, str] = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+}
 
 
 class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
@@ -285,7 +292,7 @@ class WorkerHandle:
                     child,
                     self._engines,
                     self._nice,
-                    scrub_env(os.environ),
+                    {**scrub_env(os.environ), **FORCED_WORKER_ENV},
                     self._test_hooks,
                     self._max_message_bytes,
                     os.getpid(),

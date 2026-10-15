@@ -35,6 +35,17 @@ from sqlalchemy.ext.asyncio import (
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """`model` tests hit the real hub: skipped unless selected with `-m model`."""
+    if "model" in (config.getoption("-m") or ""):
+        return
+    skip = pytest.mark.skip(reason="needs network; run with: pytest -m model")
+    for item in items:
+        if "model" in item.keywords:
+            item.add_marker(skip)
+
+
 REPO_ROOT = Path(__file__).resolve().parent
 S3_IMAGE = "chrislusf/seaweedfs:4.05"  # keep in sync with deploy/compose.yml
 S3_ACCESS_KEY = "minion"  # matches deploy/seaweedfs/s3.json
