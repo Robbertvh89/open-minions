@@ -189,6 +189,8 @@ class Executor(Base):
     paused_reason: Mapped[str | None] = mapped_column(String(64))
     registered_at: Mapped[datetime] = _now()
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # NULL = token never expires; auth rejects tokens past this instant (security carry-forward 2).
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SubtaskAcquirement(Base):
