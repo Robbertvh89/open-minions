@@ -117,11 +117,15 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 ### 4.4 Fault tolerance (Watchdog)
 - FR-30. Watchdog monitors heartbeats **only for executors currently running subtasks** **[paper]**.
 - FR-31. If no heartbeat for `heartbeat_timeout` (default 15 min = 3 missed beats) **[ours]**, the
-  watchdog deletes the acquirement, archives it as `EXPIRED`, increments `attempt`, and sets the
-  subtask back to `PENDING` **[paper semantics]**.
+  watchdog deletes the acquirement, archives it as `EXPIRED`, and sets the subtask back to
+  `PENDING` (or `FAILED` once the budget is spent) **[paper semantics]**. Reclaim does not touch
+  `attempt`: the next acquire increments it, so attempt-scoped output keys stay unique.
 - FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts; once it reaches
   `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or `PARTIAL`
-  depending on policy. A voluntary `release` does not consume the budget **[ours]**.
+  depending on policy. A voluntary `release` does not consume the budget **[ours]**, but a
+  subtask already released `MINION_RELEASE_LIMIT` times (default 10) records further releases as
+  a retryable `FAILED` attempt (`RELEASE_LIMIT`), so a misclassified error cannot livelock the
+  fleet.
 - FR-33. Executor-reported errors: retryable (OOM, download failure) → requeue; non-retryable (bad
   input) → `FAILED` immediately **[ours]**.
 - FR-34. A late result from a reclaimed owner is rejected (`409 STALE_ACQUIREMENT`) **[ours]**.

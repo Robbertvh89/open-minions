@@ -130,6 +130,25 @@ async def failed_attempt_count(session: AsyncSession, o: Owned) -> int:
     )
 
 
+async def released_attempt_count(session: AsyncSession, o: Owned) -> int:
+    """RELEASED attempts of this subtask (free until the release cap, then they count)."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(SubtaskAttempt)
+                .where(
+                    SubtaskAttempt.team == o.team,
+                    SubtaskAttempt.project == o.project,
+                    SubtaskAttempt.task_name == o.task_name,
+                    SubtaskAttempt.subtask_id == o.subtask_id,
+                    SubtaskAttempt.outcome == AttemptOutcome.RELEASED.value,
+                )
+            )
+        ).scalar_one()
+    )
+
+
 async def finish_attempt(
     session: AsyncSession,
     o: Owned,

@@ -44,6 +44,9 @@ class ServerSettings(BaseSettings):
     splitter_poll_s: float = Field(default=2.0, gt=0)
     executor_token_ttl_days: int = Field(default=90, gt=0)
 
+    # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
+    release_limit: int = Field(default=10, ge=0)
+
     # Splitter bounds (memory/DoS protection) and retry policy.
     split_max_line_bytes: int = Field(default=16 << 20, gt=0)  # LINE_TOO_LONG above this
     split_max_input_bytes: int = Field(default=50 << 30, gt=0)  # total per task

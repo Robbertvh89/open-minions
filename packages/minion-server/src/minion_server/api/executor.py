@@ -147,6 +147,7 @@ async def release(
     acquirement_id: uuid.UUID,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[ServerSettings, Depends(_settings)],
 ) -> Response:
-    await completion.release(session, principal, acquirement_id)
+    await completion.release(session, principal, acquirement_id, settings=settings)
     return Response(status_code=204)

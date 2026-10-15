@@ -83,6 +83,42 @@ async def complete(
         await _bump_and_derive(session, o, succeeded=1, failed=0)
 
 
+def next_status(
+    used: int, max_attempts: int, *, retryable: bool, task_cancelled: bool
+) -> SubtaskStatus:
+    """Subtask status after a budget-consuming attempt (`used` includes that attempt)."""
+    if task_cancelled:
+        return SubtaskStatus.CANCELLED  # never requeue work of a cancelled task
+    if not retryable or used >= max_attempts:
+        return SubtaskStatus.FAILED
+    return SubtaskStatus.PENDING
+
+
+async def finish_failed(
+    session: AsyncSession,
+    o: repo.Owned,
+    *,
+    outcome: AttemptOutcome,
+    error: dict[str, object],
+    retryable: bool,
+) -> SubtaskStatus:
+    """Record a budget-consuming attempt (FAILED or EXPIRED); shared by fail, reclaim, release cap.
+
+    Caller holds the acquirement lock. Lock order: acquirement -> heartbeat -> subtask -> task.
+    """
+    used = await repo.failed_attempt_count(session, o) + 1
+    status = next_status(
+        used,
+        o.max_attempts,
+        retryable=retryable,
+        task_cancelled=o.task_status == TaskStatus.CANCELLED,
+    )
+    await repo.finish_attempt(session, o, outcome=outcome, subtask_status=status, error=error)
+    if status == SubtaskStatus.FAILED:
+        await _bump_and_derive(session, o, succeeded=0, failed=1)
+    return status
+
+
 async def fail(
     session: AsyncSession,
     principal: ExecutorPrincipal,
@@ -93,31 +129,50 @@ async def fail(
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
-        error = {"code": req.code, "message": req.message, "retryable": req.retryable}
-        # This attempt counts against the budget, so record it before counting.
-        used = await repo.failed_attempt_count(session, o) + 1
-        terminal = not req.retryable or used >= o.max_attempts
-        await repo.finish_attempt(
+        await finish_failed(
             session,
             o,
             outcome=AttemptOutcome.FAILED,
-            subtask_status=SubtaskStatus.FAILED if terminal else SubtaskStatus.PENDING,
-            error=error,
+            error={"code": req.code, "message": req.message, "retryable": req.retryable},
+            retryable=req.retryable,
         )
-        if terminal:
-            await _bump_and_derive(session, o, succeeded=0, failed=1)
 
 
 async def release(
-    session: AsyncSession, principal: ExecutorPrincipal, acquirement_id: uuid.UUID
+    session: AsyncSession,
+    principal: ExecutorPrincipal,
+    acquirement_id: uuid.UUID,
+    *,
+    settings: ServerSettings,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
-        await repo.finish_attempt(
-            session,
-            o,
-            outcome=AttemptOutcome.RELEASED,
-            subtask_status=SubtaskStatus.PENDING,
-        )
+        if o.task_status == TaskStatus.CANCELLED:
+            await repo.finish_attempt(
+                session,
+                o,
+                outcome=AttemptOutcome.CANCELLED,
+                subtask_status=SubtaskStatus.CANCELLED,
+            )
+        elif await repo.released_attempt_count(session, o) >= settings.release_limit:
+            # Repeated releases must not livelock a subtask: past the cap they cost budget.
+            await finish_failed(
+                session,
+                o,
+                outcome=AttemptOutcome.FAILED,
+                error={
+                    "code": "RELEASE_LIMIT",
+                    "message": "release limit exceeded",
+                    "retryable": True,
+                },
+                retryable=True,
+            )
+        else:
+            await repo.finish_attempt(
+                session,
+                o,
+                outcome=AttemptOutcome.RELEASED,
+                subtask_status=SubtaskStatus.PENDING,
+            )
