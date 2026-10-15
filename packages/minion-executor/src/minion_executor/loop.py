@@ -39,6 +39,7 @@ from minion_common.schemas import (
 )
 
 from minion_executor import io
+from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
 from minion_executor.runners.base import Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
@@ -63,6 +64,7 @@ class _Outcome(enum.Enum):
     FAILED = enum.auto()  # failed/released/gave up: back off before the next acquire
     DISCARDED = enum.auto()  # stale (409): someone else owns it now, nothing to report
     STOPPED = enum.auto()  # stop requested mid-subtask
+    CANCELLED = enum.auto()  # task cancelled via heartbeat: released, no failure backoff
 
 
 def cleanup_stale_tmp(root: Path | None = None) -> int:
@@ -94,6 +96,7 @@ def cleanup_stale_tmp(root: Path | None = None) -> int:
 class Worker(Protocol):
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None: ...
     def run(self, batch: list[Record]) -> list[Record]: ...
+    def interrupt(self) -> None: ...
     def kill(self) -> None: ...
     def close(self) -> None: ...
 
@@ -123,6 +126,8 @@ class ExecutorLoop:
         failure_pause_s: float = 300.0,
         complete_retries: int = 5,
         allow_http_loopback: bool = False,
+        heartbeat_interval_s: float = 300.0,
+        heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._client = client
         self._worker = worker
@@ -138,6 +143,8 @@ class ExecutorLoop:
         self._fail_pause_s = failure_pause_s
         self._complete_retries = complete_retries
         self._allow_http = allow_http_loopback
+        self._hb_interval = heartbeat_interval_s
+        self._hb_sleep = heartbeat_sleep
         self._stop = asyncio.Event()
         self._idle = 0
         self._fails = 0
@@ -234,11 +241,23 @@ class ExecutorLoop:
             subtask_id=a.subtask_id,
             attempt=a.attempt,
         )
-        work = asyncio.create_task(self._execute(a, tmp))
+        hb = Heartbeater(
+            self._client,
+            a.acquirement_id,
+            interval_s=self._hb_interval,
+            budget=self._budget,
+            total=a.record_count,
+            initial_output_url=a.output_url,
+            sleep=self._hb_sleep,
+        )
+        work = asyncio.create_task(self._execute(a, tmp, hb))
         stopper = asyncio.create_task(self._stop.wait())
+        beat = asyncio.create_task(hb.run())
         try:
-            await asyncio.wait({work, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({work, stopper, beat}, return_when=asyncio.FIRST_COMPLETED)
             if not work.done():
+                if not stopper.done():
+                    return await self._on_signal(a, work, beat.result(), bound)
                 # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
                 await asyncio.to_thread(self._worker.kill)
                 work.cancel()
@@ -261,6 +280,26 @@ class ExecutorLoop:
             return await self._complete(a, result, bound)
         finally:
             stopper.cancel()
+            beat.cancel()  # also during _complete: the lease is kept alive until we return
+            await asyncio.gather(beat, return_exceptions=True)
+
+    async def _on_signal(
+        self, a: Assignment, work: asyncio.Task[CompleteRequest], sig: HeartbeatSignal, bound: Any
+    ) -> _Outcome:
+        """Cancel/409 from a heartbeat: stop the work now and free the GPU (invariant 6).
+
+        The worker is interrupted (killed, respawnable) so a cancelled task holds no model memory;
+        nothing is uploaded or completed. Cancel is released (server records CANCELLED); a stale
+        acquirement reports nothing.
+        """
+        await asyncio.to_thread(self._worker.interrupt)
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
+        if sig is HeartbeatSignal.CANCEL:
+            await self._release(a, bound)
+            return _Outcome.CANCELLED
+        bound.info("stale_discarded")
+        return _Outcome.DISCARDED
 
     async def _complete(self, a: Assignment, result: CompleteRequest, bound: Any) -> _Outcome:
         """Report completion, retrying transport errors/5xx (the server treats a same-owner
@@ -309,7 +348,7 @@ class ExecutorLoop:
         except ValueError:
             raise _FailureError(True, "INSECURE_URL", "presigned URL is not https") from None
 
-    async def _execute(self, a: Assignment, tmp: Path) -> CompleteRequest:
+    async def _execute(self, a: Assignment, tmp: Path, hb: Heartbeater) -> CompleteRequest:
         in_path = tmp / f"{a.acquirement_id}.in.jsonl"
         out_path = tmp / f"{a.acquirement_id}.out.jsonl"
         try:
@@ -329,7 +368,7 @@ class ExecutorLoop:
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
-            outputs = await self._run_batches(a, records)
+            outputs = await self._run_batches(a, records, hb)
             if len(outputs) != len(records):
                 raise _FailureError(True, "OUTPUT_MISMATCH", "runner returned wrong record count")
             try:
@@ -337,8 +376,10 @@ class ExecutorLoop:
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
+            output_url = hb.output_url  # refreshed by heartbeats; same attempt-scoped key
+            self._check_url(output_url)
             try:
-                await io.upload_file(self._http, a.output_url, out_path)
+                await io.upload_file(self._http, output_url, out_path)
             except (httpx.HTTPError, OSError) as exc:
                 msg = type(exc).__name__
                 local = isinstance(exc, (*LOCAL_TRANSPORT_ERRORS, OSError))
@@ -348,13 +389,16 @@ class ExecutorLoop:
             in_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
 
-    async def _run_batches(self, a: Assignment, records: list[Record]) -> list[Record]:
+    async def _run_batches(
+        self, a: Assignment, records: list[Record], hb: Heartbeater
+    ) -> list[Record]:
         step = self._budget.max_batch_size
         outputs: list[Record] = []
         try:
             await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
             for i in range(0, len(records), step):
                 outputs.extend(await asyncio.to_thread(self._worker.run, records[i : i + step]))
+                hb.records_done = len(outputs)
         except WorkerCrashed:
             raise _FailureError(True, "WORKER_CRASHED", "worker process died") from None
         except RunnerError as exc:

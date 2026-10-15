@@ -39,11 +39,14 @@ DEFAULT_TIMEOUT_S = 30.0
 class ApiError(Exception):
     """Non-success response from the server. Never carries request payloads."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self, status_code: int, code: str, message: str, *, retry_after: float | None = None
+    ) -> None:
         super().__init__(f"{status_code} {code}: {message}")
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.retry_after = retry_after  # seconds, from a numeric `Retry-After` header
 
 
 class StaleAcquirementError(ApiError):
@@ -76,7 +79,11 @@ def _error_from(resp: httpx.Response) -> ApiError:
         pass
     stale = resp.status_code == 409 and code == "STALE_ACQUIREMENT"
     cls = StaleAcquirementError if stale else ApiError
-    return cls(resp.status_code, code, message)
+    retry_after: float | None = None
+    raw = resp.headers.get("Retry-After")
+    if raw is not None and raw.strip().isdigit():
+        retry_after = float(raw.strip())
+    return cls(resp.status_code, code, message, retry_after=retry_after)
 
 
 class _BaseClient:

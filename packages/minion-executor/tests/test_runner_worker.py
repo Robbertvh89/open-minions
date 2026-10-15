@@ -324,3 +324,34 @@ def test_worker_exits_when_control_process_is_killed(tmp_path: Path) -> None:
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_interrupt_kills_worker_but_allows_respawn() -> None:
+    h = WorkerHandle("fake")
+    try:
+        h.ensure_model(_model(), BUDGET)
+        first = h.pid
+        assert first is not None
+        h.interrupt()
+        h.interrupt()  # idempotent
+        h.ensure_model(_model(), BUDGET)  # dead idle worker: respawned, model reloaded
+        assert h.pid is not None and h.pid != first
+        assert h.run([{"id": 1, "text": "a"}])[0]["id"] == 1
+    finally:
+        h.close()
+
+
+def test_interrupt_aborts_inflight_call_then_respawns() -> None:
+    h = WorkerHandle("fake", test_hooks=True)
+    try:
+        h.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        t = threading.Timer(0.5, h.interrupt)
+        t.start()
+        t0 = time.monotonic()
+        with pytest.raises(WorkerCrashed):
+            h.run([{"id": 1, "text": "x", "sleep_s": 30}])
+        assert time.monotonic() - t0 < 10
+        h.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        assert h.run([{"id": 2, "text": "ok"}]) == [{"id": 2, "completion": "ok"}]
+    finally:
+        h.close()

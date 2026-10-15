@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,8 @@ from minion_common.schemas import (
     Budget,
     CompleteRequest,
     FailRequest,
+    HeartbeatRequest,
+    HeartbeatResponse,
     ModelEntry,
 )
 from minion_executor.loop import ExecutorLoop, cleanup_stale_tmp
@@ -55,6 +57,26 @@ def assignment(
     )
 
 
+def hb_resp(
+    cancel: bool = False, url: str = "https://s3.test/out", minutes: int = 0
+) -> HeartbeatResponse:
+    return HeartbeatResponse(
+        cancel=cancel, output_url=url, expires_at=datetime.now(UTC) + timedelta(minutes=minutes)
+    )
+
+
+def gated_sleep(beats: int, delays: list[float]) -> Any:
+    """Fake heartbeat sleep: the first `beats` sleeps return quickly, then it blocks forever."""
+
+    async def sleep(d: float) -> None:
+        delays.append(d)
+        if len(delays) > beats:
+            await asyncio.Event().wait()
+        await asyncio.sleep(0.01)
+
+    return sleep
+
+
 class FakeClient:
     def __init__(self, items: list[Assignment | Exception | None]) -> None:
         self.items = items
@@ -63,6 +85,7 @@ class FakeClient:
         self.complete_excs: list[Exception] = []
         self.register_excs: list[Exception] = []
         self.on_empty: Any = None
+        self.hb_script: list[HeartbeatResponse | Exception] = []
 
     async def register(self, req: Any) -> None:
         self.calls.append(("register", None))
@@ -93,6 +116,15 @@ class FakeClient:
     async def release(self, aid: uuid.UUID) -> None:
         self.calls.append(("release", aid))
 
+    async def heartbeat(self, aid: uuid.UUID, req: HeartbeatRequest) -> HeartbeatResponse:
+        self.calls.append(("heartbeat", req))
+        if self.hb_script:
+            item = self.hb_script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return hb_resp()
+
     def kinds(self) -> list[str]:
         return [k for k, _ in self.calls]
 
@@ -102,6 +134,7 @@ class FakeWorker:
         self.exc, self.block = exc, block
         self.batches: list[int] = []
         self.killed = False
+        self.interrupted = False
         self.closed = False
 
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
@@ -111,13 +144,16 @@ class FakeWorker:
         if self.block:
             import time
 
-            while not self.killed:
+            while not (self.killed or self.interrupted):
                 time.sleep(0.01)
             raise WorkerCrashed("killed")
         if self.exc:
             raise self.exc
         self.batches.append(len(batch))
         return [{"id": r["id"], "embedding": [1.0]} for r in batch]
+
+    def interrupt(self) -> None:
+        self.interrupted = True
 
     def kill(self) -> None:
         self.killed = True
@@ -578,3 +614,181 @@ async def test_register_retry_pause_is_interruptible_by_stop(tmp_path: Path) -> 
     await asyncio.sleep(0.1)
     loop.stop()
     assert await asyncio.wait_for(task, 3) == 0
+
+
+# --- heartbeats (TASK-3.3) ---
+
+
+async def test_heartbeats_sent_with_progress_and_interval(tmp_path: Path) -> None:
+    client, delays = FakeClient([assignment()]), list[float]()
+    worker = FakeWorker(block=True)
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(2, delays),
+    )  # fmt: skip
+    asyncio.get_running_loop().call_later(0.4, loop.stop)
+    await loop.run()
+    beats = [r for k, r in client.calls if k == "heartbeat"]
+    assert len(beats) == 2
+    assert all(90.0 <= d <= 110.0 for d in delays[:2])
+    assert beats[0].progress.records_total == 3 and beats[0].progress.records_done == 0
+    assert beats[0].budget == BUDGET
+
+
+async def test_heartbeat_reports_progress_and_no_beats_after_subtask(tmp_path: Path) -> None:
+    client, delays = FakeClient([assignment()]), list[float]()
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, delays),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert "heartbeat" not in client.kinds()
+    await asyncio.sleep(0.05)
+    assert len(delays) == 1  # the heartbeater was cancelled while sleeping its first interval
+
+
+async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -> None:
+    first, second = assignment(), assignment()
+    client, s3 = FakeClient([first, second]), FakeS3()
+    client.hb_script = [hb_resp(cancel=True)]
+    worker = FakeWorker(block=True)
+    sleeps: list[float] = []
+    loop = make_loop(
+        client, worker, s3, tmp_path, sleeps,
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+
+    def after_first_cancel() -> None:
+        loop.stop()
+
+    client.on_empty = after_first_cancel
+    # second assignment: worker is no longer blocking after interrupt reset
+    orig_run = worker.run
+
+    def run(batch: list[Record]) -> list[Record]:
+        if worker.interrupted:
+            worker.block = False
+        return orig_run(batch)
+
+    worker.run = run  # type: ignore[method-assign]
+    await loop.run()
+    assert worker.interrupted and not worker.killed
+    kinds = client.kinds()
+    assert kinds.index("release") > kinds.index("heartbeat")
+    assert "fail" not in kinds
+    assert s3.puts == [] or len(s3.puts) == 1  # only the second subtask may upload
+    assert kinds.count("acquire") >= 2  # kept polling after the cancel
+    assert sleeps == [] or all(d >= 5.0 for d in sleeps)  # no failure backoff for CANCELLED
+
+
+async def test_cancel_has_no_failure_backoff_and_no_upload(tmp_path: Path) -> None:
+    client, s3, sleeps = FakeClient([assignment()]), FakeS3(), list[float]()
+    client.hb_script = [hb_resp(cancel=True)]
+    loop = make_loop(
+        client, FakeWorker(block=True), s3, tmp_path, sleeps,
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    assert s3.puts == []
+    assert client.kinds() == ["acquire", "heartbeat", "release", "acquire"]
+    assert len(sleeps) == 1  # only the empty-queue sleep, no failure delay
+    assert leftover(tmp_path) == []
+
+
+async def test_stale_heartbeat_interrupts_and_reports_nothing(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.hb_script = [StaleAcquirementError(409, "STALE_ACQUIREMENT", "gone")]
+    worker = FakeWorker(block=True)
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await loop.run()
+    assert worker.interrupted
+    kinds = client.kinds()
+    assert not {"release", "complete", "fail"} & set(kinds)
+    assert s3.puts == []
+
+
+async def test_rate_limited_heartbeat_honours_retry_after(tmp_path: Path) -> None:
+    client, delays = FakeClient([assignment()]), list[float]()
+    client.hb_script = [ApiError(429, "RATE_LIMITED", "slow", retry_after=42.0)]
+    loop = make_loop(
+        client, FakeWorker(block=True), FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(2, delays),
+    )  # fmt: skip
+    asyncio.get_running_loop().call_later(0.4, loop.stop)
+    await loop.run()
+    assert delays[1] == 42.0
+    assert "release" in client.kinds()  # only because of stop, not the 429
+    assert "fail" not in client.kinds()
+
+
+async def test_transport_error_in_heartbeat_does_not_fail_subtask(tmp_path: Path) -> None:
+    client, delays = FakeClient([assignment()]), list[float]()
+    client.hb_script = [httpx.ConnectError("x"), ApiError(503, "X", "down")]
+    s3 = FakeS3()
+    worker = FakeWorker()
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(2, delays),
+    )  # fmt: skip
+    # slow the worker so both beats happen while the subtask is running
+    orig = worker.run
+
+    def slow(batch: list[Record]) -> list[Record]:
+        import time
+
+        time.sleep(0.2)
+        return orig(batch)
+
+    worker.run = slow  # type: ignore[method-assign]
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert client.kinds().count("heartbeat") == 2
+    assert all(d <= 33.0 for d in delays[1:3])  # retry delay capped at 30 s (+jitter)
+    assert "fail" not in client.kinds()
+
+
+async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.hb_script = [hb_resp(url="https://s3.test/out-refreshed", minutes=10)]
+    urls: list[str] = []
+    orig_handler = s3.handler
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "PUT":
+            urls.append(str(req.url))
+        return orig_handler(req)
+
+    s3.handler = handler  # type: ignore[method-assign]
+    worker = FakeWorker()
+    orig = worker.run
+
+    def slow(batch: list[Record]) -> list[Record]:
+        import time
+
+        time.sleep(0.3)
+        return orig(batch)
+
+    worker.run = slow  # type: ignore[method-assign]
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert urls == ["https://s3.test/out-refreshed"]
+
+
+async def test_stop_during_heartbeat_wait_is_prompt(tmp_path: Path) -> None:
+    client = FakeClient([assignment()])
+    worker = FakeWorker(block=True)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], heartbeat_interval_s=100.0)
+    asyncio.get_running_loop().call_later(0.2, loop.stop)
+    await asyncio.wait_for(loop.run(), timeout=5)
+    assert worker.killed
+    assert client.kinds().count("release") == 1

@@ -168,6 +168,7 @@ class WorkerHandle:
         self._ctx = mp.get_context("spawn")
         self._lock = threading.RLock()
         self._closed = False
+        self._interrupted = False
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
@@ -245,6 +246,9 @@ class WorkerHandle:
     def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
         """Load `model`; no-op if already warm, kill+restart on a model switch."""
         with self._lock:
+            if self._interrupted:
+                self._interrupted = False
+                self._reset()
             if self._model_id == model.model_id and self._proc and self._proc.is_alive():
                 return
             if self._model_id is not None:
@@ -270,6 +274,19 @@ class WorkerHandle:
         Lock-free so it can interrupt a call that holds the lock; safe from any thread.
         """
         self._closed = True
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                proc.kill()
+
+    def interrupt(self) -> None:
+        """Abort the current work: hard-kill the worker but allow a respawn on the next call.
+
+        Unlike `kill()` this leaves the handle open. An in-flight call fails with `WorkerCrashed`
+        and resets; a dead idle worker is replaced by `ensure_model` (which reloads the model).
+        Lock-free, safe from any thread.
+        """
+        self._interrupted = True  # kill() is async: don't trust is_alive() right after it
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
