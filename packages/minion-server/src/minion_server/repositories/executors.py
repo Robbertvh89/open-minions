@@ -126,6 +126,30 @@ async def touch(
     )
 
 
+async def report_state(
+    session: AsyncSession,
+    executor_id: uuid.UUID,
+    *,
+    profile: str | None,
+    budget: dict[str, Any] | None,
+    paused_reason: str | None,
+) -> None:
+    """Heartbeat-time refresh of liveness and (optionally) the reported budget/pause state."""
+    values: dict[str, Any] = {"last_seen_at": func.now(), "paused_reason": paused_reason}
+    if profile is not None:
+        values["profile"] = profile
+    if budget is not None:
+        values["budget"] = budget
+    await session.execute(
+        update(Executor)
+        .where(
+            Executor.executor_id == executor_id,
+            Executor.status != ExecutorStatus.REVOKED.value,
+        )
+        .values(**values)
+    )
+
+
 async def set_preference(
     session: AsyncSession,
     executor_id: uuid.UUID,

@@ -26,7 +26,7 @@ def derive_task_status(total: int, succeeded: int, failed: int) -> TaskStatus | 
     return TaskStatus.PARTIAL if succeeded > 0 else TaskStatus.FAILED
 
 
-def _stale() -> Exception:
+def stale_error() -> Exception:
     # Identical body for "not found" and "not yours" so ids cannot be probed.
     return api_error(409, "STALE_ACQUIREMENT", STALE_MESSAGE)
 
@@ -55,7 +55,7 @@ async def complete(
             # A retried complete whose first response was lost: already done, same owner.
             if await repo.completed_by(session, acquirement_id) == principal.executor_id:
                 return
-            raise _stale()
+            raise stale_error()
         if req.record_count != o.record_count:
             raise api_error(422, "RECORD_COUNT_MISMATCH", "record_count differs from the subtask")
         out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
@@ -92,7 +92,7 @@ async def fail(
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
-            raise _stale()
+            raise stale_error()
         error = {"code": req.code, "message": req.message, "retryable": req.retryable}
         # This attempt counts against the budget, so record it before counting.
         used = await repo.failed_attempt_count(session, o) + 1
@@ -114,7 +114,7 @@ async def release(
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
-            raise _stale()
+            raise stale_error()
         await repo.finish_attempt(
             session,
             o,

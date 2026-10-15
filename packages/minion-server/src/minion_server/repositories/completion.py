@@ -37,6 +37,7 @@ class Owned:
     record_count: int
     max_attempts: int
     task_output_uri: str
+    task_status: TaskStatus
 
 
 @dataclass(frozen=True)
@@ -60,9 +61,14 @@ async def lock_owned(
     ).scalar_one_or_none()
     if row is None or row.executor_id != executor_id:
         return None
+    return await owned(session, row)
+
+
+async def owned(session: AsyncSession, row: SubtaskAcquirement) -> Owned:
+    """Build `Owned` from an already-locked acquirement row (reused by reclaim)."""
     info = (
         await session.execute(
-            select(Subtask.record_count, Subtask.max_attempts, Task.output_uri)
+            select(Subtask.record_count, Subtask.max_attempts, Task.output_uri, Task.status)
             .join(
                 Task,
                 (Task.team == Subtask.team)
@@ -89,6 +95,7 @@ async def lock_owned(
         record_count=info[0],
         max_attempts=info[1],
         task_output_uri=info[2],
+        task_status=TaskStatus(info[3]),
     )
 
 
