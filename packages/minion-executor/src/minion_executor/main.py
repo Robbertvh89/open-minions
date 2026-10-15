@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 import typer
 from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
-from minion_common.enums import CapacityProfile, Engine
+from minion_common.enums import CapacityProfile, Engine, TaskType
 from minion_common.schemas import RegisterRequest
 from pydantic import SecretStr
 
@@ -59,7 +59,11 @@ def _validate_runner(name: str) -> None:
     """Fail fast (exit 2 via ValueError) on unknown runners; `fake` needs MINION_EXECUTOR_DEV=1."""
     if name == "fake" and os.environ.get(DEV_ENV) != "1":
         raise ValueError(f"runner 'fake' serves no real work; set {DEV_ENV}=1 to use it (dev only)")
-    create_runner(name)  # raises ValueError for unknown names; engine imports are lazy
+    try:
+        engine = Engine(name)
+    except ValueError:
+        raise ValueError(f"unknown runner: {name!r}") from None
+    create_runner(engine, TaskType.EMBEDDING)  # ValueError if not available yet; imports lazy
 
 
 def _validate_heartbeat(interval_s: float) -> None:
@@ -99,7 +103,7 @@ async def _run(
         budget=budget,
     )
     hooks = os.environ.get(DEV_ENV) == "1" and os.environ.get(TEST_HOOKS_ENV) == "1"
-    worker = WorkerHandle(runner, nice=PROFILES[profile].nice, test_hooks=hooks)
+    worker = WorkerHandle(engines, nice=PROFILES[profile].nice, test_hooks=hooks)
     async with ExecutorClient(server, token) as client:
         loop = ExecutorLoop(
             client,

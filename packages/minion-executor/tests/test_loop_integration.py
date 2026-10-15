@@ -60,7 +60,7 @@ async def test_loop_runs_one_subtask_end_to_end(app: Any, s3: S3Env, tmp_path: P
     budget = Budget.model_validate(
         {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 3}
     )
-    worker = WorkerHandle("fake")
+    worker = WorkerHandle([Engine.FAKE])
     async with ExecutorClient(
         "http://localhost", SecretStr(token), transport=ASGITransport(app=app)
     ) as client:
