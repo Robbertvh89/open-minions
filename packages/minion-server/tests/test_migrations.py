@@ -1,4 +1,4 @@
-"""Migration 0001 matches the ORM models and round-trips (down to base and back)."""
+"""Migrations match the ORM models and round-trips (down to base and back)."""
 
 import asyncio
 from collections.abc import Iterator
@@ -52,6 +52,14 @@ async def _table_count(url: str) -> int:
             return int(res.scalar_one())
     finally:
         await eng.dispose()
+
+
+def test_0002_downgrade_removes_token_expiry_only(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "0001")
+    assert asyncio.run(_table_count(fresh_url)) == 7
+    command.upgrade(cfg, "head")
 
 
 def test_downgrade_upgrade_round_trip(fresh_url: str) -> None:

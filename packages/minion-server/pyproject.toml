@@ -11,6 +11,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "structlog>=24.4",
     "uvicorn[standard]>=0.32",
+    "boto3>=1.43.114",
 ]
 
 [project.scripts]
@@ -22,3 +23,8 @@ minion-common = { workspace = true }
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "boto3-stubs>=1.43.114",
+]
