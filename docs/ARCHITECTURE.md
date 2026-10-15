@@ -286,7 +286,9 @@ Executor (every 300 s while running): POST /heartbeat {progress}
   Server: UPSERT minion_executor_heartbeat.last_seen_at = now()
           respond {cancel: task.status == CANCELLED, refreshed_urls?}
 
-Watchdog (every 60 s):
+Watchdog (every 60 s; also reclaims acquirements older than MINION_MAX_LEASE_S regardless of beats,
+then sweeps PENDING subtasks of recently cancelled tasks to CANCELLED; the implementation uses
+FOR UPDATE SKIP LOCKED + re-check, see plan D3):
   FOR each heartbeat row WHERE last_seen_at < now() - heartbeat_timeout:
     BEGIN
       DELETE FROM minion_subtask_acquirement WHERE acquirement_id = $1 RETURNING *

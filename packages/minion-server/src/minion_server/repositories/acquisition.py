@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
-from sqlalchemy import literal, select, update
+from sqlalchemy import exists, literal, select, update
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -130,10 +130,22 @@ async def candidates(
 async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUID) -> Won | None:
     """Race for one candidate inside the caller's open transaction.
 
-    Returns None if another executor owns it (or it is no longer PENDING). The caller must roll
-    back on None; on success it commits.
+    Returns None if another executor owns it, it is no longer PENDING, or its task is no longer
+    PENDING/RUNNING (cancelled). The caller must roll back on None (so no acquirement survives a
+    failed re-check); on success it commits.
+
+    The task-status guard takes no task row lock (FOR SHARE would deadlock with the PENDING ->
+    RUNNING task update below). Residual window under READ COMMITTED: a statement that began
+    before a concurrent cancel committed can still win; that owner is told to stop by
+    `heartbeat.cancel=true` and the sweep heals the rest.
     """
     acquirement_id = uuid.uuid4()
+    live = [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
+    task_key = (
+        Task.team == c.team,
+        Task.project == c.project,
+        Task.task_name == c.task_name,
+    )
     key = (
         Subtask.team == c.team,
         Subtask.project == c.project,
@@ -160,7 +172,14 @@ async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUI
                 Subtask.subtask_id,
                 literal(executor_id, type_=UUID(as_uuid=True)),
                 Subtask.attempt + 1,
-            ).where(*key, Subtask.status == SubtaskStatus.PENDING.value),
+            )
+            .join(
+                Task,
+                (Task.team == Subtask.team)
+                & (Task.project == Subtask.project)
+                & (Task.task_name == Subtask.task_name),
+            )
+            .where(*key, Subtask.status == SubtaskStatus.PENDING.value, Task.status.in_(live)),
         )
         .on_conflict_do_nothing(constraint=ACQUIREMENT_CONSTRAINT)
         .returning(SubtaskAcquirement.acquirement_id, SubtaskAcquirement.attempt)
@@ -174,6 +193,7 @@ async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUI
             update(Subtask)
             .where(*key, Subtask.status == SubtaskStatus.PENDING.value)
             .where(Subtask.attempt == won[1] - 1)
+            .where(exists(select(1).where(*task_key, Task.status.in_(live))))
             .values(status=SubtaskStatus.RUNNING.value, attempt=Subtask.attempt + 1)
             .returning(Subtask.attempt)
         )

@@ -120,6 +120,7 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
   watchdog deletes the acquirement, archives it as `EXPIRED`, and sets the subtask back to
   `PENDING` (or `FAILED` once the budget is spent) **[paper semantics]**. Reclaim does not touch
   `attempt`: the next acquire increments it, so attempt-scoped output keys stay unique.
+- FR-31a. Hard lease: an acquirement older than `max_lease` (`MINION_MAX_LEASE_S`, default 6 h) is reclaimed as `EXPIRED` (code `MAX_LEASE_EXCEEDED`, consumes budget) even while it heartbeats, so a looping executor cannot hold a subtask forever **[ours]**.
 - FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts; once it reaches
   `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or `PARTIAL`
   depending on policy. A voluntary `release` does not consume the budget **[ours]**, but a
@@ -219,7 +220,9 @@ changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_
 without finishing).
 
 **Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
-and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog reclaim. The other rows are not yet implemented.
+and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). The other rows are not yet implemented.
+
+**Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
 ### 6.1 User-facing
 | Method | Path | Purpose |
@@ -228,7 +231,7 @@ and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog r
 | `GET` | `/tasks?team=&project=&status=` | List tasks |
 | `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts (`TaskOut`, below) |
 | `GET` | `/tasks/{team}/{project}/{task_name}/subtasks` | Paginated subtasks |
-| `POST` | `/tasks/{team}/{project}/{task_name}/cancel` | Cancel |
+| `POST` | `/tasks/{team}/{project}/{task_name}/cancel` | Cancel (key's team must own the task: `403` otherwise, `404` unknown). Lazy two-phase: task → `CANCELLED`, then `PENDING` subtasks → `CANCELLED`; `RUNNING` ones keep their owner, who learns via `heartbeat.cancel=true` and releases (their `release`/`fail`/reclaim end `CANCELLED`; a `complete` is still accepted and the task stays `CANCELLED`). Idempotent: re-cancel → `200` + task; an already `SUCCEEDED/FAILED/PARTIAL` task → `409 TASK_FINISHED`. The watchdog sweeps stragglers (`PENDING` under a task cancelled within `MINION_CANCEL_SWEEP_WINDOW_S`, default 1 h; older stragglers are healed only by re-cancel). Acquire also refuses subtasks of a non-`PENDING/RUNNING` task |
 | `GET` | `/executors` | Fleet view: online, busy, last heartbeat |
 
 ### 6.2 Executor-facing **[paper: acquire, state update, heartbeat, publish]**

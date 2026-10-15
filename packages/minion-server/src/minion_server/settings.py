@@ -47,6 +47,11 @@ class ServerSettings(BaseSettings):
     # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
     release_limit: int = Field(default=10, ge=0)
 
+    # Minimum seconds between heartbeats of one acquirement; faster beats get 429 (guards write
+    # amplification: a rogue executor cannot hammer the heartbeat row). 0 disables. Executors
+    # beat every ~30 s, so 1 s leaves ample headroom.
+    heartbeat_min_interval_s: float = Field(default=1.0, ge=0)
+
     # Splitter bounds (memory/DoS protection) and retry policy.
     split_max_line_bytes: int = Field(default=16 << 20, gt=0)  # LINE_TOO_LONG above this
     split_max_input_bytes: int = Field(default=50 << 30, gt=0)  # total per task

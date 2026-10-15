@@ -534,10 +534,10 @@ async def test_reclaim_stale_continues_after_failing_id(
     poisoned = owned[0]["acquirement_id"]
     real = mod.reclaim_one
 
-    async def flaky(session: AsyncSession, aid: Any, *, timeout_s: float) -> ReclaimResult:
+    async def flaky(session: AsyncSession, aid: Any, **kw: Any) -> ReclaimResult:
         if str(aid) == poisoned:
             raise RuntimeError("boom")
-        return await real(session, aid, timeout_s=timeout_s)
+        return await real(session, aid, **kw)
 
     monkeypatch.setattr(mod, "reclaim_one", flaky)
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)

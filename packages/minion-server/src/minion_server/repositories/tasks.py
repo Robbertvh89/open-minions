@@ -7,7 +7,7 @@ from typing import Any
 
 from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import ModelEntry, TaskCreate
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import Select, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -257,3 +257,119 @@ async def schedule_split_retry(session: AsyncSession, task: Task, delay_s: float
         .values(next_split_at=func.now() + timedelta(seconds=delay_s))
     )
     return bool(res.rowcount)  # type: ignore[attr-defined]
+
+
+_CANCELLABLE = (TaskStatus.SPLITTING.value, TaskStatus.PENDING.value, TaskStatus.RUNNING.value)
+
+
+async def cancel_task(
+    session: AsyncSession, team: str, project: str, task_name: str
+) -> TaskStatus | None:
+    """Txn 1 of cancel (plan D4): flip the task to CANCELLED; return its resulting status.
+
+    Returns CANCELLED both when this call cancelled it and when it already was (idempotent),
+    another terminal status if the task already finished, None if it does not exist. Only the
+    task row is locked here; subtasks are cancelled in a second transaction because acquire locks
+    subtask -> task and holding both orders would deadlock.
+    """
+    key = (Task.team == team, Task.project == project, Task.task_name == task_name)
+    cancelled = (
+        await session.execute(
+            update(Task)
+            .where(*key, Task.status.in_(_CANCELLABLE))
+            .values(status=TaskStatus.CANCELLED.value, finished_at=func.now(), next_split_at=None)
+            .returning(Task.task_name)
+        )
+    ).first()
+    if cancelled is not None:
+        return TaskStatus.CANCELLED
+    current = (await session.execute(select(Task.status).where(*key))).scalar_one_or_none()
+    return None if current is None else TaskStatus(current)
+
+
+CANCEL_BATCH = 10_000
+
+
+def _pending_of(team: str, project: str, task_name: str) -> Select[Any]:
+    return (
+        select(Subtask.subtask_id)
+        .where(
+            Subtask.team == team,
+            Subtask.project == project,
+            Subtask.task_name == task_name,
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .order_by(Subtask.subtask_id)
+        .limit(CANCEL_BATCH)
+        .with_for_update(skip_locked=True)
+    )
+
+
+async def cancel_pending_subtasks(
+    session: AsyncSession, team: str, project: str, task_name: str
+) -> int:
+    """Txn 2 of cancel: one batch (<= CANCEL_BATCH rows) PENDING -> CANCELLED; RUNNING keep owner.
+
+    The caller loops (one transaction per call) until this returns 0 so no single transaction
+    holds an unbounded number of row locks.
+    """
+    ids = _pending_of(team, project, task_name).scalar_subquery()
+    result = await session.execute(
+        update(Subtask)
+        .where(
+            Subtask.team == team,
+            Subtask.project == project,
+            Subtask.task_name == task_name,
+            Subtask.subtask_id.in_(ids),
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+    )
+    return int(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def sweep_cancelled(
+    session: AsyncSession, window_s: float = 3600, batch: int = CANCEL_BATCH
+) -> int:
+    """One batch (<= `batch` rows) of PENDING subtasks under tasks cancelled in the last `window_s`.
+
+    A requeue that read the task status just before cancel committed can leave one behind. They
+    are never acquired (candidates and `try_acquire` both require a PENDING/RUNNING task); this
+    keeps the counts consistent. Locks subtask rows only (SKIP LOCKED, bounded), so it cannot
+    deadlock with acquire (subtask -> task). The caller loops, one transaction per call, until
+    fewer than `batch` rows come back. Stragglers older than the window are healed only by
+    re-cancelling.
+    """
+    recent = (
+        select(Task.team, Task.project, Task.task_name)
+        .where(
+            Task.status == TaskStatus.CANCELLED.value,
+            Task.finished_at > func.now() - func.make_interval(0, 0, 0, 0, 0, 0, window_s),
+        )
+        .subquery()
+    )
+    ids = (
+        select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+        .where(
+            Subtask.status == SubtaskStatus.PENDING.value,
+            tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
+                select(recent.c.team, recent.c.project, recent.c.task_name)
+            ),
+        )
+        .order_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+        .limit(batch)
+        .with_for_update(skip_locked=True)
+        .cte("batch")
+        .prefix_with("MATERIALIZED")  # evaluate LIMIT/SKIP LOCKED once, not per outer row
+    )
+    result = await session.execute(
+        update(Subtask)
+        .where(
+            tuple_(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id).in_(
+                select(ids.c.team, ids.c.project, ids.c.task_name, ids.c.subtask_id)
+            ),
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+    )
+    return int(result.rowcount)  # type: ignore[attr-defined]

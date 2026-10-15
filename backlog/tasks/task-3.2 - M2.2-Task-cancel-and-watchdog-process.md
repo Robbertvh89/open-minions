@@ -4,7 +4,7 @@ title: 'M2.2: Task cancel and watchdog process'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 18:02'
-updated_date: '2026-10-15 18:36'
+updated_date: '2026-10-15 18:54'
 labels:
   - M2
 dependencies:
@@ -22,9 +22,11 @@ Plan steps S4-S5 of TASK-3 (D4, D7)
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Cancel endpoint: pending subtasks CANCELLED, running owners get heartbeat cancel=true, owner ops finish as CANCELLED
-- [ ] #2 minion-watchdog reclaims stale acquirements and sweeps cancelled tasks; stops cleanly on SIGTERM
+- [x] #1 Cancel endpoint: pending subtasks CANCELLED, running owners get heartbeat cancel=true, owner ops finish as CANCELLED
+- [x] #2 minion-watchdog reclaims stale acquirements and sweeps cancelled tasks; stops cleanly on SIGTERM
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 
