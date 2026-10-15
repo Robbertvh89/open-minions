@@ -918,6 +918,7 @@ source = { editable = "packages/minion-executor" }
 dependencies = [
     { name = "httpx" },
     { name = "minion-common" },
+    { name = "structlog" },
     { name = "typer" },
 ]
 
@@ -925,6 +926,7 @@ dependencies = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "minion-common", editable = "packages/minion-common" },
+    { name = "structlog", specifier = ">=24.4" },
     { name = "typer", specifier = ">=0.15" },
 ]
 

@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "minion-common",
     "httpx>=0.28",
+    "structlog>=24.4",
     "typer>=0.15",
 ]
 

@@ -14,6 +14,7 @@ class Engine(StrEnum):
     MLX = "mlx"
     OLLAMA = "ollama"
     HF = "hf"
+    FAKE = "fake"  # test/dev only: deterministic fake runner, never serves real work
 
 
 class TaskStatus(StrEnum):

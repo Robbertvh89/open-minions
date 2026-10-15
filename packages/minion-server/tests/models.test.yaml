@@ -2,6 +2,6 @@
 models:
   - model_id: fake-embed
     type: embedding
-    engine: mlx
+    engine: fake
     ref: fake
     memory_gb: 0.1

@@ -126,6 +126,74 @@ minion_executor/
 - Uses `caffeinate`-free design: it does **not** prevent sleep. If the Mac sleeps, heartbeats stop and
   the watchdog reclaims — this is intended **[paper]**.
 
+#### Executor implementation (M1, TASK-2.3)
+Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
+`runners/{base,fake}.py`, `worker/process.py`. Not yet: heartbeat, governor/signals, MLX/Ollama/HF
+runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
+
+- **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
+  `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
+  if 4xx, raise (exit non-zero); if no assignment, backoff; else handle one subtask.
+- **Per subtask** (`_execute`): ranged GET of `[byte_start, byte_end)` → parse exactly `record_count`
+  records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
+  temp dir → presigned PUT → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
+  unlinked in `finally`.
+- **Error → report mapping.** Only executor-local connectivity trouble (connect/timeout/network/
+  remote-protocol errors, local `OSError`) is `release`d (immediate requeue, no retry budget burned).
+  Anything S3 actually answered (403/404/5xx), a backend ignoring `Range`, or a short body is a
+  retryable `fail`, so `max_attempts` bounds it (a `release` would livelock the fleet):
+  | Condition | Action | Code | Retryable |
+  |---|---|---|---|
+  | input lines do not match `record_count` / not JSON / nested too deeply | fail | `BAD_INPUT` | no |
+  | input GET: connect/timeout/network/remote-protocol/proxy error | release | `INPUT_UNAVAILABLE` | n/a |
+  | input GET: HTTP error status, not `206`, or != requested bytes | fail | `INPUT_UNAVAILABLE` | yes |
+  | temp-file I/O error | release | `LOCAL_IO_ERROR` | n/a |
+  | output PUT: connect/timeout/network/remote-protocol/proxy error | release | `UPLOAD_FAILED` | n/a |
+  | output PUT: HTTP error status (e.g. expired presigned URL) | fail | `UPLOAD_FAILED` | yes |
+  | presigned URL not https (http only if the server URL is loopback) | fail | `INSECURE_URL` | yes |
+  | worker died / timed out (per-op: load 900 s, run 600 s → kill) | fail | `WORKER_CRASHED` | yes |
+  | `RunnerError` from worker | fail | runner's code (≤64 chars) | yes |
+  | runner returned a different number of records than the input | fail | `OUTPUT_MISMATCH` | yes |
+  | any other exception in the handler (poison pill) | fail (type name only in logs) | `EXECUTOR_ERROR` | yes |
+  | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: if any 5xx was seen, best-effort `fail` (retryable, burns budget); transport-only, nothing (the watchdog reclaims and counts EXPIRED) | `COMPLETE_FAILED` | yes |
+  | `complete`: 4xx other than 409 | fail | `COMPLETE_REJECTED` | yes |
+  | `complete` or `fail` returns 409 | discard, no retry | — | — |
+- **Failure back-off.** After any failed subtask the loop sleeps (same jittered exponential delay,
+  growing per consecutive failure); after `max_consecutive_failures` (5) in a row it pauses for
+  `failure_pause_s` (300 s) before acquiring again. A success resets the streak.
+- **Stop** (SIGTERM / SIGINT → `loop.stop`, exit 0): an in-flight subtask is cancelled, the worker is
+  killed to reclaim memory, and the subtask is `release`d (immediate requeue, not a failure). The
+  loop does not wait for a grace period (see SPEC §4.2 FR-17 status).
+- **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
+  not a fixed 10–30 s band. Resets on the first assignment.
+- **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
+  worker is kept warm across subtasks of the same model, killed and restarted on a model switch,
+  and killed on stop. Calls are serialised by a lock; `kill()` is lock-free, marks the handle
+  stopped and never respawns. The child gets an allowlisted environment (`PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*`, `HF_HOME`, `MLX_*`,
+  `TOKENIZERS_PARALLELISM`, `MINION_EXECUTOR_DEV`/`_TEST_HOOKS`, `__PYVENV_LAUNCHER__`); because `spawn` hands the parent's
+  environ to the child before `worker_main` runs, `main` calls `restrict_environ()` after the httpx
+  clients are built (they read proxy env at construction) and before any spawn, so the control
+  process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
+  bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
+  process dies (parent-pid watch). Only the fake runner exists in M1 (`runners/fake.py`, engine
+  `fake`, never advertised as a real engine); its `fail` / `sleep_s` / `echo_env` per-record hooks
+  work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
+  control process (invariant 7).
+- **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
+  Memory is `min(fraction, 75 %) × RAM`, sent in `Budget`. CPU priority is applied only as a POSIX
+  `nice` value in the worker (15 / 10 / 0); there is no `Budget` field for it and no `taskpolicy`.
+- **Token and CLI** (`secrets.py`, `main.py`): token from `$MINION_EXECUTOR_TOKEN`, else the macOS
+  Keychain item `open-minions-executor` via `/usr/bin/security`. Token is never logged. `run` exits 2
+  on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
+  missing token or unknown runner. The token is removed from `os.environ` right after loading, before
+  any child process. `--runner` (hidden) defaults to the real engine `mlx` (arrives in M3, so `run`
+  currently exits 2); `--runner fake` is refused unless `MINION_EXECUTOR_DEV=1`, and then registers
+  with engines `[fake]` only, so it can only be served tasks whose model uses engine `fake`.
+  `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
+- **Housekeeping**: temp dirs are `minion-exec-<pid>-*`; at startup dirs of dead pids owned by the
+  user are removed. File I/O in the data path runs in threads (`asyncio.to_thread`).
+- **Logging**: `structlog`, ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
+
 ### 2.3 minion-watchdog
 - Single loop every 60 s. Multiple replicas are safe: each reclaim is a single transaction guarded by
   `DELETE ... RETURNING` on the acquirement row.
@@ -349,7 +417,7 @@ token in macOS Keychain.
 - [ADR-0001](adr/0001-python-for-all-components.md): Python for all components — **Accepted**
 - ADR-0002: Unique-constraint acquisition over `SKIP LOCKED` *(to write)*
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
-- ADR-0004: Byte-range input slicing *(to write)*
+- [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
-- [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Proposed**
+- [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*

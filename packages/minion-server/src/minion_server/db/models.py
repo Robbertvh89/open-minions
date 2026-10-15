@@ -171,7 +171,9 @@ class Subtask(Base):
 class Executor(Base):
     __tablename__ = "minion_executor"
     __table_args__ = (
-        CheckConstraint("engines <@ ARRAY['mlx','ollama','hf']::varchar[]", name="engines_known"),
+        CheckConstraint(
+            "engines <@ ARRAY['mlx','ollama','hf','fake']::varchar[]", name="engines_known"
+        ),
     )
 
     executor_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)

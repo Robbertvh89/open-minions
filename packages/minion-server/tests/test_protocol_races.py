@@ -14,7 +14,7 @@ import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from minion_common.client import ExecutorClient, StaleAcquirementError, UserClient
-from minion_common.enums import TaskStatus
+from minion_common.enums import Engine, TaskStatus
 from minion_common.schemas import (
     CompleteRequest,
     FailRequest,
@@ -403,7 +403,7 @@ async def test_e2e_user_and_executor_clients(
                     "chip": "M3",
                     "total_memory_gb": 32,
                     "os_version": "15",
-                    "engines": ["mlx"],
+                    "engines": ["fake"],
                     "profile": "balanced",
                     "budget": _budget().model_dump(mode="json"),
                 }
@@ -413,7 +413,7 @@ async def test_e2e_user_and_executor_clients(
 
         seen = set()
         async with httpx.AsyncClient() as raw:  # real HTTP to SeaweedFS via presigned URLs
-            while (asg := await ex.acquire(_req())) is not None:
+            while (asg := await ex.acquire(_req(engines=(Engine.FAKE,)))) is not None:
                 seen.add(asg.subtask_id)
                 got_in = await raw.get(
                     asg.input_url, headers={"Range": f"bytes={asg.byte_start}-{asg.byte_end - 1}"}

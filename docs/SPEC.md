@@ -60,7 +60,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   - `completion` — input: JSONL with `id` + `prompt` (or `messages`);
     params: `temperature`, `max_tokens`, `system`, etc.
 - FR-4a. Each task names a `model` from the deployment's **model allow-list** (`models.yaml`). An entry
-  defines `model_id`, `type`, `engine` (`mlx` | `ollama` | `hf`), engine-specific reference (HF repo for
+  defines `model_id`, `type`, `engine` (`mlx` | `ollama` | `hf`; plus `fake`, a test/dev-only engine for the fake runner, never in a production allow-list), engine-specific reference (HF repo for
   MLX/HF, tag for Ollama), and `memory_gb` (peak resident estimate incl. KV cache at default batch size).
   Default engine is `mlx` **[ours, ADR-0005]**; the paper used HF transformers + Ollama.
 - FR-5. Input format **[ours]**: one or more JSONL objects under an S3 prefix. Splitting is by record
@@ -97,6 +97,14 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   instead of waiting for the watchdog **[ours]**.
 - FR-18. When and how much the executor works is governed by the capacity rules in §4.6 (the paper
   only lets users stop the executor entirely).
+
+**Implementation status (M1, TASK-2.3).** Implemented: FR-10 (register, token from
+`$MINION_EXECUTOR_TOKEN` or Keychain item `open-minions-executor`), FR-11 (loop with fake runner
+only), FR-15 (one subtask at a time), FR-17 partially (SIGTERM/SIGINT stop, release of the in-flight
+subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, which conflicts with the
+"finish-or-release within grace" wording). Not yet implemented: FR-12 model cache, FR-13 MLX/Ollama/HF
+runners, FR-14 heartbeat, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
+governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
 ### 4.3 Acquisition protocol **[paper]**
 - FR-20. Ownership is claimed by inserting into `minion_subtask_acquirement`, which has a UNIQUE
@@ -145,6 +153,11 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   | `full` | 70 % of RAM | 100 % | 32 | normal | Owner away, overnight |
   | `custom` | user-defined | | | | |
   Memory share is capped at 75 % of RAM regardless of config (headroom for macOS + apps).
+  **Status (TASK-2.3):** the three built-in profiles are implemented as static values
+  (`capacity/profiles.py`), with the 75 % cap. `~/.config/minion/executor.toml` overrides and the
+  `custom` profile are **not implemented**. `cpu_priority` is applied only as a `nice` value
+  (15 / 10 / 0) in the worker; `taskpolicy -b` is not used. FR-52, FR-53, FR-54 and FR-55 are M4;
+  FR-56 is partially met (`run --profile` only; no `profile`, `pause`, `resume`, `status`).
 - FR-52. **Adaptive switching.** The owner configures an `active_profile` (used while the user is at the
   machine) and an `idle_profile` (used when HID idle time ≥ `idle_after_min`, default 10 min, and on AC
   power). Defaults: `active_profile = light`, `idle_profile = full`. Optional time schedules override
