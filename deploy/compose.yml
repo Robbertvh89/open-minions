@@ -22,7 +22,7 @@ services:
   s3:
     # S3-compatible object store (SeaweedFS). MinIO no longer publishes community images.
     image: chrislusf/seaweedfs:4.05
-    command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0
+    command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -volume.max=200 -master.volumePreallocate=false
     ports:
       - "127.0.0.1:${MINION_S3_PORT:-9000}:9000"
     volumes:

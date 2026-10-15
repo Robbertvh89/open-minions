@@ -112,7 +112,7 @@ def _wait_http(url: str, timeout_s: float = 60.0) -> None:
 
 
 @pytest.fixture(scope="session")
-def s3() -> Iterator[S3Env]:
+def s3(request: pytest.FixtureRequest) -> Iterator[S3Env]:
     """SeaweedFS (same image/command as deploy/compose.yml) with s3.json mounted, bucket created."""
     from testcontainers.core.container import DockerContainer
 
@@ -120,6 +120,9 @@ def s3() -> Iterator[S3Env]:
         DockerContainer(S3_IMAGE)
         .with_command(
             "server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0"
+            # Small runners: the default 30 GB volume size limit with auto volume.max (derived
+            # from free disk) can yield zero writable volumes -> PutObject InternalError.
+            " -master.volumeSizeLimitMB=64 -volume.max=200 -master.volumePreallocate=false"
         )
         .with_volume_mapping(
             str(REPO_ROOT / "deploy" / "seaweedfs" / "s3.json"), "/etc/seaweedfs/s3.json", "ro"
@@ -146,7 +149,13 @@ def s3() -> Iterator[S3Env]:
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.5)
-        yield S3Env(endpoint, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, client)
+        try:
+            yield S3Env(endpoint, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, client)
+        finally:
+            if request.session.testsfailed:  # CI diagnostics for S3 InternalError etc.
+                out, err = container.get_logs()
+                tail = (out + err).decode(errors="replace").splitlines()[-80:]
+                print("\n--- seaweedfs log tail ---\n" + "\n".join(tail))
 
 
 # --- server test helpers (seeding, executors, settings) ---
