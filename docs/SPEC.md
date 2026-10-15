@@ -60,7 +60,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   - `completion` — input: JSONL with `id` + `prompt` (or `messages`);
     params: `temperature`, `max_tokens`, `system`, etc.
 - FR-4a. Each task names a `model` from the deployment's **model allow-list** (`models.yaml`). An entry
-  defines `model_id`, `type`, `engine` (`mlx` | `ollama` | `hf`), engine-specific reference (HF repo for
+  defines `model_id`, `type`, `engine` (`mlx` | `ollama` | `hf`; plus `fake`, a test/dev-only engine for the fake runner, never in a production allow-list), engine-specific reference (HF repo for
   MLX/HF, tag for Ollama), and `memory_gb` (peak resident estimate incl. KV cache at default batch size).
   Default engine is `mlx` **[ours, ADR-0005]**; the paper used HF transformers + Ollama.
 - FR-5. Input format **[ours]**: one or more JSONL objects under an S3 prefix. Splitting is by record

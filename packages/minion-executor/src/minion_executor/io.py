@@ -19,6 +19,10 @@ class BadInputError(Exception):
     """Input bytes are not valid JSONL records. Message never contains payload content."""
 
 
+class InputUnavailableError(Exception):
+    """The ranged GET did not yield exactly the requested bytes (executor-local/transient)."""
+
+
 async def download_range(
     http: httpx.AsyncClient, url: str, start: int, end_exclusive: int, dest: Path
 ) -> int:
@@ -28,17 +32,27 @@ async def download_range(
     written = 0
     async with http.stream("GET", url, headers=headers) as resp:
         resp.raise_for_status()
-        with dest.open("wb") as fh:
+        if resp.status_code != 206:  # a 200 means the Range header was ignored
+            raise InputUnavailableError(f"ranged GET returned {resp.status_code}, expected 206")
+        fh = await asyncio.to_thread(dest.open, "wb")
+        try:
             async for chunk in resp.aiter_bytes(CHUNK):
                 written += len(chunk)
                 if written > expected:
-                    raise BadInputError("ranged GET returned more bytes than requested")
-                fh.write(chunk)
+                    raise InputUnavailableError("ranged GET returned more bytes than requested")
+                await asyncio.to_thread(fh.write, chunk)
+        finally:
+            await asyncio.to_thread(fh.close)
+    if written != expected:
+        raise InputUnavailableError(f"ranged GET returned {written} bytes, expected {expected}")
     return written
 
 
 def parse_jsonl(path: Path, expected_records: int) -> list[Record]:
-    """Parse a JSONL file of objects; blank lines are skipped. Raises BadInputError."""
+    """Parse a JSONL file of objects; blank lines are skipped. Raises BadInputError.
+
+    Blocking; call via `asyncio.to_thread`.
+    """
     records: list[Record] = []
     with path.open("rb") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -46,6 +60,8 @@ def parse_jsonl(path: Path, expected_records: int) -> list[Record]:
                 continue
             try:
                 rec = json.loads(line)
+            except RecursionError:  # pathologically nested JSON
+                raise BadInputError(f"line {lineno} is nested too deeply") from None
             except ValueError:
                 raise BadInputError(f"line {lineno} is not valid JSON") from None
             if not isinstance(rec, dict):
@@ -57,7 +73,7 @@ def parse_jsonl(path: Path, expected_records: int) -> list[Record]:
 
 
 def write_jsonl(path: Path, records: list[Record]) -> tuple[int, str]:
-    """Write records as JSONL; return (byte_size, sha256 hex)."""
+    """Write records as JSONL; return (byte_size, sha256 hex). Blocking; use `to_thread`."""
     digest = hashlib.sha256()
     size = 0
     with path.open("wb") as fh:
@@ -72,9 +88,12 @@ def write_jsonl(path: Path, records: list[Record]) -> tuple[int, str]:
 
 
 async def _file_chunks(path: Path) -> AsyncIterator[bytes]:
-    with path.open("rb") as fh:
-        while chunk := fh.read(CHUNK):
+    fh = await asyncio.to_thread(path.open, "rb")
+    try:
+        while chunk := await asyncio.to_thread(fh.read, CHUNK):
             yield chunk
+    finally:
+        await asyncio.to_thread(fh.close)
 
 
 async def upload_file(http: httpx.AsyncClient, url: str, path: Path) -> None:

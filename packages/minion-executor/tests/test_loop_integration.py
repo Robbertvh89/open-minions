@@ -64,7 +64,9 @@ async def test_loop_runs_one_subtask_end_to_end(app: Any, s3: S3Env, tmp_path: P
     async with ExecutorClient(
         "http://localhost", SecretStr(token), transport=ASGITransport(app=app)
     ) as client:
-        loop = ExecutorLoop(client, worker, budget, [Engine.MLX], tmp_root=tmp_path)
+        loop = ExecutorLoop(
+            client, worker, budget, [Engine.MLX], tmp_root=tmp_path, allow_http_loopback=True
+        )
         assert await loop.run(max_subtasks=1) == 1
 
     out = s3.client.get_object(Bucket=s3.bucket, Key="outputs/exl1/loop1/000000.jsonl")

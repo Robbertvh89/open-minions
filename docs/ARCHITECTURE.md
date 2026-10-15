@@ -138,16 +138,26 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
   temp dir → presigned PUT → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
   unlinked in `finally`.
-- **Error → report mapping** (`fail(retryable, code)`):
-  | Condition | Code | Retryable |
-  |---|---|---|
-  | input lines do not match `record_count` / not JSON | `BAD_INPUT` | no |
-  | input GET fails (HTTP error) | `INPUT_UNAVAILABLE` | yes |
-  | worker process died / timed out (600 s call timeout → kill) | `WORKER_CRASHED` | yes |
-  | `RunnerError` from worker | runner's code (≤64 chars) | yes |
-  | output PUT fails | `UPLOAD_FAILED` | yes |
-  | `complete` or `fail` returns 409 (stale acquirement) | — discard, no retry | — |
-  | `complete` fails on transport/5xx | — logged, not reported; watchdog reclaims | — |
+- **Error → report mapping.** Executor-local trouble is `release`d (immediate requeue, no retry
+  budget burned) so one broken Mac cannot exhaust a subtask's attempts; subtask-level problems are
+  `fail`ed:
+  | Condition | Action | Code | Retryable |
+  |---|---|---|---|
+  | input lines do not match `record_count` / not JSON / nested too deeply | fail | `BAD_INPUT` | no |
+  | input GET fails, is not `206`, or returns != requested bytes | release | `INPUT_UNAVAILABLE` | n/a |
+  | temp-file I/O error | release | `LOCAL_IO_ERROR` | n/a |
+  | output PUT fails | release | `UPLOAD_FAILED` | n/a |
+  | presigned URL not https (http only if the server URL is loopback) | fail | `INSECURE_URL` | yes |
+  | worker died / timed out (per-op: load 900 s, run 600 s → kill) | fail | `WORKER_CRASHED` | yes |
+  | `RunnerError` from worker | fail | runner's code (≤64 chars) | yes |
+  | runner returned a different number of records than the input | fail | `OUTPUT_MISMATCH` | yes |
+  | any other exception in the handler (poison pill) | fail (type name only in logs) | `EXECUTOR_ERROR` | yes |
+  | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: not reported, watchdog reclaims | — | — |
+  | `complete`: 4xx other than 409 | fail | `COMPLETE_REJECTED` | yes |
+  | `complete` or `fail` returns 409 | discard, no retry | — | — |
+- **Failure back-off.** After any failed subtask the loop sleeps (same jittered exponential delay,
+  growing per consecutive failure); after `max_consecutive_failures` (5) in a row it pauses for
+  `failure_pause_s` (300 s) before acquiring again. A success resets the streak.
 - **Stop** (SIGTERM / SIGINT → `loop.stop`, exit 0): an in-flight subtask is cancelled, the worker is
   killed to reclaim memory, and the subtask is `release`d (immediate requeue, not a failure). The
   loop does not wait for a grace period (see SPEC §4.2 FR-17 status).
@@ -155,15 +165,26 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   not a fixed 10–30 s band. Resets on the first assignment.
 - **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
   worker is kept warm across subtasks of the same model, killed and restarted on a model switch,
-  and killed on stop. Only the fake runner exists in M1 (`runners/fake.py`, test aid; honours
-  `oom` admission and a capped `sleep_s`). Inference never runs in the control process (invariant 7).
+  and killed on stop. Calls are serialised by a lock; `kill()` is lock-free, marks the handle
+  stopped and never respawns. The child gets a scrubbed environment (no token/secret-like names),
+  bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
+  process dies (parent-pid watch). Only the fake runner exists in M1 (`runners/fake.py`, engine
+  `fake`, never advertised as a real engine); its `fail` / `sleep_s` / `echo_env` per-record hooks
+  work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
+  control process (invariant 7).
 - **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
   Memory is `min(fraction, 75 %) × RAM`, sent in `Budget`. CPU priority is applied only as a POSIX
   `nice` value in the worker (15 / 10 / 0); there is no `Budget` field for it and no `taskpolicy`.
 - **Token and CLI** (`secrets.py`, `main.py`): token from `$MINION_EXECUTOR_TOKEN`, else the macOS
   Keychain item `open-minions-executor` via `/usr/bin/security`. Token is never logged. `run` exits 2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
-  missing token. The `--runner` option is hidden and defaults to `fake`.
+  missing token or unknown runner. The token is removed from `os.environ` right after loading, before
+  any child process. `--runner` (hidden) defaults to the real engine `mlx` (arrives in M3, so `run`
+  currently exits 2); `--runner fake` is refused unless `MINION_EXECUTOR_DEV=1`, and then registers
+  with engines `[fake]` only, so it can only be served tasks whose model uses engine `fake`.
+  `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
+- **Housekeeping**: temp dirs are `minion-exec-<pid>-*`; at startup dirs of dead pids owned by the
+  user are removed. File I/O in the data path runs in threads (`asyncio.to_thread`).
 - **Logging**: `structlog`, ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
 
 ### 2.3 minion-watchdog

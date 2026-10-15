@@ -142,7 +142,9 @@ async def _run_loops(live: Live, workers: list[WorkerHandle], name: str, tmp: Pa
     tokens = [await live.token(f"o{i}") for i in range(len(workers))]
     clients = [ExecutorClient(live.url, SecretStr(t)) for t in tokens]
     loops = [
-        ExecutorLoop(c, w, BUDGET, [Engine.MLX], backoff=FAST, tmp_root=tmp)
+        ExecutorLoop(
+            c, w, BUDGET, [Engine.FAKE], backoff=FAST, tmp_root=tmp, allow_http_loopback=True
+        )
         for c, w in zip(clients, workers, strict=True)
     ]
     tasks = [asyncio.create_task(lp.run()) for lp in loops]
@@ -232,7 +234,12 @@ async def test_sigterm_releases_inflight_subtask(live: Live, tmp_path: Path) -> 
     live.put_input("term", "a.jsonl", body)
     await live.submit("term", rps=10)
     token = await live.token("sigterm")
-    env = {**os.environ, "MINION_EXECUTOR_TOKEN": token}
+    env = {
+        **os.environ,
+        "MINION_EXECUTOR_TOKEN": token,
+        "MINION_EXECUTOR_DEV": "1",
+        "MINION_EXECUTOR_TEST_HOOKS": "1",
+    }
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -242,6 +249,8 @@ async def test_sigterm_releases_inflight_subtask(live: Live, tmp_path: Path) -> 
         live.url,
         "--profile",
         "balanced",
+        "--runner",
+        "fake",
         env=env,
         cwd=str(tmp_path),
     )

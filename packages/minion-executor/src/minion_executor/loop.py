@@ -8,16 +8,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
+import os
 import random
+import re
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
-from minion_common.client import ApiError, ExecutorClient, StaleAcquirementError
+from minion_common.client import (
+    ApiError,
+    ExecutorClient,
+    StaleAcquirementError,
+    require_secure_url,
+)
 from minion_common.enums import Engine
 from minion_common.schemas import (
     AcquireRequest,
@@ -36,6 +45,41 @@ from minion_executor.worker.process import WorkerCrashed
 log = structlog.get_logger("minion_executor.loop")
 
 BAD_INPUT = "BAD_INPUT"
+TMP_PREFIX = "minion-exec-"
+_TMP_RE = re.compile(r"^minion-exec-(\d+)-")
+
+
+class _Outcome(enum.Enum):
+    DONE = enum.auto()  # completed and acknowledged
+    FAILED = enum.auto()  # failed/released/gave up: back off before the next acquire
+    DISCARDED = enum.auto()  # stale (409): someone else owns it now, nothing to report
+    STOPPED = enum.auto()  # stop requested mid-subtask
+
+
+def cleanup_stale_tmp(root: Path | None = None) -> int:
+    """Remove `minion-exec-<pid>-*` dirs owned by this user whose pid is no longer alive."""
+    base = root or Path(tempfile.gettempdir())
+    removed = 0
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        m = _TMP_RE.match(entry.name)
+        if m is None or entry.is_symlink() or int(m.group(1)) == os.getpid():
+            continue
+        try:
+            if not entry.is_dir() or entry.stat().st_uid != os.getuid():
+                continue
+            os.kill(int(m.group(1)), 0)
+            continue  # owner process is alive: not stale
+        except ProcessLookupError:
+            pass
+        except OSError:  # PermissionError (pid reused by another user) or stat failure
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 class Worker(Protocol):
@@ -46,9 +90,11 @@ class Worker(Protocol):
 
 
 class _FailureError(Exception):
-    def __init__(self, retryable: bool, code: str, message: str) -> None:
+    """A subtask failed locally. `release` hands it back without burning the retry budget."""
+
+    def __init__(self, retryable: bool, code: str, message: str, *, release: bool = False) -> None:
         super().__init__(code)
-        self.retryable, self.code, self.message = retryable, code, message
+        self.retryable, self.code, self.message, self.release = retryable, code, message, release
 
 
 class ExecutorLoop:
@@ -64,6 +110,10 @@ class ExecutorLoop:
         backoff: tuple[float, float] = (10.0, 30.0),
         sleep: Callable[[float], Awaitable[None]] | None = None,
         tmp_root: Path | None = None,
+        max_consecutive_failures: int = 5,
+        failure_pause_s: float = 300.0,
+        complete_retries: int = 5,
+        allow_http_loopback: bool = False,
     ) -> None:
         self._client = client
         self._worker = worker
@@ -75,8 +125,13 @@ class ExecutorLoop:
         self._backoff = backoff
         self._sleep_fn = sleep
         self._tmp_root = tmp_root
+        self._max_fails = max_consecutive_failures
+        self._fail_pause_s = failure_pause_s
+        self._complete_retries = complete_retries
+        self._allow_http = allow_http_loopback
         self._stop = asyncio.Event()
         self._idle = 0
+        self._fails = 0
 
     def stop(self) -> None:
         self._stop.set()
@@ -85,29 +140,60 @@ class ExecutorLoop:
     def stopping(self) -> bool:
         return self._stop.is_set()
 
-    async def _sleep(self) -> None:
+    def _delay(self, n: int) -> float:
         lo, hi = self._backoff
-        delay = min(hi, lo * (2 ** min(self._idle, 16))) * random.uniform(0.5, 1.0)  # noqa: S311
-        self._idle += 1
+        return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
+
+    async def _pause(self, delay: float) -> None:
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=delay)
 
+    async def _sleep(self) -> None:
+        delay = self._delay(self._idle)
+        self._idle += 1
+        await self._pause(delay)
+
+    async def _back_off_after_failure(self) -> None:
+        """Exponential delay per consecutive failure; a long pause after too many in a row."""
+        self._fails += 1
+        if self._fails >= self._max_fails:
+            log.warning("too_many_consecutive_failures", pause_s=self._fail_pause_s)
+            self._fails = 0
+            await self._pause(self._fail_pause_s)
+        else:
+            await self._pause(self._delay(self._fails - 1))
+
+    async def _register_with_retry(self, req: RegisterRequest) -> None:
+        attempt = 0
+        while not self.stopping:
+            try:
+                await self._client.register(req)
+                return
+            except (httpx.HTTPError, ApiError) as exc:
+                if isinstance(exc, ApiError) and exc.status_code < 500:
+                    raise
+                log.warning("register_failed", error=type(exc).__name__)
+                await self._pause(self._delay(attempt))
+                attempt += 1
+
     async def run(self, max_subtasks: int | None = None) -> int:
         """Run until stopped (or `max_subtasks` handled). Returns subtasks completed."""
         done = 0
-        tmp = Path(tempfile.mkdtemp(prefix="minion-exec-", dir=self._tmp_root))  # mode 0700
+        await asyncio.to_thread(cleanup_stale_tmp, self._tmp_root)
+        pid_prefix = f"{TMP_PREFIX}{os.getpid()}-"
+        tmp = Path(tempfile.mkdtemp(prefix=pid_prefix, dir=self._tmp_root))  # mode 0700
         try:
             if self._register is not None:
-                await self._client.register(self._register)
+                await self._register_with_retry(self._register)
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
                 try:
                     assignment = await self._client.acquire(
                         AcquireRequest(engines=self._engines, budget=self._budget)
                     )
-                except (httpx.HTTPError, ApiError) as exc:
+                except (httpx.HTTPError, ApiError, ValueError) as exc:
                     if isinstance(exc, ApiError) and exc.status_code < 500:
                         raise
                     log.warning("acquire_failed", error=type(exc).__name__)
@@ -117,8 +203,12 @@ class ExecutorLoop:
                     await self._sleep()
                     continue
                 self._idle = 0
-                if await self._handle(assignment, tmp):
+                outcome = await self._handle(assignment, tmp)
+                if outcome is _Outcome.DONE:
+                    self._fails = 0
                     done += 1
+                elif outcome is _Outcome.FAILED:
+                    await self._back_off_after_failure()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             await asyncio.to_thread(self._worker.close)
@@ -126,7 +216,7 @@ class ExecutorLoop:
                 await self._http.aclose()
         return done
 
-    async def _handle(self, a: Assignment, tmp: Path) -> bool:
+    async def _handle(self, a: Assignment, tmp: Path) -> _Outcome:
         bound = log.bind(
             acquirement_id=str(a.acquirement_id),
             team=a.team,
@@ -145,45 +235,95 @@ class ExecutorLoop:
                 work.cancel()
                 await asyncio.gather(work, return_exceptions=True)
                 await self._release(a, bound)
-                return False
+                return _Outcome.STOPPED
             try:
                 result = work.result()
             except _FailureError as f:
                 await self._report_failure(a, f, bound)
-                return False
+                return _Outcome.FAILED
             except StaleAcquirementError:
                 bound.info("stale_discarded")
-                return False
-            try:
-                await self._client.complete(a.acquirement_id, result)
-            except StaleAcquirementError:
-                bound.info("stale_discarded")
-                return False
-            except (httpx.HTTPError, ApiError) as exc:
-                bound.warning("complete_failed", error=type(exc).__name__)
-                return False
-            bound.info("subtask_completed", records=result.record_count)
-            return True
+                return _Outcome.DISCARDED
+            except Exception as exc:  # poison pill: never let one subtask kill the loop
+                bound.warning("unexpected_error", error=type(exc).__name__)
+                err = _FailureError(True, "EXECUTOR_ERROR", "unexpected executor error")
+                await self._report_failure(a, err, bound)
+                return _Outcome.FAILED
+            return await self._complete(a, result, bound)
         finally:
             stopper.cancel()
+
+    async def _complete(self, a: Assignment, result: CompleteRequest, bound: Any) -> _Outcome:
+        """Report completion, retrying transport errors/5xx (the server treats a same-owner
+        repeat as success). Other 4xx are reported as a retryable failure."""
+        attempt = 0
+        while True:
+            try:
+                await self._client.complete(a.acquirement_id, result)
+                bound.info("subtask_completed", records=result.record_count)
+                return _Outcome.DONE
+            except StaleAcquirementError:
+                bound.info("stale_discarded")
+                return _Outcome.DISCARDED
+            except ApiError as exc:
+                if exc.status_code == 409:
+                    bound.warning("complete_conflict", code=exc.code)
+                    return _Outcome.DISCARDED
+                if exc.status_code < 500:
+                    bound.warning("complete_rejected", status=exc.status_code)
+                    err = _FailureError(True, "COMPLETE_REJECTED", f"HTTP {exc.status_code}")
+                    await self._report_failure(a, err, bound)
+                    return _Outcome.FAILED
+                bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
+            except httpx.HTTPError as exc:
+                bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
+            attempt += 1
+            if self.stopping:
+                await self._release(a, bound)
+                return _Outcome.STOPPED
+            if attempt >= self._complete_retries:
+                bound.error("complete_gave_up")  # watchdog reclaims it
+                return _Outcome.FAILED
+            await self._pause(self._delay(attempt - 1))
+
+    def _check_url(self, url: str) -> None:
+        try:
+            require_secure_url(url)
+            if urlsplit(url).scheme != "https" and not self._allow_http:
+                raise ValueError("http not allowed")
+        except ValueError:
+            raise _FailureError(True, "INSECURE_URL", "presigned URL is not https") from None
 
     async def _execute(self, a: Assignment, tmp: Path) -> CompleteRequest:
         in_path = tmp / f"{a.acquirement_id}.in.jsonl"
         out_path = tmp / f"{a.acquirement_id}.out.jsonl"
         try:
+            self._check_url(a.input_url)
+            self._check_url(a.output_url)
             try:
                 await io.download_range(self._http, a.input_url, a.byte_start, a.byte_end, in_path)
-                records = io.parse_jsonl(in_path, a.record_count)
+                records = await asyncio.to_thread(io.parse_jsonl, in_path, a.record_count)
             except io.BadInputError as exc:
                 raise _FailureError(False, BAD_INPUT, str(exc)) from None
-            except httpx.HTTPError as exc:
-                raise _FailureError(True, "INPUT_UNAVAILABLE", type(exc).__name__) from None
+            except (io.InputUnavailableError, httpx.HTTPError) as exc:
+                msg = type(exc).__name__
+                raise _FailureError(True, "INPUT_UNAVAILABLE", msg, release=True) from None
+            except OSError as exc:
+                msg = type(exc).__name__
+                raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
             outputs = await self._run_batches(a, records)
-            size, digest = io.write_jsonl(out_path, outputs)
+            if len(outputs) != len(records):
+                raise _FailureError(True, "OUTPUT_MISMATCH", "runner returned wrong record count")
+            try:
+                size, digest = await asyncio.to_thread(io.write_jsonl, out_path, outputs)
+            except OSError as exc:
+                msg = type(exc).__name__
+                raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
             try:
                 await io.upload_file(self._http, a.output_url, out_path)
-            except httpx.HTTPError as exc:
-                raise _FailureError(True, "UPLOAD_FAILED", type(exc).__name__) from None
+            except (httpx.HTTPError, OSError) as exc:
+                msg = type(exc).__name__
+                raise _FailureError(True, "UPLOAD_FAILED", msg, release=True) from None
             return CompleteRequest(record_count=len(outputs), byte_size=size, sha256=digest)
         finally:
             in_path.unlink(missing_ok=True)
@@ -203,7 +343,10 @@ class ExecutorLoop:
         return outputs
 
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:
-        bound.warning("subtask_failed", code=f.code, retryable=f.retryable)
+        bound.warning("subtask_failed", code=f.code, retryable=f.retryable, released=f.release)
+        if f.release:  # executor-local trouble: don't burn the subtask's retry budget
+            await self._release(a, bound)
+            return
         try:
             await self._client.fail(
                 a.acquirement_id,

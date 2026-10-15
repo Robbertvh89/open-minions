@@ -23,3 +23,53 @@ def test_run_rejects_insecure_server(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 2
     assert "https" in result.output
     assert "tok" not in result.output
+
+
+def test_run_rejects_custom_profile_and_help_omits_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    result = runner.invoke(app, ["run", "--profile", "custom"])
+    assert result.exit_code == 2
+    assert "custom" not in runner.invoke(app, ["run", "--help"]).output
+
+
+def test_run_rejects_unknown_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    result = runner.invoke(app, ["run", "--runner", "nope"])
+    assert result.exit_code == 2
+    assert "unknown runner" in result.output
+
+
+def test_fake_runner_refused_without_dev_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
+    result = runner.invoke(app, ["run", "--runner", "fake"])
+    assert result.exit_code == 2
+    assert "MINION_EXECUTOR_DEV" in result.output
+
+
+def test_default_runner_is_real_engine_not_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
+    result = runner.invoke(app, ["run"])  # no real engine until M3: refuses, never runs fake
+    assert result.exit_code == 2
+    assert "fake" not in result.output.replace("unknown runner: 'mlx'", "")
+
+
+def test_token_removed_from_environment_before_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    seen: dict[str, object] = {}
+
+    async def fake_run(server: str, profile: object, runner_name: str, token: object) -> None:
+        seen["env"] = os.environ.get("MINION_EXECUTOR_TOKEN")
+        seen["token"] = token.get_secret_value()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run", "--runner", "fake"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"env": None, "token": "tok"}
+    monkeypatch.undo()
