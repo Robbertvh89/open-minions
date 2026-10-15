@@ -1,7 +1,7 @@
 ---
 id: TASK-3
 title: 'M2: Fault tolerance'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 14:02'
 updated_date: '2026-10-15 17:52'
