@@ -81,7 +81,7 @@ async def _run(server: str, profile: CapacityProfile, runner: str, token: Secret
             register=reg,
             allow_http_loopback=_is_loopback(server),
         )
-        # httpx read proxy/SSL_CERT_* env when the clients were built (client + loop above); from
+        # httpx reads proxy env when the clients were built (client + loop above); from
         # here on the control process holds no secrets, so spawned workers inherit none.
         restrict_environ()
         aloop = asyncio.get_running_loop()

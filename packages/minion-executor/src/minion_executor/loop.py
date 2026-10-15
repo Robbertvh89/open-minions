@@ -54,6 +54,7 @@ LOCAL_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.RemoteProtocolError,
+    httpx.ProxyError,
 )
 
 
@@ -265,6 +266,7 @@ class ExecutorLoop:
         """Report completion, retrying transport errors/5xx (the server treats a same-owner
         repeat as success). Other 4xx are reported as a retryable failure."""
         attempt = 0
+        saw_5xx = False
         while True:
             try:
                 await self._client.complete(a.acquirement_id, result)
@@ -282,6 +284,7 @@ class ExecutorLoop:
                     err = _FailureError(True, "COMPLETE_REJECTED", f"HTTP {exc.status_code}")
                     await self._report_failure(a, err, bound)
                     return _Outcome.FAILED
+                saw_5xx = True
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             except httpx.HTTPError as exc:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
@@ -290,8 +293,11 @@ class ExecutorLoop:
                 await self._release(a, bound)
                 return _Outcome.STOPPED
             if attempt >= self._complete_retries:
-                bound.error("complete_gave_up")  # best effort hand-back; else watchdog reclaims
-                await self._release(a, bound)
+                bound.error("complete_gave_up", server_error=saw_5xx)
+                if saw_5xx:  # deterministic server fault: a release would livelock; burn budget
+                    err = _FailureError(True, "COMPLETE_FAILED", "complete failed")
+                    await self._report_failure(a, err, bound)
+                # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
             await self._pause(self._delay(attempt - 1))
 

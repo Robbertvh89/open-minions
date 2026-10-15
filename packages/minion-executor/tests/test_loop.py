@@ -301,16 +301,27 @@ async def test_complete_retried_on_transport_error_then_succeeds(tmp_path: Path)
     assert "fail" not in client.kinds() and "release" not in client.kinds()
 
 
-async def test_complete_gives_up_after_retries_without_fail(tmp_path: Path) -> None:
+async def test_complete_transport_exhaustion_leaves_to_watchdog(tmp_path: Path) -> None:
     client, sleeps = FakeClient([assignment()]), list[float]()
     client.complete_exc = httpx.ConnectError("x")
     loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps, complete_retries=3)
     client.on_empty = loop.stop
     assert await loop.run() == 0
     assert client.kinds().count("complete") == 3
-    assert "fail" not in client.kinds()
-    assert client.kinds().count("release") == 1  # best-effort hand-back, watchdog is the backstop
+    assert "fail" not in client.kinds() and "release" not in client.kinds()
     assert len(sleeps) == 2 + 1 + 1  # 2 complete waits, 1 post-failure backoff, 1 idle
+
+
+async def test_complete_5xx_exhaustion_fails_retryable(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([assignment()]), list[float]()
+    client.complete_exc = ApiError(503, "X", "down")
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps, complete_retries=3)
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    assert client.kinds().count("complete") == 3
+    assert client.kinds().count("fail") == 1 and "release" not in client.kinds()
+    req = next(r for k, r in client.calls if k == "fail")
+    assert req.code == "COMPLETE_FAILED" and req.retryable
 
 
 async def test_complete_4xx_reports_retryable_failure(tmp_path: Path) -> None:

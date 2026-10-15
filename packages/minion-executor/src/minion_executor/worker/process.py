@@ -26,6 +26,8 @@ from minion_executor.runners.base import Record, RunnerError
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
+# TODO(M3): real engines need proxy/CA/HF_HUB_*/HF_ENDPOINT/OLLAMA_HOST handling here; decide
+# how to treat credential-bearing proxy URLs at that point.
 _ALLOWED_NAMES = frozenset(
     {
         "PATH",
