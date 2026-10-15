@@ -215,3 +215,74 @@ async def test_get_task_rejects_bad_segments(bad: str) -> None:
         with pytest.raises(ValueError):
             await u.get_task("ml", bad, "t")
     assert not called
+
+
+async def test_heartbeat_ok_and_stale() -> None:
+    from minion_common.schemas import HeartbeatRequest, Progress
+
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if len(seen) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "cancel": True,
+                    "output_url": "http://s3/new",
+                    "expires_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        return httpx.Response(
+            409, json={"detail": {"code": "STALE_ACQUIREMENT", "message": "gone"}}
+        )
+
+    req = HeartbeatRequest(progress=Progress(records_done=1, records_total=2), budget=BUDGET)
+    async with _client(handler) as c:
+        out = await c.heartbeat(AID, req)
+        assert out.cancel is True
+        assert out.output_url == "http://s3/new"
+        with pytest.raises(StaleAcquirementError):
+            await c.heartbeat(AID, HeartbeatRequest())
+    assert seen[0].url.path.endswith(f"/subtasks/{AID}/heartbeat")
+    assert json.loads(seen[0].content)["progress"] == {"records_done": 1, "records_total": 2}
+
+
+async def test_cancel_task() -> None:
+    task = {
+        "team": "ml",
+        "project": "p",
+        "task_name": "t",
+        "type": "embedding",
+        "model": "fake-embed",
+        "input_uri": "s3://b/inputs/",
+        "output_uri": "s3://b/outputs/",
+        "params": {},
+        "records_per_subtask": 500,
+        "priority": 0,
+        "status": "CANCELLED",
+        "created_by": "alice",
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        if len(calls) == 1:
+            return httpx.Response(200, json=task)
+        return httpx.Response(409, json={"detail": {"code": "TASK_FINISHED", "message": "done"}})
+
+    async with UserClient(
+        "http://localhost", SecretStr("k"), transport=httpx.MockTransport(handler)
+    ) as u:
+        out = await u.cancel_task("ml", "p", "t")
+        assert out.status.value == "CANCELLED"
+        with pytest.raises(ApiError) as ei:
+            await u.cancel_task("ml", "p", "t")
+        with pytest.raises(ValueError):
+            await u.cancel_task("ml", "../x", "t")
+    assert ei.value.code == "TASK_FINISHED"
+    assert not isinstance(ei.value, StaleAcquirementError)
+    assert calls[0].method == "POST"
+    assert calls[0].url.path.endswith("/tasks/ml/p/t/cancel")
+    assert len(calls) == 2

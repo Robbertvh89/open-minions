@@ -135,3 +135,15 @@ def test_engines_list_is_bounded() -> None:
     AcquireRequest.model_validate({"engines": ["mlx"] * 16, "budget": budget})
     with pytest.raises(ValidationError):
         AcquireRequest.model_validate({"engines": ["mlx"] * 17, "budget": budget})
+
+
+def test_heartbeat_request_validation() -> None:
+    from minion_common.schemas import HeartbeatRequest, Progress
+
+    assert HeartbeatRequest().progress is None
+    HeartbeatRequest(progress=Progress(records_done=0, records_total=5), paused_reason="on_battery")
+    for bad in ({"paused_reason": "Bad Reason"}, {"paused_reason": "a" * 65}, {"extra": 1}):
+        with pytest.raises(ValidationError):
+            HeartbeatRequest.model_validate(bad)
+    with pytest.raises(ValidationError):
+        Progress(records_done=-1, records_total=0)

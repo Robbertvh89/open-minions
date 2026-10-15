@@ -22,6 +22,8 @@ from minion_common.schemas import (
     CompleteRequest,
     ErrorBody,
     FailRequest,
+    HeartbeatRequest,
+    HeartbeatResponse,
     PreferenceRequest,
     RegisterRequest,
     RegisterResponse,
@@ -141,6 +143,12 @@ class ExecutorClient(_BaseClient):
     async def fail(self, acquirement_id: uuid.UUID, req: FailRequest) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/fail", req)
 
+    async def heartbeat(
+        self, acquirement_id: uuid.UUID, req: HeartbeatRequest
+    ) -> HeartbeatResponse:
+        resp = await self._send("POST", f"/executor/subtasks/{acquirement_id}/heartbeat", req)
+        return HeartbeatResponse.model_validate_json(resp.content)
+
     async def release(self, acquirement_id: uuid.UUID) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/release")
 
@@ -150,13 +158,21 @@ class UserClient(_BaseClient):
         resp = await self._send("POST", "/tasks", req)
         return TaskOut.model_validate_json(resp.content)
 
-    async def get_task(self, team: str, project: str, task_name: str) -> TaskOut:
+    @staticmethod
+    def _task_path(team: str, project: str, task_name: str) -> str:
         segments = []
         for seg in (team, project, task_name):
             if not re.fullmatch(SLUG_PATTERN, seg):
                 raise ValueError(f"invalid path segment {seg!r}")
             segments.append(quote(seg, safe=""))
-        resp = await self._send("GET", "/tasks/" + "/".join(segments))
+        return "/tasks/" + "/".join(segments)
+
+    async def get_task(self, team: str, project: str, task_name: str) -> TaskOut:
+        resp = await self._send("GET", self._task_path(team, project, task_name))
+        return TaskOut.model_validate_json(resp.content)
+
+    async def cancel_task(self, team: str, project: str, task_name: str) -> TaskOut:
+        resp = await self._send("POST", self._task_path(team, project, task_name) + "/cancel")
         return TaskOut.model_validate_json(resp.content)
 
 

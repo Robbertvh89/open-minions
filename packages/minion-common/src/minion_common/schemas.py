@@ -140,6 +140,25 @@ class FailRequest(_Model):
     message: str = Field(max_length=1000, description="Diagnostic only; never payload content")
 
 
+class Progress(_Model):
+    records_done: int = Field(ge=0)
+    records_total: int = Field(ge=0)
+
+
+class HeartbeatRequest(_Model):
+    """Liveness beat (SPEC §6.2). Bounded fields only: no free-form payload."""
+
+    progress: Progress | None = None
+    budget: Budget | None = None
+    paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
+
+
+class HeartbeatResponse(_Model):
+    cancel: bool
+    output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
+    expires_at: datetime
+
+
 class ErrorBody(_Model):
     code: str
     message: str
@@ -153,8 +172,11 @@ __all__ = [
     "CompleteRequest",
     "ErrorBody",
     "FailRequest",
+    "HeartbeatRequest",
+    "HeartbeatResponse",
     "ModelEntry",
     "PreferenceRequest",
+    "Progress",
     "RegisterRequest",
     "RegisterResponse",
     "TaskCounts",
