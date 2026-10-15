@@ -1,10 +1,10 @@
 ---
 id: TASK-3
 title: 'M2: Fault tolerance'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-15 19:48'
+updated_date: '2026-10-15 20:31'
 labels:
   - milestone
   - M2
