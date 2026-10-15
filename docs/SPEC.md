@@ -180,14 +180,21 @@ Task status is derived from subtask counts and updated by the server on each sub
 ## 6. API (v1)
 
 All endpoints under `/api/v1`. JSON. Users authenticate with user API keys; executors with executor
-tokens (`Authorization: Bearer ...`).
+tokens (`Authorization: Bearer ...`). User keys come from a config file, executor tokens from the
+database (§8, ADR-0007). Request/response schemas live in `minion-common` and are shared by server and
+client. The schemas and typed client exist (TASK-2.1); the endpoints themselves land in TASK-2.2.
+
+**Error body.** Every error is `{"detail": {"code": "<CODE>", "message": "<text>"}}`. Messages are
+diagnostic only and never echo payload content. Codes: `UNAUTHORIZED` (401: missing, invalid, expired
+or revoked credential) and `STALE_ACQUIREMENT` (409, below). Other 4xx responses (403 team not in the
+key's teams, 422 invalid input or URI, 404) carry the same shape with their own code.
 
 ### 6.1 User-facing
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/tasks` | Create task. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask, priority?` → `202` + task |
+| `POST` | `/tasks` | Create task. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
 | `GET` | `/tasks?team=&project=&status=` | List tasks |
-| `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts |
+| `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts (`TaskOut`, below) |
 | `GET` | `/tasks/{team}/{project}/{task_name}/subtasks` | Paginated subtasks |
 | `POST` | `/tasks/{team}/{project}/{task_name}/cancel` | Cancel |
 | `GET` | `/executors` | Fleet view: online, busy, last heartbeat |
@@ -197,15 +204,25 @@ tokens (`Authorization: Bearer ...`).
 |---|---|---|
 | `POST` | `/executor/register` | Report host capabilities + engines + capacity profile; returns `executor_id` |
 | `PUT` | `/executor/preference` | Set/clear `(team?, project?, task_name?)` preference |
-| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb` and engine. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` if none |
+| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb` and engine. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
 | `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state; response `{cancel: bool}` |
 | `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (fleet view only) |
 | `POST` | `/executor/subtasks/{acquirement_id}/complete` | Report success + output metadata (record count, checksum) |
 | `POST` | `/executor/subtasks/{acquirement_id}/fail` | Report error `{retryable, code, message}` |
 | `POST` | `/executor/subtasks/{acquirement_id}/release` | Voluntarily give back (graceful stop) |
 
-Errors: `409 STALE_ACQUIREMENT` if `acquirement_id` is no longer current; `401/403` auth.
+Errors: `409 STALE_ACQUIREMENT` if `acquirement_id` is no longer current (or belongs to another
+executor; the response is identical for both, so ids cannot be probed); `401` auth.
 Executors should back off with jitter on `204` (default 10–30 s).
+
+**Identifiers.** `acquirement_id` and `executor_id` are UUIDs. `subtask_id` is a non-negative integer,
+sequential per task and deterministic from the input. `attempt` is an integer ≥ 1.
+
+**`TaskOut`** (response of `POST /tasks` and `GET /tasks/...`):
+`team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask, priority,
+allowed_pool, status` (`SPLITTING | PENDING | RUNNING | SUCCEEDED | FAILED | PARTIAL | CANCELLED`),
+`created_by` (the API key's name), `created_at`, `finished_at` (null until terminal), `error` (null or a
+short diagnostic), `counts: {total, pending, running, succeeded, failed, cancelled}`.
 
 ## 7. Data model (PostgreSQL — 7 tables)
 
@@ -215,7 +232,7 @@ The paper states 7 tables and names `minion_subtask_acquirement` and a heartbeat
 2. `minion_subtask` — `(team, project, task_name, subtask_id)` unique; input slice, status, attempt, max_attempts, error, output_uri, timestamps.
 3. `minion_subtask_acquirement` — **UNIQUE `(team, project, task_name, subtask_id)`** **[paper]**; `acquirement_id` uuid, executor_id, attempt, acquired_at.
 4. `minion_executor_heartbeat` — acquirement_id (the executor is reached by joining `minion_subtask_acquirement`), last_seen_at, progress jsonb (one row per active acquirement, upserted).
-5. `minion_executor` — executor_id, token_hash, hostname, owner, chip, total_memory_gb, os_version, engines, status, **profile, budget jsonb, paused_reason**, registered_at, last_seen_at.
+5. `minion_executor` — executor_id, token_hash, hostname, owner, pool, chip, total_memory_gb, os_version, engines, status, **profile, budget jsonb, paused_reason**, registered_at, last_seen_at, token_expires_at (NULL = no expiry; auth rejects tokens past it).
 6. `minion_executor_preference` — executor_id, team, project, task_name (nullable for wildcards).
 7. `minion_subtask_attempt` — history: one row per finished attempt (executor, outcome `SUCCEEDED|FAILED|EXPIRED|RELEASED|CANCELLED`, duration, error). Feeds Grafana.
 
@@ -231,12 +248,26 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   restricted to an executor pool via `allowed_pool` **[ours]**.
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
   via heartbeat) **[ours]**.
-- S-3. Executor tokens: random 256-bit, stored as SHA-256 hash, revocable, scoped to a pool.
+- S-3. Executor tokens: random 256-bit (`token_urlsafe(32)`), stored as SHA-256 hash only, revocable,
+  scoped to a pool, optional expiry (`token_expires_at`). Tokens are pre-issued by the operator with
+  `minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days N]` (N = 1..365,
+  default `MINION_EXECUTOR_TOKEN_TTL_DAYS`, 90); the token is printed once and the executor row starts as
+  `(unregistered)`. Revoke with `minion-server-admin revoke-executor-token --executor-id <uuid>`. Auth
+  rejects a revoked or expired token with `401` on its next request. Tokens are never logged.
 - S-4. Executor deletes local input/output files after upload; model cache is retained.
 - S-5. No payload content in logs or metrics.
 - S-6. TLS required between executor and server outside local dev.
 - S-7. Model ids are allow-listed per deployment (executors must not pull arbitrary remote code;
   `trust_remote_code=False`).
+- S-8. User API keys: `minion-server-admin generate-api-key --name <name> --teams a,b` prints the key
+  once and a YAML entry holding only its SHA-256 hash. Entries live in the file named by
+  `MINION_API_KEYS_FILE`; lookup is by SHA-256 with `hmac.compare_digest`. The file is read at server
+  startup, so revoking a user key requires removing it and restarting the server. No DB table (ADR-0007).
+  `created_by` on a task records the key name; there is no foreign key yet (deferred to M5).
+- S-9. Storage configuration: S3 access and secret keys are required server settings and are never sent
+  to executors. `MINION_S3_PUBLIC_ENDPOINT_URL` (the host that presigned URLs point at) must be `https`
+  unless it is a loopback host; the server refuses to start otherwise. Presigned URLs use the configured
+  TTL (`MINION_PRESIGN_TTL_S`, default 900 s, max 3600 s).
 
 ## 9. Non-functional requirements
 

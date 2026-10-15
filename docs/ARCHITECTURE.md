@@ -37,7 +37,7 @@ the server is the only DB client · bulk data bypasses the server · liveness vi
 ### 2.1 minion-server (FastAPI)
 ```
 minion_server/
-  app.py               # FastAPI factory, lifespan (DB pool, S3 client)
+  app.py               # FastAPI factory, lifespan (DB engine, API keys file)
   api/
     tasks.py           # user endpoints
     executor.py        # executor endpoints
@@ -48,13 +48,49 @@ minion_server/
     acquisition.py     # acquire / complete / fail / release logic
     presign.py         # S3 presigned URL generation
   repositories/        # ALL SQL lives here
-  auth.py              # user API keys, executor tokens
-  settings.py
+  auth.py              # user API keys (file), executor tokens (DB)
+  settings.py          # ServerSettings: MINION_* env vars (pydantic-settings)
+  admin.py             # minion-server-admin CLI (typer)
 ```
 - **Splitter** runs as a background job (`asyncio` task drained from an in-DB `SPLITTING` queue so it
   survives restarts; any server replica can pick it up with `SELECT ... FOR UPDATE SKIP LOCKED` on
   `minion_task`). Inserts subtasks in batches of 1 000 via `COPY`/`executemany`.
 - Stateless; run ≥2 replicas behind a load balancer in production.
+
+#### Foundation (implemented, TASK-2.1)
+Files that exist today; the endpoints and services above are built on them in TASK-2.2.
+- **`settings.py`** — `ServerSettings` reads `MINION_*` (and `.env`). Required: `database_url`,
+  `s3_access_key`, `s3_secret_key`. `s3_input_prefixes` / `s3_output_prefixes` must be non-empty and end
+  with `/`. `presign_ttl_s` ≤ 3600. The public S3 endpoint (`s3_public_endpoint_url`, defaults to
+  `s3_endpoint_url`) must be https unless it is loopback.
+- **`db/session.py`** — the only place the async engine and sessionmaker are built. The `app.py`
+  lifespan creates the engine, loads the API keys file (if `MINION_API_KEYS_FILE` is set) into
+  `app.state`, and disposes the engine on shutdown. `S3Storage` is not yet constructed in the lifespan;
+  wiring it in is part of TASK-2.2.
+- **`storage.py`** — `S3Storage` wraps sync boto3 and runs every call in `asyncio.to_thread` (plan D3).
+  It holds three clients: the default one for head/list/get, a copy client with a longer read timeout
+  for CopyObject, and a signer bound to the public endpoint that is used only for presigning. Path-style
+  addressing, SigV4.
+- **`uris.py`** — `parse_s3_uri(uri, bucket=, prefixes=)` accepts only `s3://<configured bucket>/<key>`
+  where the key starts with an allowed prefix. It rejects other schemes, query/fragment, whitespace and
+  control characters, `//`, backslashes, and `.`/`..` segments. Violations raise `InvalidUriError`, which
+  handlers map to 422.
+- **`auth.py`** — `current_user`: API keys from the file loaded at startup (ADR-0007). Each presented key
+  is hashed with SHA-256 and compared against every stored hash with `hmac.compare_digest`, with no early
+  exit. No file or an empty file fails closed (401). `current_executor`: the token is hashed and looked up
+  by its unique index, then compared with `compare_digest`. A missing, REVOKED or expired
+  (`token_expires_at`) token gets 401. Secrets are never logged.
+- **`models_registry.py`** — `load_models(path)` parses `MINION_MODELS_FILE` (default
+  `deploy/models.yaml`) into a dict keyed by `model_id`. Duplicate ids are rejected.
+- **`repositories/executors.py`** — the first repository module: token-hash lookup, unregistered-executor
+  insert, and revoke.
+- **`admin.py`** — `minion-server-admin`: `generate-api-key` (no DB, prints the key once and the YAML
+  entry with its hash), `issue-executor-token` and `revoke-executor-token` (DB).
+- **Test fixtures** — repo-root `conftest.py` provides session-scoped testcontainers: `postgres_url`
+  (`postgres:16-alpine`), `migrated_url` (Alembic head), `engine`, and `s3` (SeaweedFS
+  `chrislusf/seaweedfs:4.05` with `deploy/seaweedfs/s3.json` mounted, bucket created). The `s3` fixture
+  is the one the presigned round-trip tests use. Integration tests carry the `integration` marker and need
+  Docker.
 
 ### 2.2 minion-executor (macOS agent)
 ```
@@ -292,4 +328,5 @@ token in macOS Keychain.
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - ADR-0004: Byte-range input slicing *(to write)*
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
+- [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Proposed**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*
