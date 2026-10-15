@@ -4,7 +4,7 @@ title: 'M1.2: Protocol endpoints: tasks, splitter, acquire, complete/fail/releas
 status: In Progress
 assignee: []
 created_date: '2026-10-15 14:26'
-updated_date: '2026-10-15 14:54'
+updated_date: '2026-10-15 15:38'
 labels:
   - M1
 dependencies:
@@ -22,12 +22,22 @@ Plan steps B3, B4, B5 of TASK-2 (D5, D6). Decision: release does NOT consume the
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 >=50 parallel acquires yield unique owners (service and HTTP level)
-- [ ] #2 Two-pass acquire: preference first, then global FIFO; engine, memory and allowed_pool filters enforced
-- [ ] #3 Complete promotes attempt-scoped output via CopyObject; stale or foreign acquirement gets 409
-- [ ] #4 Splitter is resumable and slices on newline boundaries (unit + integration)
-- [ ] #5 Release requeues without consuming retry budget
+- [x] #1 >=50 parallel acquires yield unique owners (service and HTTP level)
+- [x] #2 Two-pass acquire: preference first, then global FIFO; engine, memory and allowed_pool filters enforced
+- [x] #3 Complete promotes attempt-scoped output via CopyObject; stale or foreign acquirement gets 409
+- [x] #4 Splitter is resumable and slices on newline boundaries (unit + integration)
+- [x] #5 Release requeues without consuming retry budget
 <!-- AC:END -->
+
+
+
+
+
+
+
+
+
+
 
 ## Implementation Notes
 
