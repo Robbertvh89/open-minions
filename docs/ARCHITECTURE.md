@@ -139,7 +139,8 @@ used by the executor and by tests, shared settings base.
 
 ### 3.1 Task submission
 ```
-User ─POST /tasks─▶ Server: validate (model allow-list, S3 prefix readable, params schema)
+User ─POST /tasks─▶ Server: validate (team membership, model allow-list + type, team-scoped S3 URIs
+                    `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output)
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
 Splitter (async):   list input objects → scan JSONL → emit slices of N records
                     bulk INSERT minion_subtask(status=PENDING, attempt=0)
@@ -184,10 +185,10 @@ Worker:   load model (or reuse warm one) with MLX memory/cache limits from budge
                 throttle.pace()   ← duty-cycle sleep + check governor events
           stream results back to control process
 Executor: write results to local temp JSONL
-          PUT to presigned URL  outputs/_attempts/{subtask_id}/{attempt}.jsonl
+          PUT to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
           POST /complete {record_count, sha256}
 Server:   verify acquirement is current (else 409)
-          S3 CopyObject → outputs/{subtask_id:06d}.jsonl   (promotion = idempotency)
+          S3 CopyObject → {output_prefix}/{subtask_id:06d}.jsonl   (promotion = idempotency)
           txn: DELETE acquirement, DELETE heartbeat row,
                UPDATE subtask SUCCEEDED, INSERT minion_subtask_attempt,
                UPDATE task counters / status

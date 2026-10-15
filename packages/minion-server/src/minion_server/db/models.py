@@ -111,6 +111,7 @@ class Task(Base):
     succeeded_subtasks: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     failed_subtasks: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     created_by: Mapped[str] = mapped_column(String(128))
+    error: Mapped[str | None] = mapped_column(Text)  # task-level failure (e.g. empty input)
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _updated_at()
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
