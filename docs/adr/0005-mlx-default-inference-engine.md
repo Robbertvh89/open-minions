@@ -1,6 +1,6 @@
 # ADR-0005: MLX as default inference engine
 
-- Status: **Accepted** (defaults to be confirmed by the M3 benchmark)
+- Status: **Accepted (confirmed by M3 benchmark, docs/bench/m3-apple-m3-pro.md)**
 - Date: 2026-10-15
 - Deciders: project owner
 - Deviates from paper: **yes** — the paper uses HuggingFace transformers (embeddings) and Ollama (completions).
@@ -68,6 +68,35 @@ Sources: [Ollama MLX blog](https://registry.ollama.ai/blog/mlx),
   throttling control → consider Ollama as default for simplicity.
 - vllm-mlx (or similar) matures into a stable library with paged KV cache and clear embedding support
   → consider it as the `mlx` runner implementation.
+
+## Benchmark outcome (M3)
+
+Source: [`docs/bench/m3-apple-m3-pro.md`](../bench/m3-apple-m3-pro.md) (Apple M3 Pro, 36 GB, one run
+per row; `minion-executor bench`, TASK-4.4).
+
+Completion, Qwen2.5-0.5B-Instruct 16-bit, tok/s, mlx vs hf:
+
+| batch | mlx tok/s | hf tok/s | mlx / hf |
+|---|---|---|---|
+| 1 | 116.5 | 95.6 | 1.22x |
+| 8 | 809.7 | 391.5 | 2.07x |
+| 32 | 1718.4 | 919.8 | 1.87x |
+
+Embedding, all-MiniLM-L6-v2, prompt tok/s, mlx vs hf at batch 1 / 8 / 32: 24214 / 58659 / 66086 vs
+14375 / 44516 / 56962.
+
+Worker RSS peak (the cross-engine comparable memory column): Qwen2.5-0.5B 1.42 GB mlx vs 2.26 GB hf;
+MiniLM 0.39 GB mlx vs 0.52 GB hf.
+
+**Conclusion.** MLX stays the default for both task types. HF on `mps` remains the in-sandbox fallback
+(about 54 % of MLX completion throughput at batch 32). Ollama was **not measured**: it is opt-in only
+(its daemon runs outside the sandbox and `/api/pull` writes to `~/.ollama` outside the cache cap,
+ADR-0009), and it is not installed on the bench Mac. The "Revisit when" condition on Ollama is therefore
+still untested; measurement is deferred to TASK-13.
+
+**Caveats.** Single run per row, one small model per task type. MiniLM is hf fp32 (cast to fp16) vs mlx
+bf16, so precision matches only approximately. Engine-peak columns are per-engine allocator views and are
+not comparable across engines; use worker RSS for cross-engine memory.
 
 ## Addendum 2026-10-16 (TASK-4.3 S6): own MLX encoder instead of `mlx-embeddings`
 

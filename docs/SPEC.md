@@ -426,6 +426,11 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - Q3. Should executors batch-acquire (N subtasks) to cut round-trips for very small subtasks?
 - Q4. Auth for the web UI (SSO/OIDC vs API keys only)?
 - Q5. Is step-level duty cycling enough to keep video calls smooth, or do we also need to throttle on
-  measured *total* GPU utilization (ioreg `Device Utilization %`)? Decide after M3 benchmark.
+  measured *total* GPU utilization (ioreg `Device Utilization %`)? **Open.** The M3 benchmark ran at
+  duty cycle 1.0 with no foreground load, so it does not answer this; decide with the M4 governor
+  measurements (NF-7, NF-8).
 - Q6. Should `memory_gb` estimates in `models.yaml` be measured automatically by `minion-executor bench`
-  and fed back to the server?
+  and fed back to the server? **Partly answered by M3:** `bench` measures worker RSS peak and
+  per-engine peak; `memory_gb` is still hand-set in `deploy/bench-models.yaml`, and feeding measured
+  values to the server is **not implemented** (open). The M3 data shows the hand-set 1.5 GB for
+  Qwen2.5-0.5B is below the HF worker RSS peak (2.26 GB) and above the MLX peak (1.42 GB); not reconciled.
