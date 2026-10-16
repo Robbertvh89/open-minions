@@ -19,7 +19,7 @@ models:
     engine: hf
     ref: Qwen/Qwen2.5-0.5B-Instruct
     revision: 7ae557604adf67be50417f59c2c2f167def9a775
-    memory_gb: 1.5
+    memory_gb: 2.5  # measured worker RSS peak 2.26 GB at batch 32 (docs/bench/m3-apple-m3-pro.md)
   - model_id: bge-small-en-hf
     type: embedding
     engine: hf
