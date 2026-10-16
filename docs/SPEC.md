@@ -121,7 +121,8 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 |---|---|---|
 | `MODEL_DOWNLOAD_FAILED` | release | network down, proxy error, fetch process died, download timeout |
 | `MODEL_DOWNLOAD_FAILED` | fail, retryable | hub answered with another HTTP error (404, 5xx) |
-| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 403, or 401 when no `HF_TOKEN` is set (this Mac has no valid token); with a token set, 401 is a plain retryable failure |
+| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 403, or 401 when no `HF_TOKEN` is set (this Mac has no valid token) |
+| `MODEL_DOWNLOAD_FAILED` | release, not remembered | hub 401 with `HF_TOKEN` set (bad, expired or revoked token on this Mac; a rotated token works on the next assignment) |
 | `MODEL_INTEGRITY` | fail, retryable | sha256/blob-sha1/size mismatch, file set differs from the hub listing, symlink, hub returned another revision |
 | `MODEL_UNSUPPORTED` | fail, non-retryable | no safetensors, disallowed file type, `auto_map` / bad JSON (would need remote code) |
 | `MODEL_CACHE_FULL` | release, remembered 1 h | model larger than `MODEL_CACHE_GB` |
@@ -131,7 +132,7 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 | `SANDBOX_FAILED` | release, remembered 1 h | the fetch sandbox could not be applied (fail closed: nothing is downloaded unconfined) |
 | `LOCAL_IO_ERROR` | release | the cache directory itself is unreadable or unwritable (`OSError` from the cache) |
 
-"Remembered" means the executor keeps a bounded in-memory (model, revision) to reason map, so repeated assignments of that model are released immediately without network or disk work; the server's `MINION_RELEASE_LIMIT` still bounds how often one subtask bounces. A full or unusable local disk is a property of this Mac, not of the subtask, which is why it is a release and not a (retry-burning) failure.
+A 401 with a token set is released rather than failed because the credential is a property of this Mac, not of the subtask; it is not remembered so that fixing the token takes effect at once. "Remembered" means the executor keeps a bounded in-memory (model, revision) to reason map, so repeated assignments of that model are released immediately without network or disk work; the server's `MINION_RELEASE_LIMIT` still bounds how often one subtask bounces. A full or unusable local disk is a property of this Mac, not of the subtask, which is why it is a release and not a (retry-burning) failure.
 
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 

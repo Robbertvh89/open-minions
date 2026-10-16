@@ -109,6 +109,7 @@ FETCH_MACH_ALLOW: tuple[str, ...] = ("com.apple.trustd.agent",)
 _STAGING_MARGIN_BYTES = 64 * 1024 * 1024
 _STAGING_MARGIN_FRACTION = 0.05
 _STAGING_POLL_S = 1.0
+_STAGING_MAX_ENTRIES = 10_000  # files + dirs in a staging dir, before and after the plan
 
 
 class ModelFetchError(RunnerError):
@@ -230,9 +231,11 @@ def _send_err(conn: Connection, exc: BaseException) -> None:
         # Hub verdict (HTTP status) -> failure, except 401/403 which only mean this Mac has no
         # (valid) token: local, released. Anything else is network/local -> release.
         status = getattr(getattr(exc, "response", None), "status_code", None)
-        # 401 means "no (valid) token" only when none was configured; with a token set it is a
-        # rejected credential, which another Mac (or a fixed token) may get past: plain failure.
-        if status == 403 or (status == 401 and not os.environ.get("HF_TOKEN")):
+        # 401 with a token set is a bad/expired/revoked credential on THIS Mac: released but not
+        # remembered, so a rotated token works next time.
+        if status == 401 and os.environ.get("HF_TOKEN"):
+            conn.send(("err", MODEL_DOWNLOAD_FAILED, "hub rejected token 401", True, True, False))
+        elif status == 403 or status == 401:
             conn.send(
                 ("err", MODEL_DOWNLOAD_FAILED, f"hub access denied {status}", True, True, True)
             )
@@ -251,6 +254,8 @@ def _child_main(
     confine: dict[str, Any] | None = None,
 ) -> None:
     from minion_executor.worker.process import _watch_parent
+
+    seatbelt.new_session()
 
     if parent_pid is not None:  # the control process died: never keep downloading
         threading.Thread(target=_watch_parent, args=(parent_pid, 1.0), daemon=True).start()
@@ -343,14 +348,18 @@ def _dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for _rel, p in _tree_files(path) if not p.is_symlink())
 
 
-def _staging_bytes(path: Path) -> int:
-    """Bytes under `path`, tolerant of files appearing and vanishing mid-walk (a live download)."""
-    total = 0
-    for dirpath, _dirs, names in os.walk(path):
+def _staging_usage(path: Path) -> tuple[int, int]:
+    """`(bytes, entries)` under `path`, tolerant of files appearing and vanishing mid-walk (a live
+    download). Bytes are the larger of apparent size and allocated blocks (`st_blocks * 512`)."""
+    total = entries = 0
+    for dirpath, dirs, names in os.walk(path):
+        entries += len(dirs)
         for name in names:
+            entries += 1
             with contextlib.suppress(OSError):
-                total += (Path(dirpath) / name).lstat().st_size
-    return total
+                st = (Path(dirpath) / name).lstat()
+                total += max(st.st_size, st.st_blocks * 512)
+    return total, entries
 
 
 def _died(proc: Any) -> ModelFetchError:
@@ -659,6 +668,7 @@ class ModelCache:
         env["HF_HOME"] = str(staging / ".hf-home")
         env["HF_XET_CACHE"] = str(staging / ".hf-home" / "xet")
         env["TMPDIR"] = str(staging / ".tmp")
+        env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
         env["HF_HUB_DISABLE_TELEMETRY"] = "1"
         env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         return env
@@ -676,6 +686,8 @@ class ModelCache:
             if name == "SSL_CERT_DIR":
                 # A directory under HOME would expose everything next to the certs.
                 for part in raw.split(os.pathsep):
+                    if not part:
+                        continue
                     real = os.path.realpath(part)
                     if any(seatbelt._under(real, h) for h in seatbelt.home_dirs()):
                         raise ModelFetchError(
@@ -700,23 +712,12 @@ class ModelCache:
         }
 
     def _fetch_tcp(self) -> list[str]:
-        """Outbound TCP the fetch child may open: HTTPS (the hub endpoint's port, 443 by default)
-        and the configured proxy's port. Loopback stays denied unless the proxy itself is local."""
-        ports = [443]
-        remotes: list[str] = []
-        endpoint = self._fetch_env.values.get("HF_ENDPOINT")
-        if endpoint is not None:
-            with contextlib.suppress(ValueError):
-                ports.append(urlsplit(endpoint.get_secret_value()).port or 443)
-        remotes += [f"*:{p}" for p in dict.fromkeys(ports)]
-        for name in (
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        ):
+        """Outbound TCP the fetch child may open. Direct: HTTPS (the hub endpoint's port, 443 by
+        default) to anywhere. With a proxy (`HTTPS_PROXY` / `ALL_PROXY`; `HTTP_PROXY` is not used
+        for https): only the proxy's `*:<port>`, nothing else. Loopback stays denied unless the
+        proxy itself is local."""
+        proxies: list[str] = []
+        for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
             value = self._fetch_env.values.get(name)
             if value is None:
                 continue
@@ -728,8 +729,15 @@ class ModelCache:
             except ValueError:
                 continue
             local = host in ("localhost", "127.0.0.1", "::1")
-            remotes.append(f"{'localhost' if local else '*'}:{port}")
-        return list(dict.fromkeys(remotes))
+            proxies.append(f"{'localhost' if local else '*'}:{port}")
+        if proxies:
+            return list(dict.fromkeys(proxies))
+        ports = [443]
+        endpoint = self._fetch_env.values.get("HF_ENDPOINT")
+        if endpoint is not None:
+            with contextlib.suppress(ValueError):
+                ports.append(urlsplit(endpoint.get_secret_value()).port or 443)
+        return [f"*:{p}" for p in dict.fromkeys(ports)]
 
     async def _fetch_into(self, model: ModelEntry, final: Path) -> None:
         staging_root = self._root / ".staging"
@@ -754,9 +762,12 @@ class ModelCache:
             cancel.set()  # a hashing thread still running after a cancel stops at its next chunk
             await asyncio.to_thread(shutil.rmtree, staging_root, True)
 
+    def _reserve(self, total: int) -> int:
+        return max(self._min_free, int(total * _DISK_RESERVE_FRACTION))
+
     def _check_disk(self, needed: int, planned_bytes: int = 0) -> None:
         usage = shutil.disk_usage(self._root)
-        reserve = max(self._min_free, int(usage.total * _DISK_RESERVE_FRACTION))
+        reserve = self._reserve(usage.total)
         if usage.free + planned_bytes - needed < reserve:
             log.error("model_cache_disk_reserve", needed=needed, free=usage.free, reserve=reserve)
             raise ModelFetchError(
@@ -782,8 +793,9 @@ class ModelCache:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout_s
         plan: dict[str, list[Any]] | None = None
-        limit: int | None = None
-        last_size_check = 0.0
+        # Before the plan arrives only the margin is allowed (the child just lists the hub).
+        limit = _STAGING_MARGIN_BYTES
+        last_size_check = loop.time()
         try:
             while True:
                 if loop.time() > deadline:
@@ -791,10 +803,20 @@ class ModelCache:
                 if not parent.poll(0):
                     if not proc.is_alive() and not parent.poll(0):
                         raise _died(proc)
-                    if limit is not None and loop.time() - last_size_check >= _STAGING_POLL_S:
+                    if loop.time() - last_size_check >= _STAGING_POLL_S:
                         last_size_check = loop.time()
-                        size = await asyncio.to_thread(_staging_bytes, Path(spec.staging))
-                        if size > limit:
+                        usage = await asyncio.to_thread(shutil.disk_usage, self._root)
+                        if usage.free < self._reserve(usage.total):
+                            # unlinked-but-open files and fast writes show up here, not in a walk
+                            log.error("model_staging_disk_reserve", repo=spec.repo)
+                            raise ModelFetchError(
+                                MODEL_CACHE_FULL,
+                                "not enough free disk space",
+                                release=True,
+                                local=True,
+                            )
+                        size, entries = await asyncio.to_thread(_staging_usage, Path(spec.staging))
+                        if size > limit or entries > _STAGING_MAX_ENTRIES:
                             log.error("model_staging_overflow", repo=spec.repo)
                             raise ModelFetchError(
                                 MODEL_INTEGRITY, "download exceeds the hub listing", release=True
@@ -833,7 +855,7 @@ class ModelCache:
         finally:  # also on CancelledError: stop/cancel must kill the download (invariant 6)
             parent.close()
             if proc.is_alive():
-                proc.kill()
+                seatbelt.kill_tree(proc)
             proc.join(5)
 
     def _verify_and_seal(

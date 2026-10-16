@@ -11,7 +11,7 @@ whole classes* and re-allows the minimum, validated against a real MLX GPU run (
   * network: none, except outbound TCP to loopback `ollama_port` (Ollama workers only); the fetch
     child gets DNS, TCP to :443 and a configured proxy port only (`_network_rules`)
   * other processes' launch env (KERN_PROCARGS2): denied (three rules, all required)
-  * process-exec: none
+  * process-exec and process-fork: none; the fetch child also cannot bind or accept
   * LaunchServices (`lsopen`), AppleEvents, distributed notifications, other-process signals:
     denied (these are the "launch an app / drive an app / talk to other processes" escapes)
   * user preferences (`cfprefsd`): denied, so `~/Library/Preferences` is not readable through
@@ -32,6 +32,7 @@ import ctypes
 import ctypes.util
 import os
 import re
+import signal
 import sys
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
@@ -112,7 +113,7 @@ MDNS_SOCKET = "/private/var/run/mDNSResponder"
 # Fetch child default: HTTPS to anywhere (the hub and its CDN hosts vary), nothing else.
 DEFAULT_FETCH_TCP = ("*:443",)
 _LOCAL_HOSTS = ("localhost", "127.0.0.1")
-_TCP_REMOTE = re.compile(r"^(\*|localhost|127\.0\.0\.1|[0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$")
+_TCP_REMOTE = re.compile(r"^(\*|localhost):([0-9]{1,5})$")
 
 
 def _network_rules(tcp_remotes: Sequence[str] | None) -> list[str]:
@@ -120,13 +121,13 @@ def _network_rules(tcp_remotes: Sequence[str] | None) -> list[str]:
     socket: docker.sock, the SSH agent, ...), then re-allowed for DNS (mDNSResponder socket) and
     outbound TCP to `tcp_remotes` (`host:port`, host `*`, an IPv4 literal or `localhost`).
     Loopback is denied even where `*:port` would match it, except for explicit local entries
-    (a proxy on this Mac), which come last."""
+    (a proxy on this Mac), which come last. Remotes are `*:<port>` or `localhost:<port>` only."""
     remotes = list(DEFAULT_FETCH_TCP if tcp_remotes is None else tcp_remotes)
     remote_hosts: list[str] = []
     local: list[str] = []
     for r in remotes:
         m = _TCP_REMOTE.match(r)
-        if m is None or not 0 < int(m.group(3)) < 65536:
+        if m is None or not 0 < int(m.group(2)) < 65536:
             raise ValueError("bad tcp remote")
         (local if m.group(1) in _LOCAL_HOSTS else remote_hosts).append(r)
     lines = [
@@ -188,12 +189,16 @@ def build_profile(
         lines.append("(deny network*)")
     else:
         lines += _network_rules(tcp_remotes)
+        # No listening sockets: a setsid grandchild could outlive the kill and serve a fake
+        # local service (e.g. Ollama on 11434).
+        lines += ["(deny network-bind)", "(deny network-inbound)"]
     if ollama_port is not None:
         if not 0 < ollama_port < 65536:
             raise ValueError("bad ollama port")
         lines.append(f'(allow network-outbound (remote tcp "localhost:{ollama_port}"))')
 
     lines.append("(deny process-exec*)")
+    lines.append("(deny process-fork)")  # no grandchildren that could outlive proc.kill()
     lines += ["(deny lsopen)", "(deny appleevent-send)", "(deny distributed-notification-post)"]
     lines.append("(deny user-preference-read user-preference-write)")
     # `(deny signal (target others))` is accepted but does NOT deny (verified: SIGCONT to the
@@ -379,13 +384,28 @@ def apply(profile: str) -> None:
         raise RunnerError(SANDBOX_FAILED, detail[:200])
 
 
+def new_session() -> None:
+    """Child side: become a session/process-group leader so `kill_tree` reaps stragglers."""
+    with contextlib.suppress(OSError):
+        os.setsid()
+
+
+def kill_tree(proc: Any) -> None:
+    """Parent side: SIGKILL the child's process group (set up by `new_session`), then the child
+    itself (covers the window before the child called `setsid`)."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 1:
+        with contextlib.suppress(OSError):
+            os.killpg(pid, signal.SIGKILL)
+    proc.kill()
+
+
 def procargs_readable(pid: int) -> bool:
     """True if `sysctl(KERN_PROCARGS2)` for `pid` (its launch arguments and environment) works."""
     libc = ctypes.CDLL(None, use_errno=True)
     mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
-    size = ctypes.c_size_t(1 << 16)
-    buf = ctypes.create_string_buffer(size.value)
-    return bool(libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0)
+    size = ctypes.c_size_t(0)  # size query only: no data is copied
+    return bool(libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) == 0)
 
 
 def _connect_denied(host: str, port: int) -> bool:

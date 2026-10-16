@@ -542,12 +542,17 @@ class ExecutorLoop:
 
         try:
             model_path = await self._ensure_cached(a.model)
-            if model_path is None:
-                await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
-            else:
-                await asyncio.to_thread(
-                    self._worker.ensure_model, a.model, self._budget, model_path
-                )
+            try:
+                if model_path is None:
+                    await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
+                else:
+                    await asyncio.to_thread(
+                        self._worker.ensure_model, a.model, self._budget, model_path
+                    )
+            except RunnerError:
+                if self._cache is not None:
+                    self._cache.release_in_use()  # a failed load holds no model: unpin it
+                raise
             for i in range(0, len(records), step):
                 batch = records[i : i + step]
                 outputs.extend(

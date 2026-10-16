@@ -172,6 +172,7 @@ def worker_main(
     `load` from the model's engine, which must be in `engines`."""
     from minion_executor.runners import create_runner, probe_engines
 
+    sbx.new_session()  # own process group: the parent kills the whole group
     if env is not None:  # explicit, scrubbed environment replaces whatever was inherited
         os.environ.clear()
         os.environ.update(env)
@@ -508,7 +509,7 @@ class WorkerHandle:
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
-                proc.kill()
+                sbx.kill_tree(proc)
 
     def interrupt(self) -> None:
         """Abort the current work: hard-kill the worker but allow a respawn on the next call.
@@ -521,7 +522,7 @@ class WorkerHandle:
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
-                proc.kill()
+                sbx.kill_tree(proc)
 
     def _reset(self) -> None:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
@@ -531,7 +532,7 @@ class WorkerHandle:
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():
-                    proc.kill()
+                    sbx.kill_tree(proc)
         if conn is not None:
             conn.close()
         if proc is not None:

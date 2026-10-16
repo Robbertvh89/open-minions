@@ -121,6 +121,17 @@ together with `MINION_EXECUTOR_DEV=1`.
     workers. Accepted and documented only; not mitigated.
   - The fetch child reaches any host on port 443 (and the proxy), so a compromised fetch child can
     exfiltrate what it can read (its staging dir, the fetch env including `HF_TOKEN`).
+  - With a proxy configured the fetch child may reach `*:<proxyport>` (any host on that port, as
+    Seatbelt does not filter by hostname) and no longer `*:443`; `HTTP_PROXY` is not honoured for
+    https fetches and opens nothing. Without a proxy it is `*:443` (plus the `HF_ENDPOINT` port).
+  - Both profiles deny `process-fork`, `network-bind` and `network-inbound`, so a compromised child
+    cannot leave a grandchild serving a fake local service (e.g. Ollama on 11434) after
+    `proc.kill()`. As belt and braces children are session leaders and teardown also `killpg`s them.
+  - The localhost deny covers `localhost` only: the rest of 127/8 and the Mac's own LAN IP are not
+    covered.
+  - Process listing (`KERN_PROC_ALL`) stays possible, as do `AF_ROUTE` and `AF_SYSTEM` sockets.
+  - Staging-size accounting walks the tree and may double count hard links/renamed files while a
+    download is in flight (accepted, low risk; a free-disk-reserve check backs it up).
   - Allowed Mach services (above) and the `com.apple.metal` cache are shared system surface; a bug in
     Metal's compiler service is reachable from the worker.
   - A malicious model can still burn CPU/GPU up to the budget and can fill its tmp dir (disk quota is

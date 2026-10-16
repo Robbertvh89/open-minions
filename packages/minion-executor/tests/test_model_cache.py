@@ -772,7 +772,7 @@ async def test_sandbox_failure_fails_closed_and_releases(
     assert not ran.exists()  # the fetch never ran unconfined
 
 
-async def test_hub_401_with_a_token_is_a_plain_retryable_failure(tmp_path: Path) -> None:
+async def test_hub_401_with_a_token_is_released_but_not_remembered(tmp_path: Path) -> None:
     spawned = tmp_path / "spawned"
 
     class Resp:
@@ -787,10 +787,10 @@ async def test_hub_401_with_a_token_is_a_plain_retryable_failure(tmp_path: Path)
         raise HubError("detail")
 
     cache = _cache(tmp_path, hub, fetch_env=FetchEnv.capture({"HF_TOKEN": "hf_x"}))
-    for _ in range(2):  # not remembered either: a fixed token should work next time
+    for _ in range(2):  # not remembered: a rotated token should work next time
         with pytest.raises(ModelFetchError) as ei:
             await cache.ensure(_model())
-        assert ei.value.release is False and ei.value.local is False and ei.value.retryable
+        assert ei.value.release is True and ei.value.local is False
     assert spawned.read_text().count("x") == 2
 
 
@@ -885,9 +885,12 @@ def test_confine_spec_tcp_is_https_plus_proxy_only(tmp_path: Path) -> None:
 
     assert tcp({}) == ["*:443"]
     assert tcp({"HF_ENDPOINT": "https://hub.example:8443"}) == ["*:443", "*:8443"]
-    assert tcp({"HTTPS_PROXY": "http://user:pw@proxy.corp:3128"}) == ["*:443", "*:3128"]
-    assert tcp({"HTTPS_PROXY": "http://127.0.0.1:8888"}) == ["*:443", "localhost:8888"]
-    assert tcp({"ALL_PROXY": "proxy.corp:8080"}) == ["*:443", "*:8080"]
+    # with a proxy only the proxy port is allowed, not *:443
+    assert tcp({"HTTPS_PROXY": "http://user:pw@proxy.corp:3128"}) == ["*:3128"]
+    assert tcp({"HTTPS_PROXY": "http://127.0.0.1:8888"}) == ["localhost:8888"]
+    assert tcp({"ALL_PROXY": "proxy.corp:8080"}) == ["*:8080"]
+    # HTTP_PROXY is not used for https: never opens *:80
+    assert tcp({"HTTP_PROXY": "http://proxy.corp"}) == ["*:443"]
 
 
 def test_confine_spec_ca_files_are_literals_and_home_cert_dirs_refused(tmp_path: Path) -> None:
@@ -917,3 +920,41 @@ def test_confine_spec_ca_files_are_literals_and_home_cert_dirs_refused(tmp_path:
     )
     spec = ok._confine_spec(tmp_path / "st")
     assert spec is not None and os.path.realpath("/etc/ssl/certs") in spec["read"]
+
+
+async def test_staging_disk_reserve_kills_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_POLL_S", 0.05)
+    monkeypatch.setattr(ModelCache, "_reserve", lambda _self, total: total + 1)  # never met
+    monkeypatch.setattr(ModelCache, "_check_disk", lambda *_a, **_k: None)
+
+    def slow(spec: FetchSpec, conn: Connection) -> None:
+        time.sleep(60)
+
+    t0 = time.monotonic()
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, slow).ensure(_model())
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release and ei.value.local
+    assert time.monotonic() - t0 < 20
+
+
+async def test_staging_entry_cap_applies_before_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_POLL_S", 0.05)
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_MAX_ENTRIES", 5)
+
+    def spam(spec: FetchSpec, conn: Connection) -> None:
+        for i in range(50):
+            (Path(spec.staging) / f"f{i}").write_bytes(b"x")
+        time.sleep(60)
+
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, spam).ensure(_model())
+    assert ei.value.code == MODEL_INTEGRITY and ei.value.release
+
+
+def test_child_env_disables_xet_chunk_cache(tmp_path: Path) -> None:
+    env = _cache(tmp_path, fake_fetch())._child_env(tmp_path / "st")
+    assert env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == "0"

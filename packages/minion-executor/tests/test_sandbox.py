@@ -375,6 +375,20 @@ def test_fetch_profile_network_rules() -> None:
         build_profile("/Users/me", [], [], allow_network=True, tcp_remotes=['*:1") (allow default'])
 
 
+def test_profiles_deny_fork_bind_and_inbound() -> None:
+    fetch = build_profile("/Users/me", [], [], allow_network=True).splitlines()
+    for rule in ("(deny process-fork)", "(deny network-bind)", "(deny network-inbound)"):
+        assert rule in fetch
+    worker = build_profile("/Users/me", [], []).splitlines()
+    assert "(deny process-fork)" in worker and "(deny network*)" in worker
+
+
+def test_tcp_remote_accepts_only_star_or_localhost() -> None:
+    for bad in ("127.0.0.1:80", "10.0.0.1:443", "example.com:443"):
+        with pytest.raises(ValueError):
+            build_profile("/Users/me", [], [], allow_network=True, tcp_remotes=[bad])
+
+
 def test_worker_profile_has_no_network_allow_except_ollama() -> None:
     prof = build_profile("/Users/me", [], [])
     assert "(deny network*)" in prof and "remote tcp" not in prof
