@@ -1032,6 +1032,7 @@ dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "minion-common" },
+    { name = "pyyaml" },
     { name = "structlog" },
     { name = "typer" },
 ]
@@ -1054,6 +1055,7 @@ requires-dist = [
     { name = "minion-common", editable = "packages/minion-common" },
     { name = "mlx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = "==0.32.4" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mlx'", specifier = "==0.32.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "safetensors", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'hf'", specifier = ">=0.8.0" },
     { name = "structlog", specifier = ">=24.4" },
     { name = "torch", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'hf'", specifier = ">=2.14.1" },

@@ -4,6 +4,7 @@ title: Worker IPC and Ollama hardening follow-ups (from TASK-4.3 review)
 status: To Do
 assignee: []
 created_date: '2026-10-16 03:29'
+updated_date: '2026-10-16 13:09'
 labels:
   - executor
   - security
@@ -32,3 +33,9 @@ Leftover MINOR/LOW findings from TASK-4.3 review and security rounds 4:
 <!-- AC:BEGIN -->
 - [ ] #1 Each item fixed with a test or explicitly accepted in ADR-0009
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+TASK-4.4 (M3 bench): the worker sandbox denies writes to the com.apple.MetalPerformanceShadersGraph cache dir. Runs succeed, but stderr is noisy and there is no MPSGraph cache reuse, so bench numbers may be slightly pessimistic. Evaluate a narrowly scoped write allow for that cache dir (ADR-0009), or accept it explicitly.
+<!-- SECTION:NOTES:END -->

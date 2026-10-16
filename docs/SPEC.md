@@ -172,6 +172,24 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
 A 401 with a token set is released rather than failed because the credential is a property of this Mac, not of the subtask; it is not remembered so that fixing the token takes effect at once. "Remembered" means the executor keeps a bounded in-memory (model, revision) to reason map, so repeated assignments of that model are released immediately without network or disk work; the server's `MINION_RELEASE_LIMIT` still bounds how often one subtask bounces. A full or unusable local disk is a property of this Mac, not of the subtask, which is why it is a release and not a (retry-burning) failure.
 
+Errors from the worker and engines (the full set of codes the executor reports; payload text is never included):
+
+| Code | Outcome | When |
+|---|---|---|
+| `MODEL_NOT_ADMISSIBLE` | release | the assigned model's engine is not advertised by this executor, or its `memory_gb` exceeds the budget |
+| `ENGINE_UNAVAILABLE` | release | the engine cannot run here right now (e.g. the Ollama daemon is unreachable at load) |
+| `ENGINE_NOT_ALLOWED` | fail, retryable | the worker was asked to load an engine outside its allowed set (defence in depth; the loop checks first) |
+| `SANDBOX_FAILED` | release | the worker sandbox could not be applied (worker exit 78) |
+| `BAD_PARAMS` | fail, non-retryable | task params fail the executor's re-validation, or do not match the task type |
+| `BAD_INPUT` | fail, non-retryable | the input object is not valid JSONL records |
+| `MODEL_NOT_FOUND` | fail, non-retryable | the model directory is missing from the local cache at load |
+| `MODEL_UNSUPPORTED` | fail, non-retryable | also: architecture or pooling the runner does not implement (XLM-R, `mean_sqrt_len`) |
+| `OOM` | fail, retryable | Metal/MPS (or Ollama) out of memory |
+| `ENGINE_STALLED` | fail, retryable | MLX generation made no progress |
+| `ENGINE_REJECTED` | fail, non-retryable | Ollama answered 4xx at run time |
+| `ENGINE_ERROR` | fail, retryable | Ollama answered 5xx at run time (404 = model gone: release) |
+| `PROMPT_TOO_LONG` | per record | written as an output line for that record; the subtask still succeeds (FR-6) |
+
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 
 ### 4.3 Acquisition protocol **[paper]**
@@ -426,6 +444,11 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - Q3. Should executors batch-acquire (N subtasks) to cut round-trips for very small subtasks?
 - Q4. Auth for the web UI (SSO/OIDC vs API keys only)?
 - Q5. Is step-level duty cycling enough to keep video calls smooth, or do we also need to throttle on
-  measured *total* GPU utilization (ioreg `Device Utilization %`)? Decide after M3 benchmark.
+  measured *total* GPU utilization (ioreg `Device Utilization %`)? **Open.** The M3 benchmark ran at
+  duty cycle 1.0 with no foreground load, so it does not answer this; decide with the M4 governor
+  measurements (NF-7, NF-8).
 - Q6. Should `memory_gb` estimates in `models.yaml` be measured automatically by `minion-executor bench`
-  and fed back to the server?
+  and fed back to the server? **Partly answered by M3:** `bench` measures worker RSS peak and
+  per-engine peak; `memory_gb` is still hand-set in `deploy/bench-models.yaml`, and feeding measured
+  values to the server is **not implemented** (open). The M3 data shows the hand-set 1.5 GB for
+  Qwen2.5-0.5B is below the HF worker RSS peak (2.26 GB) and above the MLX peak (1.42 GB); not reconciled.

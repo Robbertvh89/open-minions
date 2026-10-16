@@ -144,7 +144,7 @@ minion_executor/
 #### Executor implementation (M1, TASK-2.3)
 Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
 `runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Later: MLX/Ollama/HF runners (TASK-4.3,
-listed under the worker bullets below). Not yet: governor/signals, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
+listed under the worker bullets below), model cache and worker sandbox (TASK-4.2, ADR-0009), and `bench` (TASK-4.4, `bench.py`, results in `docs/bench/`). Not yet: governor/signals, `status` (stub), `register`/`prefer`/`pause` CLI commands.
 
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
   `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
@@ -307,7 +307,7 @@ Notes:
 ```
 Executor: GET input via presigned URL (Range header for byte slice)
           ensure model cached → hand records to worker subprocess
-Worker:   load model (or reuse warm one) with MLX memory/cache limits from budget
+Worker:   load model (or reuse warm one) with MLX memory/cache limits from budget (hf: torch.mps fraction)
           loop: run one generation step / embedding batch (≤ budget.max_batch_size)
                 ctl.checkpoint()  ← duty-cycle sleep + check governor events
           stream results back to control process
@@ -462,6 +462,7 @@ token in macOS Keychain.
 4. **M3 – Real inference + benchmark:** MLX completion (batched) and MLX embedding runners, Ollama/HF
    fallback runners, model cache, `models.yaml` admission. `minion-executor bench`: same model on
    mlx-lm batched vs Ollama(MLX) vs HF/mps — tokens/s, records/h, peak memory. Confirms/adjusts ADR-0005 defaults.
+   Done (TASK-4.4): mlx vs hf measured on M3 Pro, ADR-0005 confirmed; Ollama unmeasured (TASK-13).
 5. **M4 – Capacity governor:** profiles, signals, duty-cycle throttle, auto-pause, budget reporting,
    downgrade-release. Measure NF-8/NF-9.
 6. **M5 – Ops & usability:** Grafana dashboards, web UI, launchd packaging, auth hardening; usability
