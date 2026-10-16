@@ -1,10 +1,10 @@
 ---
 id: TASK-4.3
 title: 'M3.3: MLX, Ollama and HF runners'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-16 03:24'
+updated_date: '2026-10-16 03:29'
 labels:
   - M3
 dependencies:
