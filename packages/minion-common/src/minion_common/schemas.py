@@ -9,7 +9,7 @@ from typing import Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from minion_common.enums import CapacityProfile, Engine, TaskStatus, TaskType
+from minion_common.enums import CapacityProfile, CpuPriority, Engine, TaskStatus, TaskType
 
 SLUG_PATTERN = r"^[a-z0-9]([a-z0-9_-]{0,62}[a-z0-9])?$"
 
@@ -56,6 +56,8 @@ class Budget(_Model):
     memory_gb: float = Field(gt=0, le=1024, allow_inf_nan=False)
     gpu_duty_cycle: float = Field(gt=0, le=1, allow_inf_nan=False)
     max_batch_size: int = Field(ge=1, le=4096)
+    # Optional so requests from older clients (and the server's view of them) stay valid.
+    cpu_priority: CpuPriority | None = None
 
 
 class ModelEntry(_Model):
@@ -245,6 +247,13 @@ class HeartbeatRequest(_Model):
     paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
 
 
+class PresenceRequest(_Model):
+    """Low-frequency ping while paused/idle (SPEC FR-55). Bounded fields only (S-5)."""
+
+    budget: Budget
+    paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
+
+
 class HeartbeatResponse(_Model):
     cancel: bool
     output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
@@ -270,6 +279,7 @@ __all__ = [
     "HeartbeatResponse",
     "ModelEntry",
     "PreferenceRequest",
+    "PresenceRequest",
     "Progress",
     "RegisterRequest",
     "RegisterResponse",

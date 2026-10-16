@@ -122,7 +122,13 @@ async def touch(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
         )
-        .values(engines=engines, profile=profile, budget=budget, last_seen_at=func.now())
+        .values(
+            engines=engines,
+            profile=profile,
+            budget=budget,
+            paused_reason=None,  # an acquiring executor is by definition not paused
+            last_seen_at=func.now(),
+        )
     )
 
 
@@ -133,14 +139,14 @@ async def report_state(
     profile: str | None,
     budget: dict[str, Any] | None,
     paused_reason: str | None,
-) -> None:
-    """Heartbeat-time refresh of liveness and (optionally) the reported budget/pause state."""
+) -> bool:
+    """Heartbeat/presence-time refresh of liveness and the reported budget/pause state."""
     values: dict[str, Any] = {"last_seen_at": func.now(), "paused_reason": paused_reason}
     if profile is not None:
         values["profile"] = profile
     if budget is not None:
         values["budget"] = budget
-    await session.execute(
+    result = await session.execute(
         update(Executor)
         .where(
             Executor.executor_id == executor_id,
@@ -148,6 +154,7 @@ async def report_state(
         )
         .values(**values)
     )
+    return bool(result.rowcount)  # type: ignore[attr-defined]
 
 
 async def set_preference(

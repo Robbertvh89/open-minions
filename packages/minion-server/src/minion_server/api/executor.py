@@ -13,6 +13,7 @@ from minion_common.schemas import (
     HeartbeatResponse,
     ModelEntry,
     PreferenceRequest,
+    PresenceRequest,
     RegisterRequest,
     RegisterResponse,
 )
@@ -24,6 +25,7 @@ from minion_server.errors import api_error
 from minion_server.repositories import executors as executors_repo
 from minion_server.services import acquisition, completion
 from minion_server.services import heartbeat as heartbeat_service
+from minion_server.services import presence as presence_service
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 
@@ -82,6 +84,16 @@ async def set_preference(
             project=body.project,
             task_name=body.task_name,
         )
+    return Response(status_code=204)
+
+
+@router.post("/presence", status_code=204)
+async def presence(
+    body: PresenceRequest,
+    principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> Response:
+    await presence_service.report(session, principal, body)
     return Response(status_code=204)
 
 

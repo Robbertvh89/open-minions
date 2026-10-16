@@ -21,6 +21,7 @@ from minion_common.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
     PreferenceRequest,
+    PresenceRequest,
     RegisterRequest,
     TaskCreate,
 )
@@ -99,6 +100,20 @@ async def test_acquire_200_and_204() -> None:
     assert seen[0].url.path == "/api/v1/executor/acquire"
     assert seen[0].headers["authorization"] == "Bearer tok123"
     assert json.loads(seen[0].content)["engines"] == ["mlx"]
+
+
+async def test_presence_posts_budget() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(204)
+
+    async with _client(handler) as c:
+        await c.presence(PresenceRequest(budget=BUDGET, paused_reason="thermal"))
+    assert seen[0].method == "POST"
+    assert seen[0].url.path == "/api/v1/executor/presence"
+    assert json.loads(seen[0].content)["paused_reason"] == "thermal"
 
 
 async def test_register_and_preference() -> None:
