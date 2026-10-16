@@ -49,6 +49,10 @@ _ALL = H._models()
 QWEN_HF: ModelEntry = _ALL["qwen2.5-0.5b-instruct-hf"]
 BGE_HF: ModelEntry = _ALL["bge-small-en-hf"]
 BGE_MLX: ModelEntry = _ALL["bge-small-en"]
+# Qwen's catalogue `memory_gb` (2.5, bench RSS peak 2.26) exceeds the shared 2 GB BUDGET: a model
+# that does not fit the budget is never acquired (loop) and OOMs under the MPS cap once other
+# tests have left allocations behind. Size the budget to the model.
+QWEN_BUDGET: Budget = H._budget_for(QWEN_HF)
 
 
 @pytest.fixture(scope="session")
@@ -83,7 +87,7 @@ async def bge_mlx_path(cache: ModelCache) -> Path:
 @pytest.fixture
 def completion(qwen_path: Path) -> Iterator[HfCompletionRunner]:
     r = HfCompletionRunner()
-    r.load(QWEN_HF, qwen_path, BUDGET, EngineConfig(max_prompt_tokens=512))
+    r.load(QWEN_HF, qwen_path, QWEN_BUDGET, EngineConfig(max_prompt_tokens=512))
     yield r
     r.unload()
 
@@ -173,7 +177,7 @@ def test_completion_oom_maps_to_runner_error(
 
 def test_unload_frees_model_memory(qwen_path: Path) -> None:
     r = HfCompletionRunner()
-    r.load(QWEN_HF, qwen_path, BUDGET, EngineConfig())
+    r.load(QWEN_HF, qwen_path, QWEN_BUDGET, EngineConfig())
     r.run(_recs(PROMPTS[:1]), CompletionParams(max_tokens=4), Ctl())
     loaded = r.memory_in_use()["active_bytes"]
     r.unload()
@@ -238,7 +242,7 @@ def test_interrupt_mid_generation_kills_worker_and_frees_memory(qwen_path: Path)
         step_timeout_s=120,
     )
     try:
-        h.ensure_model(QWEN_HF, BUDGET, qwen_path)
+        h.ensure_model(QWEN_HF, QWEN_BUDGET, qwen_path)
         pid = h.pid
         assert pid is not None and H._alive(pid)
         ticks: list[int] = []
