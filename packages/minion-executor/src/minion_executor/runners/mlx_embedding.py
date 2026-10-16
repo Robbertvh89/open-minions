@@ -28,7 +28,9 @@ from minion_executor.runners.prompts import embedding_text
 
 MAX_LENGTH = 512
 CHUNK = 16  # texts per forward pass; bounds activation memory and sets the checkpoint cadence
-_SUPPORTED_ARCH = ("BertModel", "BertForMaskedLM", "XLMRobertaModel")
+# XLM-R is out: its position ids start at padding_idx + 1 and skip pads, which this encoder
+# (positions 0..n-1) does not model, so it would silently produce wrong vectors.
+_SUPPORTED_ARCH = ("BertModel", "BertForMaskedLM")
 
 
 def _build_encoder(cfg: dict[str, Any]) -> Any:
@@ -172,17 +174,15 @@ class MlxEmbeddingRunner:
         self, model: ModelEntry, model_path: Path | None, budget: Budget, cfg: EngineConfig
     ) -> None:
         path = common.require_model_path(model_path)
-        import mlx.core as mx
-        from transformers import AutoTokenizer
-
         conf = read_json(path / "config.json")
         if conf is None:
             raise RunnerError(common.MODEL_UNSUPPORTED, "missing config.json", retryable=False)
         archs = conf.get("architectures") or []
-        if conf.get("model_type") not in ("bert", "xlm-roberta") and not any(
-            a in _SUPPORTED_ARCH for a in archs
-        ):
+        if conf.get("model_type") != "bert" and not any(a in _SUPPORTED_ARCH for a in archs):
             raise RunnerError(common.MODEL_UNSUPPORTED, "not a BERT-family model", retryable=False)
+        import mlx.core as mx
+        from transformers import AutoTokenizer
+
         common.apply_memory_limits(budget)
         try:
             net = _build_encoder(conf)

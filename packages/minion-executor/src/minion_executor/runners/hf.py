@@ -330,14 +330,26 @@ class HfCompletionRunner:
         kw: dict[str, Any] = {
             "temperature": params.temperature,
             "top_p": params.top_p,
-            "top_k": 0,  # off: Qwen's generation_config.json would otherwise set top_k=20
         }
         # Explicit values override whatever the model's generation_config.json prescribes
         # (e.g. Qwen's repetition_penalty/top_k): the same params give the same sampler everywhere.
         return GenerationConfig(
             max_new_tokens=params.max_tokens,
             do_sample=sample,
+            # Every sampler knob is explicit, so the model's own generation_config.json (Qwen
+            # ships top_k=20, repetition_penalty, ...) can never change what the params mean.
+            top_k=0,
+            min_p=0.0,
+            typical_p=1.0,
             repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            encoder_no_repeat_ngram_size=0,
+            length_penalty=1.0,
+            num_beams=1,
+            num_return_sequences=1,
+            epsilon_cutoff=0.0,
+            eta_cutoff=0.0,
+            diversity_penalty=0.0,
             eos_token_id=self._eos,
             pad_token_id=self._tok.pad_token_id,
             **(kw if sample else {}),

@@ -16,19 +16,26 @@ Record = dict[str, Any]
 ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
 # The accelerator ran out of memory (retryable: another Mac, or a smaller batch, may fit).
 OOM = "OOM"
+# A model on this Mac does not match its pinned digest (executor-local: release, don't burn).
+MODEL_INTEGRITY = "MODEL_INTEGRITY"
 
 
 class RunnerError(Exception):
     """A runner failed on a batch (e.g. OOM). `code` is short and never contains payload.
 
     `retryable` tells the loop whether another attempt (here or elsewhere) could succeed.
+    `release` marks executor-local trouble: the loop hands the subtask back without burning an
+    attempt.
     """
 
-    def __init__(self, code: str, message: str = "", *, retryable: bool = True) -> None:
+    def __init__(
+        self, code: str, message: str = "", *, retryable: bool = True, release: bool = False
+    ) -> None:
         super().__init__(f"{code}: {message}" if message else code)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.release = release
 
 
 @dataclass(frozen=True)
@@ -37,6 +44,10 @@ class EngineConfig:
 
     ollama_url: str = "http://127.0.0.1:11434"
     max_prompt_tokens: int = 8192
+    # Ollama only: how long the daemon keeps the model after a request (bounded, invariant 6).
+    keep_alive_s: int = 60
+    # The worker's load timeout: a model pull must finish well inside it (set by the handle).
+    load_timeout_s: float = 1800.0
 
 
 class MemoryStats(TypedDict):

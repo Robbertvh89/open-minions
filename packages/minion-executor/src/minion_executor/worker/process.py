@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -41,6 +41,7 @@ from minion_executor.worker.sandbox import SandboxPolicy
 from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+UNLOAD_TIMEOUT_S = 5.0  # graceful worker unload before the kill
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
 # Proxy, CA and HF_TOKEN are deliberately not on it: they go only to the model-fetch subprocess
@@ -238,6 +239,10 @@ def worker_main(
                 ctl = _Ctl(conn, budget.gpu_duty_cycle, tick_interval_s)
                 ctl.start()
                 result = runner.run(msg["batch"], params, ctl)
+            elif op == "unload":  # graceful: let the runner free what lives outside this process
+                if runner is not None:
+                    runner.unload()
+                    runner = None
             elif op == "stats":
                 mem = runner.memory_in_use() if runner is not None else None
                 result = {
@@ -254,7 +259,13 @@ def worker_main(
         except RunnerError as e:
             _send(
                 conn,
-                {"ok": False, "code": e.code, "message": e.message, "retryable": e.retryable},
+                {
+                    "ok": False,
+                    "code": e.code,
+                    "message": e.message,
+                    "retryable": e.retryable,
+                    "release": e.release,
+                },
             )
         except Exception as e:
             _send(conn, {"ok": False, "code": "runner_error", "message": type(e).__name__})
@@ -303,6 +314,7 @@ class WorkerHandle:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
+        self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
 
     @property
@@ -319,7 +331,7 @@ class WorkerHandle:
             if self._closed:
                 raise WorkerCrashed("worker handle is stopped")
             gen = self._seen_gen
-            env = {**scrub_env(os.environ), **FORCED_WORKER_ENV}
+            env = {**scrub_env(os.environ), **FORCED_WORKER_ENV, **self._engine_env}
             if self._sandbox is not None:
                 # `minion-exec-<pid>-` so `cleanup_stale_tmp` sweeps it if the control dies
                 prefix = f"minion-exec-{os.getpid()}-worker-"
@@ -403,7 +415,10 @@ class WorkerHandle:
                 raise
             if not reply["ok"]:
                 raise RunnerError(
-                    reply["code"], reply.get("message", ""), retryable=reply.get("retryable", True)
+                    reply["code"],
+                    reply.get("message", ""),
+                    retryable=reply.get("retryable", True),
+                    release=reply.get("release", False),
                 )
             return reply
 
@@ -420,6 +435,8 @@ class WorkerHandle:
                 return
             if self._model_id is not None or (self._sandbox is not None and self._proc):
                 self._reset()  # a sandboxed worker's grants are fixed: load into a fresh one
+            # MLX workers never need torch: keep `transformers` from importing it (smaller surface).
+            self._engine_env = {"USE_TORCH": "0"} if model.engine == Engine.MLX else {}
             self._call(
                 {
                     "op": "load",
@@ -427,7 +444,7 @@ class WorkerHandle:
                     "model": model.model_dump(mode="json"),
                     "budget": budget.model_dump(mode="json"),
                     "model_path": str(model_path) if model_path else None,
-                    "cfg": asdict(self._cfg),
+                    "cfg": asdict(replace(self._cfg, load_timeout_s=self._load_timeout_s)),
                 },
                 self._load_timeout_s,
             )
@@ -495,8 +512,16 @@ class WorkerHandle:
                 self._reset()
 
     def unload(self) -> None:
-        """Drop the model and free its memory by resetting the worker; the handle stays usable."""
+        """Drop the model and free its memory by resetting the worker; the handle stays usable.
+
+        A live worker is first asked to unload (short timeout) so a runner can release memory
+        held outside the process (Ollama `keep_alive: 0`); then it is killed regardless.
+        """
         with self._lock:
+            proc = self._proc
+            if proc is not None and proc.is_alive() and self._model_id is not None:
+                with contextlib.suppress(WorkerCrashed, RunnerError):
+                    self._call({"op": "unload"}, UNLOAD_TIMEOUT_S)
             self._reset()
 
     def kill(self) -> None:

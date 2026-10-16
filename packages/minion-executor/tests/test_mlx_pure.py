@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from minion_common.enums import Engine, TaskType
 from minion_common.schemas import CompletionParams, EmbeddingParams
@@ -82,3 +84,42 @@ def test_load_without_cached_model_is_non_retryable() -> None:
     with pytest.raises(RunnerError) as ei:
         MlxCompletionRunner().load(model, None, budget, EngineConfig())
     assert ei.value.code == "MODEL_NOT_FOUND" and not ei.value.retryable
+
+
+@pytest.mark.parametrize(
+    "conf",
+    [
+        {"model_type": "xlm-roberta", "architectures": ["XLMRobertaModel"]},
+        {"model_type": "roberta", "architectures": ["RobertaModel"]},
+        {"model_type": "llama"},
+    ],
+)
+def test_embedding_load_rejects_non_bert_before_any_mlx_import(
+    conf: dict[str, object], tmp_path: Path
+) -> None:
+    import json
+
+    from minion_common.schemas import Budget, ModelEntry
+    from minion_executor.runners.base import EngineConfig
+
+    (tmp_path / "config.json").write_text(json.dumps(conf))
+    model = ModelEntry(
+        model_id="m", type=TaskType.EMBEDDING, engine=Engine.MLX, ref="o/m",
+        revision="a" * 40, memory_gb=1,
+    )  # fmt: skip
+    budget = Budget.model_validate(
+        {"profile": "balanced", "memory_gb": 2, "gpu_duty_cycle": 1.0, "max_batch_size": 2}
+    )
+    with pytest.raises(RunnerError) as ei:
+        MlxEmbeddingRunner().load(model, tmp_path, budget, EngineConfig())
+    assert ei.value.code == MODEL_UNSUPPORTED and not ei.value.retryable
+
+
+def test_context_window_from_config() -> None:
+    from minion_executor.runners.mlx_completion import _context_window
+
+    assert _context_window({"max_position_embeddings": 32768}) == 32768
+    assert _context_window({"text_config": {"max_position_embeddings": 4096}}) == 4096
+    assert _context_window({"max_position_embeddings": "x"}) == 0
+    assert _context_window({"max_position_embeddings": True}) == 0
+    assert _context_window({}) == 0

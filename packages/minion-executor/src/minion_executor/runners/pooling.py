@@ -27,9 +27,13 @@ def pooling_mode(cfg: dict[str, Any] | None) -> str:
     """
     if not cfg:
         return "cls"
+    if cfg.get("pooling_mode_mean_sqrt_len_tokens"):  # sum / sqrt(n): not plain mean pooling
+        raise RunnerError(
+            MODEL_UNSUPPORTED, "mean_sqrt_len pooling is not supported", retryable=False
+        )
     if cfg.get("pooling_mode_cls_token"):
         return "cls"
-    if cfg.get("pooling_mode_mean_tokens") or cfg.get("pooling_mode_mean_sqrt_len_tokens"):
+    if cfg.get("pooling_mode_mean_tokens"):
         return "mean"
     if cfg.get("pooling_mode_lasttoken"):
         return "lasttoken"

@@ -16,10 +16,21 @@ from minion_executor.runners.base import (
     RunnerError,
     StepControl,
 )
+from minion_executor.runners.pooling import read_json
 from minion_executor.runners.prompts import build_messages
 
 PROMPT_TOO_LONG = "PROMPT_TOO_LONG"
 _STALL_STEPS = 1000  # consecutive steps without any response before giving up
+
+
+def _context_window(conf: dict[str, Any]) -> int:
+    """`max_position_embeddings` from a model config (top level or `text_config`), 0 if absent."""
+    for cfg in (conf, conf.get("text_config")):
+        if isinstance(cfg, dict):
+            value = cfg.get("max_position_embeddings")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return 0
 
 
 class MlxCompletionRunner:
@@ -28,6 +39,7 @@ class MlxCompletionRunner:
         self._tok: Any = None
         self._budget: Budget | None = None
         self._cfg = EngineConfig()
+        self._context = 0  # the model's position limit; 0 = unknown
         self.wired_limit_bytes: int | None = None  # last value set by `run` (tests, diagnostics)
 
     def load(
@@ -38,7 +50,11 @@ class MlxCompletionRunner:
 
         common.apply_memory_limits(budget)
         try:
-            self._model, self._tok = mlx_lm.load(str(path))
+            self._model, self._tok = mlx_lm.load(
+                str(path),
+                tokenizer_config={"trust_remote_code": False, "local_files_only": True},
+                trust_remote_code=False,
+            )
         except RuntimeError as exc:
             self.unload()
             if common.is_oom(exc):
@@ -49,6 +65,8 @@ class MlxCompletionRunner:
             raise RunnerError(
                 common.MODEL_UNSUPPORTED, "model has no chat template", retryable=False
             )
+        conf = read_json(path / "config.json") or {}
+        self._context = _context_window(conf)
         self._budget, self._cfg = budget, cfg
 
     def _encode(self, rec: Record, params: TaskParams) -> list[int]:
@@ -79,7 +97,10 @@ class MlxCompletionRunner:
         out: list[Record | None] = [None] * len(batch)
         prompts: list[list[int]] = []
         slots: list[int] = []  # batch index per inserted prompt
-        limit = self._cfg.max_prompt_tokens - params.max_tokens
+        window = self._cfg.max_prompt_tokens
+        if self._context:
+            window = min(window, self._context)  # never past the model's position limit
+        limit = window - params.max_tokens
         for i, rec in enumerate(batch):
             ids = self._encode(rec, params)  # BAD_INPUT fails the whole batch (non-retryable)
             if len(ids) > limit or not ids:
@@ -103,7 +124,7 @@ class MlxCompletionRunner:
             stop_tokens=[[t] for t in self._tok.eos_token_ids],
             sampler=sampler,
             completion_batch_size=self._budget.max_batch_size,
-            prefill_batch_size=min(8, len(prompts)),
+            prefill_batch_size=min(8, len(prompts), self._budget.max_batch_size),
         )
         try:
             # Construction wired the Metal working set up to the recommended maximum (D14).

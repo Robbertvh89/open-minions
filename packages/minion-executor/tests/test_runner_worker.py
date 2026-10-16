@@ -585,6 +585,93 @@ def test_stats_and_unload() -> None:
         w.close()
 
 
+def test_unload_asks_the_worker_to_unload_before_the_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner gets a graceful `unload` op (Ollama `keep_alive: 0`) with a short timeout."""
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(), BUDGET)
+        proc = w._proc
+        assert proc is not None
+        sent: list[tuple[str, float]] = []
+        real_call = w._call
+
+        def spy(msg: dict[str, object], timeout_s: float, on_progress: object = None) -> dict:  # type: ignore[type-arg]
+            sent.append((str(msg["op"]), timeout_s))
+            return real_call(msg, timeout_s)
+
+        monkeypatch.setattr(w, "_call", spy)
+        w.unload()
+        assert sent == [("unload", 5.0)]
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        w.close()
+
+
+def test_unload_still_kills_when_the_graceful_unload_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(), BUDGET)
+        proc = w._proc
+        assert proc is not None
+
+        def hang(*a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            raise WorkerCrashed("worker timed out")
+
+        monkeypatch.setattr(w, "_call", hang)
+        w.unload()
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        w.close()
+
+
+def test_unload_without_a_model_does_not_spawn_a_worker() -> None:
+    w = WorkerHandle([Engine.FAKE])
+    w.unload()
+    assert w.pid is None
+
+
+def test_worker_unload_op_drops_the_runner_and_release_flag_crosses_the_pipe() -> None:
+    import multiprocessing as mp
+
+    from minion_executor.worker.process import DEFAULT_MAX_MESSAGE_BYTES, _recv, _send, worker_main
+
+    parent, child = mp.get_context("spawn").Pipe()
+    t = threading.Thread(target=worker_main, args=(child, ["fake"]), daemon=True)
+    t.start()
+
+    def call(msg: dict[str, object]) -> dict[str, object]:
+        _send(parent, msg)
+        assert parent.poll(10)
+        return _recv(parent, DEFAULT_MAX_MESSAGE_BYTES)
+
+    model = _model().model_dump(mode="json")
+    assert call({"op": "load", "model": model, "budget": BUDGET.model_dump(mode="json")})["ok"]
+    assert call({"op": "unload"}) == {"ok": True, "result": None}
+    assert call({"op": "run", "batch": [], "params": {}})["code"] == "not_loaded"
+    assert call({"op": "shutdown"})["ok"]
+    t.join(5)
+
+
+def test_runner_error_release_flag_is_carried_by_the_reply() -> None:
+    e = RunnerError("MODEL_INTEGRITY", "x", release=True)
+    assert e.release and not RunnerError("X").release
+
+
+def test_mlx_workers_get_use_torch_off_and_others_do_not() -> None:
+    w = WorkerHandle([Engine.MLX, Engine.HF])
+    assert w._engine_env == {}
+    mlx = ModelEntry(
+        model_id="m", type=TaskType.EMBEDDING, engine=Engine.MLX, ref="o/m",
+        revision="a" * 40, memory_gb=1,
+    )  # fmt: skip
+    w._call = lambda *a, **k: {"ok": True}  # type: ignore[method-assign]
+    w.ensure_model(mlx, BUDGET)
+    assert w._engine_env == {"USE_TORCH": "0"}
+    hf = mlx.model_copy(update={"engine": Engine.HF, "model_id": "h"})
+    w.ensure_model(hf, BUDGET)
+    assert w._engine_env == {}
+
+
 def test_worker_run_without_load_and_prompt_too_long() -> None:
     w = WorkerHandle([Engine.FAKE], engine_config=EngineConfig(max_prompt_tokens=300))
     try:

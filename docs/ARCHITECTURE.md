@@ -191,7 +191,7 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
   bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
   process dies (parent-pid watch). Runners: `mlx` (TASK-4.3 S6; completion and embedding) and the
-  test-only `fake` (`runners/fake.py`, never advertised as a real engine); ollama/hf follow in S7/S8. The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
+  test-only `fake` (`runners/fake.py`, never advertised as a real engine). The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
   work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
   control process (invariant 7).
 - **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
@@ -202,7 +202,7 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   Token is never logged. `run` exits 2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
   missing token or unknown runner. The token is removed from `os.environ` right after loading, before
-  any child process. `--engines auto` (default) or a list such as `mlx,ollama`: after the environ is
+  any child process. `--engines auto` (default; probes mlx and hf, Ollama is opt-in) or a list such as `mlx,ollama`: after the environ is
   restricted, a short-lived worker subprocess (90 s timeout) probes which engines work (only engines
   `create_runner` implements, see `runners.SUPPORTED`) and the executor registers with those; none
   available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden

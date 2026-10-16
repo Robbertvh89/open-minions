@@ -240,28 +240,36 @@ def test_interrupt_mid_generation_kills_worker_and_frees_memory(qwen_path: Path)
         h.ensure_model(QWEN_HF, BUDGET, qwen_path)
         pid = h.pid
         assert pid is not None and H._alive(pid)
-        progress: list[int] = []
+        ticks: list[int] = []
         err: list[BaseException] = []
+
+        def on_progress(done: int) -> None:
+            # First checkpoint tick = a decode step is running: interrupt from inside it, so the
+            # outcome never depends on how fast the model happens to finish.
+            ticks.append(done)
+            if len(ticks) == 1:
+                h.interrupt()
 
         def go() -> None:
             try:
                 h.run(
-                    [{"id": 1, "prompt": "Write a very long story about a dragon."}],
-                    CompletionParams(max_tokens=2048),
-                    progress.append,
+                    [
+                        {
+                            "id": 1,
+                            "prompt": "Count from 1 to 5000, one number per line, nothing else.",
+                        }
+                    ],
+                    CompletionParams(max_tokens=4096),
+                    on_progress,
                 )
             except BaseException as e:
                 err.append(e)
 
         t = threading.Thread(target=go)
         t.start()
-        deadline = time.monotonic() + 60
-        while not progress and time.monotonic() < deadline and t.is_alive():
-            time.sleep(0.05)
-        time.sleep(0.3)
-        h.interrupt()
-        t.join(30)
+        t.join(60)
         assert not t.is_alive()
+        assert ticks, "no checkpoint tick arrived"
         assert err and isinstance(err[0], WorkerCrashed)
         deadline = time.monotonic() + 10
         while H._alive(pid) and time.monotonic() < deadline:

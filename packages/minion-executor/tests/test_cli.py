@@ -75,7 +75,7 @@ def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyP
     result = runner.invoke(app, ["run"])
     assert result.exit_code == 2
     assert "no inference engine available" in result.output  # NO_ENGINE_MSG
-    assert asked == [[Engine.MLX, Engine.OLLAMA, Engine.HF]]
+    assert asked == [[Engine.MLX, Engine.HF]]  # Ollama is opt-in, never probed by auto
 
 
 def test_probe_runs_after_environ_restricted_with_short_timeout(
@@ -150,6 +150,13 @@ def test_auto_advertises_probed_engines(monkeypatch: pytest.MonkeyPatch) -> None
     result = runner.invoke(app, ["run"])
     assert result.exit_code == 0, result.output
     assert seen["engines"] == [Engine.MLX, Engine.HF]
+
+
+def test_keep_alive_is_bounded() -> None:
+    from minion_executor.main import keep_alive_s
+
+    assert keep_alive_s(600.0) == 300 and keep_alive_s(90.0) == 90
+    assert keep_alive_s(0.0) == 60 and keep_alive_s(0.2) == 1
 
 
 def test_explicit_engines_are_intersected_with_probe(monkeypatch: pytest.MonkeyPatch) -> None:

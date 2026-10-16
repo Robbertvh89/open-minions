@@ -100,9 +100,32 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
     resets the wired limit to `min(budget, recommended)` after `BatchGenerator` raised it. All
     records of a subtask are processed in batches sized by the capacity budget; the pacer runs
     after every generation step. Install with `uv sync --package minion-executor --extra mlx`.
-    All records of a subtask are processed in batches sized by the capacity budget.
-  - `ollama` (fallback, e.g. GGUF-only models): local Ollama HTTP API **[paper]**. The runner talks to a loopback daemon only, pulls missing models with `/api/pull` and verifies the pinned manifest digest (`MODEL_INTEGRITY` on mismatch). The daemon runs outside the sandbox and the capacity budget (residual confused-deputy risk, ADR-0009).
-  - `hf` (fallback): HuggingFace transformers on `mps` **[paper]**.
+    BERT encoders only (`model_type: bert`): XLM-R is `MODEL_UNSUPPORTED` (its position ids differ),
+    as is `mean_sqrt_len` pooling. The prompt limit is the smaller of the executor's
+    `max_prompt_tokens` and the model's `max_position_embeddings`.
+  - `ollama` (fallback, e.g. GGUF-only models; **opt-in**: `--engines auto` never probes it, use
+    `--engines ollama` or a list containing it): local Ollama HTTP API **[paper]**. The runner talks
+    to a loopback daemon only, pulls missing models with `/api/pull` (bounded below the worker load
+    timeout) and verifies the pinned manifest digest after load and again after every run
+    (`MODEL_INTEGRITY`, executor-local: the subtask is released and no output is stamped). The
+    daemon runs outside the sandbox and the capacity budget, and `/api/pull` writes to `~/.ollama`
+    outside the model-cache cap (residual confused-deputy risk, ADR-0009). Refs need an explicit
+    tag and no registry host. Deviations from the other engines (ADR-0009): the daemon cannot return
+    unnormalised embeddings, so the server rejects `normalize=false` for ollama models (422
+    `INVALID_PARAMS`) and the runner fails it non-retryably (`PARAMS_UNSUPPORTED`); embedding
+    `tokens` is `prompt_eval_count` of one `/api/embed` call per text and can under-report when
+    Ollama's prompt cache holds a shared prefix; over-long prompts are not detectable (no
+    `PROMPT_TOO_LONG` lines; `num_ctx` is `max_prompt_tokens + max_tokens`). Every request carries a
+    bounded `keep_alive` (`MINION_EXECUTOR_IDLE_UNLOAD_S`, at most 300 s, 60 s when disabled) and
+    the worker asks the runner to unload (`keep_alive: 0`) before it is killed. HTTP 4xx is a
+    non-retryable failure, 5xx a retryable failure (`OOM` when the daemon reports too little
+    memory), a transport error a release (`ENGINE_UNAVAILABLE`).
+  - `hf` (fallback): HuggingFace transformers on `mps` **[paper]**. Output lines as for `mlx`
+    (embedding `{id, embedding, tokens}`; completion `{id, completion, finish_reason,
+    prompt_tokens, completion_tokens}`), safetensors only, local files only, remote code off.
+    `torch.mps.set_per_process_memory_fraction` caps the allocator at the memory budget; an MPS
+    out-of-memory error is a retryable `OOM`. Sampler settings are explicit, so the model's
+    `generation_config.json` cannot change them. Install with `--extra hf`.
   - Inference runs in a worker subprocess; the loaded model is kept warm across consecutive subtasks
     of the same model and unloaded when the budget drops or the executor idles > 10 min.
 - FR-14. Heartbeat every **5 minutes** while running a subtask **[paper]**. Heartbeat response may carry
@@ -124,7 +147,7 @@ subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, whi
 runners, FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
 governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
-**M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
+**M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`, which probes mlx and hf only: Ollama is opt-in, see S-10) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
 
 **M3 update (TASK-4.2, model cache; FR-12).** MLX/HF models are fetched by the control side in a killable, Seatbelt-sandboxed `spawn` subprocess (network allowed; writes only to its staging dir; no HOME reads, exec, LaunchServices or AppleEvents), pinned to `ModelEntry.revision` and verified (LFS sha256, git blob sha1 for non-LFS files, no symlinks, no `auto_map` in any JSON) before the worker, which is offline and sandboxed (ADR-0009), loads it. Settings: `MINION_EXECUTOR_MODEL_CACHE_DIR` (absolute, `~` expanded), `MINION_EXECUTOR_MODEL_CACHE_GB` (LRU cap, default 50), `MINION_EXECUTOR_MIN_FREE_DISK_GB` (default 10: a download must leave at least max(this, 10% of the disk) free), `MINION_EXECUTOR_DOWNLOAD_TIMEOUT_S`; `MINION_EXECUTOR_FETCH_SANDBOX=0` is dev-only (needs `MINION_EXECUTOR_DEV=1`). A model that is loaded is pinned with a shared `flock`, so no executor process sharing the cache evicts it. Provisioning outcomes (release = `release` call, no retry budget burnt; fail = `fail` with the code):
 
@@ -353,7 +376,8 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   subprocess at a pinned revision, safetensors-only, sha256-verified; `HF_TOKEN`, proxy and CA settings
   reach only that subprocess. The worker is offline (`HF_HUB_OFFLINE=1`) and runs inside a macOS
   Seatbelt sandbox applied before any engine import: no network (except the loopback Ollama port,
-  granted to Ollama loads only), no process exec, no LaunchServices/AppleEvents/distributed
+  granted to Ollama loads only; Ollama is opt-in via `--engines ollama` because its daemon runs
+  outside this sandbox and `/api/pull` writes to `~/.ollama` outside the cache cap), no process exec, no LaunchServices/AppleEvents/distributed
   notifications/preferences/foreign signals, Mach lookups deny-default with a six-service Metal and
   logging allow-list (no Keychain, tccd, pasteboard, WindowServer, mds, nsurlsessiond), writes denied
   except the worker's tmp dir, a few `/dev` nodes and the Python Metal cache, reads denied for HOME,

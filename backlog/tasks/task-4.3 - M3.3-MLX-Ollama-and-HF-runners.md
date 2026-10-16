@@ -4,7 +4,7 @@ title: 'M3.3: MLX, Ollama and HF runners'
 status: In Progress
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-16 00:59'
+updated_date: '2026-10-16 02:20'
 labels:
   - M3
 dependencies:
@@ -22,8 +22,8 @@ Plan steps S6-S8 of TASK-4 (D10, D11, D12, D14).
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 MLX completion (BatchGenerator) and embedding runners pass gpu+model tests with tiny models; wired limit within budget
-- [ ] #2 Ollama runner (loopback only, digest pinned) passes MockTransport unit tests in CI
-- [ ] #3 HF mps runner: bge-small embeddings match MLX (cosine >= 0.99)
-- [ ] #4 CI stays green without engine extras (markers auto-skip; mypy strict clean)
+- [x] #1 MLX completion (BatchGenerator) and embedding runners pass gpu+model tests with tiny models; wired limit within budget
+- [x] #2 Ollama runner (loopback only, digest pinned) passes MockTransport unit tests in CI
+- [x] #3 HF mps runner: bge-small embeddings match MLX (cosine >= 0.99)
+- [x] #4 CI stays green without engine extras (markers auto-skip; mypy strict clean)
 <!-- AC:END -->

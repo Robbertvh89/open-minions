@@ -2,7 +2,13 @@
 
 The Ollama daemon is a separate, unsandboxed process: `/api/pull` makes *it* download weights from
 its own registry (confused-deputy residual risk, ADR-0009). The pin is the manifest digest, checked
-against `/api/tags` after every load. Prompts and responses are never logged or put in messages.
+against `/api/tags` after every load and again after every `run` (TOCTOU: a swapped model must
+not get its outputs stamped with our pin). Ollama is opt-in (`--engines ollama`). Prompts and
+responses are never logged or put in messages.
+
+Failure mapping: transport error -> release (`ENGINE_UNAVAILABLE`); 4xx -> non-retryable fail;
+5xx -> retryable fail (`OOM` when the status body says the model needs more memory; the body is
+matched, never copied); digest mismatch -> release (`MODEL_INTEGRITY`, executor-local).
 """
 
 from __future__ import annotations
@@ -10,7 +16,9 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import math
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,6 +34,8 @@ from minion_common.schemas import (
 
 from minion_executor.runners.base import (
     ENGINE_UNAVAILABLE,
+    MODEL_INTEGRITY,
+    OOM,
     EngineConfig,
     MemoryStats,
     Record,
@@ -34,10 +44,13 @@ from minion_executor.runners.base import (
 )
 from minion_executor.runners.prompts import build_messages, embedding_text
 
-MODEL_INTEGRITY = "MODEL_INTEGRITY"
-EMBED_CHUNK = 16  # texts per /api/embed call; sets the checkpoint cadence
+PARAMS_UNSUPPORTED = "PARAMS_UNSUPPORTED"
+ENGINE_REJECTED = "ENGINE_REJECTED"  # 4xx: the daemon refused this request; retrying cannot help
+ENGINE_ERROR = "ENGINE_ERROR"  # 5xx: the daemon failed; another attempt may succeed
+_TICK_S = 1.0  # checkpoint cadence while requests are in flight (duty cycle, pause, step timeout)
 _REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
-_PULL_TIMEOUT = httpx.Timeout(3600.0, connect=5.0)
+_PULL_MARGIN_S = 60.0  # a pull must end this long before the worker's load timeout
+_OOM_MARKERS = ("more system memory", "out of memory", "insufficient memory")
 
 
 def check_loopback(url: str) -> str:
@@ -59,28 +72,50 @@ def _unavailable(detail: str) -> RunnerError:
     return RunnerError(ENGINE_UNAVAILABLE, detail, retryable=True)
 
 
+def _status_error(resp: httpx.Response) -> RunnerError:
+    """Map an HTTP error status to a RunnerError. The body may echo the prompt: it is only
+    pattern-matched for out-of-memory, never copied into the message."""
+    status = resp.status_code
+    if status < 500:
+        return RunnerError(ENGINE_REJECTED, f"ollama http {status}", retryable=False)
+    try:
+        text = resp.text.lower()
+    except (httpx.HTTPError, ValueError):
+        text = ""
+    if any(m in text for m in _OOM_MARKERS):
+        return RunnerError(OOM, "ollama out of memory", retryable=True)
+    return RunnerError(ENGINE_ERROR, f"ollama http {status}", retryable=True)
+
+
 class OllamaRunner:
     def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
         self._transport = transport
         self._client: httpx.Client | None = None
+        self._model: ModelEntry | None = None
         self._ref = ""
         self._budget: Budget | None = None
+        self._cfg = EngineConfig()
 
     # -- HTTP -------------------------------------------------------------------------------
     def _request(
-        self, method: str, path: str, body: dict[str, Any] | None = None, *, pull: bool = False
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        timeout: httpx.Timeout = _REQUEST_TIMEOUT,
     ) -> httpx.Response:
-        assert self._client is not None  # noqa: S101 - callers check loaded state
+        client = self._client
+        if client is None:  # unloaded while a request was queued
+            raise _unavailable("ollama client closed")
         try:
-            return self._client.request(
-                method, path, json=body, timeout=_PULL_TIMEOUT if pull else _REQUEST_TIMEOUT
-            )
+            return client.request(method, path, json=body, timeout=timeout)
         except httpx.HTTPError as exc:  # transport, timeout, protocol: never echo the message
             raise _unavailable(type(exc).__name__) from None
 
     def _json(self, resp: httpx.Response) -> dict[str, Any]:
-        if resp.status_code >= 400:  # body may echo the prompt: status only
-            raise _unavailable(f"ollama http {resp.status_code}")
+        if resp.status_code >= 400:
+            raise _status_error(resp)
         try:
             data = resp.json()
         except ValueError:
@@ -88,6 +123,9 @@ class OllamaRunner:
         if not isinstance(data, dict):
             raise _unavailable("ollama returned unexpected json")
         return data
+
+    def _keep_alive(self) -> str:
+        return f"{max(1, self._cfg.keep_alive_s)}s"
 
     # -- Runner protocol --------------------------------------------------------------------
     def load(
@@ -101,46 +139,62 @@ class OllamaRunner:
             trust_env=False,
             follow_redirects=False,
         )
-        self._ref, self._budget = model.ref, budget
+        self._model, self._ref, self._budget, self._cfg = model, model.ref, budget, cfg
         try:
             show = self._request("POST", "/api/show", {"model": model.ref})
             if show.status_code == 404:
+                # Bounded below the worker's load timeout: a slow pull is a release, never a
+                # killed worker. (A pull that did not finish resumes on the next attempt.)
+                limit = max(10.0, cfg.load_timeout_s - _PULL_MARGIN_S)
                 pulled = self._request(
-                    "POST", "/api/pull", {"model": model.ref, "stream": False}, pull=True
+                    "POST",
+                    "/api/pull",
+                    {"model": model.ref, "stream": False},
+                    timeout=httpx.Timeout(limit, connect=5.0),
                 )
                 self._json(pulled)
             elif show.status_code >= 400:
-                raise _unavailable(f"ollama http {show.status_code}")
-            self._check_digest(model)
+                raise _status_error(show)
+            self._check_digest()
         except BaseException:
             self.unload()
             raise
 
-    def _check_digest(self, model: ModelEntry) -> None:
+    def _check_digest(self) -> None:
+        """The loaded tag must still resolve to the pinned manifest digest. A mismatch is
+        executor-local (this Mac's Ollama store differs): release, outputs are never stamped."""
+        assert self._model is not None  # noqa: S101 - callers check loaded state
         tags = self._json(self._request("GET", "/api/tags"))
-        want = (model.revision or "").removeprefix("sha256:").lower()
+        want = (self._model.revision or "").removeprefix("sha256:").lower()
         for m in tags.get("models") or []:
-            if isinstance(m, dict) and model.ref in (m.get("name"), m.get("model")):
+            if isinstance(m, dict) and self._ref in (m.get("name"), m.get("model")):
                 have = str(m.get("digest", "")).removeprefix("sha256:").lower()
                 if want and have == want:
                     return
                 break
-        raise RunnerError(MODEL_INTEGRITY, "ollama model digest mismatch", retryable=False)
+        raise RunnerError(
+            MODEL_INTEGRITY, "ollama model digest mismatch", retryable=True, release=True
+        )
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:
         if self._client is None or self._budget is None:
             raise RunnerError("not_loaded")
         if isinstance(params, CompletionParams):
-            return self._complete(batch, params, ctl)
-        if isinstance(params, EmbeddingParams):
-            return self._embed(batch, params, ctl)
-        raise RunnerError("BAD_PARAMS", "unknown params", retryable=False)
+            out = self._complete(batch, params, ctl)
+        elif isinstance(params, EmbeddingParams):
+            out = self._embed(batch, params, ctl)
+        else:
+            raise RunnerError("BAD_PARAMS", "unknown params", retryable=False)
+        if batch:
+            self._check_digest()  # the model may have been replaced while we ran (TOCTOU)
+        return out
 
     def _chat(self, rec: Record, messages: list[Any], params: CompletionParams) -> Record:
         options: dict[str, Any] = {
             "temperature": params.temperature,
             "top_p": params.top_p,
             "num_predict": params.max_tokens,
+            "num_ctx": self._cfg.max_prompt_tokens + params.max_tokens,
         }
         if params.seed is not None:
             options["seed"] = params.seed
@@ -148,7 +202,13 @@ class OllamaRunner:
             self._request(
                 "POST",
                 "/api/chat",
-                {"model": self._ref, "messages": messages, "stream": False, "options": options},
+                {
+                    "model": self._ref,
+                    "messages": messages,
+                    "stream": False,
+                    "keep_alive": self._keep_alive(),
+                    "options": options,
+                },
             )
         )
         msg = data.get("message")
@@ -164,51 +224,71 @@ class OllamaRunner:
             "completion_tokens": int(data.get("eval_count") or 0),
         }
 
+    def _embed_one(self, rec: Record, text: str) -> Record:
+        data = self._json(
+            self._request(
+                "POST",
+                "/api/embed",
+                {"model": self._ref, "input": text, "keep_alive": self._keep_alive()},
+            )
+        )
+        vecs = data.get("embeddings")
+        if not isinstance(vecs, list) or len(vecs) != 1:
+            raise _unavailable("ollama returned wrong embedding count")
+        # `prompt_eval_count` can under-report when Ollama's prompt cache holds a shared prefix.
+        return {
+            "id": rec.get("id"),
+            "embedding": _l2(vecs[0]),
+            "tokens": int(data.get("prompt_eval_count") or 0),
+        }
+
+    def _fan_out(self, jobs: Sequence[Callable[[], Record]], ctl: StepControl) -> list[Record]:
+        """Run `jobs` on a pool bounded by the budget's batch size. The main thread wakes at
+        least every `_TICK_S` to checkpoint (duty cycle, pause, step timeout stay live during
+        long requests); control-side calls never leave this thread. The first failure aborts."""
+        assert self._budget is not None  # noqa: S101
+        if not jobs:
+            return []
+        pool = ThreadPoolExecutor(
+            max_workers=max(1, min(len(jobs), self._budget.max_batch_size)),
+            thread_name_prefix="ollama",
+        )
+        futures: list[Future[Record]] = [pool.submit(job) for job in jobs]
+        pending = set(futures)
+        try:
+            while pending:
+                done, pending = wait(pending, timeout=_TICK_S, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    fut.result()  # re-raise the first failure
+                ctl.checkpoint(len(futures) - len(pending))
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        return [f.result() for f in futures]
+
     def _complete(
         self, batch: list[Record], params: CompletionParams, ctl: StepControl
     ) -> list[Record]:
-        assert self._budget is not None  # noqa: S101
         all_messages = [build_messages(rec, params) for rec in batch]  # BAD_INPUT before any I/O
-        if not batch:
-            return []
-        out: list[Record | None] = [None] * len(batch)
-        workers = max(1, min(len(batch), self._budget.max_batch_size))
-        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ollama")
-        futures: dict[Future[Record], int] = {}
-        try:
-            for i, (rec, msgs) in enumerate(zip(batch, all_messages, strict=True)):
-                futures[pool.submit(self._chat, rec, list(msgs), params)] = i
-            for done, fut in enumerate(as_completed(futures), 1):
-                out[futures[fut]] = fut.result()  # first failure fails the batch
-                ctl.checkpoint(done)  # control-side calls stay on this thread
-        except BaseException:
-            for f in futures:
-                f.cancel()
-            raise
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
-        return [o for o in out if o is not None]
+        jobs = [
+            partial(self._chat, rec, list(msgs), params)
+            for rec, msgs in zip(batch, all_messages, strict=True)
+        ]
+        return self._fan_out(jobs, ctl)
 
     def _embed(
         self, batch: list[Record], params: EmbeddingParams, ctl: StepControl
     ) -> list[Record]:
         if not params.normalize:
-            # Ollama only returns L2-normalised vectors: let another executor/engine take it.
-            raise _unavailable("ollama cannot return unnormalised embeddings")
-        texts = [embedding_text(rec) for rec in batch]
-        out: list[Record] = []
-        for start in range(0, len(texts), EMBED_CHUNK):
-            chunk = texts[start : start + EMBED_CHUNK]
-            data = self._json(
-                self._request("POST", "/api/embed", {"model": self._ref, "input": chunk})
+            # Ollama only returns L2-normalised vectors. The server rejects such tasks for
+            # ollama models (422 INVALID_PARAMS); this is the backstop, and it is final.
+            raise RunnerError(
+                PARAMS_UNSUPPORTED, "ollama cannot return unnormalised embeddings", retryable=False
             )
-            vecs = data.get("embeddings")
-            if not isinstance(vecs, list) or len(vecs) != len(chunk):
-                raise _unavailable("ollama returned wrong embedding count")
-            for rec, vec in zip(batch[start : start + EMBED_CHUNK], vecs, strict=True):
-                out.append({"id": rec.get("id"), "embedding": _l2(vec)})
-            ctl.checkpoint(len(out))
-        return out
+        texts = [embedding_text(rec) for rec in batch]  # BAD_INPUT before any I/O
+        jobs = [partial(self._embed_one, rec, text) for rec, text in zip(batch, texts, strict=True)]
+        return self._fan_out(jobs, ctl)
 
     def memory_in_use(self) -> MemoryStats:
         """Bytes Ollama holds for our model (`/api/ps`); the daemon's memory is not ours."""
@@ -232,7 +312,7 @@ class OllamaRunner:
                 client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=10.0)
         if client is not None:
             client.close()
-        self._client, self._ref, self._budget = None, "", None
+        self._client, self._model, self._ref, self._budget = None, None, "", None
 
 
 def _l2(vec: Any) -> list[float]:

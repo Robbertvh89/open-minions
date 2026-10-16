@@ -2,14 +2,16 @@ import asyncio
 import hashlib
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from minion_common.schemas import TaskCreate
-from minion_server.api.tasks import validate_uris
+from minion_common.enums import Engine, TaskType
+from minion_common.schemas import ModelEntry, TaskCreate
+from minion_server.api.tasks import create_task, validate_uris
 from minion_server.app import create_app
+from minion_server.auth import User
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
@@ -51,6 +53,42 @@ def _body(**kw: Any) -> TaskCreate:
         "output_uri": "s3://minion/outputs/t1/run1",
     }
     return TaskCreate.model_validate(base | kw)
+
+
+# --- unit: engine-specific params -------------------------------------------------------------
+
+
+async def _create_with(model: ModelEntry, params: dict[str, Any]) -> None:
+    body = _body(model=model.model_id, params=params)
+    await create_task(
+        body,
+        User(name="u", teams=("t1",)),
+        session=cast(Any, None),  # the checks under test fail before any I/O
+        settings=cast(Any, None),
+        storage=cast(Any, None),
+        models={model.model_id: model},
+    )
+
+
+def _embed_model(engine: Engine, ref: str, revision: str) -> ModelEntry:
+    return ModelEntry(
+        model_id="m1", type=TaskType.EMBEDDING, engine=engine, ref=ref,
+        revision=revision, memory_gb=1,
+    )  # fmt: skip
+
+
+async def test_ollama_model_rejects_unnormalized_embeddings() -> None:
+    model = _embed_model(Engine.OLLAMA, "nomic-embed-text:v1.5", "a" * 64)
+    with pytest.raises(HTTPException) as ei:
+        await _create_with(model, {"normalize": False})
+    assert ei.value.status_code == 422
+    assert ei.value.detail["code"] == "INVALID_PARAMS"  # type: ignore[index]
+
+
+async def test_other_engines_do_not_get_the_ollama_normalize_rule() -> None:
+    model = _embed_model(Engine.MLX, "o/m", "a" * 40)
+    with pytest.raises(AttributeError):  # got past the params check: next step needs real storage
+        await _create_with(model, {"normalize": False})
 
 
 # --- unit: URI rules -------------------------------------------------------------------------

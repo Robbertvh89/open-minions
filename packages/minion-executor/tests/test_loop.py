@@ -1152,7 +1152,7 @@ async def test_budget_duty_cycle_reaches_worker(tmp_path: Path) -> None:
 
 async def test_engine_not_advertised_or_too_big_is_always_released(tmp_path: Path) -> None:
     worker = FakeWorker()
-    a = _asn(model={**MODEL, "engine": "ollama", "revision": "sha256:" + "b" * 64})
+    a = _asn(model={**MODEL, "engine": "ollama", "ref": "o/m:t", "revision": "b" * 64})
     client, _ = await _run_one(tmp_path, a, worker)
     assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
     assert worker.ensured == []

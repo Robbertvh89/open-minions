@@ -38,6 +38,7 @@ class Daemon:
         self.digest, self.present = digest, present
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.chat_hook: Callable[[], None] | None = None
+        self.embed_hook: Callable[[], None] | None = None
         self.lock = threading.Lock()
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
@@ -65,7 +66,13 @@ class Daemon:
                 },
             )
         if p == "/api/embed":
-            return httpx.Response(200, json={"embeddings": [[3.0, 4.0] for _ in body["input"]]})
+            if self.embed_hook:
+                self.embed_hook()
+            inputs = body["input"] if isinstance(body["input"], list) else [body["input"]]
+            return httpx.Response(
+                200,
+                json={"embeddings": [[3.0, 4.0] for _ in inputs], "prompt_eval_count": 5},
+            )
         if p == "/api/ps":
             return httpx.Response(200, json={"models": [{"name": REF, "size": 1234}]})
         return httpx.Response(200, json={})
@@ -106,12 +113,12 @@ def test_load_404_pulls_without_streaming() -> None:
     assert d.calls[1][1] == {"model": REF, "stream": False}
 
 
-def test_digest_mismatch_is_not_retryable() -> None:
+def test_digest_mismatch_is_released_not_failed() -> None:
     d = Daemon(digest="cd" * 32)
     r = OllamaRunner(transport=httpx.MockTransport(d))
     with pytest.raises(RunnerError) as ei:
         r.load(MODEL, None, _budget(), EngineConfig())
-    assert ei.value.code == "MODEL_INTEGRITY" and not ei.value.retryable
+    assert ei.value.code == "MODEL_INTEGRITY" and ei.value.release  # executor-local
 
 
 def test_unknown_model_in_tags_is_integrity_error() -> None:
@@ -171,7 +178,14 @@ def test_chat_request_body_and_output() -> None:
             {"role": "system", "content": "be nice"},
             {"role": "user", "content": "hello"},
         ],
-        "options": {"temperature": 0.5, "top_p": 0.9, "num_predict": 16, "seed": 3},
+        "keep_alive": "60s",
+        "options": {
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "num_predict": 16,
+            "seed": 3,
+            "num_ctx": 8192 + 16,
+        },
     }
     assert out == [
         {"id": "a", "completion": "hi", "finish_reason": "stop",
@@ -183,7 +197,7 @@ def test_chat_omits_seed_when_unset() -> None:
     d = Daemon()
     _loaded(d).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
     body = next(b for p, b in d.calls if p == "/api/chat")
-    assert set(body["options"]) == {"temperature", "top_p", "num_predict"}
+    assert set(body["options"]) == {"temperature", "top_p", "num_predict", "num_ctx"}
 
 
 def test_bad_input_fails_before_any_request() -> None:
@@ -216,13 +230,48 @@ def test_concurrency_bound_checkpoint_and_order() -> None:
     out = r.run(batch, CompletionParams(), ctl)
     assert [o["id"] for o in out] == list(range(8))
     assert 1 < peak <= 3
-    assert ctl.ticks == list(range(1, 9))
+    assert ctl.ticks[-1] == 8 and ctl.ticks == sorted(t or 0 for t in ctl.ticks)
 
 
-def test_chat_failure_fails_batch_retryable() -> None:
+def _failing(status: int, text: str = "echo of the prompt") -> OllamaRunner:
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.path == "/api/chat":
-            return httpx.Response(500, text="echo of the prompt")
+            return httpx.Response(status, text=text)
+        return Daemon()(req)
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    r.load(MODEL, None, _budget(), EngineConfig())
+    return r
+
+
+@pytest.mark.parametrize("status", [400, 404, 413])
+def test_4xx_is_a_non_retryable_fail(status: int) -> None:
+    with pytest.raises(RunnerError) as ei:
+        _failing(status).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "ENGINE_REJECTED" and not ei.value.retryable
+    assert not ei.value.release and "echo" not in str(ei.value)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_5xx_is_a_retryable_fail_not_a_release(status: int) -> None:
+    with pytest.raises(RunnerError) as ei:
+        _failing(status).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "ENGINE_ERROR" and ei.value.retryable and not ei.value.release
+    assert "echo" not in str(ei.value)
+
+
+def test_oom_looking_500_maps_to_oom_without_echoing_the_body() -> None:
+    body = "model requires more system memory (9.0 GiB) than is available: SECRET PROMPT"
+    with pytest.raises(RunnerError) as ei:
+        _failing(500, body).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "OOM" and ei.value.retryable
+    assert "SECRET" not in str(ei.value) and "9.0" not in str(ei.value)
+
+
+def test_mid_run_transport_error_is_a_release() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/chat":
+            raise httpx.ReadTimeout("secret prompt text")
         return Daemon()(req)
 
     r = OllamaRunner(transport=httpx.MockTransport(handler))
@@ -230,27 +279,152 @@ def test_chat_failure_fails_batch_retryable() -> None:
     with pytest.raises(RunnerError) as ei:
         r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
     assert ei.value.code == "ENGINE_UNAVAILABLE" and ei.value.retryable
-    assert "echo" not in str(ei.value)
+    assert "secret" not in str(ei.value)
 
 
-def test_embed_list_input_normalized_and_chunked() -> None:
+def test_show_5xx_at_load_is_a_fail_not_a_release() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    with pytest.raises(RunnerError) as ei:
+        r.load(MODEL, None, _budget(), EngineConfig())
+    assert ei.value.code == "ENGINE_ERROR" and not ei.value.release
+
+
+def test_first_failure_aborts_without_waiting_for_the_rest() -> None:
+    calls = 0
+    lock = threading.Lock()
+    gate = threading.Event()
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if req.url.path == "/api/chat":
+            with lock:
+                calls += 1
+                first = calls == 1
+            if first:
+                return httpx.Response(400, text="no")
+            gate.wait(5)  # the rest are slow: the batch must not wait for them
+            return Daemon()(req)
+        return Daemon()(req)
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    r.load(MODEL, None, _budget(2), EngineConfig())
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(RunnerError):
+            r.run([{"id": i, "prompt": "x"} for i in range(6)], CompletionParams(), Ctl())
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        gate.set()
+
+
+def test_checkpoints_keep_firing_during_one_long_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as mod
+
+    monkeypatch.setattr(mod, "_TICK_S", 0.05)
+    d = Daemon()
+    d.chat_hook = lambda: time.sleep(0.5)
+    ctl = Ctl()
+    _loaded(d).run([{"id": 1, "prompt": "x"}], CompletionParams(), ctl)
+    assert len(ctl.ticks) >= 5 and ctl.ticks[:-1] == [0] * (len(ctl.ticks) - 1)
+    assert ctl.ticks[-1] == 1
+
+
+def test_checkpoint_raising_aborts_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as mod
+
+    monkeypatch.setattr(mod, "_TICK_S", 0.05)
+
+    class StopError(Exception):
+        pass
+
+    class StopCtl:
+        def checkpoint(self, records_done: int | None = None) -> None:
+            raise StopError
+
+    d = Daemon()
+    d.chat_hook = lambda: time.sleep(0.3)
+    with pytest.raises(StopError):
+        _loaded(d).run([{"id": 1, "prompt": "x"}], CompletionParams(), StopCtl())
+
+
+def test_digest_is_rechecked_after_run_and_mismatch_releases() -> None:
     d = Daemon()
     r = _loaded(d)
+    d.chat_hook = lambda: setattr(d, "digest", "cd" * 32)  # swapped while we ran
+    with pytest.raises(RunnerError) as ei:
+        r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "MODEL_INTEGRITY" and ei.value.release and ei.value.retryable
+    assert d.paths()[-1] == "/api/tags"
+
+
+def test_embed_one_text_per_call_with_tokens_and_keep_alive() -> None:
+    d = Daemon()
+    r = _loaded(d, n=3)
     ctl = Ctl()
-    batch = [{"id": i, "text": f"t{i}"} for i in range(20)]
+    batch = [{"id": i, "text": f"t{i}"} for i in range(5)]
     out = r.run(batch, EmbeddingParams(normalize=True), ctl)
     bodies = [b for p, b in d.calls if p == "/api/embed"]
-    assert [len(b["input"]) for b in bodies] == [16, 4]
-    assert all(set(b) == {"model", "input"} for b in bodies)
-    assert [o["id"] for o in out] == list(range(20))
+    assert sorted(b["input"] for b in bodies) == [f"t{i}" for i in range(5)]
+    assert all(
+        set(b) == {"model", "input", "keep_alive"} and b["keep_alive"] == "60s" for b in bodies
+    )
+    assert [o["id"] for o in out] == list(range(5))
+    assert all(set(o) == {"id", "embedding", "tokens"} and o["tokens"] == 5 for o in out)
     assert math.isclose(out[0]["embedding"][0], 0.6) and math.isclose(out[0]["embedding"][1], 0.8)
-    assert ctl.ticks == [16, 20]
+    assert ctl.ticks[-1] == 5
 
 
-def test_embed_unnormalized_is_released_not_failed() -> None:
-    r = _loaded(Daemon())
+def test_embed_unnormalized_is_a_final_params_error() -> None:
+    d = Daemon()
+    r = _loaded(d)
+    n = len(d.calls)
     with pytest.raises(RunnerError) as ei:
         r.run([{"id": 1, "text": "x"}], EmbeddingParams(normalize=False), Ctl())
+    assert ei.value.code == "PARAMS_UNSUPPORTED" and not ei.value.retryable
+    assert not ei.value.release and len(d.calls) == n
+
+
+def test_keep_alive_follows_config() -> None:
+    d = Daemon()
+    r = OllamaRunner(transport=httpx.MockTransport(d))
+    r.load(MODEL, None, _budget(), EngineConfig(keep_alive_s=120))
+    r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert next(b for p, b in d.calls if p == "/api/chat")["keep_alive"] == "120s"
+
+
+def test_num_ctx_covers_prompt_window_plus_output() -> None:
+    d = Daemon()
+    r = OllamaRunner(transport=httpx.MockTransport(d))
+    r.load(MODEL, None, _budget(), EngineConfig(max_prompt_tokens=1000))
+    r.run([{"id": 1, "prompt": "x"}], CompletionParams(max_tokens=24), Ctl())
+    assert next(b for p, b in d.calls if p == "/api/chat")["options"]["num_ctx"] == 1024
+
+
+def test_pull_timeout_is_below_the_worker_load_timeout() -> None:
+    seen: list[float | None] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/pull":
+            seen.append(req.extensions["timeout"]["read"])
+        return Daemon(present=False)(req)
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    r.load(MODEL, None, _budget(), EngineConfig(load_timeout_s=600.0))
+    assert seen == [540.0]
+
+
+def test_pull_timeout_is_a_release_not_a_crash() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/pull":
+            raise httpx.ReadTimeout("slow")
+        return Daemon(present=False)(req)
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    with pytest.raises(RunnerError) as ei:
+        r.load(MODEL, None, _budget(), EngineConfig())
     assert ei.value.code == "ENGINE_UNAVAILABLE" and ei.value.retryable
 
 

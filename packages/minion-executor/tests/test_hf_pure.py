@@ -27,7 +27,6 @@ def test_hf_is_supported_and_builds_per_task_type() -> None:
         ({}, "cls"),
         ({"pooling_mode_cls_token": True, "pooling_mode_mean_tokens": False}, "cls"),
         ({"pooling_mode_cls_token": False, "pooling_mode_mean_tokens": True}, "mean"),
-        ({"pooling_mode_mean_sqrt_len_tokens": True}, "mean"),
         ({"pooling_mode_lasttoken": True}, "lasttoken"),
         ({"word_embedding_dimension": 384}, "mean"),
     ],
@@ -78,3 +77,9 @@ def test_run_before_load_is_not_loaded() -> None:
     with pytest.raises(RunnerError) as ei:
         HfEmbeddingRunner().run([], EmbeddingParams(), Ctl())
     assert ei.value.code == "not_loaded"
+
+
+def test_mean_sqrt_len_pooling_is_unsupported() -> None:
+    with pytest.raises(RunnerError) as ei:
+        pooling_mode({"pooling_mode_mean_sqrt_len_tokens": True})
+    assert ei.value.code == MODEL_UNSUPPORTED and not ei.value.retryable

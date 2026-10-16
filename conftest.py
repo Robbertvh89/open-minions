@@ -69,7 +69,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 def _gpu_skip_reason(selected: str) -> str:
     if "gpu" not in selected:
-        return "needs an Apple GPU; run with: pytest -m gpu"
+        return 'needs an Apple GPU; run with: pytest -m "gpu or model"'
     if sys.platform != "darwin":
         return "needs macOS on Apple Silicon"
     try:

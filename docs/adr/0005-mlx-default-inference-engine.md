@@ -79,5 +79,5 @@ mean-pools unconditionally, which is wrong for CLS-pooled models such as bge. We
 sentence-transformers `1_Pooling/config.json` (CLS when absent) and tokenisation via the
 `transformers` tokenizer that `mlx-lm` already requires. Validated against `mlx-embeddings` on
 `bge-small-en-v1.5-bf16` with mean pooling: cosine >= 0.9999 on every text. Supported
-architectures: BERT / XLM-R style encoders; anything else fails the load with the non-retryable
+architectures: BERT encoders (XLM-R is excluded: its position ids start at `padding_idx + 1`); anything else fails the load with the non-retryable
 `MODEL_UNSUPPORTED`.

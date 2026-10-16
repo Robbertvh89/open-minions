@@ -25,6 +25,24 @@ def _bad_segments(ref: str) -> bool:
     return ".." in ref or tag == "." or any(seg in ("", ".") for seg in name.split("/"))
 
 
+def _ollama_ref_problem(ref: str) -> str | None:
+    """Why `ref` is not a plain 'name:tag' / 'namespace/name:tag' library ref, else None.
+
+    A tag is required (no implicit ':latest' to drift). A first path segment with '.' or ':' (or
+    'localhost') is a registry host, which would make the daemon pull from an arbitrary server.
+    """
+    if not _OLLAMA_TAG_RE.fullmatch(ref) or _bad_segments(ref):
+        return "ref must be an Ollama tag like 'name:tag'"
+    last = ref.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return "ref must carry an explicit tag like 'name:tag'"
+    if "/" in ref:
+        first = ref.split("/", 1)[0]
+        if "." in first or ":" in first or first == "localhost":
+            return "ref must not name a registry host"
+    return None
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -62,8 +80,8 @@ class ModelEntry(_Model):
             if rev is None or not _SHA1_RE.fullmatch(rev):
                 raise ValueError("revision must be a 40-hex commit SHA for mlx/hf models")
         elif self.engine == Engine.OLLAMA:
-            if not _OLLAMA_TAG_RE.fullmatch(ref) or _bad_segments(ref):
-                raise ValueError("ref must be an Ollama tag like 'name:tag'")
+            if (problem := _ollama_ref_problem(ref)) is not None:
+                raise ValueError(problem)
             digest = rev.removeprefix("sha256:") if rev is not None else None
             if digest is None or not _SHA256_RE.fullmatch(digest):
                 raise ValueError("revision must be a 64-hex manifest digest for ollama models")

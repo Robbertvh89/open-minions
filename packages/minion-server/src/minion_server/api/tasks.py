@@ -4,9 +4,10 @@ import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from minion_common.enums import SubtaskStatus, TaskStatus
+from minion_common.enums import Engine, SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     SLUG_PATTERN,
+    EmbeddingParams,
     ModelEntry,
     TaskCounts,
     TaskCreate,
@@ -132,9 +133,16 @@ async def create_task(
     if model.type != body.type:
         raise api_error(422, "MODEL_TYPE_MISMATCH", "model type does not match task type")
     try:
-        parse_params(body.type, body.params)
+        params = parse_params(body.type, body.params)
     except ValidationError as exc:
         raise api_error(422, "INVALID_PARAMS", _params_message(exc)) from exc
+    if (
+        model.engine == Engine.OLLAMA
+        and isinstance(params, EmbeddingParams)
+        and not params.normalize
+    ):
+        # Ollama only returns L2-normalised vectors: no executor could honour this (ADR-0009).
+        raise api_error(422, "INVALID_PARAMS", "model engine ollama requires normalize=true")
     in_uri, out_uri, in_key = validate_uris(body, settings)
     if not await storage.any_key(in_key):
         raise api_error(422, "EMPTY_INPUT", "no objects under the input prefix")

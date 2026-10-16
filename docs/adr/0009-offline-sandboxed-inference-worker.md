@@ -146,12 +146,27 @@ together with `MINION_EXECUTOR_DEV=1`.
     service on that port is trusted.
   - **Ollama daemon outside the sandbox (confused deputy).** The Ollama runner only talks HTTP to a
     loopback daemon. `/api/pull` makes that unsandboxed daemon download weights from its own
-    registry, and it then runs inference outside our Seatbelt profile and capacity budget. We accept
-    this because pulls use Ollama's own channel and the model is pinned by manifest digest, which the
-    runner re-checks against `/api/tags` on every load (mismatch: `MODEL_INTEGRITY`, not retryable).
-    The runner refuses non-loopback URLs and never logs prompts or responses. Ollama cannot return
-    unnormalised embeddings, so `normalize=false` is released (`ENGINE_UNAVAILABLE`) for another
-    engine, and truncation of over-long prompts is not detectable (no `PROMPT_TOO_LONG` lines).
+    registry (into `~/.ollama`, outside the model-cache cap), and it then runs inference outside our
+    Seatbelt profile and capacity budget. Therefore **Ollama is opt-in**: `--engines auto` probes
+    mlx and hf only, and Ollama needs `--engines ollama` (or a list containing it). Mitigations: a
+    `ModelEntry` ref must carry an explicit tag and must not name a registry host (a first path
+    segment with `.` or `:`, `localhost`, or an IP is rejected), so pulls come from Ollama's default
+    library; the model is pinned by manifest digest, which the runner checks against `/api/tags`
+    after every load **and after every run** (TOCTOU: a swapped model must not get its outputs
+    stamped). A mismatch is executor-local trouble (this Mac's store), so the subtask is released
+    (`MODEL_INTEGRITY`, retryable, no output stamped) rather than failed. The pull timeout stays
+    below the worker's load timeout, so a large pull is a release, never a killed worker. The
+    runner refuses non-loopback URLs and never logs prompts or responses.
+  - **Ollama deviations.** The daemon cannot return unnormalised embeddings: the server rejects
+    `normalize=false` for ollama models with 422 `INVALID_PARAMS`, and the runner fails it
+    non-retryably (`PARAMS_UNSUPPORTED`; no other engine is tried because the server already
+    refused such tasks). Embedding `tokens` is `prompt_eval_count` per text (one `/api/embed` call
+    each) and can under-report when the prompt cache holds a shared prefix. Over-long prompts are
+    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines); `num_ctx` is set to
+    `max_prompt_tokens + max_tokens`. Requests carry a bounded `keep_alive` and the worker unloads
+    the model (`keep_alive: 0`) on idle unload or a budget downgrade, before the process is killed.
+  - MLX workers are spawned with `USE_TORCH=0`, so `transformers` (used only for tokenisation) never
+    imports `torch`; MLX loads pass `trust_remote_code=False` and `local_files_only` explicitly.
   - The HF runner (`torch` 2.14 / `transformers` 5.20 on `mps`) runs under the same profile with
     **no extra grants**: weights load from the read-only model dir, and every cache variable
     torch/transformers might write (`TORCH_HOME`, `TORCHINDUCTOR_CACHE_DIR`, `XDG_CACHE_HOME`,

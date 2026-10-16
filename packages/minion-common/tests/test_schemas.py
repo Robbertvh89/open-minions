@@ -286,3 +286,24 @@ def test_parse_params_bounds() -> None:
         {"temperature": 2, "top_p": 1, "max_tokens": 4096, "seed": 0, "system": "x" * 8000},
     )
     assert isinstance(ok, CompletionParams) and ok.max_tokens == 4096
+
+
+def test_ollama_ref_requires_tag() -> None:
+    for ref in ("qwen2.5", "library/qwen2.5", "user/model"):
+        with pytest.raises(ValidationError, match="tag"):
+            _entry(engine="ollama", ref=ref, revision=SHA256)
+    assert _entry(engine="ollama", ref="user/model:7b", revision=SHA256).ref == "user/model:7b"
+
+
+def test_ollama_ref_rejects_registry_host() -> None:
+    for ref in (
+        "hf.co/user/model:q4",
+        "registry.example.com/user/model:1",
+        "localhost/model:1",
+        "localhost:5000/model:1",
+        "127.0.0.1/model:1",
+        "10.0.0.5:11434/model:1",
+        "example.com:443/a/b:1",
+    ):
+        with pytest.raises(ValidationError, match="ref"):
+            _entry(engine="ollama", ref=ref, revision=SHA256)
