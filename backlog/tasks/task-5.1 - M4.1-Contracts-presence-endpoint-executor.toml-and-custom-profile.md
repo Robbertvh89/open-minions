@@ -1,10 +1,10 @@
 ---
 id: TASK-5.1
 title: 'M4.1 Contracts, presence endpoint, executor.toml and custom profile'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 13:59'
+updated_date: '2026-10-16 14:14'
 labels:
   - M4
 dependencies: []
