@@ -9,9 +9,9 @@ from minion_common.enums import Engine, TaskType
 
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, EngineConfig, Runner, RunnerError
 
-# Engines `create_runner` can build. Ollama/HF land with their runners (TASK-4.3 S7/S8); until
-# then they probe as unavailable so they are never advertised.
-SUPPORTED: frozenset[Engine] = frozenset({Engine.FAKE, Engine.MLX})
+# Engines `create_runner` can build. HF lands with its runner (TASK-4.3 S8); until
+# then it probes as unavailable so they are never advertised.
+SUPPORTED: frozenset[Engine] = frozenset({Engine.FAKE, Engine.MLX, Engine.OLLAMA})
 
 
 def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = False) -> Runner:
@@ -29,7 +29,11 @@ def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = Fal
         from minion_executor.runners.mlx_completion import MlxCompletionRunner
 
         return MlxCompletionRunner()
-    raise RunnerError(ENGINE_UNAVAILABLE, engine.value)  # ollama/hf land in TASK-4.3 S7/S8
+    if engine is Engine.OLLAMA:
+        from minion_executor.runners.ollama import OllamaRunner
+
+        return OllamaRunner()
+    raise RunnerError(ENGINE_UNAVAILABLE, engine.value)  # hf lands in TASK-4.3 S8
 
 
 _PROBE_MODULES: dict[Engine, tuple[str, ...]] = {
@@ -55,11 +59,14 @@ def _probe(engine: Engine, cfg: EngineConfig) -> str | None:
     if engine is Engine.OLLAMA:
         import httpx
 
+        from minion_executor.runners.ollama import check_loopback
+
         try:
-            r = httpx.get(f"{cfg.ollama_url}/api/version", timeout=2.0)
+            url = check_loopback(cfg.ollama_url)
+            r = httpx.get(f"{url}/api/version", timeout=2.0, trust_env=False)
             version = r.json().get("version")
             return str(version) if r.status_code == 200 and version else None
-        except (httpx.HTTPError, ValueError, AttributeError):
+        except (httpx.HTTPError, ValueError, AttributeError, RunnerError):
             return None
     try:
         mods = [importlib.import_module(m) for m in _PROBE_MODULES[engine]]

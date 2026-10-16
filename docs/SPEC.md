@@ -101,7 +101,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
     records of a subtask are processed in batches sized by the capacity budget; the pacer runs
     after every generation step. Install with `uv sync --package minion-executor --extra mlx`.
     All records of a subtask are processed in batches sized by the capacity budget.
-  - `ollama` (fallback, e.g. GGUF-only models): local Ollama HTTP API **[paper]**.
+  - `ollama` (fallback, e.g. GGUF-only models): local Ollama HTTP API **[paper]**. The runner talks to a loopback daemon only, pulls missing models with `/api/pull` and verifies the pinned manifest digest (`MODEL_INTEGRITY` on mismatch). The daemon runs outside the sandbox and the capacity budget (residual confused-deputy risk, ADR-0009).
   - `hf` (fallback): HuggingFace transformers on `mps` **[paper]**.
   - Inference runs in a worker subprocess; the loaded model is kept warm across consecutive subtasks
     of the same model and unloaded when the budget drops or the executor idles > 10 min.

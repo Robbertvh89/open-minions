@@ -74,6 +74,7 @@ markers = [
     "integration: needs Docker (Postgres/MinIO via testcontainers)",
     "macos: needs macOS (Seatbelt sandbox); auto-skipped elsewhere",
     "gpu: needs an Apple GPU and the mlx extra (pytest -m gpu); auto-skipped unless selected/available",
+    "ollama: needs a live local Ollama daemon (opt in: pytest -m ollama); auto-skipped otherwise",
     "model: downloads a real tiny model from the Hugging Face hub (opt in: pytest -m model)",
 ]
 addopts = "--import-mode=importlib"

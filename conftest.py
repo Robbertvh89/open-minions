@@ -53,6 +53,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if "gpu" in item.keywords:
                 item.add_marker(skip_gpu)
+    ollama_reason = _ollama_skip_reason(selected)
+    if ollama_reason:
+        skip_ollama = pytest.mark.skip(reason=ollama_reason)
+        for item in items:
+            if "ollama" in item.keywords:
+                item.add_marker(skip_ollama)
     if "model" in selected:
         return
     skip = pytest.mark.skip(reason="needs network; run with: pytest -m model")
@@ -71,6 +77,16 @@ def _gpu_skip_reason(selected: str) -> str:
     except ImportError:
         return "install the mlx extra: uv sync --package minion-executor --extra mlx"
     return ""
+
+
+def _ollama_skip_reason(selected: str) -> str:
+    if "ollama" not in selected:
+        return "needs a live Ollama daemon; run with: pytest -m ollama"
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=2):
+            return ""
+    except (OSError, ValueError):
+        return "no Ollama daemon answering on 127.0.0.1:11434"
 
 
 REPO_ROOT = Path(__file__).resolve().parent

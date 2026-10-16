@@ -144,6 +144,14 @@ together with `MINION_EXECUTOR_DEV=1`.
     not enforced).
   - Seatbelt does not filter by hostname; the Ollama grant is a loopback port, so a hostile local
     service on that port is trusted.
+  - **Ollama daemon outside the sandbox (confused deputy).** The Ollama runner only talks HTTP to a
+    loopback daemon. `/api/pull` makes that unsandboxed daemon download weights from its own
+    registry, and it then runs inference outside our Seatbelt profile and capacity budget. We accept
+    this because pulls use Ollama's own channel and the model is pinned by manifest digest, which the
+    runner re-checks against `/api/tags` on every load (mismatch: `MODEL_INTEGRITY`, not retryable).
+    The runner refuses non-loopback URLs and never logs prompts or responses. Ollama cannot return
+    unnormalised embeddings, so `normalize=false` is released (`ENGINE_UNAVAILABLE`) for another
+    engine, and truncation of over-long prompts is not detectable (no `PROMPT_TOO_LONG` lines).
   - The profile is validated on macOS 27 / Apple Silicon with mlx 0.32 only; other macOS releases may
     need extra allows (the failure mode is `SANDBOX_FAILED`/engine error, never silent widening).
 - **`sandbox_init` is deprecated** by Apple. It is still shipped and is what Chromium, Firefox and

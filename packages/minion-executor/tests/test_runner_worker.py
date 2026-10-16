@@ -100,13 +100,13 @@ def test_fake_memory_in_use_zeros() -> None:
 
 def test_unavailable_engine_and_unknown() -> None:
     with pytest.raises(RunnerError) as ei:
-        create_runner(Engine.HF, TaskType.EMBEDDING)  # hf/ollama land in TASK-4.3 S7/S8
+        create_runner(Engine.HF, TaskType.EMBEDDING)  # hf lands in TASK-4.3 S8
     assert ei.value.code == "ENGINE_UNAVAILABLE"
     from minion_executor.runners import probe_engines
 
-    # not implemented => never advertised, even if the module imports / the daemon answers
-    probed = probe_engines([Engine.OLLAMA, Engine.HF, Engine.FAKE], EngineConfig())
-    assert probed == {"ollama": None, "hf": None, "fake": "fake"}
+    # not implemented => never advertised, even if the module imports
+    probed = probe_engines([Engine.HF, Engine.FAKE], EngineConfig())
+    assert probed == {"hf": None, "fake": "fake"}
     with pytest.raises(ValueError):
         Engine("nope")
 
