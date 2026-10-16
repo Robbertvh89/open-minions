@@ -1,10 +1,10 @@
 ---
 id: TASK-14
 title: Fix pre-existing HF gpu test failures (OOM vs 2 GB test budget)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 19:01'
-updated_date: '2026-10-16 19:12'
+updated_date: '2026-10-16 19:17'
 labels:
   - executor
   - test

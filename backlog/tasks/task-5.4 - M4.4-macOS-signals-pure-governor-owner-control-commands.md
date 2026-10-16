@@ -1,9 +1,10 @@
 ---
 id: TASK-5.4
 title: 'M4.4 macOS signals, pure governor, owner control commands'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-16 13:32'
+updated_date: '2026-10-16 19:17'
 labels:
   - M4
 dependencies: []
