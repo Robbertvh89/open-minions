@@ -143,8 +143,8 @@ minion_executor/
 
 #### Executor implementation (M1, TASK-2.3)
 Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
-`runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Not yet: governor/signals, MLX/Ollama/HF
-runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
+`runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Later: MLX/Ollama/HF runners (TASK-4.3,
+listed under the worker bullets below). Not yet: governor/signals, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
 
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
   `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
@@ -190,8 +190,8 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   clients are built (they read proxy env at construction) and before any spawn, so the control
   process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
   bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
-  process dies (parent-pid watch). Runners: `mlx` (TASK-4.3 S6; completion and embedding) and the
-  test-only `fake` (`runners/fake.py`, never advertised as a real engine). The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
+  process dies (parent-pid watch). Runners: `mlx` (completion and embedding), `ollama` (opt-in, loopback only), `hf` (mps)
+  (all TASK-4.3) and the test-only `fake` (`runners/fake.py`, never advertised as a real engine). The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
   work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
   control process (invariant 7).
 - **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
