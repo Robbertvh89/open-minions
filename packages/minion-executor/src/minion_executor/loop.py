@@ -46,6 +46,7 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.capacity.governor import Decision
+from minion_executor.capacity.profiles import GIB
 from minion_executor.capacity.runtime import FixedGovernor, Governor
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
 from minion_executor.model_cache import MODEL_CACHE_FULL, ModelCache, ModelFetchError
@@ -84,6 +85,25 @@ class _Outcome(enum.Enum):
     DISCARDED = enum.auto()  # stale (409): someone else owns it now, nothing to report
     STOPPED = enum.auto()  # stop requested mid-subtask
     CANCELLED = enum.auto()  # task cancelled via heartbeat: released, no failure backoff
+    RELEASED = enum.auto()  # governor released it (pause, downgrade, critical): no back-off
+
+
+class _Verdict(enum.Enum):
+    """Why the governor watcher ended the in-flight subtask (values are the log codes)."""
+
+    PAUSE_EXPIRED = "PAUSE_RELEASE"  # paused >= pause_release_after_s: release
+    MEMORY_CRITICAL = "MEMORY_CRITICAL_RELEASE"  # memory pressure critical: release at once
+    DOWNGRADE_TIMEOUT = "BUDGET_DOWNGRADE"  # batch overran the 60 s bound after a downgrade
+    OOM = "OOM"  # worker footprint > 1.1 x budget twice (D7): retryable failure
+    PRIORITY = "PRIORITY_VIOLATION"  # worker less throttled than its budget (D8): respawn
+
+
+class _DowngradeError(Exception):
+    """The memory budget fell below the loaded model at a batch boundary (FR-54)."""
+
+
+MEMORY_GUARD_FACTOR = 1.10  # D7: footprint over budget x 1.10 on two consecutive samples
+MEMORY_GUARD_SAMPLES = 2
 
 
 def cleanup_stale_tmp(root: Path | None = None) -> int:
@@ -178,6 +198,9 @@ class ExecutorLoop:
         stop_grace_s: float = 0.0,
         governor: Governor | None = None,
         presence_interval_s: float = 60.0,
+        downgrade_batch_s: float = 60.0,
+        guard_interval_s: float = 2.0,
+        priority_grace_s: float = 60.0,
     ) -> None:
         self._cache = model_cache
         self._client = client
@@ -186,6 +209,11 @@ class ExecutorLoop:
         # decision is the only source of the budget (never budget_for(profile): a hold lowers it)
         self._gov: Governor = governor if governor is not None else FixedGovernor(budget)
         self._presence_s = presence_interval_s
+        self._downgrade_batch_s = downgrade_batch_s  # FR-54: finish the batch, bounded
+        self._guard_s = guard_interval_s  # footprint / priority sampling period (D7)
+        self._prio_grace_s = priority_grace_s  # a new priority applies at the worker's next batch
+        self._ctl_key: tuple[float, bool] | None = None  # last (duty, paused) pushed to the worker
+        self._trim_pushed = False
         self._presence_key: tuple[object, object] | None = None
         self._presence_due = 0.0
         self._loaded: ModelEntry | None = None  # model the warm worker holds (None: nothing)
@@ -550,8 +578,9 @@ class ExecutorLoop:
         work = asyncio.create_task(self._execute(a, tmp, hb))
         stopper = asyncio.create_task(self._hard_stop.wait())
         beat = asyncio.create_task(hb.run())
+        watch = asyncio.create_task(self._watch(a))
         try:
-            pending: set[asyncio.Future[Any]] = {work, stopper, beat}
+            pending: set[asyncio.Future[Any]] = {work, stopper, beat, watch}
             while not work.done():
                 await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 if work.done():
@@ -568,13 +597,23 @@ class ExecutorLoop:
                         return await self._complete(a, work.result(), bound)
                     await self._release(a, bound)
                     return _Outcome.STOPPED
-                if beat.cancelled() or beat.exception() is not None:
-                    # A broken heartbeater is "no signal": the work carries on.
-                    exc = None if beat.cancelled() else beat.exception()
-                    bound.warning("heartbeat_task_error", error=type(exc).__name__)
-                    pending.discard(beat)
-                    continue
-                return await self._on_signal(a, work, beat.result(), bound)
+                if watch.done():
+                    if watch.cancelled() or watch.exception() is not None:
+                        # A broken watcher must not take the subtask down; the heartbeat and the
+                        # server-side lease still bound it. Fail closed on the budget instead.
+                        exc = None if watch.cancelled() else watch.exception()
+                        bound.error("governor_watch_error", error=type(exc).__name__)
+                        pending.discard(watch)
+                        continue
+                    return await self._on_verdict(a, work, watch.result(), bound)
+                if beat.done():
+                    if beat.cancelled() or beat.exception() is not None:
+                        # A broken heartbeater is "no signal": the work carries on.
+                        exc = None if beat.cancelled() else beat.exception()
+                        bound.warning("heartbeat_task_error", error=type(exc).__name__)
+                        pending.discard(beat)
+                        continue
+                    return await self._on_signal(a, work, beat.result(), bound)
             try:
                 result = work.result()
             except _SignalledError as s:
@@ -585,6 +624,16 @@ class ExecutorLoop:
             except StaleAcquirementError:
                 bound.info("stale_discarded")
                 return _Outcome.DISCARDED
+            except _DowngradeError:
+                # FR-54: the batch is done; hand the subtask back and free the model memory
+                bound.warning("budget_downgrade_release", code="BUDGET_DOWNGRADE")
+                self._loaded = None
+                self._unloaded = True
+                await self._bounded_thread(self._worker.unload)  # Ollama keep_alive 0, then kill
+                if self._cache is not None:
+                    self._cache.release_in_use()
+                await self._release(a, bound)
+                return _Outcome.RELEASED
             except Exception as exc:  # poison pill: never let one subtask kill the loop
                 bound.warning("unexpected_error", error=type(exc).__name__)
                 err = _FailureError(True, "EXECUTOR_ERROR", "unexpected executor error")
@@ -598,12 +647,109 @@ class ExecutorLoop:
         finally:
             stopper.cancel()
             beat.cancel()  # also during _complete: the lease is kept alive until we return
+            watch.cancel()  # the governor only steers a running subtask, not its completion
             if not work.done():
                 work.cancel()
-            await asyncio.gather(stopper, beat, work, return_exceptions=True)
+            await asyncio.gather(stopper, beat, watch, work, return_exceptions=True)
             # The work task has truly finished (incl. a shielded file write): nothing may linger.
             for p in self._paths(a, tmp):
                 p.unlink(missing_ok=True)
+
+    async def _push_control(self, d: Decision) -> None:
+        """Hand the live duty / pause (and a one-shot trim) to the worker, on change only. The
+        worker applies it at its next checkpoint, at once during a pacer sleep (FR-54)."""
+        key = (d.budget.gpu_duty_cycle, d.paused)
+        trim = d.trim and not self._trim_pushed
+        self._trim_pushed = d.trim
+        if key == self._ctl_key and not trim:
+            return
+        self._ctl_key = key
+        try:
+            await asyncio.to_thread(self._worker.control, duty=key[0], paused=key[1], trim=trim)
+        except Exception as exc:  # e.g. a malformed value: log, retry on the next change
+            self._ctl_key = None
+            log.warning("worker_control_failed", error=type(exc).__name__)
+
+    def _sample_worker(self) -> tuple[int | None, bool | None]:
+        try:
+            return self._worker.footprint_bytes(), self._worker.priority_ok()
+        except Exception:  # sampling must never take the watcher down
+            return None, None
+
+    async def _watch(self, a: Assignment) -> _Verdict:
+        """Beside the work: keep the worker in step with the governor and decide when the
+        in-flight subtask must be given up. Returns the verdict; otherwise runs until cancelled.
+
+        - pushes duty / pause / trim to the worker on every change;
+        - `release_now` (memory critical) and `pause_expired` (>= 60 s paused) end it at once; both
+          are level-triggered, so acting on them is idempotent;
+        - FR-54: a memory budget below the model gets `downgrade_batch_s` to finish the batch
+          (the batch loop checks at each boundary), then the worker is interrupted;
+        - D7: footprint over 1.1 x the memory budget on two consecutive samples;
+        - D8: a worker less throttled than its CPU priority, after a grace window of one batch.
+        """
+        gov, clock = self._gov, self._clock
+        version = gov.version
+        over = 0
+        downgrade_since: float | None = None
+        cpu = gov.decision.budget.cpu_priority
+        grace_until = clock() + self._prio_grace_s
+        next_sample = clock() + self._guard_s
+        while True:
+            d = gov.decision
+            await self._push_control(d)
+            if d.release_now:
+                return _Verdict.MEMORY_CRITICAL
+            if d.pause_expired:
+                return _Verdict.PAUSE_EXPIRED
+            now = clock()
+            if d.budget.cpu_priority != cpu:
+                cpu, grace_until = d.budget.cpu_priority, now + self._prio_grace_s
+            downgrading = a.model.memory_gb > d.budget.memory_gb
+            if downgrading:
+                downgrade_since = now if downgrade_since is None else downgrade_since
+                if now - downgrade_since >= self._downgrade_batch_s:
+                    return _Verdict.DOWNGRADE_TIMEOUT
+            else:
+                downgrade_since = None
+            if now >= next_sample:
+                next_sample = now + self._guard_s
+                footprint, prio_ok = await asyncio.to_thread(self._sample_worker)
+                limit = d.budget.memory_gb * GIB * MEMORY_GUARD_FACTOR
+                # while downgrading the worker legitimately exceeds the new, lower budget
+                if not downgrading and footprint is not None and footprint > limit:
+                    over += 1
+                    if over >= MEMORY_GUARD_SAMPLES:
+                        return _Verdict.OOM
+                else:
+                    over = 0
+                if prio_ok is False and now >= grace_until:
+                    return _Verdict.PRIORITY
+            wake = next_sample - clock()
+            if downgrade_since is not None:
+                wake = min(wake, downgrade_since + self._downgrade_batch_s - clock())
+            version = await gov.wait_change(version, max(0.01, wake))
+
+    async def _on_verdict(
+        self, a: Assignment, work: asyncio.Task[CompleteRequest], v: _Verdict, bound: Any
+    ) -> _Outcome:
+        """The governor ended the subtask: interrupt the worker (it is killed, so its memory is
+        back at once), drop the work, then release - or, for the memory guard, fail it as a
+        retryable OOM. Nothing is uploaded or completed (invariant 5)."""
+        bound.warning("governor_interrupt", code=v.value)
+        self._loaded = None
+        await asyncio.to_thread(self._worker.interrupt)
+        if self._cache is not None:
+            self._cache.release_in_use()  # the killed worker no longer holds the model
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
+        if v is _Verdict.OOM:
+            err = _FailureError(True, "OOM", "worker memory exceeded the budget")
+            await self._report_failure(a, err, bound)
+            return _Outcome.FAILED
+        await self._release(a, bound)
+        # a priority violation is a local fault: back off so it cannot churn; the rest is policy
+        return _Outcome.FAILED if v is _Verdict.PRIORITY else _Outcome.RELEASED
 
     def _paused_reason(self) -> str | None:
         reason = self._gov.decision.paused_reason
@@ -801,6 +947,8 @@ class ExecutorLoop:
             model_path = await self._ensure_cached(a.model)
             await self._wait_unpaused()  # no model load while paused (the watcher bounds this)
             budget = self._gov.decision.budget
+            if a.model.memory_gb > budget.memory_gb:
+                raise _DowngradeError  # the budget fell while the model was being fetched
             try:
                 if model_path is None:
                     await asyncio.to_thread(self._worker.ensure_model, a.model, budget)
@@ -815,7 +963,11 @@ class ExecutorLoop:
             i = 0
             while i < len(records):
                 await self._wait_unpaused()
-                budget = self._gov.decision.budget  # re-read per batch: FR-54 "next batch"
+                d = self._gov.decision
+                budget = d.budget  # re-read per batch: FR-54 "next batch"
+                if a.model.memory_gb > budget.memory_gb:
+                    raise _DowngradeError  # finish the batch, then give the subtask back (FR-54)
+                await self._push_control(d)
                 batch = records[i : i + budget.max_batch_size]
                 outputs.extend(
                     await asyncio.to_thread(self._worker.run, batch, params, progress(i), budget)
