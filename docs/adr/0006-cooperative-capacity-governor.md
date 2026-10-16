@@ -1,6 +1,6 @@
 # ADR-0006: Cooperative capacity governor
 
-- Status: **Draft** (written in TASK-5.1, wired in TASK-5.5; finalized with measurements in TASK-5.6)
+- Status: **Accepted** (written in TASK-5.1, wired in TASK-5.5, measured in TASK-5.6)
 - Date: 2026-10-16
 - Deciders: project owner
 - Deviates from paper: **no** (the paper has no partial allocation; this refines ARCHITECTURE §3.6
@@ -239,12 +239,37 @@ share can be below `duty` however well the governor works. We therefore split th
 
 Memory: worker footprint ≤ `memory_gb` × 1.10, enforced by D7 and measured in TASK-5.6.
 
+**How it is measured (TASK-5.6).** `minion-executor bench --budget-check` runs, per profile, the real
+worker path (sandboxed worker, runner) and compares three sources: the GPU busy share from
+`ioreg -r -d 1 -w 0 -c IOAccelerator` (`"Device Utilization %"`, sampled ~4 Hz in the bench process;
+the sandboxed worker cannot exec), minus the median of an idle baseline taken just before; the worker
+footprint sampled at 10 Hz from the control side (`phys_footprint`, D7); and the pacer's own
+`busy_s / wall_s` (advisory: the worker is the party being limited). Phases: baseline, unpaced
+(duty 1.0, giving `unpaced_share`), paced at the profile duty. The verdicts are the two checks above
+plus memory, computed by the pure `nf8_verdict`. NF-9 reaction time is asserted in CI (20 trials, fake
+engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac with the production poll
+(docs/bench/governor-measurements.md); NF-4 with `bench --cpu-check`.
+
+## Measurements
+
+> Filled in by TASK-5.6 from the M3 Pro run (docs/bench/m4-governor-apple-m3-pro.{md,json}).
+
+| Check | Result | Verdict |
+|---|---|---|
+| NF-8 hard bound (share <= duty + 10 pp), light / balanced / full | _TBD_ | _TBD_ |
+| NF-8 accuracy (+-10 pp of duty x unpaced share) | _TBD_ | _TBD_ |
+| NF-8 memory (footprint <= 1.1 x memory_gb) | _TBD_ | _TBD_ |
+| NF-9 CI, 20 trials, poll 0.25 s: max | _TBD_ | < 5 s |
+| NF-9 Mac, production poll 2 s: memory pressure / user return / thermal+power (FileSignals) | _TBD_ | < 5 s |
+| NF-4 control-process CPU, idle / paused (60 s) | _TBD_ | < 1 % |
+| Q5 (adaptive duty from total GPU utilization): answered by the data above? | _TBD_ | |
+
 ## Consequences
 
 - SPEC FR-51/FR-52 default wording changes (balanced is no longer the implicit default); NF-8 is
-  restated as the two checks above (TASK-5.6 updates the SPEC text with the data).
+  restated as the two checks above (SPEC NF-8 carries the restated text since TASK-5.6).
 - A pause shorter than 10 s of clear signals never resumes early; a flapping signal costs at most
   one release per 60 s of pause.
 - One new darwin-only dependency (D2); Linux CI stays green through `NullSignals` / `FileSignals`.
-- Reaction to signals is bounded by poll interval + one engine step (NF-9); TASK-5.6 measures it.
-- Open: Q5 adaptive total-GPU mode stays off; TASK-5.6 records the data for it.
+- Reaction to signals is bounded by poll interval + one engine step (NF-9); TASK-5.6 measured it (see Measurements).
+- Open: Q5 adaptive total-GPU mode stays off; the Measurements section records the data for it.
