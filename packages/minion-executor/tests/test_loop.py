@@ -405,6 +405,20 @@ async def test_complete_non_stale_409_is_discarded(tmp_path: Path) -> None:
     assert client.kinds().count("complete") == 1
 
 
+async def test_runner_release_error_releases_without_failing(tmp_path: Path) -> None:
+    from minion_executor.runners.base import RunnerError
+
+    class RelWorker(FakeWorker):
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
+            raise RunnerError("MODEL_INTEGRITY", "x", release=True)
+
+    client = FakeClient([assignment()])
+    loop = make_loop(client, RelWorker(), FakeS3(), tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
     class ShortWorker(FakeWorker):
         def run(self, batch: list[Record], *_: Any) -> list[Record]:

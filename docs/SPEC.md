@@ -115,11 +115,16 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
     `INVALID_PARAMS`) and the runner fails it non-retryably (`PARAMS_UNSUPPORTED`); embedding
     `tokens` is `prompt_eval_count` of one `/api/embed` call per text and can under-report when
     Ollama's prompt cache holds a shared prefix; over-long prompts are not detectable (no
-    `PROMPT_TOO_LONG` lines; `num_ctx` is `max_prompt_tokens + max_tokens`). Every request carries a
+    `PROMPT_TOO_LONG` lines; `num_ctx` is the constant `max_prompt_tokens + 4096`, which costs KV cache for that window, ADR-0009). Every request carries a
     bounded `keep_alive` (`MINION_EXECUTOR_IDLE_UNLOAD_S`, at most 300 s, 60 s when disabled) and
-    the worker asks the runner to unload (`keep_alive: 0`) before it is killed. HTTP 4xx is a
-    non-retryable failure, 5xx a retryable failure (`OOM` when the daemon reports too little
-    memory), a transport error a release (`ENGINE_UNAVAILABLE`).
+    the worker asks the runner to unload (`keep_alive: 0`) before it is killed, on idle unload and on
+    a model switch, under a total deadline that always ends in a kill; after a hard kill (stop,
+    cancel, 409) the control side sends a best-effort `keep_alive: 0` (short timeout, no env
+    proxies). Load phase (show, pull, tags): 5xx and transport errors are releases
+    (`ENGINE_UNAVAILABLE`), 4xx a non-retryable failure. Run phase: 4xx is a non-retryable failure,
+    except 404 (model removed locally), which is a release; 5xx a retryable failure (`OOM` when
+    the daemon reports too little memory); a transport error a release (`ENGINE_UNAVAILABLE`).
+    Refs allow at most one `/` (`namespace/name:tag`).
   - `hf` (fallback): HuggingFace transformers on `mps` **[paper]**. Output lines as for `mlx`
     (embedding `{id, embedding, tokens}`; completion `{id, completion, finish_reason,
     prompt_tokens, completion_tokens}`), safetensors only, local files only, remote code off.

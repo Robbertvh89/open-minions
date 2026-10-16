@@ -36,6 +36,8 @@ def _ollama_ref_problem(ref: str) -> str | None:
     last = ref.rsplit("/", 1)[-1]
     if ":" not in last:
         return "ref must carry an explicit tag like 'name:tag'"
+    if ref.count("/") > 1:
+        return "ref must be 'name:tag' or 'namespace/name:tag'"
     if "/" in ref:
         first = ref.split("/", 1)[0]
         if "." in first or ":" in first or first == "localhost":

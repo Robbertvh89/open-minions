@@ -194,6 +194,7 @@ class FakeRunner:
                         INJECTED_FAILURE,
                         "injected failure",
                         retryable=rec.get("retryable", True) is not False,
+                        release=rec.get("release") is True,
                     )
                 if rec.get("sleep_s"):  # simulate a slow subtask (capped); no ticks
                     time.sleep(min(float(rec["sleep_s"]), 60.0))

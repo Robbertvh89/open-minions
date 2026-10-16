@@ -595,9 +595,10 @@ def test_unload_asks_the_worker_to_unload_before_the_kill(monkeypatch: pytest.Mo
         sent: list[tuple[str, float]] = []
         real_call = w._call
 
-        def spy(msg: dict[str, object], timeout_s: float, on_progress: object = None) -> dict:  # type: ignore[type-arg]
+        def spy(msg: dict[str, object], timeout_s: float, **kw: object) -> dict:  # type: ignore[type-arg]
             sent.append((str(msg["op"]), timeout_s))
-            return real_call(msg, timeout_s)
+            assert kw.get("hard_deadline") is not None  # ticks cannot extend the unload
+            return real_call(msg, timeout_s, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(w, "_call", spy)
         w.unload()
@@ -652,9 +653,121 @@ def test_worker_unload_op_drops_the_runner_and_release_flag_crosses_the_pipe() -
     t.join(5)
 
 
-def test_runner_error_release_flag_is_carried_by_the_reply() -> None:
-    e = RunnerError("MODEL_INTEGRITY", "x", release=True)
-    assert e.release and not RunnerError("X").release
+def test_runner_error_release_flag_crosses_the_pipe() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        with pytest.raises(RunnerError) as ei:
+            w.run([{"id": 1, "fail": "x", "release": True}])
+        assert ei.value.release is True
+        with pytest.raises(RunnerError) as ei:
+            w.run([{"id": 1, "fail": "x"}])
+        assert ei.value.release is False
+    finally:
+        w.close()
+
+
+def test_model_integrity_error_resets_the_worker() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(_model(), BUDGET)
+        assert w.pid is not None
+
+        def boom(*a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            raise RunnerError("MODEL_INTEGRITY", "x", release=True)
+
+        w._call = boom  # type: ignore[method-assign]
+        with pytest.raises(RunnerError):
+            w.run([])
+        assert w.pid is None
+    finally:
+        w.close()
+
+
+def test_model_switch_sends_unload_before_the_respawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(mid="a"), BUDGET)
+        first = w._proc
+        assert first is not None
+        ops: list[str] = []
+        real_call = w._call
+
+        def spy(msg: dict, *a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            ops.append(str(msg["op"]))
+            return real_call(msg, *a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(w, "_call", spy)
+        w.ensure_model(_model(mid="b"), BUDGET)
+        assert ops == ["unload", "load"]
+        assert not first.is_alive() and w.loaded_model_id == "b"
+    finally:
+        w.close()
+
+
+def _hostile_worker(mode: str) -> tuple[WorkerHandle, BaseProcess]:
+    """A handle whose 'worker' is a thread-less fake pipe peer misbehaving on `unload`."""
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    proc = w._proc
+    assert proc is not None
+    real_send_conn = w._conn
+
+    class Peer:
+        """Replaces the control-side Connection: answers `unload` hostilely."""
+
+        def __init__(self) -> None:
+            self.sent = 0
+
+        def send_bytes(self, data: bytes) -> None:
+            self.sent += 1
+
+        def poll(self, timeout: float = 0.0) -> bool:
+            time.sleep(min(timeout, 0.01))
+            return True
+
+        def recv_bytes(self, maxlength: int) -> bytes:
+            return {
+                "list": b"[]",
+                "no_ok": b'{"result": 1}',
+                "garbage": b"not json",
+                "ticks": b'{"tick": 1}',
+            }[mode]
+
+        def close(self) -> None:
+            if real_send_conn is not None:
+                real_send_conn.close()
+
+    w._conn = Peer()  # type: ignore[assignment]
+    return w, proc
+
+
+@pytest.mark.parametrize("mode", ["list", "no_ok", "garbage", "ticks"])
+def test_hostile_unload_reply_still_kills_the_worker_within_the_deadline(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.worker.process as wp
+
+    monkeypatch.setattr(wp, "UNLOAD_TIMEOUT_S", 0.5)
+    w, proc = _hostile_worker(mode)
+    t0 = time.monotonic()
+    w.unload()
+    assert time.monotonic() - t0 < 5
+    assert not proc.is_alive() and w.pid is None
+
+
+def test_kill_releases_an_ollama_model_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append((url, ref)))
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "qwen2.5:0.5b"
+    w.interrupt()
+    w.kill()
+    assert seen and seen[0][1] == "qwen2.5:0.5b"
+    w.close()
 
 
 def test_mlx_workers_get_use_torch_off_and_others_do_not() -> None:

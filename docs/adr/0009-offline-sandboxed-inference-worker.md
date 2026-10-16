@@ -162,9 +162,16 @@ together with `MINION_EXECUTOR_DEV=1`.
     non-retryably (`PARAMS_UNSUPPORTED`; no other engine is tried because the server already
     refused such tasks). Embedding `tokens` is `prompt_eval_count` per text (one `/api/embed` call
     each) and can under-report when the prompt cache holds a shared prefix. Over-long prompts are
-    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines); `num_ctx` is set to
-    `max_prompt_tokens + max_tokens`. Requests carry a bounded `keep_alive` and the worker unloads
-    the model (`keep_alive: 0`) on idle unload or a budget downgrade, before the process is killed.
+    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines); `num_ctx` is the constant
+    `max_prompt_tokens + 4096` (constant so the daemon never reloads for a changed context; the cost
+    is KV cache for that whole window per request). Requests carry a bounded `keep_alive`. The
+    worker unloads the model (`keep_alive: 0`) on idle unload and on a model switch, under a total
+    wall-clock deadline that always ends in a kill (a hostile reply or tick flood cannot keep it
+    alive). After a hard kill (stop, cancel, 409) the control side sends a best-effort
+    `keep_alive: 0` (short timeout, `trust_env=False`); if that fails the daemon drops the weights
+    when `keep_alive` expires (at most 300 s). A budget downgrade (M4) will reuse the same path.
+    Load-phase 5xx and transport errors are releases (the daemon is this Mac's problem); a run-phase
+    404 (model removed locally) is a release too.
   - MLX workers are spawned with `USE_TORCH=0`, so `transformers` (used only for tokenisation) never
     imports `torch`; MLX loads pass `trust_remote_code=False` and `local_files_only` explicitly.
   - The HF runner (`torch` 2.14 / `transformers` 5.20 on `mps`) runs under the same profile with

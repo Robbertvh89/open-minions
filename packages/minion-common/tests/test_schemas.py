@@ -304,6 +304,8 @@ def test_ollama_ref_rejects_registry_host() -> None:
         "127.0.0.1/model:1",
         "10.0.0.5:11434/model:1",
         "example.com:443/a/b:1",
+        "evilhost/ns/model:7b",
+        "a/b/c/d:1",
     ):
         with pytest.raises(ValidationError, match="ref"):
             _entry(engine="ollama", ref=ref, revision=SHA256)

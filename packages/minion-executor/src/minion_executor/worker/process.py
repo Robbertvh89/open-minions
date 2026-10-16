@@ -31,6 +31,7 @@ from minion_common.schemas import Budget, ModelEntry, TaskParams, parse_params
 
 from minion_executor.runners.base import (
     ENGINE_UNAVAILABLE,
+    MODEL_INTEGRITY,
     EngineConfig,
     Record,
     Runner,
@@ -41,7 +42,7 @@ from minion_executor.worker.sandbox import SandboxPolicy
 from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
-UNLOAD_TIMEOUT_S = 5.0  # graceful worker unload before the kill
+UNLOAD_TIMEOUT_S = 5.0  # total wall-clock cap on the graceful unload (> runner keep_alive POST)
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
 # Proxy, CA and HF_TOKEN are deliberately not on it: they go only to the model-fetch subprocess
@@ -268,7 +269,15 @@ def worker_main(
                 },
             )
         except Exception as e:
-            _send(conn, {"ok": False, "code": "runner_error", "message": type(e).__name__})
+            _send(
+                conn,
+                {
+                    "ok": False,
+                    "code": "runner_error",
+                    "message": type(e).__name__,
+                    "retryable": True,
+                },
+            )
     conn.close()
 
 
@@ -314,6 +323,7 @@ class WorkerHandle:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
+        self._ollama_ref: str | None = None  # set while an Ollama model may be resident
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
 
@@ -368,9 +378,12 @@ class WorkerHandle:
         msg: dict[str, Any],
         timeout_s: float,
         on_progress: Callable[[int], None] | None = None,
+        *,
+        hard_deadline: float | None = None,
     ) -> dict[str, Any]:
         """Send `msg`, wait for the reply. `timeout_s` is an inactivity limit: every tick from
-        the worker resets it, and ticks are forwarded to `on_progress`."""
+        the worker resets it, and ticks are forwarded to `on_progress`. `hard_deadline` (absolute
+        `time.monotonic()`) is a total cap that ticks cannot extend."""
         with self._lock:
             gen = self._seen_gen
             conn = self._ensure_started()
@@ -391,8 +404,14 @@ class WorkerHandle:
                             raise WorkerCrashed(f"worker exited with code {proc.exitcode}")
                         if time.monotonic() > deadline:
                             raise WorkerCrashed("worker timed out")
+                        if hard_deadline is not None and time.monotonic() > hard_deadline:
+                            raise WorkerCrashed("worker exceeded its deadline")
                         continue
                     reply = _recv(conn, self._max_message_bytes)
+                    if hard_deadline is not None and time.monotonic() > hard_deadline:
+                        raise WorkerCrashed("worker exceeded its deadline")
+                    if not isinstance(reply, dict):
+                        raise WorkerCrashed("malformed worker reply")
                     if "tick" not in reply:
                         break
                     deadline = time.monotonic() + timeout_s  # liveness: restart the clock
@@ -413,12 +432,25 @@ class WorkerHandle:
             except WorkerCrashed:
                 self._reset()
                 raise
-            if not reply["ok"]:
+            except ValueError:  # malformed JSON / bad utf-8 from the worker
+                self._reset()
+                raise WorkerCrashed("malformed worker reply") from None
+            ok = reply.get("ok")
+            code, message = reply.get("code"), reply.get("message", "")
+            valid = isinstance(ok, bool) and (
+                isinstance(reply.get("result"), (dict, list, type(None)))
+                if ok
+                else isinstance(code, str) and isinstance(message, str)
+            )
+            if not valid:
+                self._reset()
+                raise WorkerCrashed("malformed worker reply")
+            if not ok:
                 raise RunnerError(
-                    reply["code"],
-                    reply.get("message", ""),
-                    retryable=reply.get("retryable", True),
-                    release=reply.get("release", False),
+                    str(code),
+                    str(message),
+                    retryable=reply.get("retryable") is True,
+                    release=reply.get("release") is True,
                 )
             return reply
 
@@ -433,9 +465,12 @@ class WorkerHandle:
                 self._reset()
             if self._model_id == model.model_id and self._proc and self._proc.is_alive():
                 return
-            if self._model_id is not None or (self._sandbox is not None and self._proc):
+            if self._model_id is not None and self._proc and self._proc.is_alive():
+                self._graceful_reset()  # model switch: let the runner free external memory
+            elif self._model_id is not None or (self._sandbox is not None and self._proc):
                 self._reset()  # a sandboxed worker's grants are fixed: load into a fresh one
             # MLX workers never need torch: keep `transformers` from importing it (smaller surface).
+            self._ollama_ref = model.ref if model.engine == Engine.OLLAMA else None
             self._engine_env = {"USE_TORCH": "0"} if model.engine == Engine.MLX else {}
             self._call(
                 {
@@ -484,7 +519,13 @@ class WorkerHandle:
             "batch": batch,
             "params": params.model_dump(mode="json") if params is not None else {},
         }
-        reply = self._call(msg, self._step_timeout_s, on_progress)
+        try:
+            reply = self._call(msg, self._step_timeout_s, on_progress)
+        except RunnerError as exc:
+            if exc.code == MODEL_INTEGRITY:  # a bad tag must not stay warm and churn
+                with self._lock:
+                    self._graceful_reset()
+            raise
         result: list[Record] = reply["result"]
         return result
 
@@ -518,10 +559,24 @@ class WorkerHandle:
         held outside the process (Ollama `keep_alive: 0`); then it is killed regardless.
         """
         with self._lock:
+            self._graceful_reset()
+
+    def _graceful_reset(self) -> None:
+        """Ask a live loaded worker to unload under a total deadline, then ALWAYS kill it.
+
+        Any failure of the polite step (crash, protocol violation, tick flood, bug) is
+        swallowed; the `finally` guarantees the worker never outlives this call.
+        """
+        try:
             proc = self._proc
             if proc is not None and proc.is_alive() and self._model_id is not None:
-                with contextlib.suppress(WorkerCrashed, RunnerError):
-                    self._call({"op": "unload"}, UNLOAD_TIMEOUT_S)
+                with contextlib.suppress(Exception):
+                    self._call(
+                        {"op": "unload"},
+                        UNLOAD_TIMEOUT_S,
+                        hard_deadline=time.monotonic() + UNLOAD_TIMEOUT_S,
+                    )
+        finally:
             self._reset()
 
     def kill(self) -> None:
@@ -530,10 +585,21 @@ class WorkerHandle:
         Lock-free so it can interrupt a call that holds the lock; safe from any thread.
         """
         self._closed = True
+        ref = self._ollama_ref
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+            self._release_ollama(ref)
+
+    def _release_ollama(self, ref: str | None) -> None:
+        """After a hard kill the daemon still holds the weights for up to `keep_alive`: send a
+        best-effort `keep_alive: 0` from the control side (short timeout, no env proxies). Callers
+        run off the event loop (`asyncio.to_thread`)."""
+        if ref is not None:
+            from minion_executor.runners.ollama import release_model
+
+            release_model(self._cfg.ollama_url, ref)
 
     def interrupt(self) -> None:
         """Abort the current work: hard-kill the worker but allow a respawn on the next call.
@@ -543,16 +609,19 @@ class WorkerHandle:
         Lock-free, safe from any thread.
         """
         self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
+        ref = self._ollama_ref
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+            self._release_ollama(ref)
 
     def _reset(self) -> None:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
         proc, conn = self._proc, self._conn
         self._proc = self._conn = None
         self._model_id = None
+        self._ollama_ref = None
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():

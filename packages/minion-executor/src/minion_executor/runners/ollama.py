@@ -6,9 +6,11 @@ against `/api/tags` after every load and again after every `run` (TOCTOU: a swap
 not get its outputs stamped with our pin). Ollama is opt-in (`--engines ollama`). Prompts and
 responses are never logged or put in messages.
 
-Failure mapping: transport error -> release (`ENGINE_UNAVAILABLE`); 4xx -> non-retryable fail;
-5xx -> retryable fail (`OOM` when the status body says the model needs more memory; the body is
-matched, never copied); digest mismatch -> release (`MODEL_INTEGRITY`, executor-local).
+Failure mapping. Load phase (`show`, `pull`, `tags`): transport error and 5xx -> release
+(`ENGINE_UNAVAILABLE`, this Mac's daemon is unwell); 4xx -> non-retryable fail. Run phase:
+transport error and 404 (model removed locally) -> release; other 4xx -> non-retryable fail; 5xx ->
+retryable fail (`OOM` when the status body says the model needs more memory; the body is matched,
+never copied). Digest mismatch -> release (`MODEL_INTEGRITY`, executor-local).
 """
 
 from __future__ import annotations
@@ -50,6 +52,8 @@ ENGINE_ERROR = "ENGINE_ERROR"  # 5xx: the daemon failed; another attempt may suc
 _TICK_S = 1.0  # checkpoint cadence while requests are in flight (duty cycle, pause, step timeout)
 _REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
 _PULL_MARGIN_S = 60.0  # a pull must end this long before the worker's load timeout
+_UNLOAD_TIMEOUT = httpx.Timeout(3.0, connect=1.0)  # < worker UNLOAD_TIMEOUT_S
+_NUM_CTX_HEADROOM = 4096  # constant context headroom (output tokens) on top of the prompt cap
 _OOM_MARKERS = ("more system memory", "out of memory", "insufficient memory")
 
 
@@ -72,6 +76,22 @@ def _unavailable(detail: str) -> RunnerError:
     return RunnerError(ENGINE_UNAVAILABLE, detail, retryable=True)
 
 
+def _release(detail: str) -> RunnerError:
+    return RunnerError(ENGINE_UNAVAILABLE, detail, retryable=True, release=True)
+
+
+def release_model(url: str, ref: str) -> None:
+    """Best-effort `keep_alive: 0` for `ref` on the loopback daemon (used by the control side
+    after a hard kill of the worker). Short timeout, no env proxies, never raises."""
+    with (
+        contextlib.suppress(Exception),
+        httpx.Client(
+            base_url=check_loopback(url), trust_env=False, follow_redirects=False
+        ) as client,
+    ):
+        client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_UNLOAD_TIMEOUT)
+
+
 def _status_error(resp: httpx.Response) -> RunnerError:
     """Map an HTTP error status to a RunnerError. The body may echo the prompt: it is only
     pattern-matched for out-of-memory, never copied into the message."""
@@ -91,12 +111,21 @@ class OllamaRunner:
     def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
         self._transport = transport
         self._client: httpx.Client | None = None
+        self._base = ""
         self._model: ModelEntry | None = None
         self._ref = ""
         self._budget: Budget | None = None
         self._cfg = EngineConfig()
 
     # -- HTTP -------------------------------------------------------------------------------
+    def _new_client(self) -> httpx.Client:
+        return httpx.Client(
+            base_url=self._base,
+            transport=self._transport,
+            trust_env=False,
+            follow_redirects=False,
+        )
+
     def _request(
         self,
         method: str,
@@ -113,7 +142,9 @@ class OllamaRunner:
         except httpx.HTTPError as exc:  # transport, timeout, protocol: never echo the message
             raise _unavailable(type(exc).__name__) from None
 
-    def _json(self, resp: httpx.Response) -> dict[str, Any]:
+    def _json(self, resp: httpx.Response, *, run_phase: bool = False) -> dict[str, Any]:
+        if run_phase and resp.status_code == 404:  # model removed from this Mac's store
+            raise _release("ollama model not found")
         if resp.status_code >= 400:
             raise _status_error(resp)
         try:
@@ -133,12 +164,8 @@ class OllamaRunner:
     ) -> None:
         base = check_loopback(cfg.ollama_url)
         self.unload()
-        self._client = httpx.Client(
-            base_url=base,
-            transport=self._transport,
-            trust_env=False,
-            follow_redirects=False,
-        )
+        self._base = base
+        self._client = self._new_client()
         self._model, self._ref, self._budget, self._cfg = model, model.ref, budget, cfg
         try:
             show = self._request("POST", "/api/show", {"model": model.ref})
@@ -156,6 +183,12 @@ class OllamaRunner:
             elif show.status_code >= 400:
                 raise _status_error(show)
             self._check_digest()
+        except RunnerError as exc:
+            self.unload()
+            if exc.code in (ENGINE_ERROR, OOM, ENGINE_UNAVAILABLE) and not exc.release:
+                # load phase: a sick or unreachable daemon is this Mac's problem, not the subtask's
+                raise _release(exc.message) from None
+            raise
         except BaseException:
             self.unload()
             raise
@@ -177,8 +210,10 @@ class OllamaRunner:
         )
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:
-        if self._client is None or self._budget is None:
+        if self._budget is None:
             raise RunnerError("not_loaded")
+        if self._client is None:  # closed by a failed run's abort: reconnect for this one
+            self._client = self._new_client()
         if isinstance(params, CompletionParams):
             out = self._complete(batch, params, ctl)
         elif isinstance(params, EmbeddingParams):
@@ -194,7 +229,8 @@ class OllamaRunner:
             "temperature": params.temperature,
             "top_p": params.top_p,
             "num_predict": params.max_tokens,
-            "num_ctx": self._cfg.max_prompt_tokens + params.max_tokens,
+            # constant per executor so the daemon never reloads the model for a changed context
+            "num_ctx": self._cfg.max_prompt_tokens + _NUM_CTX_HEADROOM,
         }
         if params.seed is not None:
             options["seed"] = params.seed
@@ -209,7 +245,8 @@ class OllamaRunner:
                     "keep_alive": self._keep_alive(),
                     "options": options,
                 },
-            )
+            ),
+            run_phase=True,
         )
         msg = data.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
@@ -230,7 +267,8 @@ class OllamaRunner:
                 "POST",
                 "/api/embed",
                 {"model": self._ref, "input": text, "keep_alive": self._keep_alive()},
-            )
+            ),
+            run_phase=True,
         )
         vecs = data.get("embeddings")
         if not isinstance(vecs, list) or len(vecs) != 1:
@@ -244,11 +282,14 @@ class OllamaRunner:
 
     def _fan_out(self, jobs: Sequence[Callable[[], Record]], ctl: StepControl) -> list[Record]:
         """Run `jobs` on a pool bounded by the budget's batch size. The main thread wakes at
-        least every `_TICK_S` to checkpoint (duty cycle, pause, step timeout stay live during
-        long requests); control-side calls never leave this thread. The first failure aborts."""
+        least every `_TICK_S` to checkpoint (duty cycle and pause stay live during long requests).
+        Those ticks also keep the control side's inactivity timeout from firing, so the real bound
+        on a hung daemon is `_REQUEST_TIMEOUT`, not the step timeout. Control-side calls never
+        leave this thread. The first failure aborts (and closes the client under in-flight jobs)."""
         assert self._budget is not None  # noqa: S101
         if not jobs:
             return []
+        self._check_digest()  # a swapped tag must not even start (inputs are validated already)
         pool = ThreadPoolExecutor(
             max_workers=max(1, min(len(jobs), self._budget.max_batch_size)),
             thread_name_prefix="ollama",
@@ -262,6 +303,11 @@ class OllamaRunner:
                     fut.result()  # re-raise the first failure
                 ctl.checkpoint(len(futures) - len(pending))
         except BaseException:
+            # fail in-flight requests fast: close the client under them (reopened by the next run)
+            client, self._client = self._client, None
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
             pool.shutdown(wait=False, cancel_futures=True)
             raise
         pool.shutdown(wait=True)
@@ -309,7 +355,9 @@ class OllamaRunner:
         if client is not None and ref:
             # best effort: ask the daemon to drop the weights now
             with contextlib.suppress(httpx.HTTPError):
-                client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=10.0)
+                client.post(
+                    "/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_UNLOAD_TIMEOUT
+                )
         if client is not None:
             client.close()
         self._client, self._model, self._ref, self._budget = None, None, "", None

@@ -184,7 +184,7 @@ def test_chat_request_body_and_output() -> None:
             "top_p": 0.9,
             "num_predict": 16,
             "seed": 3,
-            "num_ctx": 8192 + 16,
+            "num_ctx": 8192 + 4096,
         },
     }
     assert out == [
@@ -244,7 +244,7 @@ def _failing(status: int, text: str = "echo of the prompt") -> OllamaRunner:
     return r
 
 
-@pytest.mark.parametrize("status", [400, 404, 413])
+@pytest.mark.parametrize("status", [400, 403, 413])
 def test_4xx_is_a_non_retryable_fail(status: int) -> None:
     with pytest.raises(RunnerError) as ei:
         _failing(status).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
@@ -282,14 +282,65 @@ def test_mid_run_transport_error_is_a_release() -> None:
     assert "secret" not in str(ei.value)
 
 
-def test_show_5xx_at_load_is_a_fail_not_a_release() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, text="boom")
+@pytest.mark.parametrize("phase", ["show", "pull", "tags"])
+def test_load_phase_5xx_and_transport_errors_are_releases(phase: str) -> None:
+    def make(kind: str) -> OllamaRunner:
+        d = Daemon(present=phase != "pull")
 
-    r = OllamaRunner(transport=httpx.MockTransport(handler))
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path == f"/api/{phase}":
+                if kind == "transport":
+                    raise httpx.ConnectError("refused")
+                return httpx.Response(500, text="boom")
+            return d(req)
+
+        return OllamaRunner(transport=httpx.MockTransport(handler))
+
+    for kind in ("5xx", "transport"):
+        with pytest.raises(RunnerError) as ei:
+            make(kind).load(MODEL, None, _budget(), EngineConfig())
+        assert ei.value.code == "ENGINE_UNAVAILABLE" and ei.value.release, (phase, kind)
+
+
+def test_load_phase_4xx_stays_a_non_retryable_fail() -> None:
+    r = OllamaRunner(transport=httpx.MockTransport(lambda req: httpx.Response(403, text="no")))
     with pytest.raises(RunnerError) as ei:
         r.load(MODEL, None, _budget(), EngineConfig())
-    assert ei.value.code == "ENGINE_ERROR" and not ei.value.release
+    assert ei.value.code == "ENGINE_REJECTED" and not ei.value.release
+
+
+def test_run_phase_404_is_a_release() -> None:
+    with pytest.raises(RunnerError) as ei:
+        _failing(404).run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "ENGINE_UNAVAILABLE" and ei.value.release
+
+
+def test_run_checks_the_digest_first_and_a_failed_run_reconnects() -> None:
+    d = Daemon()
+    r = OllamaRunner(transport=httpx.MockTransport(d))
+    r.load(MODEL, None, _budget(), EngineConfig())
+    d.calls.clear()
+    d.digest = "cd" * 32
+    with pytest.raises(RunnerError) as ei:
+        r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    assert ei.value.code == "MODEL_INTEGRITY" and ei.value.release
+    assert [p for p, _ in d.calls] == ["/api/tags"]  # no inference before the check
+    d.digest = DIGEST
+    d.chat_hook = lambda: (_ for _ in ()).throw(httpx.ReadTimeout("x"))
+    with pytest.raises(RunnerError):
+        r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    d.chat_hook = None
+    assert r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())[0]["completion"] == "hi"
+
+
+def test_num_ctx_is_constant_per_executor() -> None:
+    d = Daemon()
+    r = OllamaRunner(transport=httpx.MockTransport(d))
+    r.load(MODEL, None, _budget(), EngineConfig(max_prompt_tokens=1000))
+    for mt in (16, 512):
+        r.run([{"id": 1, "prompt": "x"}], CompletionParams(max_tokens=mt), Ctl())
+    ctxs = {b["options"]["num_ctx"] for p, b in d.calls if p == "/api/chat"}
+    assert ctxs == {1000 + 4096}
 
 
 def test_first_failure_aborts_without_waiting_for_the_rest() -> None:
@@ -395,12 +446,12 @@ def test_keep_alive_follows_config() -> None:
     assert next(b for p, b in d.calls if p == "/api/chat")["keep_alive"] == "120s"
 
 
-def test_num_ctx_covers_prompt_window_plus_output() -> None:
+def test_num_ctx_covers_prompt_window_plus_headroom() -> None:
     d = Daemon()
     r = OllamaRunner(transport=httpx.MockTransport(d))
     r.load(MODEL, None, _budget(), EngineConfig(max_prompt_tokens=1000))
     r.run([{"id": 1, "prompt": "x"}], CompletionParams(max_tokens=24), Ctl())
-    assert next(b for p, b in d.calls if p == "/api/chat")["options"]["num_ctx"] == 1024
+    assert next(b for p, b in d.calls if p == "/api/chat")["options"]["num_ctx"] == 1000 + 4096
 
 
 def test_pull_timeout_is_below_the_worker_load_timeout() -> None:
