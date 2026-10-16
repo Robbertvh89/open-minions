@@ -595,8 +595,7 @@ class ExecutorLoop:
         """Wait for an unload still running in its thread (the watcher may have been cancelled
         mid-unload): a model load must never overlap it, or the unload would kill the fresh
         worker."""
-        fut = self._unload_fut
-        if fut is not None and not fut.done():
+        while (fut := self._unload_fut) is not None and not fut.done():
             with contextlib.suppress(Exception):
                 await asyncio.shield(fut)
 
@@ -604,23 +603,32 @@ class ExecutorLoop:
         self._unloaded = True
         unloaded_path = self._loaded_path  # the model actually unloaded, not whatever is pinned now
         self._forget_loaded()
-        try:
-            await self._await_unload()
-            fut = asyncio.ensure_future(asyncio.to_thread(self._worker.unload))
-            self._unload_fut = fut
-            await asyncio.shield(fut)  # a cancelled watcher leaves the unload running
-            # unpin only that model: a subtask may have pinned its own meanwhile
-            if (
-                self._cache is not None
-                and unloaded_path is not None
-                and self._cache.in_use == unloaded_path
-            ):
-                self._cache.release_in_use()
-            log.info(
-                "worker_unloaded_idle" if reason == "idle" else "worker_unloaded", reason=reason
-            )
-        except Exception as exc:  # a failed unload must not stop the loop
+        await self._await_unload()
+        fut = asyncio.ensure_future(asyncio.to_thread(self._worker.unload))
+        self._unload_fut = fut
+        # the unpin and the log run when the unload finishes, even if the watcher awaiting it
+        # was cancelled meanwhile (the shielded unload keeps running)
+        fut.add_done_callback(lambda f: self._after_unload(f, unloaded_path, reason))
+        # a failed unload must not stop the loop: _after_unload logs it
+        with contextlib.suppress(Exception):
+            await asyncio.shield(fut)
+
+    def _after_unload(
+        self, fut: asyncio.Future[None], unloaded_path: Path | None, reason: str
+    ) -> None:
+        if fut.cancelled():
+            return
+        if (exc := fut.exception()) is not None:
             log.warning("idle_unload_failed", error=type(exc).__name__)
+            return
+        # unpin only that model: a subtask may have pinned its own meanwhile
+        if (
+            self._cache is not None
+            and unloaded_path is not None
+            and self._cache.in_use == unloaded_path
+        ):
+            self._cache.release_in_use()
+        log.info("worker_unloaded_idle" if reason == "idle" else "worker_unloaded", reason=reason)
 
     async def _enforce_idle_budget(self) -> None:
         """FR-54 for a warm worker with no subtask: unload at once when the loaded model no longer
