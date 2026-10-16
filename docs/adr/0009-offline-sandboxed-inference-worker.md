@@ -152,6 +152,12 @@ together with `MINION_EXECUTOR_DEV=1`.
     The runner refuses non-loopback URLs and never logs prompts or responses. Ollama cannot return
     unnormalised embeddings, so `normalize=false` is released (`ENGINE_UNAVAILABLE`) for another
     engine, and truncation of over-long prompts is not detectable (no `PROMPT_TOO_LONG` lines).
+  - The HF runner (`torch` 2.14 / `transformers` 5.20 on `mps`) runs under the same profile with
+    **no extra grants**: weights load from the read-only model dir, and every cache variable
+    torch/transformers might write (`TORCH_HOME`, `TORCHINDUCTOR_CACHE_DIR`, `XDG_CACHE_HOME`,
+    `HF_MODULES_CACHE`, ...) is pointed into the worker tmp dir by `runners/hf.confine_caches`
+    before `import torch`, with `torch.compile`/dynamo disabled. MPSGraph logs a harmless
+    "Error creating directory" for its debug dumps; it also does so unsandboxed.
   - The profile is validated on macOS 27 / Apple Silicon with mlx 0.32 only; other macOS releases may
     need extra allows (the failure mode is `SANDBOX_FAILED`/engine error, never silent widening).
 - **`sandbox_init` is deprecated** by Apple. It is still shipped and is what Chromium, Firefox and

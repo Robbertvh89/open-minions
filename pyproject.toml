@@ -61,7 +61,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # mlx/mlx_lm: optional extra, absent on Linux CI. follow_imports=skip makes the Mac (extras
 # installed) and CI (absent) type-check identically instead of depending on the libs' own hints.
-module = ["mlx", "mlx.*", "mlx_lm", "mlx_lm.*", "transformers", "transformers.*"]
+module = ["mlx", "mlx.*", "mlx_lm", "mlx_lm.*", "transformers", "transformers.*", "torch", "torch.*", "safetensors", "safetensors.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 

@@ -98,15 +98,18 @@ def test_fake_memory_in_use_zeros() -> None:
     assert _fake().memory_in_use() == {"active_bytes": 0, "peak_bytes": 0}
 
 
-def test_unavailable_engine_and_unknown() -> None:
-    with pytest.raises(RunnerError) as ei:
-        create_runner(Engine.HF, TaskType.EMBEDDING)  # hf lands in TASK-4.3 S8
-    assert ei.value.code == "ENGINE_UNAVAILABLE"
+def test_missing_hf_extra_is_never_advertised_and_unknown_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
     from minion_executor.runners import probe_engines
 
-    # not implemented => never advertised, even if the module imports
-    probed = probe_engines([Engine.HF, Engine.FAKE], EngineConfig())
-    assert probed == {"hf": None, "fake": "fake"}
+    def no_module(name: str) -> object:
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", no_module)
+    assert probe_engines([Engine.HF, Engine.FAKE], EngineConfig()) == {"hf": None, "fake": "fake"}
     with pytest.raises(ValueError):
         Engine("nope")
 

@@ -55,8 +55,7 @@ MIN_TIMEOUT_FACTOR = 2.0
 REAL_ENGINES = [Engine.MLX, Engine.OLLAMA, Engine.HF]
 NO_ENGINE_MSG = (
     "no inference engine available (on Apple Silicon install the MLX extra: "
-    "`uv sync --package minion-executor --extra mlx`, or start Ollama; the hf runner is not "
-    "available yet; "
+    "`uv sync --package minion-executor --extra mlx` (or `--extra hf`), or start Ollama; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )
 

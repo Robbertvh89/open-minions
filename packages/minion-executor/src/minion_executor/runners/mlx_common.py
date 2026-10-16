@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
-from typing import Any
 
 from minion_common.schemas import Budget
 
 from minion_executor.runners.base import OOM, MemoryStats, RunnerError
+from minion_executor.runners.pooling import MODEL_UNSUPPORTED as MODEL_UNSUPPORTED
+from minion_executor.runners.pooling import pooling_mode as pooling_mode
 
-MODEL_UNSUPPORTED = "MODEL_UNSUPPORTED"
 _GIB = 1024**3
 _CACHE_LIMIT_BYTES = 256 * 1024**2  # freed Metal buffers kept for reuse; small on purpose
 _OOM_MARKERS = (
@@ -93,21 +93,3 @@ def require_model_path(model_path: Path | None) -> Path:
     if model_path is None or not model_path.is_dir():
         raise RunnerError("MODEL_NOT_FOUND", "model is not in the local cache", retryable=False)
     return model_path
-
-
-def pooling_mode(cfg: dict[str, Any] | None) -> str:
-    """`cls` | `mean` | `lasttoken` from a sentence-transformers `1_Pooling/config.json`.
-
-    No config means CLS pooling (BERT's pooled-output convention, what bge models use).
-    """
-    if not cfg:
-        return "cls"
-    if cfg.get("pooling_mode_cls_token"):
-        return "cls"
-    if cfg.get("pooling_mode_mean_tokens") or cfg.get("pooling_mode_mean_sqrt_len_tokens"):
-        return "mean"
-    if cfg.get("pooling_mode_lasttoken"):
-        return "lasttoken"
-    if cfg.get("pooling_mode_max_tokens"):
-        raise RunnerError(MODEL_UNSUPPORTED, "max pooling is not supported", retryable=False)
-    return "mean"

@@ -10,7 +10,6 @@ Pooling follows the sentence-transformers `1_Pooling/config.json` (CLS for bge m
 from __future__ import annotations
 
 import contextlib
-import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,19 +23,12 @@ from minion_executor.runners.base import (
     RunnerError,
     StepControl,
 )
+from minion_executor.runners.pooling import read_json
 from minion_executor.runners.prompts import embedding_text
 
 MAX_LENGTH = 512
 CHUNK = 16  # texts per forward pass; bounds activation memory and sets the checkpoint cadence
 _SUPPORTED_ARCH = ("BertModel", "BertForMaskedLM", "XLMRobertaModel")
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _build_encoder(cfg: dict[str, Any]) -> Any:
@@ -183,7 +175,7 @@ class MlxEmbeddingRunner:
         import mlx.core as mx
         from transformers import AutoTokenizer
 
-        conf = _read_json(path / "config.json")
+        conf = read_json(path / "config.json")
         if conf is None:
             raise RunnerError(common.MODEL_UNSUPPORTED, "missing config.json", retryable=False)
         archs = conf.get("architectures") or []
@@ -210,7 +202,7 @@ class MlxEmbeddingRunner:
                 common.MODEL_UNSUPPORTED, type(exc).__name__, retryable=False
             ) from None
         self._net = net
-        self._pooling = common.pooling_mode(_read_json(path / "1_Pooling" / "config.json"))
+        self._pooling = common.pooling_mode(read_json(path / "1_Pooling" / "config.json"))
         self._max_len = min(MAX_LENGTH, int(conf.get("max_position_embeddings", MAX_LENGTH)))
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:

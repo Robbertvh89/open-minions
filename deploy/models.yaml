@@ -14,3 +14,15 @@ models:
     ref: mlx-community/bge-small-en-v1.5-bf16
     revision: 0e415031434cdf5f1b89d584e11be33b82abfc8d
     memory_gb: 0.5
+  - model_id: qwen2.5-0.5b-instruct-hf
+    type: completion
+    engine: hf
+    ref: Qwen/Qwen2.5-0.5B-Instruct
+    revision: 7ae557604adf67be50417f59c2c2f167def9a775
+    memory_gb: 1.5
+  - model_id: bge-small-en-hf
+    type: embedding
+    engine: hf
+    ref: BAAI/bge-small-en-v1.5
+    revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+    memory_gb: 0.5
