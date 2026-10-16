@@ -76,4 +76,5 @@ class PausedReason(StrEnum):
     LOW_POWER_MODE = "low_power_mode"
     LOW_BATTERY = "low_battery"
     ON_BATTERY = "on_battery"
+    CONTROL_INVALID = "control_invalid"
     SIGNALS_UNAVAILABLE = "signals_unavailable"

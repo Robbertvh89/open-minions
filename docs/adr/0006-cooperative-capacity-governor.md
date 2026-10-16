@@ -74,8 +74,17 @@ the 60 s hold of ARCHITECTURE §3.6; de-escalation is immediate. If the governor
 the in-flight subtask is interrupted and released. Memory pressure `warning` pauses and trims;
 `critical` interrupts, releases and unloads at once. **Deviation** from ARCHITECTURE ("escalate only
 after 60 s"): without the 10 s resume window a 5 s thermal blip would always end in a release at 60 s.
-Reason priority for the single `paused_reason`: `user_paused` > `memory_pressure` > `thermal` >
-`low_power_mode` > `low_battery` > `on_battery` > `signals_unavailable`.
+Reason priority for the single `paused_reason`: `user_paused` > `control_invalid` > `memory_pressure` >
+`thermal` > `low_power_mode` > `low_battery` > `on_battery` > `signals_unavailable`. `control_invalid`
+is the fail-closed pause for a present-but-unusable `control.json` (D11). On battery with
+`allow_on_battery` and an unknown percentage also pauses (`low_battery`). Automatic profile changes
+compare the resolved budgets per dimension (memory, duty, batch, CPU priority): no higher anywhere
+applies at once; anything else (no lower anywhere, or mixed) is held 60 s. While held, the budget is
+the per-dimension minimum of the current and target budgets (invariant 6): dimensions that go down
+drop at once, those that go up wait; `Decision.profile` keeps the current profile name until the
+hold ends, then the full target applies. The comparison is against the budget actually in force
+(`GovState.applied`), so a dimension lowered by a hold is not raised again before its own 60 s,
+even if the target is the current profile (no snap-back).
 
 **D6 Downgrade (FR-54, ADR-0009).** When `budget.memory_gb` drops below the loaded model's
 `memory_gb`, the loop finishes the current batch (bounded by 60 s), releases the subtask (executor-side
@@ -130,8 +139,20 @@ active, `full` while idle on AC). **Deviation** from SPEC FR-51, which called `b
 (TASK-5.5) an adaptive run starts on `active_profile`.
 
 **D11 Owner control (FR-56).** `control.json` / `status.json` files in a 0700 state dir
-(`MINION_EXECUTOR_STATE_DIR`), written atomically, ignored if not owned by the user or writable by
-others. Works with launchd and the later menu-bar app; no socket.
+(`MINION_EXECUTOR_STATE_DIR`), written atomically. The directory is created 0700; an existing one must be owned by the user and
+not group/world-writable (it is not chmod-ed). Files are refused if not owned by the user or writable
+by others. Works with launchd and the later menu-bar app; no socket. **Implemented in TASK-5.4:**
+`minion-executor pause [--for 30m|1h|2h30m]`, `resume` and `profile <name|auto>` do a read-modify-write
+of `control.json` (strict schema, `extra=forbid`; tmp file + fsync + rename, 0600, state dir created
+0700). All file operations are relative to one vetted directory fd and never follow symlinks. A
+`control.json` that is present but not ours, group/world-writable, oversized, not regular, unreadable,
+invalid or of a newer version is **unusable**: the governor fails closed (paused `control_invalid`,
+automatic profile) until it is fixed or replaced by `resume`; a missing file or directory is just
+absent. The reader returns a reason and does not log (5.5 logs once per change). `profile <x>` on an
+unusable file keeps the pause (with a warning) instead of dropping it silently. An owner `resume` lifts the owner pause at once, the 10 s
+clear window applies to signal pauses only. `signals.py`, `governor.py` and `control.py` exist and are
+unit-tested but are wired into the run loop in TASK-5.5; `decide` takes `total_gb`, `local_now` and an
+optional `--profile` pin as arguments so it stays free of I/O and clocks.
 
 **D12 Presence (FR-55).** `POST /api/v1/executor/presence {budget, paused_reason?}` returns 204 and
 updates the caller's own executor row (profile, budget, paused_reason, `last_seen_at`). It carries no

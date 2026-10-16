@@ -65,6 +65,12 @@ module = ["mlx", "mlx.*", "mlx_lm", "mlx_lm.*", "transformers", "transformers.*"
 ignore_missing_imports = true
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# pyobjc: darwin-only dependency, absent on Linux CI; skipped so both type-check identically.
+module = ["Quartz", "Quartz.*", "Foundation", "Foundation.*", "objc"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["packages"]
 asyncio_mode = "auto"

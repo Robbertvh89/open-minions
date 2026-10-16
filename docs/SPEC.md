@@ -264,8 +264,10 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   condition persists > 60 s):
   - memory pressure `warning` or higher (pause and shrink cache at `warning`; release at `critical`);
   - thermal state `serious` or `critical`;
-  - on battery (default) or battery < 30 % (if `allow_on_battery = true`); Low Power Mode on;
+  - on battery (default) or battery < 30 % or battery percentage unknown (if `allow_on_battery = true`; reason `low_battery`); Low Power Mode on;
   - owner-triggered `minion-executor pause [--for 1h]`;
+  - an unusable owner `control.json` (fails closed; `paused_reason` `control_invalid`, listed right
+    after `user_paused` in the priority order);
   - optional: listed foreground apps active (e.g. screen sharing, `zoom.us`) → drop to `light` or pause.
 - FR-54. **Budget changes mid-subtask.** Duty cycle, batch size and CPU priority apply at the next
   generation step / batch. A memory budget below the loaded model's `memory_gb` causes the executor to
@@ -278,6 +280,9 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   Grafana. A paused executor does not poll (it only sends a low-frequency presence ping).
 - FR-56. **Owner control.** CLI (and later a menu-bar app, M6): `minion-executor profile <name>`,
   `pause`, `resume`, `status` (shows budget, current task, GPU share, today's contribution).
+  **Status (TASK-5.4):** `pause [--for 1h]`, `resume` and `profile <name|auto>` write the owner's
+  `control.json` (0600, atomic, strict schema; ADR-0006 D11); the governor that reads it and `status`
+  land in TASK-5.5.
 
 ## 5. Subtask & task state machines
 

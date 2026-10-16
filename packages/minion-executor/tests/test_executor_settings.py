@@ -54,3 +54,27 @@ def test_stop_grace_default_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MINION_EXECUTOR_STOP_GRACE_S", bad)
         with pytest.raises(ValidationError):
             ExecutorSettings()
+
+
+def test_state_dir_default_and_absolute(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINION_EXECUTOR_STATE_DIR", raising=False)
+    assert ExecutorSettings().state_dir == (
+        Path.home() / "Library" / "Application Support" / "open-minions"
+    )
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", "relative")
+    with pytest.raises(ValidationError, match="absolute"):
+        ExecutorSettings()
+
+
+def test_fake_signals_needs_dev(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
+    monkeypatch.setenv("MINION_EXECUTOR_FAKE_SIGNALS", str(tmp_path / "s.json"))
+    with pytest.raises(ValidationError, match="DEV"):
+        ExecutorSettings()
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    assert ExecutorSettings().fake_signals == tmp_path / "s.json"
+    monkeypatch.setenv("MINION_EXECUTOR_FAKE_SIGNALS", "")
+    assert ExecutorSettings().fake_signals is None
+    monkeypatch.setenv("MINION_EXECUTOR_FAKE_SIGNALS", "rel.json")
+    with pytest.raises(ValidationError, match="absolute"):
+        ExecutorSettings()

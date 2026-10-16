@@ -26,7 +26,9 @@ from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
 from minion_executor.capacity.config import load_config, resolve_profiles
+from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.profiles import budget_for, nice_for, parse_profile, total_memory_gb
+from minion_executor.capacity.safefile import SafeFileError
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
@@ -326,6 +328,67 @@ def run(
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
+
+
+def _warn(message: str) -> None:
+    typer.echo(f"warning: {message}", err=True)
+
+
+@app.command()
+def pause(
+    duration: Annotated[
+        str | None,
+        typer.Option(
+            "--for", help="Pause for this long, e.g. 30m, 1h, 2h30m (default: until resume)"
+        ),
+    ] = None,
+) -> None:
+    """Pause the executor (no new subtasks; a running executor reads this within seconds)."""
+    try:
+        settings = ExecutorSettings()
+        delta = parse_duration(duration) if duration is not None else None
+        ctl = update_control(settings.state_dir, paused=True, pause_for=delta, warn=_warn)
+    except (ValueError, SafeFileError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    until = f" until {ctl.paused_until.isoformat(timespec='seconds')}" if ctl.paused_until else ""
+    typer.echo(f"paused{until} ({settings.state_dir / CONTROL_FILE})")
+
+
+@app.command()
+def resume() -> None:
+    """Lift an owner pause."""
+    try:
+        settings = ExecutorSettings()
+        update_control(settings.state_dir, paused=False, warn=_warn)
+    except (ValueError, SafeFileError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    typer.echo(f"resumed ({settings.state_dir / CONTROL_FILE})")
+
+
+@app.command("profile")
+def profile_cmd(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="light, balanced, full, custom, or auto "
+            "(back to the run's --profile pin, or adaptive if none)"
+        ),
+    ],
+) -> None:
+    """Pin the capacity profile of the running executor, or return to automatic switching."""
+    try:
+        settings = ExecutorSettings()
+        if name == "auto":
+            update_control(settings.state_dir, clear_profile=True, warn=_warn)
+        else:
+            specs = resolve_profiles(load_config(settings.config_path))
+            update_control(settings.state_dir, profile=parse_profile(name, specs), warn=_warn)
+    except (ValueError, SafeFileError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    typer.echo(f"profile: {name} ({settings.state_dir / CONTROL_FILE})")
 
 
 @app.command()

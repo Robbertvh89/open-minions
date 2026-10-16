@@ -9,6 +9,7 @@ from typing import Self
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from minion_executor.capacity.control import default_state_dir
 from minion_executor.model_cache import default_cache_dir
 
 
@@ -37,13 +38,29 @@ class ExecutorSettings(BaseSettings):
     # MINION_EXECUTOR_CONFIG; an empty value counts as unset.
     config_path: Path | None = Field(default=None, validation_alias="MINION_EXECUTOR_CONFIG")
 
+    # Owner control (`pause`/`resume`/`profile` write control.json here; ADR-0006 D11). Created
+    # 0700; refused when not ours or writable by others.
+    state_dir: Path = Field(default_factory=default_state_dir)
+
+    # Dev/tests only: read host signals from this JSON file instead of macOS. Needs
+    # MINION_EXECUTOR_DEV=1; an empty value counts as unset.
+    fake_signals: Path | None = None
+
     # Run the inference worker inside the Seatbelt sandbox (ADR-0009). Turning it off is a dev
     # escape hatch only and requires MINION_EXECUTOR_DEV=1.
     sandbox: bool = True
     # Same for the model-fetch subprocess (network allowed, writes only to its staging dir).
     fetch_sandbox: bool = True
 
-    @field_validator("config_path", mode="before")
+    @field_validator("state_dir")
+    @classmethod
+    def _state_dir_absolute(cls, v: Path) -> Path:
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("MINION_EXECUTOR_STATE_DIR must be an absolute path")
+        return v
+
+    @field_validator("config_path", "fake_signals", mode="before")
     @classmethod
     def _empty_config_path_is_unset(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
@@ -56,6 +73,16 @@ class ExecutorSettings(BaseSettings):
         v = v.expanduser()
         if not v.is_absolute():
             raise ValueError("MINION_EXECUTOR_CONFIG must be an absolute path")
+        return v
+
+    @field_validator("fake_signals")
+    @classmethod
+    def _fake_signals_absolute(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("MINION_EXECUTOR_FAKE_SIGNALS must be an absolute path")
         return v
 
     @field_validator("model_cache_dir")
@@ -74,5 +101,9 @@ class ExecutorSettings(BaseSettings):
         if not self.fetch_sandbox and not dev:
             raise ValueError(
                 "MINION_EXECUTOR_FETCH_SANDBOX=0 is only allowed with MINION_EXECUTOR_DEV=1"
+            )
+        if self.fake_signals is not None and not dev:
+            raise ValueError(
+                "MINION_EXECUTOR_FAKE_SIGNALS is only allowed with MINION_EXECUTOR_DEV=1"
             )
         return self
