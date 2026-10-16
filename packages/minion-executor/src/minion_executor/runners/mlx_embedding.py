@@ -205,6 +205,13 @@ class MlxEmbeddingRunner:
         self._pooling = common.pooling_mode(read_json(path / "1_Pooling" / "config.json"))
         self._max_len = min(MAX_LENGTH, int(conf.get("max_position_embeddings", MAX_LENGTH)))
 
+    def set_budget(self, budget: Budget) -> None:
+        common.apply_memory_limits(budget)
+
+    def trim(self) -> None:
+        with contextlib.suppress(ImportError):
+            common.trim_cache()
+
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:
         if self._net is None:
             raise RunnerError("not_loaded")

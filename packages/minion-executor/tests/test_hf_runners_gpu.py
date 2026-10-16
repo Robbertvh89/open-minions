@@ -21,7 +21,8 @@ torch = pytest.importorskip("torch")
 if not torch.backends.mps.is_available():
     pytest.skip("torch has no MPS backend", allow_module_level=True)
 
-from minion_common.schemas import CompletionParams, EmbeddingParams, ModelEntry  # noqa: E402
+from minion_common.enums import CapacityProfile  # noqa: E402
+from minion_common.schemas import Budget, CompletionParams, EmbeddingParams, ModelEntry  # noqa: E402
 from minion_executor.model_cache import ModelCache  # noqa: E402
 from minion_executor.runners import probe_engines  # noqa: E402
 from minion_executor.runners.base import OOM, EngineConfig, Record, RunnerError  # noqa: E402
@@ -299,3 +300,43 @@ async def test_e2e_embedding_through_sandboxed_worker(cache: ModelCache, tmp_pat
     assert _cos(out[0]["embedding"], out[1]["embedding"]) > _cos(
         out[0]["embedding"], out[2]["embedding"]
     )
+
+
+# --- live budget changes (TASK-5.3) -------------------------------------------------------------
+
+
+def test_set_budget_reapplies_the_mps_memory_fraction(
+    completion: HfCompletionRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[float] = []
+    real = torch.mps.set_per_process_memory_fraction
+
+    def spy(fraction: float) -> None:
+        seen.append(fraction)
+        real(fraction)
+
+    monkeypatch.setattr(torch.mps, "set_per_process_memory_fraction", spy)
+    smaller = Budget(
+        profile=CapacityProfile.BALANCED, memory_gb=1, gpu_duty_cycle=1.0, max_batch_size=2
+    )
+    bigger = smaller.model_copy(update={"memory_gb": 3})
+    completion.set_budget(smaller)
+    completion.set_budget(bigger)
+    assert len(seen) == 2 and 0 < seen[0] < seen[1] <= 1.0
+    out = completion.run(_recs(PROMPTS[:2]), CompletionParams(max_tokens=8), Ctl())
+    assert all(isinstance(o["completion"], str) for o in out)
+    completion.trim()  # frees the MPS cache; the model keeps working
+    assert completion.run(_recs(PROMPTS[:1]), CompletionParams(max_tokens=8), Ctl())[0][
+        "completion"
+    ]
+
+
+def test_embedding_set_budget_and_trim(embedding: HfEmbeddingRunner) -> None:
+    embedding.set_budget(
+        Budget(profile=CapacityProfile.BALANCED, memory_gb=1, gpu_duty_cycle=1.0, max_batch_size=2)
+    )
+    embedding.trim()
+    out = embedding.run(
+        [{"id": f"e{i}", "text": t} for i, t in enumerate(TEXTS[:2])], EmbeddingParams(), Ctl()
+    )
+    assert len(out) == 2

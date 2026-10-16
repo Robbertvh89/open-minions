@@ -200,6 +200,12 @@ class OllamaRunner:
             self.unload()
             raise
 
+    def set_budget(self, budget: Budget) -> None:
+        self._budget = budget  # the daemon owns the memory; only the request fan-out is ours
+
+    def trim(self) -> None:
+        return  # nothing cached in this process
+
     def _check_digest(self) -> None:
         """The loaded tag must still resolve to the pinned manifest digest. A mismatch is
         executor-local (this Mac's Ollama store differs): release, outputs are never stamped."""

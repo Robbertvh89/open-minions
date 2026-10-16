@@ -49,6 +49,14 @@ def apply_memory_limits(budget: Budget) -> None:
     mx.reset_peak_memory()
 
 
+def trim_cache() -> None:
+    """Free MLX's cached (unreferenced) Metal buffers; the model stays loaded."""
+    import mlx.core as mx
+
+    gc.collect()
+    mx.clear_cache()
+
+
 def clamp_wired_limit(budget: Budget) -> int:
     """Set the wired limit to `min(budget, recommended working set)`; returns the new value.
 
