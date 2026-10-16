@@ -278,6 +278,9 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   Grafana. A paused executor does not poll (it only sends a low-frequency presence ping).
 - FR-56. **Owner control.** CLI (and later a menu-bar app, M6): `minion-executor profile <name>`,
   `pause`, `resume`, `status` (shows budget, current task, GPU share, today's contribution).
+  **Status (TASK-5.4):** `pause [--for 1h]`, `resume` and `profile <name|auto>` write the owner's
+  `control.json` (0600, atomic, strict schema; ADR-0006 D11); the governor that reads it and `status`
+  land in TASK-5.5.
 
 ## 5. Subtask & task state machines
 

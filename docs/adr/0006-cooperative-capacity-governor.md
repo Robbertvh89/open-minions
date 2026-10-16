@@ -131,7 +131,14 @@ active, `full` while idle on AC). **Deviation** from SPEC FR-51, which called `b
 
 **D11 Owner control (FR-56).** `control.json` / `status.json` files in a 0700 state dir
 (`MINION_EXECUTOR_STATE_DIR`), written atomically, ignored if not owned by the user or writable by
-others. Works with launchd and the later menu-bar app; no socket.
+others. Works with launchd and the later menu-bar app; no socket. **Implemented in TASK-5.4:**
+`minion-executor pause [--for 30m|1h|2h30m]`, `resume` and `profile <name|auto>` do a read-modify-write
+of `control.json` (strict schema, `extra=forbid`; tmp file + fsync + rename, 0600, state dir created
+0700). Reads never follow symlinks and ignore (with a warning) files that are not ours, are
+group/world-writable, oversized or invalid. An owner `resume` lifts the owner pause at once, the 10 s
+clear window applies to signal pauses only. `signals.py`, `governor.py` and `control.py` exist and are
+unit-tested but are wired into the run loop in TASK-5.5; `decide` takes `total_gb`, `local_now` and an
+optional `--profile` pin as arguments so it stays free of I/O and clocks.
 
 **D12 Presence (FR-55).** `POST /api/v1/executor/presence {budget, paused_reason?}` returns 204 and
 updates the caller's own executor row (profile, budget, paused_reason, `last_seen_at`). It carries no
