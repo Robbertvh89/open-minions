@@ -28,7 +28,7 @@ stop sending heartbeats.
 | Server | FastAPI + Pydantic v2, SQLAlchemy 2.x (async) + asyncpg, Alembic migrations |
 | Database | PostgreSQL 16 |
 | Object storage | S3 API (SeaweedFS for local dev) via `boto3`; executors use presigned URLs only |
-| Executor inference | **MLX by default**: `mlx-lm` (batched generation) for completions, `mlx-embeddings` for embeddings. Fallback engines: Ollama HTTP API, HF `transformers` on `mps` — [ADR-0005](docs/adr/0005-mlx-default-inference-engine.md) |
+| Executor inference | **MLX by default**: `mlx-lm` (batched generation) for completions, a small BERT encoder on `mlx` for embeddings (not the heavy `mlx-embeddings` package). Fallback engines: Ollama HTTP API, HF `transformers` on `mps` — [ADR-0005](docs/adr/0005-mlx-default-inference-engine.md) |
 | Executor host integration | `pyobjc` (IOKit / Foundation) for user-idle time, power source, thermal state, memory pressure |
 | Observability | Grafana reading PostgreSQL; structured JSON logs (`structlog`) |
 | Tests | `pytest`, `pytest-asyncio`, `testcontainers` (Postgres, S3) |
@@ -65,6 +65,7 @@ uv run minion-executor run --server http://localhost:8080 --profile balanced [--
 # uv run minion-executor bench --model <id>  # not implemented yet (M3); was: engine/throughput benchmark on this Mac (not implemented yet, M3)
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only (the `macos` sandbox tests run on darwin, skip elsewhere)
+uv run pytest -m "gpu or model"            # real MLX models on this Mac (mlx extra + network once); auto-skipped elsewhere
 uv run pytest -m model                    # real tiny hub download (network; skipped by default)
 uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py
 ```

@@ -110,8 +110,10 @@ minion_executor/
     base.py            # Runner protocol v2: load(model, path, budget, EngineConfig) /
                        # run(batch, params, StepControl) -> results / memory_in_use() / unload();
                        # worker ops also include probe (engine versions) and stats
-    mlx_completion.py  # mlx-lm BatchGenerator (default)
-    mlx_embedding.py   # mlx-embeddings (default)
+    prompts.py         # pure: record -> chat messages / embedding text, BAD_INPUT rules
+    mlx_common.py      # memory/wired-limit levers (invariant 6), OOM detection, pooling mode
+    mlx_completion.py  # mlx-lm BatchGenerator (default); checkpoint() every step
+    mlx_embedding.py   # BERT encoder on mlx (no mlx-embeddings: its mlx-vlm/audio tree is huge)
     ollama.py          # fallback: Ollama HTTP (localhost:11434)
     hf.py              # fallback: transformers / sentence-transformers on mps
   model_cache.py       # pinned, sha256-verified HF snapshots in a killable fetch subprocess;
@@ -188,8 +190,8 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   clients are built (they read proxy env at construction) and before any spawn, so the control
   process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
   bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
-  process dies (parent-pid watch). Only the fake runner exists in M1 (`runners/fake.py`, engine
-  `fake`, never advertised as a real engine); its `fail` / `sleep_s` / `echo_env` per-record hooks
+  process dies (parent-pid watch). Runners: `mlx` (TASK-4.3 S6; completion and embedding) and the
+  test-only `fake` (`runners/fake.py`, never advertised as a real engine); ollama/hf follow in S7/S8. The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
   work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
   control process (invariant 7).
 - **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.

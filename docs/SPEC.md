@@ -88,8 +88,19 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 - FR-12. Models are downloaded on first use and cached locally **[paper]**. Cache size is bounded
   (LRU eviction, configurable, default 50 GB) **[ours]**.
 - FR-13. Engines **[ours, ADR-0005]**:
-  - `mlx` (default): completions via `mlx-lm` batched generation (`BatchGenerator`), embeddings via
-    `mlx-embeddings`. All records of a subtask are processed in batches sized by the capacity budget.
+  - `mlx` (default): completions via `mlx-lm` batched generation (`BatchGenerator`), embeddings via a small
+    BERT-family encoder written on `mlx` (not the `mlx-embeddings` package, ADR-0005 addendum;
+    pooling from the model's sentence-transformers config, CLS by default). Output lines: embedding
+    `{id, embedding, tokens}`; completion `{id, completion, finish_reason, prompt_tokens,
+    completion_tokens}` (the loop adds `model`, `model_revision`). A malformed record (neither or
+    both of `prompt`/`messages`, wrong types, empty content, a chat ending in an assistant turn)
+    fails the subtask with non-retryable `BAD_INPUT`; an over-long prompt gives a per-record
+    `PROMPT_TOO_LONG` line; embedding input over 512 tokens is truncated. A Metal out-of-memory
+    error is a retryable `OOM`. The MLX runner keeps `mx.set_memory_limit` at the memory budget and
+    resets the wired limit to `min(budget, recommended)` after `BatchGenerator` raised it. All
+    records of a subtask are processed in batches sized by the capacity budget; the pacer runs
+    after every generation step. Install with `uv sync --package minion-executor --extra mlx`.
+    All records of a subtask are processed in batches sized by the capacity budget.
   - `ollama` (fallback, e.g. GGUF-only models): local Ollama HTTP API **[paper]**.
   - `hf` (fallback): HuggingFace transformers on `mps` **[paper]**.
   - Inference runs in a worker subprocess; the loaded model is kept warm across consecutive subtasks

@@ -54,7 +54,8 @@ SERVER_TIMEOUT_ENV = "MINION_HEARTBEAT_TIMEOUT_S"  # server/watchdog setting; op
 MIN_TIMEOUT_FACTOR = 2.0
 REAL_ENGINES = [Engine.MLX, Engine.OLLAMA, Engine.HF]
 NO_ENGINE_MSG = (
-    "no inference engine available (mlx/ollama/hf runners land in a later release; "
+    "no inference engine available (on Apple Silicon install the MLX extra: "
+    "`uv sync --package minion-executor --extra mlx`; ollama/hf runners are not available yet; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )
 

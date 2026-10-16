@@ -14,6 +14,8 @@ Record = dict[str, Any]
 # Engine cannot run here (extra missing, no runner implemented yet). Executor-local: the loop
 # releases the subtask instead of burning an attempt.
 ENGINE_UNAVAILABLE = "ENGINE_UNAVAILABLE"
+# The accelerator ran out of memory (retryable: another Mac, or a smaller batch, may fit).
+OOM = "OOM"
 
 
 class RunnerError(Exception):

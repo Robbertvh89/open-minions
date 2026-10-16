@@ -33,7 +33,7 @@ Sources: [Ollama MLX blog](https://registry.ollama.ai/blog/mlx),
 
 1. **Default engine `mlx`**, running in-process in the executor's inference worker subprocess:
    - completions: `mlx-lm` with `BatchGenerator` (batched over a subtask's records);
-   - embeddings: `mlx-embeddings`.
+   - embeddings: a BERT-family encoder on `mlx` (see Addendum 2026-10-16; not `mlx-embeddings`).
 2. **Fallback engines** behind the same `Runner` protocol:
    - `ollama` — for models only available as GGUF / Ollama tags (paper-compatible path);
    - `hf` — `transformers` / `sentence-transformers` on `mps` for models without an MLX port.
@@ -68,3 +68,16 @@ Sources: [Ollama MLX blog](https://registry.ollama.ai/blog/mlx),
   throttling control → consider Ollama as default for simplicity.
 - vllm-mlx (or similar) matures into a stable library with paged KV cache and clear embedding support
   → consider it as the `mlx` runner implementation.
+
+## Addendum 2026-10-16 (TASK-4.3 S6): own MLX encoder instead of `mlx-embeddings`
+
+`mlx-embeddings==0.1.0` depends on `mlx-vlm` and `mlx-audio`, which drag in opencv-python, scipy,
+pandas, pyarrow, datasets, sounddevice, miniaudio and more (about 36 extra packages), all of which
+would be shipped to every Mac and loaded into the sandboxed worker. Its BERT `text_embeds` also
+mean-pools unconditionally, which is wrong for CLS-pooled models such as bge. We therefore ship a
+~60-line BERT encoder on `mlx.nn` (`runners/mlx_embedding.py`) with pooling taken from the model's
+sentence-transformers `1_Pooling/config.json` (CLS when absent) and tokenisation via the
+`transformers` tokenizer that `mlx-lm` already requires. Validated against `mlx-embeddings` on
+`bge-small-en-v1.5-bf16` with mean pooling: cosine >= 0.9999 on every text. Supported
+architectures: BERT / XLM-R style encoders; anything else fails the load with the non-retryable
+`MODEL_UNSUPPORTED`.
