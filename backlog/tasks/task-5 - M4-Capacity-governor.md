@@ -509,5 +509,7 @@ backlog task create "M4.6 Measure NF-8 and NF-9, ADR-0006, docs" -p task-5 -l M4
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
+Carry-over from M1 (TASK-2.3): (1) FR-17 grace period — SIGTERM currently kills worker and releases immediately; spec wants finish-or-release within 30 s grace; (2) FR-51 executor.toml overrides + custom profile not built (parse_profile rejects custom); (3) CPU priority only via nice — add taskpolicy / Budget field.
+
 Decisions (orchestrator, autonomous delivery; record in ADR-0006): D10 omitting --profile = adaptive (FR-52), pinned profiles via --profile; Gap 1 NF-8 hard bound share <= duty+10pp, ±10pp checked vs duty x unpaced share; D5 resume after 10 s clear; D7 memory guard fails as retryable OOM.
 <!-- SECTION:NOTES:END -->
