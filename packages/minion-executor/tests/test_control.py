@@ -239,6 +239,17 @@ def test_dir_fsync_failure_after_replace_warns_and_keeps_file(
         real(fd)
 
     monkeypatch.setattr(os, "fsync", fake)
-    with pytest.warns(sf.UnsyncedWriteWarning, match="not durably synced"):
-        sf.atomic_write_private(tmp_path / "f", b"x")
+    assert sf.atomic_write_private(tmp_path / "f", b"x") is False
     assert (tmp_path / "f").read_bytes() == b"x"
+
+
+def test_update_control_warns_when_not_durably_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.capacity.control as ctl_mod
+
+    monkeypatch.setattr(ctl_mod, "atomic_write_private", lambda path, data: False)
+    state = tmp_path / "state"
+    msgs: list[str] = []
+    update_control(state, paused=True, warn=msgs.append)
+    assert msgs == [f"written but not durably synced: {state / 'control.json'}"]

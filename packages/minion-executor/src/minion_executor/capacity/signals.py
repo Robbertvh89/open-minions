@@ -302,11 +302,14 @@ async def read_with_timeout(
     SignalError("previous read still hung") is raised at once. The default `to_thread` pool is
     never used, so a hung read cannot starve it.
     """
-    prev = _inflight.get(source)
-    if prev is not None and not prev.done():
-        raise SignalError("previous read still hung")
     fut: concurrent.futures.Future[SignalSnapshot] = concurrent.futures.Future()
-    _inflight[source] = fut
+    try:
+        prev = _inflight.get(source)
+        if prev is not None and not prev.done():
+            raise SignalError("previous read still hung")
+        _inflight[source] = fut
+    except TypeError:  # unhashable or not weak-referenceable: refuse before starting a thread
+        raise SignalError("signal source must be hashable and weak-referenceable") from None
 
     def _run() -> None:
         if not fut.set_running_or_notify_cancel():

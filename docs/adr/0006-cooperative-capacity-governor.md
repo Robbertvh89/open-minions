@@ -82,7 +82,9 @@ compare the resolved budgets per dimension (memory, duty, batch, CPU priority): 
 applies at once; anything else (no lower anywhere, or mixed) is held 60 s. While held, the budget is
 the per-dimension minimum of the current and target budgets (invariant 6): dimensions that go down
 drop at once, those that go up wait; `Decision.profile` keeps the current profile name until the
-hold ends, then the full target applies.
+hold ends, then the full target applies. The comparison is against the budget actually in force
+(`GovState.applied`), so a dimension lowered by a hold is not raised again before its own 60 s,
+even if the target is the current profile (no snap-back).
 
 **D6 Downgrade (FR-54, ADR-0009).** When `budget.memory_gb` drops below the loaded model's
 `memory_gb`, the loop finishes the current batch (bounded by 60 s), releases the subtask (executor-side

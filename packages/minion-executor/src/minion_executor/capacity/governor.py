@@ -12,7 +12,9 @@ Rules:
   dimension, or mixed, is held for `escalate_after_s` (60 s). While held, `Decision.budget` is the
   per-dimension minimum of the current and target budgets, so a dimension that goes down is lowered
   at once and one that goes up waits (invariant 6); `Decision.profile` stays the current profile
-  name. After the hold the full target applies.
+  name. Targets are compared with the budget in force (`GovState.applied`), not the nominal one,
+  so a lowered dimension never snaps back before its own hold. After the hold the full target
+  applies.
 - Pause (FR-53). Owner pause and the signal conditions pause at once. A signal pause lifts only
   after the conditions were clear for `resume_after_s` (10 s), so a short blip cannot make the
   60 s pause-release fire. An owner `resume` lifts the owner pause at once. Reason priority for the
@@ -40,7 +42,7 @@ from enum import StrEnum
 from minion_common.enums import CapacityProfile, CpuPriority, PausedReason
 from minion_common.schemas import Budget
 
-from minion_executor.capacity.config import DAYS, ExecutorConfig, ScheduleEntry
+from minion_executor.capacity.config import DAYS, ExecutorConfig, ScheduleEntry, resolve_profiles
 from minion_executor.capacity.control import ControlUnusable, OwnerControl
 from minion_executor.capacity.profiles import ProfileSpec, budget_for
 from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
@@ -70,7 +72,9 @@ class GovernorTiming:
 @dataclass(frozen=True)
 class GovState:
     profile: CapacityProfile | None = None  # profile currently applied
-    candidate: CapacityProfile | None = None  # higher profile waiting out the escalation timer
+    applied: Budget | None = None  # budget in force (a held minimum or the profile's budget)
+    # escalation or mixed change waiting out the hold; budget is the per-dimension min
+    candidate: CapacityProfile | None = None
     candidate_since: datetime | None = None
     signal_reason: PausedReason | None = None  # held signal pause (hysteresis)
     clear_since: datetime | None = None
@@ -88,7 +92,8 @@ class Decision:
     pause_expired: bool  # paused for >= pause_release_after_s: release the in-flight subtask
     trim: bool  # free allocator caches (memory pressure warning or worse)
     profile_source: ProfileSource  # rule behind the target profile (may be held back, see below)
-    candidate: CapacityProfile | None  # escalation waiting out the hold; `profile` is still lower
+    # escalation or mixed change waiting out the hold; budget is the per-dimension min
+    candidate: CapacityProfile | None
     candidate_since: datetime | None
 
     @property
@@ -187,9 +192,12 @@ def _signal_reason(
     return None
 
 
-def initial_state(cfg: ExecutorConfig, pinned: CapacityProfile | None = None) -> GovState:
+def initial_state(
+    cfg: ExecutorConfig, pinned: CapacityProfile | None = None, *, total_gb: float
+) -> GovState:
     """Start state: the run's start profile is already applied, so escalation holds from startup."""
-    return GovState(profile=pinned or cfg.active_profile)
+    profile = pinned or cfg.active_profile
+    return GovState(profile=profile, applied=budget_for(profile, total_gb, resolve_profiles(cfg)))
 
 
 def _secs(later: datetime, earlier: datetime) -> float:
@@ -256,27 +264,28 @@ def decide(
     else:
         target, source = _target_profile(effective, cfg, specs, ctl, pinned, local_now)
 
-    held: Budget | None = None
     cur, cand, cand_since = state.profile, state.candidate, state.candidate_since
-    if source in _EXPLICIT or cur is None or cur not in specs or target == cur:
-        applied, cand, cand_since = target, None, None
-    elif _applies_at_once(budget_for(target, total_gb, specs), budget_for(cur, total_gb, specs)):
-        applied, cand, cand_since = target, None, None  # de-escalate at once
+    target_b = budget_for(target, total_gb, specs)
+    if source in _EXPLICIT or cur is None or cur not in specs:
+        applied, cand, cand_since, applied_b = target, None, None, target_b
     else:
-        if cand != target or cand_since is None:
-            cand, cand_since = target, now
-        if _secs(now, cand_since) >= t.escalate_after_s:
-            applied, cand, cand_since = target, None, None
+        # compare with the budget actually in force (a held minimum may be below budget_for(cur))
+        in_force = state.applied or budget_for(cur, total_gb, specs)
+        if _applies_at_once(target_b, in_force):
+            applied, cand, cand_since, applied_b = target, None, None, target_b
         else:
-            applied = cur
-            held = _min_budget(
-                budget_for(cur, total_gb, specs), budget_for(target, total_gb, specs)
-            )
+            if cand != target or cand_since is None:
+                cand, cand_since = target, now
+            if _secs(now, cand_since) >= t.escalate_after_s:
+                applied, cand, cand_since, applied_b = target, None, None, target_b
+            else:
+                applied = cur
+                applied_b = _min_budget(in_force, target_b)
 
     mem = effective.memory_pressure if effective is not None else MemPressure.NORMAL
     decision = Decision(
         profile=applied,
-        budget=held or budget_for(applied, total_gb, specs),
+        budget=applied_b,
         paused_reason=reason,
         release_now=mem is MemPressure.CRITICAL,
         pause_expired=pause_expired,
@@ -288,6 +297,7 @@ def decide(
     new_state = replace(
         state,
         profile=applied,
+        applied=applied_b,
         candidate=cand,
         candidate_since=cand_since,
         signal_reason=sig_reason,

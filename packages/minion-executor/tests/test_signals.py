@@ -221,15 +221,14 @@ async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_wo
     assert await asyncio.to_thread(lambda: 7) == 7  # the default pool is untouched
     release.set()
     assert await asyncio.to_thread(finished.wait, 5)  # the abandoned read has finished
-    for _ in range(100):  # its future resolves a moment later; then the next read goes through
-        await asyncio.sleep(0)
-        try:
-            await read_with_timeout(src, 1.0)
-            break
-        except SignalError:
-            continue
-    else:
-        pytest.fail("source never recovered")
+    import concurrent.futures
+
+    from minion_executor.capacity import signals as sig_mod
+
+    fut = sig_mod._inflight[src]
+    await asyncio.to_thread(concurrent.futures.wait, [fut], 5)  # the in-flight read has resolved
+    assert fut.done()
+    assert (await read_with_timeout(src, 1.0)) is not None
 
 
 async def test_read_errors_propagate_and_signal_threads_are_daemons() -> None:
@@ -245,3 +244,18 @@ async def test_read_errors_propagate_and_signal_threads_are_daemons() -> None:
     with pytest.raises(SignalError, match="nope"):
         await read_with_timeout(Boom(), 1.0)
     assert seen == [True]
+
+
+async def test_unhashable_or_non_weakrefable_source_raises_signal_error_before_thread() -> None:
+    import threading
+
+    class Slotted:
+        __slots__ = ()
+
+        def read(self) -> SignalSnapshot:
+            raise AssertionError("must not run")
+
+    before = threading.active_count()
+    with pytest.raises(SignalError, match="weak"):
+        await read_with_timeout(Slotted())
+    assert threading.active_count() <= before

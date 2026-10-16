@@ -51,7 +51,7 @@ class Gov:
         self.specs = resolve_profiles(self.cfg)
         pin = kw.get("pinned")
         assert pin is None or isinstance(pin, P)
-        self.state = initial_state(self.cfg, pin) if start else GovState()
+        self.state = initial_state(self.cfg, pin, total_gb=TOTAL) if start else GovState()
         self.kw = kw
         self.t = T0
         self.d: Decision
@@ -489,8 +489,8 @@ def test_initial_state_holds_escalation_from_startup() -> None:
 
 def test_initial_state_uses_pin() -> None:
     cfg = ExecutorConfig()
-    assert initial_state(cfg, P.BALANCED).profile is P.BALANCED
-    assert initial_state(cfg).profile is cfg.active_profile
+    assert initial_state(cfg, P.BALANCED, total_gb=TOTAL).profile is P.BALANCED
+    assert initial_state(cfg, total_gb=TOTAL).profile is cfg.active_profile
 
 
 def test_backward_clock_jump_restarts_timers() -> None:
@@ -536,3 +536,24 @@ def test_control_unusable_ignores_owner_profile_and_idle() -> None:
     g = Gov()
     d = g.step(snap(hid_idle_s=IDLE), owner=ControlUnusable("x"))
     assert d.paused_reason is R.CONTROL_INVALID and d.profile is P.FULL  # idle rule, not owner
+
+
+def test_mixed_hold_does_not_snap_back_to_nominal_memory() -> None:
+    # custom idle profile; unplug lowers memory at once, replug must not raise it before 60 s
+    cfg = _custom(0.7, 0.2, 32, "normal").model_copy(
+        update={"allow_on_battery": True, "min_battery_percent": 20}
+    )
+    g = Gov(cfg)
+    g.step(snap(hid_idle_s=IDLE, on_ac=True))
+    g.step(snap(hid_idle_s=IDLE, on_ac=True), 61)
+    assert g.d.profile is P.CUSTOM
+    nominal = g.d.budget
+    assert nominal.memory_gb == pytest.approx(TOTAL * 0.7)
+    light = budget_for(P.LIGHT, TOTAL, g.specs)
+    d = g.step(snap(hid_idle_s=IDLE, on_ac=False, battery_percent=80), 1)
+    assert d.budget.memory_gb == light.memory_gb == 8.0
+    d = g.step(snap(hid_idle_s=IDLE, on_ac=True), 1)
+    assert d.budget.memory_gb <= 8.0
+    assert g.step(snap(hid_idle_s=IDLE, on_ac=True), 58).budget.memory_gb <= 8.0
+    d = g.step(snap(hid_idle_s=IDLE, on_ac=True), 2)
+    assert d.profile is P.CUSTOM and d.budget == nominal

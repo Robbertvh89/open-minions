@@ -93,11 +93,14 @@ def read_control(state_dir: Path) -> OwnerControl | ControlUnusable | None:
         return ControlUnusable(f"invalid schema: {detail}")
 
 
-def write_control(state_dir: Path, ctl: OwnerControl) -> None:
-    """Atomically replace control.json (creates the state dir 0700). Raises SafeFileError."""
+def write_control(state_dir: Path, ctl: OwnerControl) -> bool:
+    """Atomically replace control.json (creates the state dir 0700). Raises SafeFileError.
+
+    Returns False when the file is in place but not confirmed durable (directory fsync failed).
+    """
     ensure_private_dir(state_dir)
     stamped = ctl.model_copy(update={"written_at": datetime.now(UTC)})
-    atomic_write_private(state_dir / CONTROL_FILE, stamped.model_dump_json().encode("utf-8"))
+    return atomic_write_private(state_dir / CONTROL_FILE, stamped.model_dump_json().encode("utf-8"))
 
 
 def update_control(
@@ -136,5 +139,6 @@ def update_control(
     elif profile is not None:
         fields["profile"] = profile
     new = OwnerControl.model_validate(fields)
-    write_control(state_dir, new)
+    if not write_control(state_dir, new) and warn is not None:
+        warn(f"written but not durably synced: {state_dir / CONTROL_FILE}")
     return new

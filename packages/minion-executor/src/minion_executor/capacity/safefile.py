@@ -5,8 +5,8 @@ honoured when it belongs to the current user and nobody else can write it. Unlik
 symlinks are never followed here (`O_NOFOLLOW`): these files are written by our own CLI, so there is
 no dotfile-manager use case that would justify the extra attack surface. `O_NOFOLLOW` covers only
 the last path component (symlinks in parents are followed; same-user/admin only, TASK-9).
-A failed directory fsync after a successful rename only warns (`UnsyncedWriteWarning`, exit 0):
-the file is in place, just not confirmed durable.
+A failed directory fsync after a successful rename is not an error: `atomic_write_private` returns
+False (file in place, durability unconfirmed) and the caller decides how to tell the owner.
 """
 
 from __future__ import annotations
@@ -15,12 +15,7 @@ import contextlib
 import os
 import secrets
 import stat
-import warnings
 from pathlib import Path
-
-
-class UnsyncedWriteWarning(UserWarning):
-    """The file was replaced but the directory fsync failed (durability not confirmed)."""
 
 
 class SafeFileError(ValueError):
@@ -54,7 +49,10 @@ def open_private_dir(path: Path) -> int:
     except FileNotFoundError:
         raise MissingDirError(f"directory {path} does not exist") from None
     except OSError as exc:  # ELOOP / ENOTDIR for a symlink or file, EACCES, ...
-        raise UnsafeDirError(f"cannot open directory {path}: {exc.strerror}") from None
+        raise UnsafeDirError(
+            f"cannot open directory {path}: {exc.strerror}; fix or replace the state directory "
+            "(it must be a real directory you own, not group/world-writable: chmod 700)"
+        ) from None
     try:
         _check_owner_mode(os.fstat(dfd), "directory", path)
     except BaseException:
@@ -116,15 +114,17 @@ def read_private_file(path: Path, what: str, max_bytes: int) -> bytes | None:
     return data
 
 
-def atomic_write_private(path: Path, data: bytes) -> None:
+def atomic_write_private(path: Path, data: bytes) -> bool:
     """Write `data` to `path` atomically with mode 0600: tmp file + fsync + rename + dir fsync.
 
-    All steps are relative to one vetted directory fd.
+    All steps are relative to one vetted directory fd. Returns False when the file is in place but
+    the directory fsync failed (not confirmed durable), True otherwise.
     """
     try:
         dfd = open_private_dir(path.parent)
     except MissingDirError as exc:
         raise SafeFileError(str(exc)) from None
+    durable = True
     tmp = f".{path.name}.{secrets.token_hex(8)}.tmp"
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -146,13 +146,8 @@ def atomic_write_private(path: Path, data: bytes) -> None:
                 raise SafeFileError(f"cannot write {path}: {exc.strerror}") from None
             try:
                 os.fsync(dfd)
-            except OSError as exc:
-                # the file is in place; only its durability across a crash is unconfirmed
-                warnings.warn(
-                    f"{path} written but not durably synced: {exc.strerror}",
-                    UnsyncedWriteWarning,
-                    stacklevel=2,
-                )
+            except OSError:
+                durable = False  # the file is in place; only crash durability is unconfirmed
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -160,3 +155,4 @@ def atomic_write_private(path: Path, data: bytes) -> None:
                 os.unlink(tmp, dir_fd=dfd)
     finally:
         os.close(dfd)
+    return durable
