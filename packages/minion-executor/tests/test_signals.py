@@ -196,6 +196,7 @@ async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_wo
     import threading
 
     release = threading.Event()
+    finished = threading.Event()
 
     class Hung:
         calls = 0
@@ -203,7 +204,10 @@ async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_wo
         def read(self) -> SignalSnapshot:
             Hung.calls += 1
             release.wait(5)
-            return NullSignals().read()
+            try:
+                return NullSignals().read()
+            finally:
+                finished.set()
 
     src = Hung()
     before = threading.active_count()
@@ -216,8 +220,9 @@ async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_wo
     assert threading.active_count() <= before + 1
     assert await asyncio.to_thread(lambda: 7) == 7  # the default pool is untouched
     release.set()
-    for _ in range(100):  # the abandoned read finishes; the next read goes through again
-        await asyncio.sleep(0.02)
+    assert await asyncio.to_thread(finished.wait, 5)  # the abandoned read has finished
+    for _ in range(100):  # its future resolves a moment later; then the next read goes through
+        await asyncio.sleep(0)
         try:
             await read_with_timeout(src, 1.0)
             break

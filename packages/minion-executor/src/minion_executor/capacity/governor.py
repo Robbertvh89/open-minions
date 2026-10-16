@@ -9,8 +9,10 @@ Rules:
   (`idle_profile`) > `active_profile`. Owner/pinned choices apply at once. Automatic changes
   compare the resolved budgets per dimension (memory, GPU duty, batch size, CPU priority): a
   target that is no higher in every dimension applies at once; one that is no lower in every
-  dimension waits until it held for `escalate_after_s` (60 s); a mixed target applies at once only
-  if it lowers memory or CPU priority, else it waits.
+  dimension, or mixed, is held for `escalate_after_s` (60 s). While held, `Decision.budget` is the
+  per-dimension minimum of the current and target budgets, so a dimension that goes down is lowered
+  at once and one that goes up waits (invariant 6); `Decision.profile` stays the current profile
+  name. After the hold the full target applies.
 - Pause (FR-53). Owner pause and the signal conditions pause at once. A signal pause lifts only
   after the conditions were clear for `resume_after_s` (10 s), so a short blip cannot make the
   60 s pause-release fire. An owner `resume` lifts the owner pause at once. Reason priority for the
@@ -108,13 +110,24 @@ def _dims(b: Budget) -> tuple[float, float, int, int]:
 
 
 def _applies_at_once(target: Budget, current: Budget) -> bool:
-    """De-escalation test on resolved budgets (see module docstring)."""
-    t, c = _dims(target), _dims(current)
-    if all(a <= b for a, b in zip(t, c, strict=True)):
-        return True
-    if all(a >= b for a, b in zip(t, c, strict=True)):
-        return False
-    return t[0] < c[0] or t[3] < c[3]  # mixed: only a lower memory cap or CPU priority is safe
+    """De-escalation test on resolved budgets: no dimension rises (see module docstring)."""
+    return all(a <= b for a, b in zip(_dims(target), _dims(current), strict=True))
+
+
+def _min_budget(current: Budget, target: Budget) -> Budget:
+    """Per-dimension minimum, used while an escalation is held. Keeps `current.profile`."""
+    cpu = min(
+        current.cpu_priority or CpuPriority.LOW,
+        target.cpu_priority or CpuPriority.LOW,
+        key=_CPU_ORDER.__getitem__,
+    )
+    return Budget(
+        profile=current.profile,
+        memory_gb=min(current.memory_gb, target.memory_gb),
+        gpu_duty_cycle=min(current.gpu_duty_cycle, target.gpu_duty_cycle),
+        max_batch_size=min(current.max_batch_size, target.max_batch_size),
+        cpu_priority=cpu,
+    )
 
 
 def _in_window(entry: ScheduleEntry, local_now: datetime) -> bool:
@@ -228,7 +241,7 @@ def decide(
         clear_since = None
     user = ctl is not None and ctl.is_paused(now)
     reason = PausedReason.USER_PAUSED if user else sig_reason
-    if unusable and not user:
+    if unusable:  # then ctl is None, so `user` is False
         reason = PausedReason.CONTROL_INVALID
     paused_since = None if reason is None else (state.paused_since or now)
     pause_expired = paused_since is not None and _secs(now, paused_since) >= t.pause_release_after_s
@@ -243,6 +256,7 @@ def decide(
     else:
         target, source = _target_profile(effective, cfg, specs, ctl, pinned, local_now)
 
+    held: Budget | None = None
     cur, cand, cand_since = state.profile, state.candidate, state.candidate_since
     if source in _EXPLICIT or cur is None or cur not in specs or target == cur:
         applied, cand, cand_since = target, None, None
@@ -255,11 +269,14 @@ def decide(
             applied, cand, cand_since = target, None, None
         else:
             applied = cur
+            held = _min_budget(
+                budget_for(cur, total_gb, specs), budget_for(target, total_gb, specs)
+            )
 
     mem = effective.memory_pressure if effective is not None else MemPressure.NORMAL
     decision = Decision(
         profile=applied,
-        budget=budget_for(applied, total_gb, specs),
+        budget=held or budget_for(applied, total_gb, specs),
         paused_reason=reason,
         release_now=mem is MemPressure.CRITICAL,
         pause_expired=pause_expired,

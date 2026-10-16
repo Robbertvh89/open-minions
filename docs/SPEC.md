@@ -264,7 +264,7 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   condition persists > 60 s):
   - memory pressure `warning` or higher (pause and shrink cache at `warning`; release at `critical`);
   - thermal state `serious` or `critical`;
-  - on battery (default) or battery < 30 % (if `allow_on_battery = true`); Low Power Mode on;
+  - on battery (default) or battery < 30 % or battery percentage unknown (if `allow_on_battery = true`; reason `low_battery`); Low Power Mode on;
   - owner-triggered `minion-executor pause [--for 1h]`;
   - an unusable owner `control.json` (fails closed; `paused_reason` `control_invalid`, listed right
     after `user_paused` in the priority order);

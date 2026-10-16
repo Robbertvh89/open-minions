@@ -20,6 +20,7 @@ import ctypes.util
 import os
 import sys
 import threading
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -284,9 +285,12 @@ def default_source(fake_signals: Path | None) -> SignalSource:
     return src
 
 
-# At most one read in flight per source (keyed by id): a wedged framework call must not pile up
-# threads, and its thread must not keep the interpreter alive (daemon, so SIGTERM exits cleanly).
-_inflight: dict[int, concurrent.futures.Future[SignalSnapshot]] = {}
+# At most one read in flight per source: a wedged framework call must not pile up threads, and its
+# thread must not keep the interpreter alive (daemon, so SIGTERM exits cleanly). Weakly keyed by
+# source, so entries vanish with their source; a finished (done) entry is simply replaced.
+_inflight: weakref.WeakKeyDictionary[SignalSource, concurrent.futures.Future[SignalSnapshot]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 async def read_with_timeout(
@@ -298,18 +302,11 @@ async def read_with_timeout(
     SignalError("previous read still hung") is raised at once. The default `to_thread` pool is
     never used, so a hung read cannot starve it.
     """
-    key = id(source)
-    prev = _inflight.get(key)
+    prev = _inflight.get(source)
     if prev is not None and not prev.done():
         raise SignalError("previous read still hung")
     fut: concurrent.futures.Future[SignalSnapshot] = concurrent.futures.Future()
-    _inflight[key] = fut
-
-    def _forget(f: concurrent.futures.Future[SignalSnapshot]) -> None:
-        if _inflight.get(key) is f:
-            del _inflight[key]
-
-    fut.add_done_callback(_forget)
+    _inflight[source] = fut
 
     def _run() -> None:
         if not fut.set_running_or_notify_cancel():

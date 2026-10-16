@@ -17,6 +17,7 @@ from minion_executor.capacity.governor import (
     decide,
     initial_state,
 )
+from minion_executor.capacity.profiles import budget_for
 from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
 
 T0 = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)  # a Wednesday
@@ -411,14 +412,36 @@ def _custom(mem: float, duty: float, batch: int, cpu: str) -> ExecutorConfig:
     )
 
 
-def test_user_return_from_mixed_custom_applies_at_once() -> None:
-    # reviewer repro: custom (0.7 mem, duty 0.2, batch 32, normal) -> light lowers memory + cpu
+def test_user_return_from_mixed_custom_lowers_memory_at_once() -> None:
+    # custom (0.7 mem, duty 0.2, batch 32, normal) -> light lowers memory + cpu + batch, raises duty
     g = Gov(_custom(0.7, 0.2, 32, "normal"))
     g.step(snap(hid_idle_s=IDLE))
     g.step(snap(hid_idle_s=IDLE), 61)
     assert g.d.profile is P.CUSTOM
+    cur, light = g.d.budget, budget_for(P.LIGHT, TOTAL, g.specs)
     d = g.step(snap(hid_idle_s=1.0), 0.5)
-    assert d.profile is P.LIGHT and d.candidate is None
+    assert d.profile is P.CUSTOM and d.candidate is P.LIGHT  # duty rise is held
+    assert d.budget.memory_gb == light.memory_gb < cur.memory_gb
+    assert d.budget.gpu_duty_cycle == cur.gpu_duty_cycle
+    assert d.budget.max_batch_size == light.max_batch_size
+    assert d.budget.cpu_priority is light.cpu_priority
+
+
+def test_user_returns_memory_up_duty_down_duty_drops_now_memory_after_hold() -> None:
+    # custom has the LOWER memory and HIGHER duty than light: returning to light raises memory
+    # (held 60 s) and lowers duty (at once)
+    g = Gov(_custom(0.1, 0.9, 4, "background"))
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 61)
+    assert g.d.profile is P.CUSTOM
+    cur, light = g.d.budget, budget_for(P.LIGHT, TOTAL, g.specs)
+    assert light.memory_gb > cur.memory_gb and light.gpu_duty_cycle < cur.gpu_duty_cycle
+    d = g.step(snap(hid_idle_s=1.0), 0.5)
+    assert d.budget.gpu_duty_cycle == light.gpu_duty_cycle  # duty drops at once
+    assert d.budget.memory_gb == cur.memory_gb  # memory waits
+    assert g.step(snap(hid_idle_s=1.0), 59).budget.memory_gb == cur.memory_gb
+    d = g.step(snap(hid_idle_s=1.0), 1)
+    assert d.profile is P.LIGHT and d.budget == light
 
 
 @pytest.mark.parametrize(
@@ -427,9 +450,9 @@ def test_user_return_from_mixed_custom_applies_at_once() -> None:
         ((0.25, 0.30, 4, "background"), True),  # equal in every dimension
         ((0.20, 0.20, 2, "background"), False),  # lower everywhere: light is an escalation
         ((0.30, 0.50, 8, "normal"), True),  # higher everywhere: light is lower -> at once
-        ((0.20, 0.50, 8, "background"), False),  # mixed, memory/cpu not lowered
-        ((0.20, 0.50, 8, "low"), True),  # mixed, but light lowers the cpu priority
-        ((0.30, 0.20, 2, "background"), True),  # mixed, memory goes down
+        ((0.20, 0.50, 8, "background"), False),  # mixed: held
+        ((0.20, 0.50, 8, "low"), False),  # mixed: held (memory would rise)
+        ((0.30, 0.20, 2, "background"), False),  # mixed: held (duty would rise)
     ],
 )
 def test_escalation_table(custom: tuple[float, float, int, str], at_once: bool) -> None:

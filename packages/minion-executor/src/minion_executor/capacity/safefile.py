@@ -3,7 +3,10 @@
 Same trust rule as `executor.toml` (invariant 6): a file that shapes the capacity budget is only
 honoured when it belongs to the current user and nobody else can write it. Unlike the TOML config,
 symlinks are never followed here (`O_NOFOLLOW`): these files are written by our own CLI, so there is
-no dotfile-manager use case that would justify the extra attack surface.
+no dotfile-manager use case that would justify the extra attack surface. `O_NOFOLLOW` covers only
+the last path component (symlinks in parents are followed; same-user/admin only, TASK-9).
+A failed directory fsync after a successful rename only warns (`UnsyncedWriteWarning`, exit 0):
+the file is in place, just not confirmed durable.
 """
 
 from __future__ import annotations
@@ -12,22 +15,32 @@ import contextlib
 import os
 import secrets
 import stat
+import warnings
 from pathlib import Path
+
+
+class UnsyncedWriteWarning(UserWarning):
+    """The file was replaced but the directory fsync failed (durability not confirmed)."""
 
 
 class SafeFileError(ValueError):
     """Missing, unsafe or oversized file or directory."""
 
 
-def _check_owner_mode(st: os.stat_result, what: str, path: Path) -> None:
-    if st.st_uid != os.geteuid():
-        raise SafeFileError(f"{what} {path} is not owned by the current user")
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise SafeFileError(f"{what} {path} is group- or world-writable (use chmod go-w)")
+class UnsafeDirError(SafeFileError):
+    """The directory exists but cannot be trusted (wrong owner, writable by others, symlink)."""
 
 
 class MissingDirError(SafeFileError):
     """The directory does not exist (distinct from an unsafe one)."""
+
+
+def _check_owner_mode(st: os.stat_result, what: str, path: Path) -> None:
+    cls = UnsafeDirError if what == "directory" else SafeFileError
+    if st.st_uid != os.geteuid():
+        raise cls(f"{what} {path} is not owned by the current user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise cls(f"{what} {path} is group- or world-writable (use chmod go-w)")
 
 
 def open_private_dir(path: Path) -> int:
@@ -41,7 +54,7 @@ def open_private_dir(path: Path) -> int:
     except FileNotFoundError:
         raise MissingDirError(f"directory {path} does not exist") from None
     except OSError as exc:  # ELOOP / ENOTDIR for a symlink or file, EACCES, ...
-        raise SafeFileError(f"cannot open directory {path}: {exc.strerror}") from None
+        raise UnsafeDirError(f"cannot open directory {path}: {exc.strerror}") from None
     try:
         _check_owner_mode(os.fstat(dfd), "directory", path)
     except BaseException:
@@ -129,9 +142,17 @@ def atomic_write_private(path: Path, data: bytes) -> None:
                     os.fsync(f.fileno())
                 # replaces a symlink at `path` itself, never follows it
                 os.replace(tmp, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
-                os.fsync(dfd)
             except OSError as exc:
                 raise SafeFileError(f"cannot write {path}: {exc.strerror}") from None
+            try:
+                os.fsync(dfd)
+            except OSError as exc:
+                # the file is in place; only its durability across a crash is unconfirmed
+                warnings.warn(
+                    f"{path} written but not durably synced: {exc.strerror}",
+                    UnsyncedWriteWarning,
+                    stacklevel=2,
+                )
         finally:
             if fd >= 0:
                 os.close(fd)

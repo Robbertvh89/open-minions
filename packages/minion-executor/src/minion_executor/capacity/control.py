@@ -22,6 +22,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 
 from minion_executor.capacity.safefile import (
     SafeFileError,
+    UnsafeDirError,
     atomic_write_private,
     ensure_private_dir,
     read_private_file,
@@ -71,6 +72,7 @@ class ControlUnusable:
     """control.json exists but cannot be trusted. `reason` carries no file contents."""
 
     reason: str
+    dir_unsafe: bool = False  # the state directory itself is the problem, not control.json
 
 
 def read_control(state_dir: Path) -> OwnerControl | ControlUnusable | None:
@@ -82,7 +84,7 @@ def read_control(state_dir: Path) -> OwnerControl | ControlUnusable | None:
             return None
         return OwnerControl.model_validate_json(data)
     except SafeFileError as exc:
-        return ControlUnusable(str(exc))
+        return ControlUnusable(str(exc), dir_unsafe=isinstance(exc, UnsafeDirError))
     except ValidationError as exc:
         # loc + message only: pydantic's default text echoes the offending input
         detail = "; ".join(
@@ -117,10 +119,12 @@ def update_control(
     current = read_control(state_dir)
     if isinstance(current, ControlUnusable):
         if paused is None and warn is not None:
-            warn(
-                f"existing control file was unreadable ({current.reason}); "
-                "the pause is kept, run `minion-executor resume` to lift it"
+            fix = (
+                "fix the state directory permissions (chmod 700 / chown), then retry"
+                if current.dir_unsafe
+                else "the pause is kept, run `minion-executor resume` to lift it"
             )
+            warn(f"existing control file was unreadable ({current.reason}); {fix}")
         current = OwnerControl(paused=True)
     fields = (current or OwnerControl()).model_dump()
     if paused is not None:

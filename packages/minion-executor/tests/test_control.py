@@ -209,3 +209,36 @@ def test_symlink_at_target_is_replaced_not_followed(sd: Path, tmp_path: Path) ->
     write_control(sd, OwnerControl(paused=True))
     assert victim.read_text() == "keep"
     assert not f.is_symlink()
+
+
+def test_update_control_unsafe_dir_hint_says_fix_permissions(tmp_path: Path) -> None:
+    d = tmp_path / "state"
+    d.mkdir()
+    d.chmod(0o777)
+    msgs: list[str] = []
+    with pytest.raises(SafeFileError):
+        update_control(d, profile=None, warn=msgs.append)
+    # read_control reports the unsafe dir; the write then refuses the same dir
+    assert msgs and "chmod 700" in msgs[0] and "resume" not in msgs[0]
+
+
+def test_dir_fsync_failure_after_replace_warns_and_keeps_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+
+    import minion_executor.capacity.safefile as sf
+
+    real = os.fsync
+    dfd_stat = tmp_path.stat()
+
+    def fake(fd: int) -> None:
+        st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode) and st.st_ino == dfd_stat.st_ino:
+            raise OSError(errno.EIO, "io")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fake)
+    with pytest.warns(sf.UnsyncedWriteWarning, match="not durably synced"):
+        sf.atomic_write_private(tmp_path / "f", b"x")
+    assert (tmp_path / "f").read_bytes() == b"x"

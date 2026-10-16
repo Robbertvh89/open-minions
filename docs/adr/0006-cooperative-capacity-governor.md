@@ -79,8 +79,10 @@ Reason priority for the single `paused_reason`: `user_paused` > `control_invalid
 is the fail-closed pause for a present-but-unusable `control.json` (D11). On battery with
 `allow_on_battery` and an unknown percentage also pauses (`low_battery`). Automatic profile changes
 compare the resolved budgets per dimension (memory, duty, batch, CPU priority): no higher anywhere
-applies at once, no lower anywhere waits 60 s, a mixed change applies at once only if memory or CPU
-priority drops.
+applies at once; anything else (no lower anywhere, or mixed) is held 60 s. While held, the budget is
+the per-dimension minimum of the current and target budgets (invariant 6): dimensions that go down
+drop at once, those that go up wait; `Decision.profile` keeps the current profile name until the
+hold ends, then the full target applies.
 
 **D6 Downgrade (FR-54, ADR-0009).** When `budget.memory_gb` drops below the loaded model's
 `memory_gb`, the loop finishes the current batch (bounded by 60 s), releases the subtask (executor-side
