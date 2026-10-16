@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -124,13 +125,34 @@ def sandbox_policy(settings: ExecutorSettings, engines: list[Engine]) -> Sandbox
     return SandboxPolicy(cache_root=settings.model_cache_dir)
 
 
+_active_probe: WorkerHandle | None = None
+_probe_cancelled = threading.Event()
+
+
+def kill_active_probe() -> None:
+    """Abort the engine probe (second stop signal during startup). Lock-free. Sets a flag first,
+    so it also works when the probe thread has not created its worker yet."""
+    _probe_cancelled.set()
+    handle = _active_probe
+    if handle is not None:
+        handle.kill()
+
+
 def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = None) -> list[Engine]:
     """Ask a worker subprocess which of `requested` work here (engines are never imported in
     the control process, invariant 7). Call after `restrict_environ()` so the probe worker
     inherits no secrets. The probe worker is sandboxed like a real one, so a broken sandbox
     surfaces here as `SANDBOX_FAILED` (the CLI exits 2) and engine imports are proven to work
     under the profile."""
-    found = WorkerHandle(requested, sandbox=sandbox).probe(PROBE_TIMEOUT_S)
+    global _active_probe
+    handle = WorkerHandle(requested, sandbox=sandbox)
+    _active_probe = handle
+    try:
+        if _probe_cancelled.is_set():  # cancelled before we got here: never spawn
+            handle.kill()
+        found = handle.probe(PROBE_TIMEOUT_S)
+    finally:
+        _active_probe = None
     return [e for e in requested if found.get(e.value)]
 
 
@@ -178,14 +200,28 @@ async def _run(
         restrict_environ()
         stop_requested = asyncio.Event()
         aloop = asyncio.get_running_loop()
+        second_signal = False
+
+        def on_early_signal() -> None:  # covers the probe: a second signal kills it and exits
+            nonlocal second_signal
+            if stop_requested.is_set():
+                second_signal = True
+                kill_active_probe()
+            stop_requested.set()
+
+        _probe_cancelled.clear()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            aloop.add_signal_handler(sig, stop_requested.set)  # also covers the probe
+            aloop.add_signal_handler(sig, on_early_signal)
         try:
             available = await asyncio.to_thread(
                 probe_available, requested, sandbox_policy(settings, requested)
             )
         except (RunnerError, WorkerCrashed) as exc:
+            if second_signal:
+                return  # stopped by the user during startup: clean exit
             raise StartupError(str(exc)) from exc
+        if second_signal:
+            return
         if not available:
             raise StartupError(NO_ENGINE_MSG)
         typer.echo(f"engines: {','.join(e.value for e in available)}")
@@ -215,6 +251,7 @@ async def _run(
             allow_http_loopback=_is_loopback(server),
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
+            stop_grace_s=settings.stop_grace_s,
             model_cache=ModelCache(
                 settings.model_cache_dir,
                 int(settings.model_cache_gb * 1024**3),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import math
 import os
 import random
 import re
@@ -57,6 +58,11 @@ MODEL_NOT_ADMISSIBLE = "MODEL_NOT_ADMISSIBLE"
 TMP_PREFIX = "minion-exec-"
 # Refresh the output URL with one synchronous heartbeat when it expires within this margin.
 UPLOAD_URL_MARGIN_S = 60.0
+# One absolute budget for everything after a hard stop (grace over / second signal): the complete
+# window, release, fail, worker kill and close all draw from it, so a slow server or wedged worker
+# cannot hold the exit past grace + SHUTDOWN_BUDGET_S (+ MIN_CALL_S per call as reaping slack).
+SHUTDOWN_BUDGET_S = 10.0
+MIN_CALL_S = 0.5
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
 # Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
 # (HTTP status errors, unexpected bodies) is a retryable `fail` so max_attempts bounds it.
@@ -127,6 +133,10 @@ class _SignalledError(Exception):
         self.signal = signal
 
 
+class _HardStoppedError(Exception):
+    """A server call was abandoned because the hard stop fired and its time ran out."""
+
+
 class _FailureError(Exception):
     """A subtask failed locally. `release` hands it back without burning the retry budget."""
 
@@ -157,6 +167,7 @@ class ExecutorLoop:
         idle_unload_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
         model_cache: ModelCache | None = None,
+        stop_grace_s: float = 0.0,
     ) -> None:
         self._cache = model_cache
         self._client = client
@@ -175,7 +186,12 @@ class ExecutorLoop:
         self._allow_http = allow_http_loopback
         self._hb_interval = heartbeat_interval_s
         self._hb_sleep = heartbeat_sleep
-        self._stop = asyncio.Event()
+        self._stop = asyncio.Event()  # first signal: no new acquires, grace period starts
+        self._hard_stop = asyncio.Event()  # grace over / second signal: kill + release now
+        self._grace_s = stop_grace_s
+        self._grace_timer: asyncio.TimerHandle | None = None
+        self._deadline: float | None = None  # monotonic; set once, when the hard stop is set
+        self._kill_timed_out = False
         self._idle = 0
         self._fails = 0
         self._idle_unload_s = idle_unload_s
@@ -184,7 +200,66 @@ class ExecutorLoop:
         self._unloaded = False
 
     def stop(self) -> None:
+        """First call: stop acquiring and give the in-flight subtask `stop_grace_s` to finish
+        (heartbeats keep running). A second call, or the grace expiring, hard-stops: the worker is
+        killed and the subtask released. Grace 0 hard-stops at once. Call from the event loop."""
+        if self._stop.is_set():
+            self._set_hard_stop()
+            return
         self._stop.set()
+        if not math.isfinite(self._grace_s) or self._grace_s <= 0:
+            self._set_hard_stop()
+            return
+        try:
+            self._grace_timer = asyncio.get_running_loop().call_later(
+                self._grace_s, self._set_hard_stop
+            )
+        except RuntimeError:  # no running loop: nothing can be in flight
+            self._set_hard_stop()
+
+    def _set_hard_stop(self) -> None:
+        if self._deadline is None:
+            self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+        self._hard_stop.set()
+
+    def _left(self) -> float:
+        """Seconds left of the shared shutdown budget, floored at MIN_CALL_S so a call still gets
+        a real attempt. Before the hard stop (a call during grace) each call gets a full budget
+        of its own; the shared deadline is only fixed by `_set_hard_stop` or `run`'s cleanup."""
+        deadline = self._deadline
+        if deadline is None:
+            deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+        return max(MIN_CALL_S, deadline - time.monotonic())
+
+    def _call_timeout(self) -> float | None:
+        """Bound for a server call: the shared budget once stopping, else unbounded."""
+        if self._stop.is_set() or self._hard_stop.is_set():
+            return self._left()
+        return None
+
+    async def _guarded(
+        self,
+        awaitable: Awaitable[Any],
+        trigger: asyncio.Event,
+        window: Callable[[], float],
+    ) -> Any:
+        """Await `awaitable`, but once `trigger` is set give it only `window()` more seconds; then
+        cancel it and raise `_HardStoppedError` (the outcome is unknown: the request may have
+        reached the server)."""
+        call = asyncio.ensure_future(awaitable)
+        stopper = asyncio.ensure_future(trigger.wait())
+        try:
+            await asyncio.wait({call, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if not call.done():
+                await asyncio.wait({call}, timeout=window())
+                if not call.done():
+                    raise _HardStoppedError
+            return call.result()
+        finally:
+            stopper.cancel()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, stopper, return_exceptions=True)
 
     @property
     def stopping(self) -> bool:
@@ -194,12 +269,12 @@ class ExecutorLoop:
         lo, hi = self._backoff
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
-    async def _pause(self, delay: float) -> None:
+    async def _pause(self, delay: float, *, until: asyncio.Event | None = None) -> None:
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            await asyncio.wait_for((until or self._stop).wait(), timeout=delay)
 
     async def _sleep(self) -> None:
         delay = self._delay(self._idle)
@@ -220,7 +295,13 @@ class ExecutorLoop:
         attempt = 0
         while not self.stopping:
             try:
-                await self._client.register(req)
+                await self._guarded(
+                    self._client.register(req), self._stop, lambda: SHUTDOWN_BUDGET_S
+                )
+                return
+            except _HardStoppedError:
+                # A register that landed is idempotent; the loop below exits on the stop.
+                log.warning("register_abandoned_at_stop")
                 return
             except (httpx.HTTPError, ApiError) as exc:
                 if isinstance(exc, ApiError) and exc.status_code < 500:
@@ -240,9 +321,18 @@ class ExecutorLoop:
                 await self._register_with_retry(self._register)
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
                 try:
-                    assignment = await self._client.acquire(
-                        AcquireRequest(engines=self._engines, budget=self._budget)
+                    assignment = await self._guarded(
+                        self._client.acquire(
+                            AcquireRequest(engines=self._engines, budget=self._budget)
+                        ),
+                        self._stop,
+                        lambda: SHUTDOWN_BUDGET_S,
                     )
+                except _HardStoppedError:
+                    # An acquirement that landed server-side is not ours to hold: just exit, the
+                    # watchdog reclaims it when its first heartbeat never arrives.
+                    log.warning("acquire_abandoned_at_stop")
+                    break
                 except (httpx.HTTPError, ApiError, ValueError) as exc:
                     if isinstance(exc, ApiError) and exc.status_code < 500:
                         raise
@@ -254,6 +344,9 @@ class ExecutorLoop:
                     await self._maybe_unload()
                     await self._sleep()
                     continue
+                if self.stopping:  # acquired while a stop arrived: hand it back untouched
+                    await self._release(assignment, log.bind(subtask_id=assignment.subtask_id))
+                    break
                 self._idle = 0
                 self._unloaded = False
                 outcome = await self._handle(assignment, tmp)
@@ -264,11 +357,37 @@ class ExecutorLoop:
                 elif outcome is _Outcome.FAILED:
                     await self._back_off_after_failure()
         finally:
+            if self._grace_timer is not None:
+                self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
-            await asyncio.to_thread(self._worker.close)
+            if self._deadline is None:  # close and its fallback kill share one budget
+                self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+            # a kill that already timed out means close/kill would wedge as well: skip them
+            if not self._kill_timed_out and not await self._bounded_thread(self._worker.close):
+                await self._bounded_thread(self._worker.kill, is_kill=True)  # lock-free fallback
             if self._owns_http:
                 await self._http.aclose()
         return done
+
+    async def _bounded_thread(self, fn: Callable[[], object], *, is_kill: bool = False) -> bool:
+        """Run a blocking worker call off-loop, waiting at most the rest of the shared shutdown
+        budget. Returns whether it completed.
+
+        On a timeout the *thread keeps running* (Python cannot cancel it); only the wait is
+        abandoned. The exit bound therefore relies on every worker-lock holder aborting once the
+        handle is `_closed` (`kill()` sets it), so the leftover thread ends on its own and the
+        interpreter's executor shutdown does not wait on it."""
+        try:
+            await asyncio.wait_for(asyncio.to_thread(fn), self._left())
+        except TimeoutError:
+            log.warning("worker_call_timed_out", call=getattr(fn, "__name__", "?"))
+            if is_kill:
+                self._kill_timed_out = True
+            return False
+        except Exception as exc:  # shutdown must continue
+            log.warning("worker_call_failed", error=type(exc).__name__)
+            return False
+        return True
 
     async def _maybe_unload(self) -> None:
         """Free model memory once idle for `idle_unload_s` (invariant 6); 0 disables."""
@@ -316,7 +435,7 @@ class ExecutorLoop:
             sleep=self._hb_sleep,
         )
         work = asyncio.create_task(self._execute(a, tmp, hb))
-        stopper = asyncio.create_task(self._stop.wait())
+        stopper = asyncio.create_task(self._hard_stop.wait())
         beat = asyncio.create_task(hb.run())
         try:
             pending: set[asyncio.Future[Any]] = {work, stopper, beat}
@@ -325,12 +444,15 @@ class ExecutorLoop:
                 if work.done():
                     break
                 if stopper.done():
-                    # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
-                    await asyncio.to_thread(self._worker.kill)
+                    # Grace over / second signal: reclaim worker memory, hand the subtask back.
+                    await self._bounded_thread(self._worker.kill, is_kill=True)
                     if self._cache is not None:
                         self._cache.release_in_use()
+                    finished = work.done()  # raced the kill: its result is still good
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
+                    if finished and not work.cancelled() and work.exception() is None:
+                        return await self._complete(a, work.result(), bound)
                     await self._release(a, bound)
                     return _Outcome.STOPPED
                 if beat.cancelled() or beat.exception() is not None:
@@ -355,6 +477,10 @@ class ExecutorLoop:
                 err = _FailureError(True, "EXECUTOR_ERROR", "unexpected executor error")
                 await self._report_failure(a, err, bound)
                 return _Outcome.FAILED
+            if self.stopping:  # exiting: free GPU memory now, before the (possibly slow) complete
+                await self._bounded_thread(self._worker.kill, is_kill=True)
+                if self._cache is not None:
+                    self._cache.release_in_use()
             return await self._complete(a, result, bound)
         finally:
             stopper.cancel()
@@ -404,9 +530,15 @@ class ExecutorLoop:
         saw_5xx = False
         while True:
             try:
-                await self._client.complete(a.acquirement_id, result)
+                await self._call_complete(a, result)
                 bound.info("subtask_completed", records=result.record_count)
                 return _Outcome.DONE
+            except _HardStoppedError:
+                # The call may have reached the server: never claim success. If it did, the
+                # release below gets a 409 (handled); if not, the subtask requeues at once.
+                bound.warning("complete_abandoned_at_hard_stop")
+                await self._release(a, bound)
+                return _Outcome.STOPPED
             except StaleAcquirementError:
                 bound.info("stale_discarded")
                 return _Outcome.DISCARDED
@@ -424,7 +556,7 @@ class ExecutorLoop:
             except httpx.HTTPError as exc:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             attempt += 1
-            if self.stopping:
+            if self._hard_stop.is_set():
                 await self._release(a, bound)
                 return _Outcome.STOPPED
             if attempt >= self._complete_retries:
@@ -434,7 +566,14 @@ class ExecutorLoop:
                     await self._report_failure(a, err, bound)
                 # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
-            await self._pause(self._delay(attempt - 1))
+            await self._pause(self._delay(attempt - 1), until=self._hard_stop)
+
+    async def _call_complete(self, a: Assignment, result: CompleteRequest) -> None:
+        """`client.complete`, but once a hard stop is set (or arrives mid-call) the call gets only
+        the rest of the shared shutdown budget; then `_HardStoppedError` (outcome unknown)."""
+        await self._guarded(
+            self._client.complete(a.acquirement_id, result), self._hard_stop, self._left
+        )
 
     def _check_url(self, url: str) -> None:
         try:
@@ -576,18 +715,21 @@ class ExecutorLoop:
             await self._release(a, bound)
             return
         try:
-            await self._client.fail(
-                a.acquirement_id,
-                FailRequest(retryable=f.retryable, code=f.code, message=f.message[:1000]),
+            await asyncio.wait_for(
+                self._client.fail(
+                    a.acquirement_id,
+                    FailRequest(retryable=f.retryable, code=f.code, message=f.message[:1000]),
+                ),
+                self._call_timeout(),
             )
         except StaleAcquirementError:
             bound.info("stale_discarded")
-        except (httpx.HTTPError, ApiError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("fail_report_failed", error=type(exc).__name__)
 
     async def _release(self, a: Assignment, bound: Any) -> None:
         try:
-            await self._client.release(a.acquirement_id)
+            await asyncio.wait_for(self._client.release(a.acquirement_id), self._call_timeout())
             bound.info("subtask_released")
-        except (httpx.HTTPError, ApiError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("release_failed", error=type(exc).__name__)
