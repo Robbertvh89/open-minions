@@ -242,15 +242,19 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   | Profile | memory | GPU duty | max batch | CPU | Intended use |
   |---|---|---|---|---|---|
   | `light` | 25 % of RAM | 30 % | 4 | background | Owner actively working, video calls |
-  | `balanced` (default) | 40 % of RAM | 50 % | 8 | low | Normal office day |
+  | `balanced` | 40 % of RAM | 50 % | 8 | low | Normal office day |
   | `full` | 70 % of RAM | 100 % | 32 | normal | Owner away, overnight |
   | `custom` | user-defined | | | | |
   Memory share is capped at 75 % of RAM regardless of config (headroom for macOS + apps).
-  **Status (TASK-2.3):** the three built-in profiles are implemented as static values
-  (`capacity/profiles.py`), with the 75 % cap. `~/.config/minion/executor.toml` overrides and the
-  `custom` profile are **not implemented**. `cpu_priority` is applied only as a `nice` value
-  (15 / 10 / 0) in the worker; `taskpolicy -b` is not used. FR-52, FR-53, FR-54 and FR-55 are M4;
-  FR-56 is partially met (`run --profile` only; no `profile`, `pause`, `resume`, `status`).
+  **Status (TASK-5.1):** the built-in profiles, `~/.config/minion/executor.toml` overrides
+  (`MINION_EXECUTOR_CONFIG`, refused when not owned by the user or group/world-writable; unknown keys
+  and bad values exit 2) and the `custom` profile (`[profiles.custom]`, all dimensions required) are
+  implemented, with the 75 % cap on every profile. `cpu_priority` is part of the budget on the wire
+  (optional for older clients) and derives the worker/fetch `nice` (15 / 10 / 0); background QoS
+  (`taskpolicy -b`) lands in M4.3. FR-52..FR-55 enforcement is M4.2..M4.5; `POST /executor/presence`
+  exists (FR-55); FR-56 is partially met (`run --profile` only). Proposed (ADR-0006 D10): there is no
+  implicit `balanced` default; `run` without `--profile` is adaptive (FR-52), and `--profile
+  <name>` pins a profile.
 - FR-52. **Adaptive switching.** The owner configures an `active_profile` (used while the user is at the
   machine) and an `idle_profile` (used when HID idle time ≥ `idle_after_min`, default 10 min, and on AC
   power). Defaults: `active_profile = light`, `idle_profile = full`. Optional time schedules override
@@ -308,7 +312,7 @@ changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_
 without finishing).
 
 **Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
-and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). The other rows are not yet implemented.
+and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). The other rows are not yet implemented.
 
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
@@ -329,7 +333,7 @@ and all of §6.2 except `presence`; TASK-3.1 adds `heartbeat` and the watchdog r
 | `PUT` | `/executor/preference` | Set/clear `(team?, project?, task_name?)` preference |
 | `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb`, engine and `allowed_pool`. `200` + assignment (presigned input GET URL, presigned output PUT URL, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
 | `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state. Body (all optional, unknown fields rejected): `progress? {records_done, records_total}` (ints 0..2^31-1, `done ≤ total`; `total` above the subtask's `record_count` → `422 INVALID_PROGRESS`), `budget?` (`memory_gb` 0..1024 finite, `gpu_duty_cycle` 0..1, `max_batch_size` 1..4096), `paused_reason?` (`[a-z_]{1,64}`). Response `200 {cancel: bool, output_url, expires_at}` (`output_url` is a refreshed presigned PUT for the same attempt key); stale/foreign `acquirement_id` → `409 STALE_ACQUIREMENT` |
-| `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (fleet view only) |
+| `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (`budget.cpu_priority` optional; `paused_reason` `[a-z_]{1,64}`). Response `204`; updates the caller's own executor row only (profile, budget, paused_reason, `last_seen_at`); revoked/invalid token → `401`; bad body → `422`. `acquire` clears `paused_reason` |
 | `POST` | `/executor/subtasks/{acquirement_id}/complete` | Report success + output metadata (record count, checksum) |
 | `POST` | `/executor/subtasks/{acquirement_id}/fail` | Report error `{retryable, code, message}` |
 | `POST` | `/executor/subtasks/{acquirement_id}/release` | Voluntarily give back (graceful stop) |

@@ -24,7 +24,8 @@ from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
-from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
+from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
+from minion_executor.capacity.profiles import budget_for, nice_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
@@ -157,8 +158,11 @@ async def _run(
     requested: list[Engine],
     token: SecretStr,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    config: ExecutorConfig | None = None,
 ) -> None:
-    budget = budget_for(profile)
+    specs = resolve_profiles(config or ExecutorConfig())
+    budget = budget_for(profile, specs=specs)
+    nice = nice_for(budget.cpu_priority)
     settings = ExecutorSettings()
     try:
         # Before restrict_environ(). FetchEnv keeps HF_TOKEN / proxy / CA values in this
@@ -198,7 +202,7 @@ async def _run(
         )
         worker = WorkerHandle(
             available,
-            nice=PROFILES[profile].nice,
+            nice=nice,
             test_hooks=hooks,
             sandbox=sandbox_policy(settings, available),
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
@@ -219,7 +223,7 @@ async def _run(
                 fetch_env=fetch_env,
                 download_timeout_s=settings.download_timeout_s,
                 min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
-                nice=PROFILES[profile].nice,
+                nice=nice,
                 sandbox=settings.fetch_sandbox,
             ),
         )
@@ -236,8 +240,15 @@ def run(
         "http://localhost:8080"
     ),
     profile: Annotated[
-        str, typer.Option(help="Capacity profile: light, balanced or full (SPEC §4.6)")
-    ] = "balanced",
+        str | None,
+        typer.Option(
+            help=(
+                "Pin a capacity profile: light, balanced, full or custom (SPEC §4.6). "
+                "Omitted: adaptive (FR-52); until the governor lands (M4.5) the executor "
+                "starts on active_profile from executor.toml (default light)"
+            )
+        ),
+    ] = None,
     engines: Annotated[
         str,
         typer.Option(
@@ -263,17 +274,19 @@ def run(
     """Poll the server and run subtasks. Token: $MINION_EXECUTOR_TOKEN or Keychain."""
     try:
         require_secure_url(server)
-        prof = parse_profile(profile)
         requested = _requested_engines(engines, runner)
         _validate_heartbeat(heartbeat_interval_s)
-        ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
+        settings = ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
+        config = load_config(settings.config_path)  # before restrict_environ(); exit 2 if unsafe
+        specs = resolve_profiles(config)
+        prof = parse_profile(profile if profile is not None else config.active_profile, specs)
         token = load_token()  # fail fast, before starting anything
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
-        asyncio.run(_run(server, prof, requested, token, heartbeat_interval_s))
+        asyncio.run(_run(server, prof, requested, token, heartbeat_interval_s, config))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -324,14 +337,16 @@ def bench(
     max_tokens: Annotated[int, typer.Option(help="Completion max_tokens")] = (
         bench_mod.DEFAULT_MAX_TOKENS
     ),
-    profile: Annotated[str, typer.Option(help="Capacity profile: light, balanced or full")] = (
-        "full"
-    ),
+    profile: Annotated[
+        str, typer.Option(help="Capacity profile: light, balanced, full or custom")
+    ] = "full",
     out: Annotated[Path | None, typer.Option(help="Also write the JSON report here")] = None,
 ) -> None:
     """Benchmark engines on this Mac through the real worker path. No server or token needed."""
     try:
-        prof = parse_profile(profile)
+        settings = ExecutorSettings()
+        specs = resolve_profiles(load_config(settings.config_path))
+        prof = parse_profile(profile, specs)
         config = bench_mod.BenchConfig(
             records=records,
             batch_sizes=bench_mod.parse_batch_sizes(batch_sizes),
@@ -348,7 +363,6 @@ def bench(
             _require_dev_for_fake()
         if out is not None:
             _check_out_path(out)
-        settings = ExecutorSettings()
         fetch_env = FetchEnv.capture()
     except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -358,7 +372,7 @@ def bench(
     try:
         structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
         restrict_environ()  # fetch_env holds the secrets; workers inherit none
-        base = budget_for(prof)
+        base = budget_for(prof, specs=specs)
         # sweep honestly: the profile's batch cap must not clamp the requested batch sizes
         budget = Budget.model_validate(
             {**base.model_dump(), "max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
@@ -369,7 +383,7 @@ def bench(
         def factory(engine: Engine) -> WorkerHandle:
             return WorkerHandle(
                 [engine],
-                nice=PROFILES[prof].nice,
+                nice=nice_for(base.cpu_priority),
                 sandbox=sandbox,
                 engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
             )
@@ -380,7 +394,7 @@ def bench(
             fetch_env=fetch_env,
             download_timeout_s=settings.download_timeout_s,
             min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
-            nice=PROFILES[prof].nice,
+            nice=nice_for(base.cpu_priority),
             sandbox=settings.fetch_sandbox,
         )
         report = asyncio.run(

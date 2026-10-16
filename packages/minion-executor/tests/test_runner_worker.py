@@ -218,8 +218,9 @@ def test_profiles_to_budget() -> None:
     assert budget_for(CapacityProfile.FULL, total_gb=100).memory_gb == 70
     assert budget_for(CapacityProfile.FULL).memory_gb > 0
     assert parse_profile("light") is CapacityProfile.LIGHT
+    assert b.cpu_priority is not None
     with pytest.raises(ValueError):
-        parse_profile("custom")
+        parse_profile("custom")  # needs [profiles.custom] in executor.toml
     with pytest.raises(ValueError):
         parse_profile("bogus")
 

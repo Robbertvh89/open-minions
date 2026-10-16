@@ -123,7 +123,7 @@ async def test_acquire_clears_paused_reason_and_stores_cpu_priority(
     assert r.status_code == 204
     assert (await _row(sm, p.executor_id)).paused_reason == "thermal"
     await seed_task(sm, "presence-clear", 1, team="presence")
-    req = AcquireRequest(engines=["mlx"], budget=Budget.model_validate(BUDGET))  # type: ignore[list-item]
+    req = AcquireRequest(engines=["mlx"], budget=Budget.model_validate(BUDGET))
     r = await c.post(f"{BASE}/acquire", json=req.model_dump(mode="json"), headers=_auth(token))
     assert r.status_code in (200, 204), r.text
     row = await _row(sm, p.executor_id)

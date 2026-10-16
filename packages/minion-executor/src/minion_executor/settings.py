@@ -28,6 +28,10 @@ class ExecutorSettings(BaseSettings):
     # Wall-clock limit for one model download (fetch subprocess); on expiry the subtask is released.
     download_timeout_s: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
 
+    # executor.toml (FR-51/52/53). Unset: ~/.config/minion/executor.toml, which may be absent.
+    # An explicit path must exist. Env var: MINION_EXECUTOR_CONFIG.
+    config_path: Path | None = Field(default=None, validation_alias="MINION_EXECUTOR_CONFIG")
+
     # Run the inference worker inside the Seatbelt sandbox (ADR-0009). Turning it off is a dev
     # escape hatch only and requires MINION_EXECUTOR_DEV=1.
     sandbox: bool = True
