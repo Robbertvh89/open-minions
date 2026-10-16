@@ -64,6 +64,7 @@ class Heartbeater:
         initial_output_url: str,
         initial_expires_at: datetime | None = None,
         pause_fn: Callable[[], str | None] | None = None,
+        budget_fn: Callable[[], Budget | None] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         check_interval(interval_s)
@@ -71,6 +72,7 @@ class Heartbeater:
         self._aid = acquirement_id
         self._interval = interval_s
         self._budget = budget
+        self._budget_fn = budget_fn  # live budget (governor); wins over the fixed `budget`
         self._total = total
         self._pause_fn = pause_fn
         self._sleep = sleep
@@ -90,7 +92,7 @@ class Heartbeater:
         reason = self._pause_fn() if self._pause_fn is not None else None
         return HeartbeatRequest(
             progress=Progress(records_done=done, records_total=self._total),
-            budget=self._budget,
+            budget=self._budget_fn() if self._budget_fn is not None else self._budget,
             paused_reason=reason,
         )
 

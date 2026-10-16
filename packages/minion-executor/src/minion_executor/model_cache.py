@@ -413,6 +413,7 @@ class ModelCache:
         mp_context: str = "spawn",
         min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
         nice: int = 0,
+        nice_fn: Callable[[], int] | None = None,
         sandbox: bool = True,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -427,6 +428,7 @@ class ModelCache:
         self._pin_fd: int | None = None
         self._min_free = min_free_bytes
         self._nice = nice
+        self._nice_fn = nice_fn  # niceness taken per fetch at spawn, not live
         self._sandbox = sandbox
         self._clock = clock
         # (repo, revision) -> (expires_at, code, message); bounded, oldest first
@@ -472,6 +474,11 @@ class ModelCache:
                 self._remember(key, exc)
             raise
         return final
+
+    @property
+    def in_use(self) -> Path | None:
+        """The protected in-use model directory, if any."""
+        return self._in_use
 
     def release_in_use(self) -> None:
         """Forget the protected in-use model (call after the worker holding it was unloaded)
@@ -788,7 +795,7 @@ class ModelCache:
                 spec,
                 child,
                 os.getpid(),
-                self._nice,
+                self._nice_fn() if self._nice_fn is not None else self._nice,
                 self._confine_spec(Path(spec.staging)),
             ),
             daemon=True,

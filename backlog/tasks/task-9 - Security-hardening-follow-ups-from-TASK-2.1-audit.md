@@ -4,7 +4,7 @@ title: Security hardening follow-ups from TASK-2.1 audit
 status: To Do
 assignee: []
 created_date: '2026-10-15 14:41'
-updated_date: '2026-10-16 19:55'
+updated_date: '2026-10-16 21:36'
 labels:
   - security
 dependencies: []
@@ -38,4 +38,6 @@ From TASK-5.1 audit: no per-executor rate limit on any executor endpoint (presen
 macOS ACLs are not checked on the state dir, control.json or executor.toml (mode bits only, TASK-5.4 review): reject extended ACLs (acl_get_file) or document the limitation.
 
 TASK-5.4 review: O_NOFOLLOW covers only the last path component; symlinks in state dir parents are followed (same-user/admin only). Consider an openat component walk.
+
+TASK-5.5 review follow-up: POST /executor/presence has no server-side minimum interval / 429 like heartbeat. A misbehaving or hostile executor can spam it (DB write per call). Add a per-executor min interval and a 429 with Retry-After, and honor it in the executor's presence sender.
 <!-- SECTION:NOTES:END -->

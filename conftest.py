@@ -37,6 +37,17 @@ if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
 
+@pytest.fixture(autouse=True)
+def _isolated_executor_state_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The executor's `run` creates and `status` reads its state dir: point both at a throwaway
+    path so no test touches the developer's real one (tests that need a specific directory set
+    MINION_EXECUTOR_STATE_DIR themselves, which wins)."""
+    root = tmp_path_factory.mktemp("state-root")
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(root / "state"))
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """`model` tests hit the real hub: skipped unless selected with `-m model`; `gpu` tests need
     an Apple GPU plus the `mlx` extra and are skipped unless selected with `-m gpu`; `macos` tests

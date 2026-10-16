@@ -13,6 +13,7 @@ import time
 from collections import namedtuple
 from multiprocessing.connection import Connection
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -988,3 +989,28 @@ async def test_staging_entry_cap_applies_before_the_plan(
 def test_child_env_disables_xet_chunk_cache(tmp_path: Path) -> None:
     env = _cache(tmp_path, fake_fetch())._child_env(tmp_path / "st")
     assert env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == "0"
+
+
+async def test_fetch_niceness_follows_the_live_priority(tmp_path: Path) -> None:
+    seen: list[int] = []
+
+    class StopError(Exception):
+        pass
+
+    class FakeCtx:
+        def Pipe(self) -> tuple[Any, Any]:  # noqa: N802
+            return object(), object()
+
+        def Process(self, *, target: Any, args: tuple[Any, ...], daemon: bool) -> Any:  # noqa: N802
+            seen.append(args[4])
+            raise StopError
+
+    live = [5]
+    cache = _cache(tmp_path, fake_fetch(), nice=19, nice_fn=lambda: live[0])
+    cache._ctx = FakeCtx()
+    cache._confine_spec = lambda staging: None  # type: ignore[method-assign]
+    for n in (5, 10):
+        live[0] = n
+        with pytest.raises(StopError):
+            await cache._run_child(SimpleNamespace(staging=str(tmp_path)), tmp_path / "final")  # type: ignore[arg-type]
+    assert seen == [5, 10]  # not the constructor's 19

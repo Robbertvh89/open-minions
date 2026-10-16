@@ -46,6 +46,18 @@ class ExecutorSettings(BaseSettings):
     # MINION_EXECUTOR_DEV=1; an empty value counts as unset.
     fake_signals: Path | None = None
 
+    # Governor (ADR-0006 D1/D12): seconds between signal polls (bounds NF-9 detection), and between
+    # presence pings while paused (the server polls "< 2 min", ARCHITECTURE §7).
+    signal_poll_s: float = Field(default=2.0, ge=0.5, le=5.0, allow_inf_nan=False)
+    presence_interval_s: float = Field(default=60.0, ge=1.0, le=110.0, allow_inf_nan=False)
+
+    # Governor timers (ADR-0006 D5/D6). The defaults are the spec; any other value is a test knob
+    # and needs MINION_EXECUTOR_DEV=1.
+    pause_release_after_s: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
+    resume_after_s: float = Field(default=10.0, ge=0, le=3600, allow_inf_nan=False)
+    escalate_after_s: float = Field(default=60.0, ge=0, le=3600, allow_inf_nan=False)
+    downgrade_batch_s: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
+
     # Run the inference worker inside the Seatbelt sandbox (ADR-0009). Turning it off is a dev
     # escape hatch only and requires MINION_EXECUTOR_DEV=1.
     sandbox: bool = True
@@ -102,6 +114,17 @@ class ExecutorSettings(BaseSettings):
             raise ValueError(
                 "MINION_EXECUTOR_FETCH_SANDBOX=0 is only allowed with MINION_EXECUTOR_DEV=1"
             )
+        timers = (
+            (self.pause_release_after_s, 60.0, "PAUSE_RELEASE_AFTER_S"),
+            (self.resume_after_s, 10.0, "RESUME_AFTER_S"),
+            (self.escalate_after_s, 60.0, "ESCALATE_AFTER_S"),
+            (self.downgrade_batch_s, 60.0, "DOWNGRADE_BATCH_S"),
+        )
+        for value, default, name in timers:
+            if value != default and not dev:
+                raise ValueError(
+                    f"MINION_EXECUTOR_{name} is only allowed with MINION_EXECUTOR_DEV=1"
+                )
         if self.fake_signals is not None and not dev:
             raise ValueError(
                 "MINION_EXECUTOR_FAKE_SIGNALS is only allowed with MINION_EXECUTOR_DEV=1"

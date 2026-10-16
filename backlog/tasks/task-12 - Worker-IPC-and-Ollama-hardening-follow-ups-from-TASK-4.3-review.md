@@ -4,7 +4,7 @@ title: Worker IPC and Ollama hardening follow-ups (from TASK-4.3 review)
 status: To Do
 assignee: []
 created_date: '2026-10-16 03:29'
-updated_date: '2026-10-16 18:51'
+updated_date: '2026-10-16 23:06'
 labels:
   - executor
   - security
@@ -42,4 +42,6 @@ TASK-4.4 (M3 bench): the worker sandbox denies writes to the com.apple.MetalPerf
 Narrowed (TASK-5.3): ctl sends are now bounded by a kill watchdog (CTL_SEND_TIMEOUT_S). Still open: _call's initial request send (up to 64 MiB, under _lock/_send_lock) has no time limit; a non-reading worker blocks the call thread until kill/interrupt. Fix with the same kill watchdog.
 
 TASK-5.3 final audit: (a) _call takes _send_lock and sends the request with no timeout; with the sandbox off (DEV) a worker can fork a child that holds the pipe open and stops reading, wedging _send_lock then _lock. Fix: acquire(timeout=CTL_SEND_TIMEOUT_S+1) -> WorkerCrashed, and the same kill watchdog on the _call write. (b) Ack 'paused' is not checked against the delivered generation's state and acks may go backwards; keep delivered gen->paused, reject mismatch and ack < previous. Acks are advisory (ADR-0006); enforcement is control-side.
+
+From TASK-5.5 review: WorkerHandle.ensure_model treats a warm worker as reusable when model_id matches (worker/process.py:675), ignoring revision; the loop now compares (model_id, revision). If the catalogue bumps a model's revision under the same id, a warm worker keeps the old weights. Compare revision (or the cache path) in ensure_model too.
 <!-- SECTION:NOTES:END -->
