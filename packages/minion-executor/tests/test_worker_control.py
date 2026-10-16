@@ -856,9 +856,12 @@ def test_an_ack_for_a_generation_never_delivered_is_a_protocol_violation() -> No
     w.control(duty=0.5, paused=False)
     w.control(duty=0.4, paused=False)
     w._op = None
-    assert w._ctl_gen == 2 and w._sent_gen == 0
-    with pytest.raises(WorkerCrashed):
+    w._unsent = None  # nothing flushed: gens 1 and 2 never reach the wire
+    assert w._ctl_gen == 2 and w._sent_gen == 0 and w._wire_gen == 0
+    started = time.monotonic()
+    with pytest.raises(WorkerCrashed, match="malformed"):
         w._call({"op": "run", "batch": []}, 5.0)
+    assert time.monotonic() - started < 2.0  # rejected on the ack, not by the step timeout
     assert not proc.is_alive() and w.last_ack() is None
 
 

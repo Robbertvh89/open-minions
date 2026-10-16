@@ -566,9 +566,9 @@ class WorkerHandle:
             op = msg.get("op")
             self._op = op if isinstance(op, str) else ""
             try:
-                if op == "run" and isinstance(msg.get("ctl"), dict):
-                    self._wire_gen = max(self._wire_gen, int(msg["ctl"].get("gen", 0)))
-                with self._send_lock:
+                with self._send_lock:  # serialises every _wire_gen writer with _send_ctl
+                    if op == "run" and isinstance(msg.get("ctl"), dict):
+                        self._wire_gen = max(self._wire_gen, int(msg["ctl"].get("gen", 0)))
                     _send(conn, msg)
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
