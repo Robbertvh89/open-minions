@@ -78,3 +78,30 @@ def test_fake_signals_needs_dev(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.setenv("MINION_EXECUTOR_FAKE_SIGNALS", "rel.json")
     with pytest.raises(ValidationError, match="absolute"):
         ExecutorSettings()
+
+
+def test_governor_poll_and_presence_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = ExecutorSettings()
+    assert (s.signal_poll_s, s.presence_interval_s) == (2.0, 60.0)
+    for name, bad in (
+        ("SIGNAL_POLL_S", "0.1"),
+        ("SIGNAL_POLL_S", "30"),
+        ("PRESENCE_INTERVAL_S", "0"),
+        ("PRESENCE_INTERVAL_S", "300"),
+    ):
+        monkeypatch.setenv(f"MINION_EXECUTOR_{name}", bad)
+        with pytest.raises(ValidationError):
+            ExecutorSettings()
+        monkeypatch.delenv(f"MINION_EXECUTOR_{name}")
+
+
+@pytest.mark.parametrize(
+    "name", ["PAUSE_RELEASE_AFTER_S", "RESUME_AFTER_S", "ESCALATE_AFTER_S", "DOWNGRADE_BATCH_S"]
+)
+def test_governor_timers_are_dev_only(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
+    monkeypatch.setenv(f"MINION_EXECUTOR_{name}", "3")
+    with pytest.raises(ValidationError, match="MINION_EXECUTOR_DEV"):
+        ExecutorSettings()
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    assert getattr(ExecutorSettings(), name.lower()) == 3.0

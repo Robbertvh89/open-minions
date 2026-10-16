@@ -634,3 +634,24 @@ def test_run_hands_the_governor_plan_to_run(
     adaptive, pinned = seen
     assert isinstance(adaptive, m.CapacityPlan) and isinstance(pinned, m.CapacityPlan)
     assert adaptive.pinned is None and pinned.pinned is CapacityProfile.BALANCED
+
+
+def test_build_governor_seeds_pinned_profile_and_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
+    from minion_executor.capacity.signals import NullSignals
+    from minion_executor.main import CapacityPlan, build_governor
+    from minion_executor.settings import ExecutorSettings
+
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    monkeypatch.setenv("MINION_EXECUTOR_PAUSE_RELEASE_AFTER_S", "5")
+    monkeypatch.setenv("MINION_EXECUTOR_SIGNAL_POLL_S", "0.5")
+    cfg = ExecutorConfig()
+    plan = CapacityPlan(
+        cfg, resolve_profiles(cfg), CapacityProfile.BALANCED, NullSignals(), ExecutorSettings()
+    )
+    gov = build_governor(plan)
+    assert gov._timing.pause_release_after_s == 5.0 and gov._poll_s == 0.5
+    assert gov.decision.profile is CapacityProfile.BALANCED  # seeded from the pin, fail-closed
+    assert gov.decision.paused  # until the first poll

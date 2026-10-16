@@ -1,6 +1,6 @@
 # ADR-0006: Cooperative capacity governor
 
-- Status: **Draft** (written in TASK-5.1; finalized with measurements in TASK-5.6)
+- Status: **Draft** (written in TASK-5.1, wired in TASK-5.5; finalized with measurements in TASK-5.6)
 - Date: 2026-10-16
 - Deciders: project owner
 - Deviates from paper: **no** (the paper has no partial allocation; this refines ARCHITECTURE §3.6
@@ -74,6 +74,15 @@ the 60 s hold of ARCHITECTURE §3.6; de-escalation is immediate. If the governor
 the in-flight subtask is interrupted and released. Memory pressure `warning` pauses and trims;
 `critical` interrupts, releases and unloads at once. **Deviation** from ARCHITECTURE ("escalate only
 after 60 s"): without the 10 s resume window a 5 s thermal blip would always end in a release at 60 s.
+**No ramp after resume** (decided in TASK-5.4/5.5): the escalation timer keeps running while paused,
+and the applied budget stays the held per-dimension minimum through a pause. The normal 60 s timer is
+the only ramp, so a pause longer than 60 s resumes straight at the target budget. No work ran in
+between and every de-escalation was already applied at once, so there is nothing to ramp towards.
+*Wired in TASK-5.5* (`capacity/runtime.py`, `loop.py`): the pause gates the acquire loop and the model
+load / next batch; a watcher task beside each subtask sees `release_now` and `pause_expired` (both
+level-triggered, so the actions are idempotent) and interrupts + releases. A pause that ends inside
+60 s simply lets the same attempt continue (the worker blocked in its checkpoint, heartbeats kept
+going).
 Reason priority for the single `paused_reason`: `user_paused` > `control_invalid` > `memory_pressure` >
 `thermal` > `low_power_mode` > `low_battery` > `on_battery` > `signals_unavailable`. `control_invalid`
 is the fail-closed pause for a present-but-unusable `control.json` (D11). On battery with
@@ -90,6 +99,12 @@ even if the target is the current profile (no snap-back).
 `memory_gb`, the loop finishes the current batch (bounded by 60 s), releases the subtask (executor-side
 code `BUDGET_DOWNGRADE`, a release, not a failure), unloads the worker (Ollama `keep_alive 0`, then
 kill), and frees the cache pin. An idle warm worker whose model no longer fits is unloaded at once.
+*Implemented in TASK-5.5*: the batch loop compares the loaded model with `decision.budget` before every
+batch (and before the model load); a model over budget ends the subtask at that boundary with
+`BUDGET_DOWNGRADE` (release, `worker.unload()`, cache unpin). If the running batch has not ended
+`MINION_EXECUTOR_DOWNGRADE_BATCH_S` (60) after the drop, the watcher interrupts the worker. The idle
+check also unloads a warm worker under memory pressure (`trim`), without waiting for `idle_unload_s`.
+The idle back-off sleep wakes on governor changes, so this happens within one poll.
 
 **D7 Memory guard (NF-8 safety net).** `mx.set_memory_limit` is a soft guideline in MLX and RSS also
 holds the Python heap, so the control side samples the worker footprint (darwin `proc_pid_rusage`,
@@ -100,7 +115,10 @@ unreaped child keeps its pid, so a recycled pid is never mistaken for the worker
 macOS, and the same counter Activity Monitor charges (compressed and GPU-wired memory included, which
 RSS misses). More than `memory_gb * 1.10` on 2 consecutive samples
 interrupts the worker and fails the subtask as **retryable `OOM`**: another Mac with a bigger budget
-may fit it, and `max_attempts` bounds the retries. The Ollama daemon's memory is outside the worker
+may fit it, and `max_attempts` bounds the retries. *Implemented in TASK-5.5* in the per-subtask
+watcher (every `MINION_EXECUTOR_SIGNAL_POLL_S`; `None` = no live worker resets the count). The guard is
+suspended while a downgrade is pending (the worker legitimately exceeds the new, lower budget until its
+batch ends, which is bounded by D6). The Ollama daemon's memory is outside the worker
 and stays the documented caveat of ADR-0009.
 
 **D8 CPU priority.** `Budget.cpu_priority` (`background|low|normal`, optional on the wire so older
@@ -119,7 +137,10 @@ whenever that priority is `low` or `background` (an absent one counts as `low`).
 Enforcement is control-side: `WorkerHandle.priority_ok()` reads the worker's nice (and, on macOS, its
 background flag from `proc_bsdinfo`; `getpriority(PRIO_DARWIN_PROCESS, other_pid)` reads 0 for any pid
 but our own) and returns False if the worker is less throttled than the budget in force. The governor
-wires it in TASK-5.5, with a grace window after a budget change.
+wires it in TASK-5.5: the watcher polls it with the footprint; a False after the grace window
+(60 s, about one batch, counted from the subtask start and from each CPU priority change, because the
+worker applies a new priority only when its next run starts) interrupts the worker and releases the
+subtask (`PRIORITY_VIOLATION`, with the normal failure back-off so a faulty host cannot churn).
 The fetch subprocess nice derives from the same value (TASK-5.1: `nice_for`).
 Rollout order: upgrade the server before the executors. `Budget` is `extra=forbid`, so an old
 server answers 422 to a new executor's `cpu_priority`.
@@ -135,8 +156,8 @@ local wall-clock time, a documented exception to the UTC rule because they are a
 **D10 `run --profile`.** Giving `--profile light|balanced|full|custom` pins that profile: no adaptive
 switching, auto-pause still applies. **Omitting it means adaptive** (FR-52, defaults `light` while
 active, `full` while idle on AC). **Deviation** from SPEC FR-51, which called `balanced` the default:
-`balanced` becomes the pinned choice owners opt into, not the implicit one. Until the governor is wired
-(TASK-5.5) an adaptive run starts on `active_profile`.
+`balanced` becomes the pinned choice owners opt into, not the implicit one. An adaptive run starts on
+`active_profile` and switches live since TASK-5.5.
 
 **D11 Owner control (FR-56).** `control.json` / `status.json` files in a 0700 state dir
 (`MINION_EXECUTOR_STATE_DIR`), written atomically. The directory is created 0700; an existing one must be owned by the user and
@@ -150,15 +171,33 @@ invalid or of a newer version is **unusable**: the governor fails closed (paused
 automatic profile) until it is fixed or replaced by `resume`; a missing file or directory is just
 absent. The reader returns a reason and does not log (5.5 logs once per change). `profile <x>` on an
 unusable file keeps the pause (with a warning) instead of dropping it silently. An owner `resume` lifts the owner pause at once, the 10 s
-clear window applies to signal pauses only. `signals.py`, `governor.py` and `control.py` exist and are
-unit-tested but are wired into the run loop in TASK-5.5; `decide` takes `total_gb`, `local_now` and an
-optional `--profile` pin as arguments so it stays free of I/O and clocks.
+clear window applies to signal pauses only. `decide` takes `total_gb`, `local_now` and an optional
+`--profile` pin as arguments so it stays free of I/O and clocks.
+**Wired in TASK-5.5** (`capacity/runtime.py` `GovernorRuntime`, `capacity/status.py`): `run` first
+requires the state dir to be creatable/safe (exit 2 otherwise) and the signal source readable (exit 2),
+then the runtime polls every `MINION_EXECUTOR_SIGNAL_POLL_S` with one source object for the whole run
+(the one-read-in-flight bound is per source) through `read_with_timeout`, reads `control.json` in a
+thread under a timeout (a hang counts as unusable), and seeds `decide` from `initial_state` (a cold
+`GovState()` has no applied budget and would skip the hold). Until its first poll finishes, and after
+an unexpected error in a poll, the decision is paused `signals_unavailable` (fail closed). The loop
+takes the budget from `Decision.budget` only (a hold lowers it below `budget_for(profile)`). A signal
+read problem and an unusable control file are logged once per change, not per poll.
+`status.json` (atomic, 0600, same dir) is rewritten on every decision change, on subtask start/finish
+and every 10 s, with a `stopped` marker on exit; `minion-executor status` prints it and exits 1 when
+the file is missing, `stopped`, older than 30 s or its pid is gone (2 on an unsafe dir). It holds ids
+and numbers only (profile and source, budget, "held below nominal" when the budget in force is under
+the profile's nominal one, candidate, paused reason, current subtask id/attempt/progress, GPU share,
+coarse signals, today's subtasks/records of this process); never a payload, URL, acquirement id or
+token.
 
 **D12 Presence (FR-55).** `POST /api/v1/executor/presence {budget, paused_reason?}` returns 204 and
 updates the caller's own executor row (profile, budget, paused_reason, `last_seen_at`). It carries no
 acquirement id: it never touches a subtask (invariant 3), and bounded fields keep payloads out (S-5).
 `acquire` clears `paused_reason`. The executor sends it on entering a pause and every 60 s while
-paused. No migration: the columns already exist.
+paused. No migration: the columns already exist. *Sent by the loop since TASK-5.5*: on entering a pause,
+whenever the pause reason or budget changes while paused, and every
+`MINION_EXECUTOR_PRESENCE_INTERVAL_S` (60, max 110). A failed ping is retried after 10 s; 401/403 end
+the run like a refused acquire. While paused the loop does not acquire.
 
 **D13 Graceful stop (FR-17).** First SIGTERM/SIGINT stops acquiring; the in-flight subtask may finish
 within `MINION_EXECUTOR_STOP_GRACE_S` (30). A second signal or the deadline interrupts and releases.

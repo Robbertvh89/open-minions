@@ -261,7 +261,9 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   power). Defaults: `active_profile = light`, `idle_profile = full`. Optional time schedules override
   both (e.g. `full` 19:00–07:00, `light` otherwise).
 - FR-53. **Automatic pause** (no new acquires; running subtask released after current batch if the
-  condition persists > 60 s):
+  condition persists > 60 s). **Status (TASK-5.5):** implemented in the executor loop: no acquire
+  while paused, the in-flight subtask keeps its attempt if the pause ends within 60 s and is
+  interrupted and released after 60 s (or at once on memory pressure `critical`):
   - memory pressure `warning` or higher (pause and shrink cache at `warning`; release at `critical`);
   - thermal state `serious` or `critical`;
   - on battery (default) or battery < 30 % or battery percentage unknown (if `allow_on_battery = true`; reason `low_battery`); Low Power Mode on;
@@ -274,15 +276,28 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   finish the current batch, `release` the subtask (immediate requeue, not a failure), and unload the model.
   **Status (TASK-5.3):** the worker side is implemented: a running batch takes a new duty cycle or a
   pause at its next checkpoint (also mid pacer-sleep, acked per generation), and each batch can carry a
-  new budget (memory limits, batch cap, CPU priority). Wiring the governor to it is M4.5.
+  new budget (memory limits, batch cap, CPU priority).
+  **Status (TASK-5.5):** the governor is wired in: duty, pause and trim reach the worker at once,
+  batch size, memory limits and CPU priority apply to the next batch, and a memory budget below the
+  loaded model finishes the batch (bounded by 60 s), releases (`BUDGET_DOWNGRADE`, executor-side log
+  code), unloads and unpins the cache; an idle warm worker above the budget is unloaded at once. A
+  worker footprint above 1.1x the memory budget on two consecutive samples fails the subtask as a
+  retryable `OOM`.
 - FR-55. **Reporting.** The executor sends its current profile, budget and pause reason with every
   `acquire` and `heartbeat`; the server uses `memory_gb` for admission filtering and records it for
   Grafana. A paused executor does not poll (it only sends a low-frequency presence ping).
+  **Status (TASK-5.5):** the loop sends the governor's live budget (the per-dimension minimum while a
+  profile hold is running) and `paused_reason`; presence goes out on entering a pause, on a reason or
+  budget change and every `MINION_EXECUTOR_PRESENCE_INTERVAL_S` (60).
 - FR-56. **Owner control.** CLI (and later a menu-bar app, M6): `minion-executor profile <name>`,
   `pause`, `resume`, `status` (shows budget, current task, GPU share, today's contribution).
   **Status (TASK-5.4):** `pause [--for 1h]`, `resume` and `profile <name|auto>` write the owner's
-  `control.json` (0600, atomic, strict schema; ADR-0006 D11); the governor that reads it and `status`
-  land in TASK-5.5.
+  `control.json` (0600, atomic, strict schema; ADR-0006 D11). **Status (TASK-5.5):** the running
+  executor's governor reads it every poll, and `minion-executor status` prints `status.json` (profile
+  and source, budget, `held below nominal`, paused reason, current subtask id and progress, GPU share,
+  a signals summary, subtasks/records completed today by this process); it exits 1 when no executor
+  is running (no file, `stopped`, not updated for 30 s, or the pid is gone). No payload, URL or token
+  is ever written to it.
 
 ## 5. Subtask & task state machines
 

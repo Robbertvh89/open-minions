@@ -402,6 +402,16 @@ executor therefore enforces the owner's budget cooperatively, at four levers (SP
                        acquire / heartbeat / presence (server)
 ```
 
+**Runtime (M4.5).** `capacity/runtime.py` `GovernorRuntime` is an asyncio task beside the control loop.
+Each poll (`MINION_EXECUTOR_SIGNAL_POLL_S`, 2 s) it reads the signals (`read_with_timeout`, one source
+object per run), `control.json` and runs the pure `decide`; the loop reads `decision` (budget,
+`paused_reason`, `release_now`, `pause_expired`, `trim`) and wakes on changes. The loop uses
+`decision.budget` everywhere (acquire, admission, heartbeat, presence, per-batch `run`). While paused it
+only sends presence (on entering the pause, on a reason/budget change, every 60 s). A watcher task
+beside each subtask (next to the heartbeater) pushes duty/pause/trim to the worker, releases the
+subtask on `pause_expired` / `release_now`, bounds a downgrade to 60 s, and runs the memory and CPU
+priority guards (D7/D8). `status.json` mirrors the state for `minion-executor status`.
+
 **Governor states:** `ACTIVE(profile)` ⇄ `IDLE(profile)` → `PAUSED(reason)` → back. Transitions:
 - user input within `idle_after_min` → `active_profile`; idle ≥ threshold and on AC → `idle_profile`;
 - schedule window overrides both; `pause` CLI / pause conditions (SPEC FR-53) → `PAUSED`;
