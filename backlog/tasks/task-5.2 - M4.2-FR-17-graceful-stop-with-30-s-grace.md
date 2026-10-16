@@ -1,10 +1,10 @@
 ---
 id: TASK-5.2
 title: M4.2 FR-17 graceful stop with 30 s grace
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 14:35'
+updated_date: '2026-10-16 15:11'
 labels:
   - M4
 dependencies: []
