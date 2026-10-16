@@ -26,9 +26,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from minion_common.enums import Engine
+from minion_common.enums import CpuPriority, Engine
 from minion_common.schemas import Budget, ModelEntry, TaskParams, parse_params
 
+from minion_executor.capacity.priority import apply_cpu_priority, current_priority, satisfies
+from minion_executor.capacity.profiles import nice_for
 from minion_executor.runners.base import (
     ENGINE_UNAVAILABLE,
     MODEL_INTEGRITY,
@@ -45,12 +47,12 @@ from minion_executor.worker.control import (
     parse_ack,
     parse_usage,
 )
-from minion_executor.worker.priority import apply_cpu_priority
+from minion_executor.worker.footprint import process_footprint_bytes
 from minion_executor.worker.sandbox import SandboxPolicy
 from minion_executor.worker.throttle import DutyCyclePacer
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
-CTL_SEND_TIMEOUT_S = 1.0  # max wait for the pipe write lock when sending a live-control message
+CTL_SEND_TIMEOUT_S = 1.0  # bounds BOTH the wait for the pipe write lock and the write itself
 UNLOAD_TIMEOUT_S = 5.0  # total wall-clock cap on the graceful unload (> runner keep_alive POST)
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
@@ -143,7 +145,10 @@ class _Ctl:
     """`StepControl` inside the worker: duty-cycle pacing, rate-limited ticks, and the live-control
     channel. Control messages (`WorkerCtl`) are read at every checkpoint and during pacer sleeps
     (so a pause or a new duty acts at once); while paused the worker blocks here and keeps ticking
-    so the control side's inactivity timeout never fires. Each applied message is acked."""
+    so the control side's inactivity timeout never fires. Each applied message is acked.
+
+    The duty actually paced is `min(ctl.duty, budget duty)`: a live duty can only be stricter than
+    the budget in force (invariant 6), never looser."""
 
     def __init__(
         self,
@@ -152,15 +157,17 @@ class _Ctl:
         tick_interval_s: float,
         max_message_bytes: int,
         on_trim: Callable[[], None],
+        duty_cap: float = 1.0,
     ) -> None:
         self._conn = conn
+        self._cap = duty_cap  # the budget's duty: the governor may lower it, never raise it
         self._tick_s = tick_interval_s
         self._max = max_message_bytes
         self._on_trim = on_trim
         self._last_tick = 0.0
         self._done: int | None = None  # last records_done seen; re-sent on pacer ticks
         self.ctl = ctl
-        self._pacer = DutyCyclePacer(ctl.duty, time.monotonic, self._wait)
+        self._pacer = DutyCyclePacer(min(ctl.duty, duty_cap), time.monotonic, self._wait)
 
     def start(self) -> None:
         """Ack the starting state; a run that begins paused does no work until resumed."""
@@ -212,7 +219,7 @@ class _Ctl:
         if new.gen <= self.ctl.gen:  # latest wins; stale or duplicate
             return
         self.ctl = new
-        self._pacer.set_duty(new.duty)
+        self._pacer.set_duty(min(new.duty, self._cap))
         if new.trim:
             self._on_trim()
         self._send_tick(ack=True)
@@ -280,6 +287,16 @@ def worker_main(
     budget: Budget | None = None
     cur_ctl: WorkerCtl | None = None  # newest live-control state seen (latest generation wins)
     sandboxed_reads: list[str] | None = None  # set once the sandbox is on (irreversible)
+    trim_errors = 0  # runner.trim() failures: counted, never fatal, never carry a message
+
+    def safe_trim() -> None:
+        nonlocal trim_errors
+        if runner is None:
+            return
+        try:
+            runner.trim()
+        except Exception:
+            trim_errors += 1
 
     def confine(spec: dict[str, Any] | None, model_path: Path | None) -> None:
         """Apply the sandbox before any engine import / model load (fail closed)."""
@@ -303,12 +320,14 @@ def worker_main(
         if op == "ctl":
             # Live control outside a run: apply silently. A reply here would be read by the next
             # `_call` as its own and desync the protocol.
-            with contextlib.suppress(Exception):
+            try:
                 new_ctl = WorkerCtl.from_msg(msg)
-                if cur_ctl is None or new_ctl.gen > cur_ctl.gen:
-                    cur_ctl = new_ctl
-                    if new_ctl.trim and runner is not None:
-                        runner.trim()
+            except ValueError:
+                continue
+            if cur_ctl is None or new_ctl.gen > cur_ctl.gen:
+                cur_ctl = new_ctl
+                if new_ctl.trim:
+                    safe_trim()
             continue
         if op == "shutdown":
             if runner is not None:
@@ -350,7 +369,14 @@ def worker_main(
                     if cur_ctl is None or sent.gen > cur_ctl.gen:
                         cur_ctl = sent
                 start = cur_ctl or WorkerCtl(gen=0, duty=budget.gpu_duty_cycle, paused=False)
-                ctl = _Ctl(conn, start, tick_interval_s, max_message_bytes, runner.trim)
+                ctl = _Ctl(
+                    conn,
+                    start,
+                    tick_interval_s,
+                    max_message_bytes,
+                    safe_trim,
+                    budget.gpu_duty_cycle,
+                )
                 try:
                     ctl.start()
                     result = runner.run(msg["batch"], params, ctl)
@@ -368,6 +394,7 @@ def worker_main(
                     "active_bytes": mem["active_bytes"] if mem else 0,
                     "peak_bytes": mem["peak_bytes"] if mem else 0,
                     "max_rss_bytes": _maxrss_bytes(),
+                    "trim_errors": trim_errors,
                 }
             elif op == "probe":
                 confine(msg.get("sandbox"), None)
@@ -427,7 +454,9 @@ class WorkerHandle:
         self._sandbox = sandbox  # None: unsandboxed (dev/tests); main passes it unless dev opt-out
         self._tmp_dir: Path | None = None  # per-spawn writable dir, the only one the sandbox allows
         self._engines = sorted(e.value for e in engines)
-        self._nice = nice
+        self._nice = nice  # spawn niceness until a budget names a priority
+        self._cpu_priority: CpuPriority | None = None  # of the latest budget seen by this handle
+        self._prio_seen = False
         self._load_timeout_s = load_timeout_s
         self._step_timeout_s = step_timeout_s
         self._tick_interval_s = tick_interval_s
@@ -441,6 +470,8 @@ class WorkerHandle:
         self._ctl_lock = threading.Lock()
         self._ctl_gen = 0  # last live-control generation issued
         self._ctl: WorkerCtl | None = None  # latest-wins state, re-sent with every run
+        self._sent_gen = 0  # newest generation known to be written to the current worker's pipe
+        self._unsent: WorkerCtl | None = None  # newest state whose send failed (+ trim)
         self._ack: WorkerAck | None = None
         self._usage: WorkerUsage | None = None
         self._closed = False
@@ -462,13 +493,23 @@ class WorkerHandle:
     def loaded_model_id(self) -> str | None:
         return self._model_id
 
+    def _note_budget(self, budget: Budget) -> None:
+        """Remember the priority of the budget in force (drives nice / OMP at the next spawn and
+        the control-side `priority_ok` check)."""
+        self._cpu_priority, self._prio_seen = budget.cpu_priority, True
+
+    def _spawn_nice(self) -> int:
+        """Niceness for the next worker: that of the latest budget seen, else the constructor's."""
+        return nice_for(self._cpu_priority) if self._prio_seen else self._nice
+
     def _ensure_started(self) -> Connection:
         if self._proc is None or self._conn is None:
             if self._closed:
                 raise WorkerCrashed("worker handle is stopped")
             gen = self._seen_gen
             env = {**scrub_env(os.environ), **FORCED_WORKER_ENV, **self._engine_env}
-            if self._nice > 0:  # a throttled worker must not fan out BLAS/OpenMP threads
+            nice = self._spawn_nice()
+            if nice > 0:  # low/background: a throttled worker must not fan out BLAS/OpenMP threads
                 env["OMP_NUM_THREADS"] = "2"
             if self._sandbox is not None:
                 # `minion-exec-<pid>-` so `cleanup_stale_tmp` sweeps it if the control dies
@@ -481,7 +522,7 @@ class WorkerHandle:
                 args=(
                     child,
                     self._engines,
-                    self._nice,
+                    nice,
                     env,
                     self._test_hooks,
                     self._max_message_bytes,
@@ -524,6 +565,8 @@ class WorkerHandle:
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
                 while True:
+                    if self._unsent is not None and abortable:
+                        self._flush_unsent(conn, proc)
                     if not conn.poll(0.1):
                         if abortable and (self._closed or self._interrupt_gen != gen):
                             raise WorkerCrashed("worker handle is stopped")
@@ -560,15 +603,16 @@ class WorkerHandle:
                         ack = parse_ack(reply, issued=self._ctl_gen, at=time.monotonic())
                     except ValueError:
                         raise WorkerCrashed("malformed worker reply") from None
-                    if usage is not None:
-                        self._usage = usage
-                    if ack is not None:
-                        self._ack = ack
                     deadline = time.monotonic() + timeout_s  # liveness: restart the clock
                     done = reply["tick"]
                     if on_progress is not None and isinstance(done, int):
                         with contextlib.suppress(Exception):  # a bad callback must not kill a run
                             on_progress(done)
+                    # after the callback: whoever sees this ack also sees the progress before it
+                    if usage is not None:
+                        self._usage = usage
+                    if ack is not None:
+                        self._ack = ack
             except _SelfTestFailedError:
                 self._reset()
                 raise _self_test_error() from None
@@ -609,6 +653,7 @@ class WorkerHandle:
     ) -> None:
         """Load `model`; no-op if already warm, kill+restart on a model switch."""
         with self._lock:
+            self._note_budget(budget)
             g = self._interrupt_gen  # read once: an interrupt landing now must not be swallowed
             if g != self._seen_gen:
                 self._seen_gen = g  # re-arm: later interrupts abort this call
@@ -677,8 +722,12 @@ class WorkerHandle:
         }
         if budget is not None:
             msg["budget"] = budget.model_dump(mode="json")
+            self._note_budget(budget)
         with self._ctl_lock:
             ctl = self._ctl
+            unsent = self._unsent
+            if ctl is not None and unsent is not None and not unsent.trim and unsent.gen <= ctl.gen:
+                self._unsent = None  # this run carries it
         if ctl is not None:
             msg["ctl"] = ctl.to_msg()
         self._usage = None
@@ -706,25 +755,60 @@ class WorkerHandle:
         call lock, so it works while a batch is running; with no worker alive the state is just
         stored and sent with the next `run`. Raises `ValueError` for an invalid duty.
         """
-        if not 0 < duty <= 1:
-            raise ValueError("duty must be in (0, 1]")
         with self._ctl_lock:
-            self._ctl_gen += 1
-            ctl = WorkerCtl(self._ctl_gen, float(duty), paused, trim)
+            gen = self._ctl_gen + 1
+            # strict round-trip: a bad duty / paused / trim type is rejected before anything moves
+            ctl = WorkerCtl.from_msg(WorkerCtl(gen, duty, paused, trim).to_msg())
+            self._ctl_gen = gen
             self._ctl = replace(ctl, trim=False)  # trim is a one-shot, not state
-        conn = self._conn
-        if (
-            conn is not None
-            and not self._closed
-            and self._send_lock.acquire(timeout=CTL_SEND_TIMEOUT_S)
-        ):
-            try:
-                # worker gone / closing: the next run carries the state
-                with contextlib.suppress(OSError, ValueError):
-                    _send(conn, ctl.to_msg())
-            finally:
-                self._send_lock.release()
+            if self._unsent is not None and self._unsent.trim:
+                ctl = replace(ctl, trim=True)  # an earlier unsent trim is not lost
+            self._unsent = ctl  # until a send succeeds
+        conn, proc = self._conn, self._proc
+        if conn is not None and proc is not None and not self._closed:
+            self._send_ctl(conn, proc, ctl, wait=True)
         return ctl.gen
+
+    def _send_ctl(self, conn: Connection, proc: BaseProcess, ctl: WorkerCtl, *, wait: bool) -> bool:
+        """Write one ctl frame without ever wedging the caller. True if it was written.
+
+        The pipe write lock is waited for at most `CTL_SEND_TIMEOUT_S` (`wait=False`: not at all),
+        and the write itself is bounded by a watchdog: a worker that has stopped reading would
+        otherwise block `send` forever once the pipe buffer is full. At the deadline the worker is
+        killed (a partial frame must never be followed by another one, and a worker that ignores
+        its control channel is not honouring the budget); the next call sees it dead.
+        """
+        if not self._send_lock.acquire(blocking=wait, timeout=CTL_SEND_TIMEOUT_S if wait else -1):
+            return False  # a newer state will be re-sent by the in-flight call (_flush_unsent)
+        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc,))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            _send(conn, ctl.to_msg())
+        except (OSError, ValueError):  # worker gone / closing: the next run carries the state
+            return False
+        finally:
+            watchdog.cancel()
+            self._send_lock.release()
+        with self._ctl_lock:
+            self._sent_gen = max(self._sent_gen, ctl.gen)
+            if self._unsent is not None and self._unsent.gen <= ctl.gen:
+                self._unsent = None
+        return True
+
+    def _abort_stuck_send(self, proc: BaseProcess) -> None:
+        """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
+        worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`)."""
+        self._interrupt_gen += 1
+        _kill_quietly(proc)
+
+    def _flush_unsent(self, conn: Connection, proc: BaseProcess) -> None:
+        """Re-send a control state whose send found the pipe busy (called by the in-flight call
+        between replies; never blocks)."""
+        with self._ctl_lock:
+            pending = self._unsent
+        if pending is not None and pending.gen > self._sent_gen and not self._closed:
+            self._send_ctl(conn, proc, pending, wait=False)
 
     def last_ack(self) -> WorkerAck | None:
         """The worker's most recent acknowledgement of a control generation (None before any)."""
@@ -734,6 +818,42 @@ class WorkerHandle:
         """Busy share of wall time in the current/last run (pauses excluded); None before data."""
         usage = self._usage
         return usage.share if usage is not None else None
+
+    def footprint_bytes(self) -> int | None:
+        """Memory the OS charges the worker, or None if there is no live worker. Safe to call
+        during a run (takes no handle lock). The sample is taken first and the child is checked
+        alive after: an unreaped child keeps its pid, so a still-alive child proves the number is
+        the worker's and not a recycled pid's."""
+        proc = self._proc
+        pid = proc.pid if proc is not None else None
+        if proc is None or pid is None:
+            return None
+        value = process_footprint_bytes(pid)
+        with contextlib.suppress(ValueError, AssertionError):
+            if proc.is_alive():
+                return value
+        return None
+
+    def priority_ok(self) -> bool | None:
+        """Control-side check that the worker honours the CPU priority of the budget in force:
+        its nice is at least the target and, for `background` on macOS, Darwin background QoS is
+        still set. False = the worker is less throttled than its budget (kill / respawn it).
+        None = nothing to check (no worker, no budget seen yet, or it just exited). A budget that
+        was only just raised is applied by the worker when its batch starts: callers should treat
+        a False right after a budget change as a grace window, not a violation.
+        """
+        proc = self._proc
+        pid = proc.pid if proc is not None else None
+        if proc is None or pid is None or not self._prio_seen:
+            return None
+        priority = self._cpu_priority
+        try:
+            state = current_priority(pid)
+            if not proc.is_alive():  # same sample-then-verify as footprint_bytes
+                return None
+        except (OSError, ValueError, AssertionError):
+            return None
+        return satisfies(state, priority)
 
     def stats(self) -> dict[str, int]:
         """Worker memory: runner `active_bytes`/`peak_bytes` plus process `max_rss_bytes`."""
@@ -829,6 +949,8 @@ class WorkerHandle:
         self._proc = self._conn = None
         self._model_id = None
         self._ack = None
+        with self._ctl_lock:
+            self._sent_gen, self._unsent = self._ctl_gen, None  # the next run carries the state
         ref, self._ollama_ref = self._ollama_ref, None
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):

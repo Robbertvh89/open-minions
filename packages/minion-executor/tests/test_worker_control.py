@@ -197,6 +197,29 @@ def test_pacer_oversleep_is_credited_against_the_next_wait() -> None:
     assert p.busy_s / p.wall_s == pytest.approx(2.0 / 4.5)  # only the last 0.5 s is unrepaid
 
 
+def test_pacer_oversleep_credit_is_capped_at_half_a_second() -> None:
+    c = _Clock()
+
+    def very_late(s: float) -> bool:
+        c.now += s + 3.0  # one 3 s stall
+        return False
+
+    p = DutyCyclePacer(0.5, c, very_late)
+    c.now += 1.0
+    p.step_done()  # owed 1.0, slept 4.0: 3.0 over, but only 0.5 may be repaid
+    c.now += 1.0
+    waits: list[float] = []
+
+    def on_time(s: float) -> bool:
+        waits.append(s)
+        c.now += s
+        return False
+
+    p._wait = on_time
+    p.step_done()
+    assert waits == [pytest.approx(0.5)]  # 1.0 owed - 0.5 credit, not - 3.0
+
+
 # -- message validation ----------------------------------------------------------------------
 def test_ctl_message_is_parsed_strictly() -> None:
     ok = {"op": "ctl", "gen": 3, "duty": 0.5, "paused": False, "trim": False}
@@ -217,6 +240,7 @@ def test_ctl_message_is_parsed_strictly() -> None:
     for m in bad:
         with pytest.raises(ValueError):
             WorkerCtl.from_msg(m)
+    assert parse_usage({"busy_s": 1.0005, "wall_s": 1.0}) is not None  # rounding slack
     for k in ("gen", "duty", "paused", "trim"):
         with pytest.raises(ValueError):
             WorkerCtl.from_msg({kk: v for kk, v in ok.items() if kk != k})
@@ -269,6 +293,7 @@ def _adversary(conn: Any, payload: bytes) -> None:  # forked child: answer the r
         b'{"tick": 1, "busy_s": NaN, "wall_s": 1}',
         b'{"tick": 1, "busy_s": 1}',
         b'{"tick": 1, "busy_s": true, "wall_s": 1}',
+        b'{"tick": 1, "busy_s": 2, "wall_s": 1}',  # busy cannot exceed wall
     ],
 )
 def test_malformed_ack_or_usage_is_a_protocol_violation(payload: bytes) -> None:
@@ -324,7 +349,8 @@ def test_paused_longer_than_the_step_timeout_is_not_a_hang() -> None:
 
 
 def test_duty_change_cuts_a_running_pacer_sleep_short(worker: WorkerHandle) -> None:
-    worker.ensure_model(MODEL, _budget(duty=0.05))  # a 0.1 s step then sleeps 1.9 s
+    worker.ensure_model(MODEL, _budget())
+    worker.control(duty=0.05, paused=False)  # a 0.1 s step then sleeps 1.9 s
     bg = _Bg(worker, _records(6, 0.1))  # ~11 s if the duty were not raised
     assert _until(lambda: bg.progress >= 1)
     t0 = time.monotonic()
@@ -336,7 +362,8 @@ def test_duty_change_cuts_a_running_pacer_sleep_short(worker: WorkerHandle) -> N
 
 
 def test_pause_during_a_pacer_sleep_takes_effect_at_once(worker: WorkerHandle) -> None:
-    worker.ensure_model(MODEL, _budget(duty=0.05))
+    worker.ensure_model(MODEL, _budget())
+    worker.control(duty=0.05, paused=False)
     bg = _Bg(worker, _records(4, 0.1))
     assert _until(lambda: bg.progress >= 1)
     t0 = time.monotonic()
@@ -375,6 +402,13 @@ def test_invalid_control_is_rejected_before_anything_is_sent(worker: WorkerHandl
     for duty in (0.0, -1.0, 1.5, float("nan")):
         with pytest.raises(ValueError):
             worker.control(duty=duty, paused=False)
+    for kw in ({"paused": 1}, {"paused": None}, {"trim": "yes"}, {"trim": 1}):
+        args: dict[str, Any] = {"duty": 0.5, "paused": False, **kw}
+        with pytest.raises(ValueError):
+            worker.control(**args)
+    assert worker._ctl is None and worker._ctl_gen == 0  # nothing was stored
+    with pytest.raises(ValueError):
+        worker.control(duty="0.5", paused=False)  # type: ignore[arg-type]
     assert worker.run([{"id": 1, "text": "a"}])  # protocol still in sync
 
 
@@ -434,9 +468,26 @@ def test_budget_duty_drives_the_pacer_until_control_overrides_it(worker: WorkerH
     share = worker.gpu_share()
     assert share is not None and abs(share - 0.5) < 0.05
     worker.control(duty=0.25, paused=False)
-    worker.run(_records(10, 0.02), budget=_budget(0.5))  # ctl wins over the budget's duty
+    worker.run(_records(10, 0.02), budget=_budget(0.5))  # a stricter ctl wins
     share = worker.gpu_share()
     assert share is not None and abs(share - 0.25) < 0.05
+
+
+def test_control_can_never_loosen_the_budgets_duty(worker: WorkerHandle) -> None:
+    """Invariant 6: the pacer runs at min(ctl duty, budget duty)."""
+    worker.ensure_model(MODEL, _budget(1.0))
+    worker.control(duty=1.0, paused=False)
+    worker.run(_records(15, 0.02), budget=_budget(0.3))
+    share = worker.gpu_share()
+    assert share is not None and abs(share - 0.3) < 0.05, share
+    # also live: a mid-run raise above the budget is capped
+    worker.control(duty=0.3, paused=False)
+    bg = _Bg(worker, _records(30, 0.02), budget=_budget(0.3))
+    assert _until(lambda: bg.progress >= 3)
+    worker.control(duty=1.0, paused=False)
+    bg.join()
+    share = worker.gpu_share()
+    assert share is not None and abs(share - 0.3) < 0.05, share
 
 
 def test_trim_is_one_shot_and_works_idle_and_mid_run(worker: WorkerHandle) -> None:
@@ -467,15 +518,89 @@ def test_cpu_priority_is_raised_live_and_never_lowered(worker: WorkerHandle) -> 
     assert again["background"] is False  # Darwin background QoS is reversible
 
 
-def test_throttled_worker_gets_few_threads_env() -> None:
-    for nice, expect in ((0, False), (10, True)):
-        w = WorkerHandle([Engine.FAKE], test_hooks=True, nice=nice)
-        try:
-            w.ensure_model(MODEL, _budget())
-            (out,) = w.run([{"id": 1, "echo_env": "OMP_NUM_THREADS"}])
-            assert out["present"] is expect
-        finally:
-            w.close()
+@pytest.mark.parametrize(
+    ("prio", "omp"),
+    [
+        (CpuPriority.NORMAL, False),
+        (CpuPriority.LOW, True),
+        (CpuPriority.BACKGROUND, True),
+        (None, True),  # an old budget counts as LOW
+    ],
+)
+def test_spawn_niceness_and_threads_follow_the_budgets_priority(
+    prio: CpuPriority | None, omp: bool
+) -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True, nice=0)  # constructor nice is not the truth
+    try:
+        w.ensure_model(MODEL, _budget(prio=prio))
+        (out,) = w.run([{"id": 1, "echo_env": "OMP_NUM_THREADS"}])
+        assert out["present"] is omp
+        assert w.pid is not None
+        got = os.getpriority(os.PRIO_PROCESS, w.pid)
+        if omp:
+            assert got >= 10
+        else:
+            assert got == os.getpriority(os.PRIO_PROCESS, 0)  # inherited, not raised
+    finally:
+        w.close()
+
+
+def test_respawn_uses_the_latest_budget_seen_by_run() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True, nice=0)
+    try:
+        w.ensure_model(MODEL, _budget(prio=CpuPriority.NORMAL))
+        w.run([{"id": 1, "text": "a"}], budget=_budget(prio=CpuPriority.LOW))
+        w.unload()  # the next worker is spawned from what the handle last saw
+        assert w._spawn_nice() == 10
+        w.ensure_model(MODEL, _budget(prio=CpuPriority.LOW))
+        (out,) = w.run([{"id": 1, "echo_env": "OMP_NUM_THREADS"}])
+        assert out["present"] is True
+    finally:
+        w.close()
+
+
+def test_priority_ok_is_checked_from_the_control_side() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        assert w.priority_ok() is None  # no worker, no budget
+        w.ensure_model(MODEL, _budget(prio=CpuPriority.LOW))
+        assert w.priority_ok() is True
+        w.run([{"id": 1, "text": "a"}], budget=_budget(prio=CpuPriority.BACKGROUND))
+        assert w.priority_ok() is True
+    finally:
+        w.close()
+
+
+def test_priority_ok_detects_a_worker_that_is_less_throttled_than_its_budget() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(MODEL, _budget(prio=CpuPriority.NORMAL))
+        assert w.priority_ok() is True
+        w._cpu_priority = CpuPriority.LOW  # the budget now demands nice >= 10; the worker has 0+
+        base = os.getpriority(os.PRIO_PROCESS, w.pid or 0)
+        assert w.priority_ok() is (base >= 10)
+        w._cpu_priority = CpuPriority.BACKGROUND
+        if sys.platform == "darwin":
+            assert w.priority_ok() is False  # nice and BG QoS both missing
+        w._cpu_priority = CpuPriority.NORMAL
+        assert w.priority_ok() is True
+        w.kill()
+        assert _until(lambda: w.priority_ok() is None, 5.0)
+    finally:
+        w.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin background QoS")
+def test_priority_ok_sees_background_qos_cleared_by_the_worker() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(MODEL, _budget(prio=CpuPriority.BACKGROUND))
+        assert w.priority_ok() is True
+        assert w.pid is not None
+        w.run([{"id": 1, "text": "a", "clear_bg": 1}])  # the worker clears its own BG flag
+        assert w.priority_ok() is False
+    finally:
+        w.close()
 
 
 # -- pacer accuracy ------------------------------------------------------------------------------
@@ -538,6 +663,21 @@ def test_footprint_tracks_allocation() -> None:
     del blob
 
 
+def test_handle_footprint_only_while_the_worker_is_alive(worker: WorkerHandle) -> None:
+    assert worker.footprint_bytes() is None  # no worker yet
+    worker.ensure_model(MODEL, _budget())
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        fp = worker.footprint_bytes()
+        assert fp is not None and fp > 1_000_000
+    proc = worker._proc
+    assert proc is not None
+    proc.kill()
+    proc.join(5)
+    assert worker.footprint_bytes() is None  # dead (and its pid may be reused): never sampled
+    worker.unload()
+    assert worker.footprint_bytes() is None
+
+
 def test_footprint_unknown_pids_are_none() -> None:
     assert process_footprint_bytes(0) is None
     assert process_footprint_bytes(-5) is None
@@ -571,3 +711,65 @@ def test_ollama_set_budget_changes_the_fan_out_cap() -> None:
     r.set_budget(_budget(batch=3))
     assert r._budget is not None and r._budget.max_batch_size == 3
     r.trim()  # nothing cached in-process: a no-op, must not raise
+
+
+# -- lost control re-send, bounded send ----------------------------------------------------------
+def test_control_that_found_the_pipe_busy_is_resent_by_the_running_call(
+    worker: WorkerHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("minion_executor.worker.process.CTL_SEND_TIMEOUT_S", 0.2)
+    worker.ensure_model(MODEL, _budget())
+    bg = _Bg(worker, _records(100, 0.05))
+    assert _until(lambda: bg.progress >= 2)
+    with worker._send_lock:  # another writer holds the pipe
+        gen = worker.control(duty=1.0, paused=True)  # waits 0.2 s, gives up
+        assert worker._sent_gen < gen and worker._unsent is not None
+    assert _until(lambda: (a := worker.last_ack()) is not None and a.gen == gen, 5.0)
+    assert worker._sent_gen == gen and worker._unsent is None
+    worker.control(duty=1.0, paused=False)
+    bg.join()
+
+
+def _never_reads(conn: Any) -> None:  # forked child: stop reading the control channel
+    time.sleep(60)
+
+
+def test_control_to_a_worker_that_stopped_reading_cannot_wedge_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import multiprocessing as mp
+
+    monkeypatch.setattr("minion_executor.worker.process.CTL_SEND_TIMEOUT_S", 0.3)
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_never_reads, args=(child,), daemon=True)
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE])
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    try:
+        t0 = time.monotonic()
+        for _ in range(100_000):  # fills the socket buffer, then a send blocks
+            w.control(duty=0.5, paused=False)
+            if not proc.is_alive() and w._interrupt_gen > 0:
+                break
+        proc.join(5)
+        assert not proc.is_alive(), "worker that ignores its control channel must be killed"
+        assert w._interrupt_gen > 0
+        assert time.monotonic() - t0 < 30
+        w.control(duty=0.5, paused=False)  # dead worker: still never raises or blocks
+    finally:
+        w._proc = w._conn = None
+        parent.close()
+
+
+def test_a_failing_trim_is_counted_and_never_fatal(worker: WorkerHandle) -> None:
+    worker.ensure_model(MODEL, _budget())
+    worker.run([{"id": 1, "fail_trim": 1, "text": "a"}])
+    worker.control(duty=1.0, paused=False, trim=True)  # idle
+    bg = _Bg(worker, _records(40, 0.05))
+    assert _until(lambda: bg.progress >= 2)
+    worker.control(duty=1.0, paused=False, trim=True)  # mid-run: the run must not fail
+    bg.join()
+    assert worker.stats()["trim_errors"] == 2
+    assert worker.run([{"id": 1, "text": "a"}])

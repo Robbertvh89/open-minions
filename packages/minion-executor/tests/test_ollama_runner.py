@@ -600,3 +600,53 @@ def test_pull_not_found_is_a_hard_failure_without_echo(marker: str) -> None:
         r.load(MODEL, None, _budget(), EngineConfig())
     assert ei.value.code == "ENGINE_REJECTED" and not ei.value.retryable
     assert not ei.value.release and "SECRET" not in str(ei.value)
+
+
+def test_a_pause_stops_new_requests_reaching_the_daemon_but_in_flight_ones_finish() -> None:
+    """Lazy submission: at most `max_batch_size` outstanding and a checkpoint before each new
+    request, so a pause (blocking in `checkpoint`) holds back everything not yet sent."""
+    d = Daemon()
+    r = _loaded(d, 2)
+    gate = threading.Event()
+
+    def hold() -> None:
+        gate.wait(10)
+
+    d.chat_hook = hold
+
+    class PausableCtl(Ctl):
+        def __init__(self) -> None:
+            super().__init__()
+            self.paused = threading.Event()
+
+        def checkpoint(self, records_done: int | None = None) -> None:
+            while self.paused.is_set():
+                time.sleep(0.01)
+            super().checkpoint(records_done)
+
+    ctl = PausableCtl()
+    out: list[Any] = []
+    t = threading.Thread(
+        target=lambda: out.extend(
+            r.run([{"id": i, "prompt": "x"} for i in range(6)], CompletionParams(), ctl)
+        ),
+        daemon=True,
+    )
+    t.start()
+
+    def chats() -> int:
+        with d.lock:
+            return d.paths().count("/api/chat")
+
+    end = time.monotonic() + 5
+    while chats() < 2 and time.monotonic() < end:
+        time.sleep(0.01)
+    assert chats() == 2  # not 6: nothing beyond the outstanding cap was sent
+    ctl.paused.set()
+    gate.set()  # the two in-flight requests finish during the pause
+    time.sleep(0.5)
+    assert chats() == 2 and t.is_alive()  # ... and nothing new is sent
+    ctl.paused.clear()
+    t.join(10)
+    assert not t.is_alive() and chats() == 6
+    assert [rec["id"] for rec in out] == list(range(6))

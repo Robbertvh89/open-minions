@@ -147,6 +147,7 @@ class FakeWorker:
         self.params: list[Any] = []
         self.ensured: list[tuple[ModelEntry, Budget]] = []
         self.unloads = 0
+        self.controls: list[tuple[float, bool, bool]] = []
         self.started = threading.Event()  # set when run() begins
 
     def ensure_model(
@@ -157,11 +158,16 @@ class FakeWorker:
     def unload(self) -> None:
         self.unloads += 1
 
+    def control(self, *, duty: float, paused: bool, trim: bool = False) -> int:
+        self.controls.append((duty, paused, trim))
+        return len(self.controls)
+
     def run(
         self,
         batch: list[Record],
         params: Any = None,
         on_progress: Any = None,
+        budget: Budget | None = None,
     ) -> list[Record]:
         self.started.set()
         self.params.append(params)
@@ -1095,7 +1101,13 @@ async def test_outputs_stamped_with_model_and_revision(tmp_path: Path) -> None:
 
 
 class TooLongWorker(FakeWorker):
-    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+    def run(
+        self,
+        batch: list[Record],
+        params: Any = None,
+        on_progress: Any = None,
+        budget: Budget | None = None,
+    ) -> list[Record]:
         return [
             {"id": r["id"], "error": "PROMPT_TOO_LONG"}
             if r["id"] == "b"
@@ -1119,11 +1131,17 @@ class TickingWorker(FakeWorker):
         self.release = threading.Event()
         self.progressed = threading.Event()
 
-    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+    def run(
+        self,
+        batch: list[Record],
+        params: Any = None,
+        on_progress: Any = None,
+        budget: Budget | None = None,
+    ) -> list[Record]:
         on_progress(1)  # one record done mid-batch
         self.progressed.set()
         self.release.wait(10)  # held until a heartbeat has observed it
-        return super().run(batch, params, None)
+        return super().run(batch, params, None, budget)
 
 
 async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
@@ -1455,7 +1473,13 @@ class SlowWorker(FakeWorker):
         super().__init__()
         self.delay_s = delay_s
 
-    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+    def run(
+        self,
+        batch: list[Record],
+        params: Any = None,
+        on_progress: Any = None,
+        budget: Budget | None = None,
+    ) -> list[Record]:
         import time
 
         end = time.monotonic() + self.delay_s

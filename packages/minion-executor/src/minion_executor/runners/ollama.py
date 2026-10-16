@@ -303,14 +303,20 @@ class OllamaRunner:
         if not jobs:
             return []
         self._check_digest()  # a swapped tag must not even start (inputs are validated already)
-        pool = ThreadPoolExecutor(
-            max_workers=max(1, min(len(jobs), self._budget.max_batch_size)),
-            thread_name_prefix="ollama",
-        )
-        futures: list[Future[Record]] = [pool.submit(job) for job in jobs]
-        pending = set(futures)
+        workers = max(1, min(len(jobs), self._budget.max_batch_size))
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ollama")
+        futures: list[Future[Record]] = []
+        pending: set[Future[Record]] = set()
         try:
-            while pending:
+            while len(futures) < len(jobs) or pending:
+                # Submit lazily: at most `workers` requests outstanding, and a checkpoint before
+                # each new one, so a pause (or a low duty) stops NEW requests reaching the daemon.
+                # Requests already in flight finish: HTTP calls to the daemon cannot be suspended.
+                while len(futures) < len(jobs) and len(pending) < workers:
+                    ctl.checkpoint(len(futures) - len(pending))
+                    fut = pool.submit(jobs[len(futures)])
+                    futures.append(fut)
+                    pending.add(fut)
                 done, pending = wait(pending, timeout=_TICK_S, return_when=FIRST_COMPLETED)
                 for fut in done:
                     fut.result()  # re-raise the first failure

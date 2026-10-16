@@ -9,22 +9,30 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import functools
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 _RUSAGE_INFO_V0 = 0
 _V0_PHYS_FOOTPRINT_OFFSET = 72  # rusage_info_v0: uuid[16] then 7 u64 (user..resident), then this
 _BUF_BYTES = 512  # >= sizeof(rusage_info_current); V0 fills the first 96 bytes
 
 
-def _darwin_footprint(pid: int) -> int | None:
+@functools.cache
+def _proc_pid_rusage() -> Any:
+    """The libproc function with its signature set, resolved once (a poll calls it every second)."""
     path = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
-    lib = ctypes.CDLL(path, use_errno=True)
-    lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-    lib.proc_pid_rusage.restype = ctypes.c_int
+    fn = ctypes.CDLL(path, use_errno=True).proc_pid_rusage
+    fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _darwin_footprint(pid: int) -> int | None:
     buf = ctypes.create_string_buffer(_BUF_BYTES)
-    if lib.proc_pid_rusage(pid, _RUSAGE_INFO_V0, buf) != 0:
+    if _proc_pid_rusage()(pid, _RUSAGE_INFO_V0, buf) != 0:
         return None
     return int.from_bytes(
         buf.raw[_V0_PHYS_FOOTPRINT_OFFSET : _V0_PHYS_FOOTPRINT_OFFSET + 8], sys.byteorder

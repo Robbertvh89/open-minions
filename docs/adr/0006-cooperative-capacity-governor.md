@@ -43,9 +43,19 @@ time is a protocol violation: worker killed, `WorkerCrashed`). A run that starts
 until resumed. While paused the worker blocks in the checkpoint polling the pipe and keeps ticking, so
 the inactivity timeout never fires. The pacer sleep is a `conn.poll(timeout)`, so a pause or duty change
 cuts it short and the owed sleep is re-derived. Pause time counts as neither busy nor wall time, and a
-late wake-up is credited against the next sleep (capped at 5 s), which keeps `busy_s / wall_s` on the
-target on a loaded machine. Known limit (TASK-12): a `control()` write blocks if the worker stops
-reading for longer than the pipe buffer holds (messages are tiny and sent on change only).
+late wake-up is credited against the next sleep (capped at 0.5 s, so a stall is repaid as a short
+catch-up, not a burst), which keeps `busy_s / wall_s` on the target on a loaded machine.
+The worker is the party being limited, so its acks, `paused` and `busy_s / wall_s` are **advisory**
+(strictly validated, and `busy_s > wall_s` is a protocol violation, but a lying worker is not
+detectable from them). Enforcement is control-side: footprint sampling (D7), the OS priority check
+(D8, `priority_ok`) and kill. `control()` is bounded end to end: the pipe write lock is waited for at most
+`CTL_SEND_TIMEOUT_S` and the write itself runs under a watchdog of the same length; a worker that has
+stopped reading its control channel is killed (never left with a partial frame followed by another),
+the in-flight call fails `WorkerCrashed`. If `control()` could not take the write lock (a large `run`
+frame is being written), the newest state is kept (`_sent_gen` / `_unsent`) and re-sent by the in-flight
+call between replies, so the latest decision is never lost. In-flight Ollama requests cannot be
+suspended: a pause stops *new* requests (the runner submits lazily, at most `max_batch_size`
+outstanding, with a checkpoint before each) and the requests already sent finish during the pause.
 
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
 memory/wired limits and batch caps; `Runner.trim` frees allocator caches. The loop re-slices records
@@ -53,8 +63,10 @@ with the current `max_batch_size` before each batch (FR-54 "next batch").
 *Implemented in TASK-5.3* at the worker level: `WorkerHandle.run(..., budget=)` sends it, the worker
 calls `set_budget` only when it differs from the one in force and re-applies CPU priority; all six
 runners implement `set_budget`/`trim` (MLX: memory, cache and wired limits; HF: MPS memory fraction;
-Ollama and fake: the fan-out cap, the daemon owns the memory). If `control()` was ever called, its duty
-overrides `Budget.gpu_duty_cycle`. The loop passes the budget per batch from TASK-5.5.
+Ollama and fake: the fan-out cap, the daemon owns the memory). The duty the worker paces at is
+`min(control duty, Budget.gpu_duty_cycle)`: the governor can make a batch stricter than its budget,
+never looser (invariant 6; enforced worker-side on every ctl and at run start). The loop passes the
+budget per batch from TASK-5.5.
 
 **D5 Pause semantics (FR-53).** Pause applies at once: no new acquires; the worker pauses at its next
 checkpoint. **Resume needs the condition clear for 10 s** (`RESUME_AFTER_S`). Profile escalation keeps
@@ -72,7 +84,12 @@ kill), and frees the cache pin. An idle warm worker whose model no longer fits i
 
 **D7 Memory guard (NF-8 safety net).** `mx.set_memory_limit` is a soft guideline in MLX and RSS also
 holds the Python heap, so the control side samples the worker footprint (darwin `proc_pid_rusage`,
-linux `/proc/<pid>/statm` resident set; `worker/footprint.py`, TASK-5.3) every poll. More than `memory_gb * 1.10` on 2 consecutive samples
+linux `/proc/<pid>/statm` resident set; `worker/footprint.py`, TASK-5.3) every poll, through
+`WorkerHandle.footprint_bytes()`, which samples first and then checks the child is still alive (an
+unreaped child keeps its pid, so a recycled pid is never mistaken for the worker). On macOS this is
+`phys_footprint` from the `rusage_info_v0` flavor: the oldest flavor, present on every supported
+macOS, and the same counter Activity Monitor charges (compressed and GPU-wired memory included, which
+RSS misses). More than `memory_gb * 1.10` on 2 consecutive samples
 interrupts the worker and fails the subtask as **retryable `OOM`**: another Mac with a bigger budget
 may fit it, and `max_attempts` bounds the retries. The Ollama daemon's memory is outside the worker
 and stays the documented caveat of ADR-0009.
@@ -82,12 +99,18 @@ clients are still accepted; the executor always sets it). In the worker: `backgr
 background QoS (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, what `taskpolicy -b` does) plus
 nice 15; `low` is nice 10; `normal` is 0. Raising priority is impossible unprivileged, so it takes
 effect at the next worker spawn (conservative; invariant 6 safe). `OMP_NUM_THREADS=2` for non-normal.
-*Implemented in TASK-5.3* (`worker/priority.py`): the worker applies the priority of each run's budget
+*Implemented in TASK-5.3* (`capacity/priority.py`): the worker applies the priority of each run's budget
 after reading back what the OS holds. Raising niceness works live (it only ever goes up); the Darwin
 background QoS is reversible both ways; lowering nice (to a higher priority) is `EACCES`, so that part
 waits for a respawn. No sandbox rule is needed: the profile is `(allow default)` plus denials, none of
 which cover `setpriority`/`nice` on the process itself (tested inside the Seatbelt sandbox).
-`OMP_NUM_THREADS=2` is set at spawn when the spawn niceness is above 0.
+At spawn the niceness and `OMP_NUM_THREADS=2` come from the latest `cpu_priority` the handle has seen
+(`ensure_model` / `run` budget; the constructor's `nice` only until a budget names one): `OMP_NUM_THREADS=2`
+whenever that priority is `low` or `background` (an absent one counts as `low`).
+Enforcement is control-side: `WorkerHandle.priority_ok()` reads the worker's nice (and, on macOS, its
+background flag from `proc_bsdinfo`; `getpriority(PRIO_DARWIN_PROCESS, other_pid)` reads 0 for any pid
+but our own) and returns False if the worker is less throttled than the budget in force. The governor
+wires it in TASK-5.5, with a grace window after a budget change.
 The fetch subprocess nice derives from the same value (TASK-5.1: `nice_for`).
 Rollout order: upgrade the server before the executors. `Budget` is `extra=forbid`, so an old
 server answers 422 to a new executor's `cpu_priority`.

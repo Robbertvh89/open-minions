@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -97,7 +98,7 @@ def _sandbox_probe(rec: Record) -> dict[str, object]:
 
 def _report_state(runner: FakeRunner) -> dict[str, object]:
     """Test hook: the live state the worker holds (budget, trims, OS priority)."""
-    from minion_executor.worker.priority import current_priority
+    from minion_executor.capacity.priority import current_priority
 
     prio = current_priority()
     b = runner.budget
@@ -190,6 +191,7 @@ class FakeRunner:
         self._hooks = test_hooks
         self.budget: Budget | None = None
         self.trims = 0
+        self._fail_trim = False
 
     def load(
         self, model: ModelEntry, model_path: Path | None, budget: Budget, cfg: EngineConfig
@@ -205,6 +207,8 @@ class FakeRunner:
 
     def trim(self) -> None:
         self.trims += 1
+        if self._fail_trim:
+            raise RuntimeError("trim failed")
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:
         if self._model is None:
@@ -225,6 +229,12 @@ class FakeRunner:
                     for _ in range(min(int(rec["sleep_steps"]), 1000)):
                         time.sleep(min(float(rec.get("step_s", 0.1)), 10.0))
                         ctl.checkpoint(len(out))
+                if rec.get("fail_trim"):  # make later trim() calls raise (worker must survive)
+                    self._fail_trim = True
+                if (
+                    rec.get("clear_bg") and sys.platform == "darwin"
+                ):  # a worker shedding its throttle
+                    os.setpriority(os.PRIO_DARWIN_PROCESS, 0, 0)
                 if rec.get("report_state"):  # budget / trim / priority as the worker sees them
                     out.append({"id": rec.get("id"), **_report_state(self)})
                     ctl.checkpoint(len(out))

@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 15:11'
+updated_date: '2026-10-16 17:41'
 labels:
   - M4
 dependencies: []
@@ -16,9 +16,9 @@ ordinal: 26000
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 WorkerHandle.control changes duty/pause at next checkpoint incl. mid pacer-sleep; ack per generation; no timeout while paused
-- [ ] #2 run carries Budget; Runner.set_budget/trim in all runners; gpu tests show mlx limits updated
-- [ ] #3 cpu_priority applied (PRIO_DARWIN_BG/nice) incl. inside sandbox
-- [ ] #4 footprint sampler darwin/linux
-- [ ] #5 pacer busy/wall within +-3 pp of target in CI
+- [x] #1 WorkerHandle.control changes duty/pause at next checkpoint incl. mid pacer-sleep; ack per generation; no timeout while paused
+- [x] #2 run carries Budget; Runner.set_budget/trim in all runners; gpu tests show mlx limits updated
+- [x] #3 cpu_priority applied (PRIO_DARWIN_BG/nice) incl. inside sandbox
+- [x] #4 footprint sampler darwin/linux
+- [x] #5 pacer busy/wall within +-3 pp of target in CI
 <!-- AC:END -->

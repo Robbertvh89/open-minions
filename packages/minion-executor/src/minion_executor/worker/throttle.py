@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-_MAX_CREDIT_S = 5.0  # how much oversleep a later step may repay (bounds the catch-up)
+_MAX_CREDIT_S = 0.5  # how much oversleep a later step may repay (bounds the catch-up burst)
 
 
 def _check(duty: float) -> float:

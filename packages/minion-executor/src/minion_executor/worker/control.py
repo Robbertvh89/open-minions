@@ -5,6 +5,9 @@ existing duplex pipe. It is latest-wins: a message with a generation not newer t
 already applied is dropped. In a run the worker answers with an ack tick (`ack` = the applied
 generation); outside a run it applies the message silently (a reply would desync `_call`).
 Every field is validated strictly on both sides: an invalid message is rejected, never coerced.
+
+The worker's acks and usage numbers are advisory (it is the party being limited): enforcement is
+control-side, by sampling the worker's footprint and OS priority and killing it on a violation.
 """
 
 from __future__ import annotations
@@ -88,8 +91,10 @@ def parse_usage(reply: Mapping[str, Any]) -> WorkerUsage | None:
     if "busy_s" not in reply and "wall_s" not in reply:
         return None
     busy, wall = reply.get("busy_s"), reply.get("wall_s")
-    if not (_is_num(busy) and _is_num(wall)) or busy < 0 or wall < 0:
-        raise ValueError("invalid tick usage")
+    if not (_is_num(busy) and _is_num(wall)) or busy < 0 or wall < 0 or busy > wall + 1e-3:
+        raise ValueError(
+            "invalid tick usage"
+        )  # busy time cannot exceed the wall time it is part of
     return WorkerUsage(float(busy), float(wall))
 
 

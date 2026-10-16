@@ -418,13 +418,15 @@ executor therefore enforces the owner's budget cooperatively, at four levers (SP
    the second knob: smaller batch → shorter bursts → smoother foreground. The duty and a pause can change
    while a batch runs: `WorkerHandle.control()` sends a latest-wins `ctl` message over the worker pipe; the
    worker reads it at the next checkpoint (or mid pacer-sleep), acks it, and while paused blocks in the
-   checkpoint, still ticking (ADR-0006 D3; implemented in M4.3).
+   checkpoint, still ticking (ADR-0006 D3; implemented in M4.3). The paced duty is
+   `min(control duty, budget duty)`: control can only be stricter than the budget.
 3. **Batch size** — capped by `budget.max_batch_size`; also bounds KV-cache memory.
-4. **CPU priority** — set by the worker on itself (`worker/priority.py`): Darwin background QoS
+4. **CPU priority** — set by the worker on itself (`capacity/priority.py`): Darwin background QoS
    (`setpriority(PRIO_DARWIN_PROCESS, …, PRIO_DARWIN_BG)`, the `taskpolicy -b` equivalent; E-cores,
    throttled I/O) for `background`, `nice` 10 / 15 for `low` / `background`; `OMP_NUM_THREADS=2` when
-   throttled. Raising niceness and toggling background QoS work live, also inside the sandbox; lowering
-   nice needs a respawn. The control side samples the worker's memory footprint
+   throttled (`low` / `background`; niceness and threads at spawn follow the latest budget the handle has
+   seen). Raising niceness and toggling background QoS work live, also inside the sandbox; lowering
+   nice needs a respawn. The control side verifies it (`WorkerHandle.priority_ok()`) and samples the worker's memory footprint
    (`worker/footprint.py`: `proc_pid_rusage` on macOS, `/proc` on Linux).
 
 **Optional adaptive mode (Q5):** read total GPU utilization from IORegistry
