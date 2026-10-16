@@ -140,15 +140,16 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   (§4.6) and whose engine it has installed **[ours]**.
 - FR-17. Graceful stop: on SIGTERM / user stop, finish-or-release the current subtask within a grace
   period (default 30 s), then exit. Releasing = explicit `release` call so it re-queues immediately
-  instead of waiting for the watchdog **[ours]**.
+  instead of waiting for the watchdog **[ours]**. Implemented (M4.2, TASK-5.2): the grace is
+  `MINION_EXECUTOR_STOP_GRACE_S` (default 30, 0..300; 0 = stop at once); a second signal stops
+  immediately. Under launchd set `ExitTimeOut` to at least grace + 10 s (plist ships in M5).
 - FR-18. When and how much the executor works is governed by the capacity rules in §4.6 (the paper
   only lets users stop the executor entirely).
 
 **Implementation status (M1, TASK-2.3).** Implemented: FR-10 (register, token from
 `$MINION_EXECUTOR_TOKEN` or Keychain item `open-minions-executor`), FR-11 (loop with fake runner
 only), FR-15 (one subtask at a time), FR-17 partially (SIGTERM/SIGINT stop, release of the in-flight
-subtask, exit 0; **no 30 s grace period**: the worker is killed immediately, which conflicts with the
-"finish-or-release within grace" wording). Not yet implemented (as of TASK-2.3; FR-12 and FR-13 are now done, see the M3 updates): FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
+subtask, exit 0; the 30 s grace period followed in M4.2, see FR-17). Not yet implemented (as of TASK-2.3; FR-12 and FR-13 are now done, see the M3 updates): FR-16 engine filtering beyond the `engines` list sent on acquire, FR-18/§4.6
 governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
 **M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`, which probes mlx and hf only: Ollama is opt-in, see S-10) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
@@ -190,7 +191,7 @@ Errors from the worker and engines (the full set of codes the executor reports; 
 | `ENGINE_ERROR` | fail, retryable | Ollama answered 5xx at run time (404 = model gone: release) |
 | `PROMPT_TOO_LONG` | per record | written as an output line for that record; the subtask still succeeds (FR-6) |
 
-**M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
+**M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remained partial until M4.2 (TASK-5.2, grace period).
 
 ### 4.3 Acquisition protocol **[paper]**
 - FR-20. Ownership is claimed by inserting into `minion_subtask_acquirement`, which has a UNIQUE

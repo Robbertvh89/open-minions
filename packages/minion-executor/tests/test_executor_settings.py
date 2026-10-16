@@ -44,3 +44,13 @@ def test_config_path_expanded_absolute_and_empty_is_unset(monkeypatch: pytest.Mo
         ExecutorSettings()
     monkeypatch.setenv("MINION_EXECUTOR_CONFIG", "")
     assert ExecutorSettings().config_path is None
+
+
+def test_stop_grace_default_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ExecutorSettings().stop_grace_s == 30.0
+    monkeypatch.setenv("MINION_EXECUTOR_STOP_GRACE_S", "0")
+    assert ExecutorSettings().stop_grace_s == 0.0
+    for bad in ("-1", "301", "nan"):
+        monkeypatch.setenv("MINION_EXECUTOR_STOP_GRACE_S", bad)
+        with pytest.raises(ValidationError):
+            ExecutorSettings()

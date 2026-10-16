@@ -19,6 +19,10 @@ class ExecutorSettings(BaseSettings):
     # 0 disables idle unload.
     idle_unload_s: float = Field(default=600.0, ge=0, allow_inf_nan=False)
 
+    # FR-17: seconds an in-flight subtask may keep running after SIGTERM/SIGINT before the worker
+    # is killed and the subtask released. 0 = stop at once. A second signal stops immediately.
+    stop_grace_s: float = Field(default=30.0, ge=0, le=300, allow_inf_nan=False)
+
     # Model cache (D6). Ollama models live in Ollama's own store and are not counted.
     model_cache_dir: Path = Field(default_factory=default_cache_dir)
     model_cache_gb: float = Field(default=50.0, gt=0, allow_inf_nan=False)

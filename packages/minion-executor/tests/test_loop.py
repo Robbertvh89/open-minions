@@ -1441,3 +1441,115 @@ async def test_sandbox_failure_is_released_not_burned(tmp_path: Path) -> None:
         tmp_path, _asn(), FakeWorker(exc=RunnerError(SANDBOX_FAILED, "x", retryable=True))
     )
     assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
+# --- FR-17 graceful stop (TASK-5.2) ---
+
+
+class SlowWorker(FakeWorker):
+    """Finishes a batch after `delay_s`, unless killed/interrupted first."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+
+    def run(self, batch: list[Record], params: Any = None, on_progress: Any = None) -> list[Record]:
+        import time
+
+        end = time.monotonic() + self.delay_s
+        while time.monotonic() < end:
+            if self.killed or self.interrupted:
+                raise WorkerCrashed("killed")
+            time.sleep(0.01)
+        return super().run(batch, params, on_progress)
+
+
+async def _until_acquired(client: FakeClient) -> None:
+    for _ in range(300):
+        if "acquire" in client.kinds():
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+
+
+async def test_stop_within_grace_completes_inflight_subtask(tmp_path: Path) -> None:
+    client, s3, worker = FakeClient([assignment(), assignment()]), FakeS3(), SlowWorker(0.4)
+    loop = make_loop(client, worker, s3, tmp_path, [], stop_grace_s=10.0)
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 1
+    assert client.kinds() == ["acquire", "complete"]  # no second acquire, no release
+    assert len(s3.puts) == 1
+    assert not worker.killed and worker.closed
+    assert not leftover(tmp_path)
+
+
+async def test_stop_past_grace_kills_worker_and_releases_at_deadline(tmp_path: Path) -> None:
+    client, s3, worker = FakeClient([assignment()]), FakeS3(), FakeWorker(block=True)
+    loop = make_loop(client, worker, s3, tmp_path, [], stop_grace_s=0.5)
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    t0 = asyncio.get_running_loop().time()
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert 0.4 <= elapsed < 3.0  # waited out the grace, then released
+    assert client.kinds() == ["acquire", "release"]
+    assert worker.killed and s3.puts == []
+    assert not leftover(tmp_path)
+
+
+async def test_second_stop_signal_kills_and_releases_immediately(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=60.0)
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    loop.stop()
+    await asyncio.sleep(0.2)
+    assert not task.done()  # still inside the grace period
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert client.kinds() == ["acquire", "release"]
+    assert worker.killed
+
+
+async def test_grace_zero_is_immediate(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=0.0)
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert client.kinds() == ["acquire", "release"] and worker.killed
+
+
+async def test_heartbeats_continue_and_cancel_interrupts_during_grace(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    client.hb_script = [hb_resp(), hb_resp(), hb_resp(cancel=True)]
+
+    async def fast(_: float) -> None:
+        await asyncio.sleep(0.15)
+
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        stop_grace_s=60.0, heartbeat_interval_s=100.0, heartbeat_sleep=fast,
+    )  # fmt: skip
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0  # the cancel ended it long before the grace
+    kinds = client.kinds()
+    assert kinds.count("heartbeat") == 3  # beats kept flowing after the stop request
+    assert kinds[-1] == "release" and worker.interrupted
+
+
+async def test_stop_during_complete_retry_waits_for_deadline_not_signal(tmp_path: Path) -> None:
+    client = FakeClient([assignment()])
+    client.complete_excs = [httpx.ConnectError("x"), httpx.ConnectError("x")]
+    loop = make_loop(client, SlowWorker(0.2), FakeS3(), tmp_path, [], stop_grace_s=30.0)
+    task = asyncio.create_task(loop.run())
+    await _until_acquired(client)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 1
+    assert client.kinds() == ["acquire", "complete", "complete", "complete"]

@@ -215,6 +215,7 @@ async def _run(
             allow_http_loopback=_is_loopback(server),
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
+            stop_grace_s=settings.stop_grace_s,
             model_cache=ModelCache(
                 settings.model_cache_dir,
                 int(settings.model_cache_gb * 1024**3),

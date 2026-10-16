@@ -157,6 +157,7 @@ class ExecutorLoop:
         idle_unload_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
         model_cache: ModelCache | None = None,
+        stop_grace_s: float = 0.0,
     ) -> None:
         self._cache = model_cache
         self._client = client
@@ -175,7 +176,10 @@ class ExecutorLoop:
         self._allow_http = allow_http_loopback
         self._hb_interval = heartbeat_interval_s
         self._hb_sleep = heartbeat_sleep
-        self._stop = asyncio.Event()
+        self._stop = asyncio.Event()  # first signal: no new acquires, grace period starts
+        self._hard_stop = asyncio.Event()  # grace over / second signal: kill + release now
+        self._grace_s = stop_grace_s
+        self._grace_timer: asyncio.TimerHandle | None = None
         self._idle = 0
         self._fails = 0
         self._idle_unload_s = idle_unload_s
@@ -184,7 +188,22 @@ class ExecutorLoop:
         self._unloaded = False
 
     def stop(self) -> None:
+        """First call: stop acquiring and give the in-flight subtask `stop_grace_s` to finish
+        (heartbeats keep running). A second call, or the grace expiring, hard-stops: the worker is
+        killed and the subtask released. Grace 0 hard-stops at once. Call from the event loop."""
+        if self._stop.is_set():
+            self._hard_stop.set()
+            return
         self._stop.set()
+        if self._grace_s <= 0:
+            self._hard_stop.set()
+            return
+        try:
+            self._grace_timer = asyncio.get_running_loop().call_later(
+                self._grace_s, self._hard_stop.set
+            )
+        except RuntimeError:  # no running loop: nothing can be in flight
+            self._hard_stop.set()
 
     @property
     def stopping(self) -> bool:
@@ -194,12 +213,12 @@ class ExecutorLoop:
         lo, hi = self._backoff
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
-    async def _pause(self, delay: float) -> None:
+    async def _pause(self, delay: float, *, until: asyncio.Event | None = None) -> None:
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            await asyncio.wait_for((until or self._stop).wait(), timeout=delay)
 
     async def _sleep(self) -> None:
         delay = self._delay(self._idle)
@@ -264,6 +283,8 @@ class ExecutorLoop:
                 elif outcome is _Outcome.FAILED:
                     await self._back_off_after_failure()
         finally:
+            if self._grace_timer is not None:
+                self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
             await asyncio.to_thread(self._worker.close)
             if self._owns_http:
@@ -316,7 +337,7 @@ class ExecutorLoop:
             sleep=self._hb_sleep,
         )
         work = asyncio.create_task(self._execute(a, tmp, hb))
-        stopper = asyncio.create_task(self._stop.wait())
+        stopper = asyncio.create_task(self._hard_stop.wait())
         beat = asyncio.create_task(hb.run())
         try:
             pending: set[asyncio.Future[Any]] = {work, stopper, beat}
@@ -325,7 +346,7 @@ class ExecutorLoop:
                 if work.done():
                     break
                 if stopper.done():
-                    # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
+                    # Grace over / second signal: reclaim worker memory, hand the subtask back.
                     await asyncio.to_thread(self._worker.kill)
                     if self._cache is not None:
                         self._cache.release_in_use()
@@ -424,7 +445,7 @@ class ExecutorLoop:
             except httpx.HTTPError as exc:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             attempt += 1
-            if self.stopping:
+            if self._hard_stop.is_set():
                 await self._release(a, bound)
                 return _Outcome.STOPPED
             if attempt >= self._complete_retries:
@@ -434,7 +455,7 @@ class ExecutorLoop:
                     await self._report_failure(a, err, bound)
                 # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
-            await self._pause(self._delay(attempt - 1))
+            await self._pause(self._delay(attempt - 1), until=self._hard_stop)
 
     def _check_url(self, url: str) -> None:
         try:

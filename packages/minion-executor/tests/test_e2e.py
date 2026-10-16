@@ -242,17 +242,19 @@ async def test_worker_sigkill_is_retried_to_success(live: Live, tmp_path: Path) 
     assert ids == sorted(f"c{i}" for i in range(20))
 
 
-async def test_sigterm_releases_inflight_subtask(live: Live, tmp_path: Path) -> None:
-    """AC #2(b): SIGTERM to `minion-executor run` -> exit 0, RELEASED, subtask PENDING again."""
-    body = b'{"id":"slow0","text":"x","sleep_s":60}\n' + _records("s", 2)
-    live.put_input("term", "a.jsonl", body)
-    await live.submit("term", rps=10)
-    token = await live.token("sigterm")
+async def _run_sigterm(
+    live: Live, tmp_path: Path, task: str, body: bytes, grace_s: int
+) -> tuple[int, float]:
+    """Start `minion-executor run`, SIGTERM it once a subtask is in flight; (exit code, seconds
+    from the signal to exit)."""
+    live.put_input(task, "a.jsonl", body)
+    await live.submit(task, rps=10)
     env = {
         **os.environ,
-        "MINION_EXECUTOR_TOKEN": token,
+        "MINION_EXECUTOR_TOKEN": await live.token(f"sig-{task}"),
         "MINION_EXECUTOR_DEV": "1",
         "MINION_EXECUTOR_TEST_HOOKS": "1",
+        "MINION_EXECUTOR_STOP_GRACE_S": str(grace_s),
     }
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -276,18 +278,38 @@ async def test_sigterm_releases_inflight_subtask(live: Live, tmp_path: Path) -> 
 
         await eventually(inflight)
         await asyncio.sleep(0.5)  # let the worker start sleeping; release works either way
+        t0 = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        rc = await asyncio.wait_for(proc.wait(), 15)
+        rc = await asyncio.wait_for(proc.wait(), grace_s + 5)
+        return rc, time.monotonic() - t0
     finally:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+async def test_sigterm_releases_inflight_subtask_after_grace(live: Live, tmp_path: Path) -> None:
+    """FR-17: a long subtask is killed and RELEASED at the grace deadline (within grace + 5 s)."""
+    body = b'{"id":"slow0","text":"x","sleep_s":60}\n' + _records("s", 2)
+    rc, took = await _run_sigterm(live, tmp_path, "term", body, grace_s=1)
     assert rc == 0
+    assert 0.5 <= took < 1 + 5
     att = await live.rows("SELECT outcome FROM minion_subtask_attempt WHERE task_name='term'")
     assert [a[0] for a in att] == ["RELEASED"]
     sub = (await live.rows("SELECT status FROM minion_subtask WHERE task_name='term'"))[0][0]
     assert sub == "PENDING"
     assert (await live.rows("SELECT count(*) FROM minion_subtask_acquirement"))[0][0] == 0
+
+
+async def test_sigterm_lets_short_subtask_finish_within_grace(live: Live, tmp_path: Path) -> None:
+    """FR-17: a subtask that finishes inside the grace period is SUCCEEDED; exit 0, no release."""
+    body = b'{"id":"nap0","text":"x","sleep_s":2}\n' + _records("s", 2)
+    rc, _ = await _run_sigterm(live, tmp_path, "gentle", body, grace_s=30)
+    assert rc == 0
+    att = await live.rows("SELECT outcome FROM minion_subtask_attempt WHERE task_name='gentle'")
+    assert [a[0] for a in att] == ["SUCCEEDED"]
+    assert await live.task_status("gentle") == "SUCCEEDED"
+    assert len(_out_rows(live, "gentle")) == 3
 
 
 # --- fault tolerance (TASK-3.3 S7). Heartbeat interval floor is 1 s, so beats are 1 s. ---

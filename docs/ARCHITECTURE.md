@@ -176,9 +176,15 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 - **Failure back-off.** After any failed subtask the loop sleeps (same jittered exponential delay,
   growing per consecutive failure); after `max_consecutive_failures` (5) in a row it pauses for
   `failure_pause_s` (300 s) before acquiring again. A success resets the streak.
-- **Stop** (SIGTERM / SIGINT → `loop.stop`, exit 0): an in-flight subtask is cancelled, the worker is
-  killed to reclaim memory, and the subtask is `release`d (immediate requeue, not a failure). The
-  loop does not wait for a grace period (see SPEC §4.2 FR-17 status).
+- **Stop** (SIGTERM / SIGINT → `loop.stop`, exit 0; FR-17): the first signal stops acquiring and
+  starts a grace timer (`MINION_EXECUTOR_STOP_GRACE_S`, default 30, 0..300). The in-flight subtask
+  keeps running with its heartbeats, so the lease cannot expire, and a cancel or 409 still
+  interrupts it. If it finishes in time it is uploaded and completed as usual. At the deadline, on
+  a second signal, or with grace 0, the work task is cancelled, the worker killed to reclaim memory
+  and the subtask `release`d with its own `acquirement_id` (immediate requeue, not a failure). An
+  upload cut off at the deadline publishes nothing complete: only `complete` makes a result final,
+  and the re-run overwrites the same attempt-scoped key (invariant 5). launchd `ExitTimeOut` must
+  be at least grace + 10 s (plist in M5).
 - **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
   not a fixed 10–30 s band. Resets on the first assignment.
 - **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
