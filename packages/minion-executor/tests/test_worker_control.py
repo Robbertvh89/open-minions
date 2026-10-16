@@ -730,19 +730,20 @@ def test_control_that_found_the_pipe_busy_is_resent_by_the_running_call(
     bg.join()
 
 
-def _never_reads(conn: Any) -> None:  # forked child: stop reading the control channel
-    time.sleep(60)
-
-
 def test_control_to_a_worker_that_stopped_reading_cannot_wedge_the_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import multiprocessing as mp
+    import select
 
     monkeypatch.setattr("minion_executor.worker.process.CTL_SEND_TIMEOUT_S", 0.3)
-    ctx = mp.get_context("fork")
+    ctx = mp.get_context("spawn")
     parent, child = ctx.Pipe()
-    proc = ctx.Process(target=_never_reads, args=(child,), daemon=True)
+    proc = ctx.Process(
+        target=select.select,
+        args=([], [], [child], 60),  # holds the pipe end but never reads from it
+        daemon=True,
+    )
     proc.start()
     child.close()
     w = WorkerHandle([Engine.FAKE])
@@ -761,6 +762,53 @@ def test_control_to_a_worker_that_stopped_reading_cannot_wedge_the_caller(
     finally:
         w._proc = w._conn = None
         parent.close()
+
+
+def test_control_spam_during_a_slow_non_run_op_does_not_kill_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import multiprocessing as mp
+    import select
+
+    monkeypatch.setattr("minion_executor.worker.process.CTL_SEND_TIMEOUT_S", 0.3)
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(
+        target=select.select,
+        args=([], [], [child], 60),  # holds the pipe end but never reads from it
+        daemon=True,
+    )  # a worker busy loading
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE])
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    w._op = "load"
+    try:
+        for _ in range(1000):  # far beyond the pipe buffer
+            gen = w.control(duty=0.5, paused=False)
+        time.sleep(0.6)  # longer than the send watchdog
+        assert proc.is_alive() and w._interrupt_gen == 0
+        assert w._unsent is not None and w._unsent.gen == gen and w._sent_gen == 0
+    finally:
+        w._proc = w._conn = None
+        proc.kill()
+        parent.close()
+
+
+def test_state_set_during_a_non_run_op_applies_at_the_next_run_with_its_trim(
+    worker: WorkerHandle,
+) -> None:
+    worker.ensure_model(MODEL, _budget())
+    worker.run([{"id": 1, "fail_trim": 1, "text": "a"}])
+    worker._op = "stats"  # pretend a non-run op is in flight
+    gen = worker.control(duty=0.5, paused=False, trim=True)
+    worker._op = None
+    assert worker._unsent is not None and worker._unsent.trim and worker._sent_gen == 0
+    worker.run([{"id": 1, "text": "a"}])
+    assert worker._unsent is None
+    ack = worker.last_ack()
+    assert ack is not None and ack.gen == gen
+    assert worker.stats()["trim_errors"] == 1  # the trim travelled with the run
 
 
 def test_a_failing_trim_is_counted_and_never_fatal(worker: WorkerHandle) -> None:

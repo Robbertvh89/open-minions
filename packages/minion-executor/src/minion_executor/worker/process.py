@@ -368,6 +368,8 @@ def worker_main(
                     sent = WorkerCtl.from_msg(msg["ctl"])
                     if cur_ctl is None or sent.gen > cur_ctl.gen:
                         cur_ctl = sent
+                        if sent.trim:  # a trim whose own send failed rides on the run
+                            safe_trim()
                 start = cur_ctl or WorkerCtl(gen=0, duty=budget.gpu_duty_cycle, paused=False)
                 ctl = _Ctl(
                     conn,
@@ -472,6 +474,7 @@ class WorkerHandle:
         self._ctl: WorkerCtl | None = None  # latest-wins state, re-sent with every run
         self._sent_gen = 0  # newest generation known to be written to the current worker's pipe
         self._unsent: WorkerCtl | None = None  # newest state whose send failed (+ trim)
+        self._op: str | None = None  # op of the call in flight (None: worker idle in its main loop)
         self._ack: WorkerAck | None = None
         self._usage: WorkerUsage | None = None
         self._closed = False
@@ -559,13 +562,15 @@ class WorkerHandle:
             proc = self._proc
             if proc is None:  # pragma: no cover - _ensure_started guarantees it
                 raise WorkerCrashed("worker not started")
+            op = msg.get("op")
+            self._op = op if isinstance(op, str) else ""
             try:
                 with self._send_lock:
                     _send(conn, msg)
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
                 while True:
-                    if self._unsent is not None and abortable:
+                    if self._unsent is not None and abortable and op == "run":
                         self._flush_unsent(conn, proc)
                     if not conn.poll(0.1):
                         if abortable and (self._closed or self._interrupt_gen != gen):
@@ -629,6 +634,8 @@ class WorkerHandle:
             except (ValueError, RecursionError, MemoryError):  # hostile JSON / bad utf-8
                 self._reset()
                 raise WorkerCrashed("malformed worker reply") from None
+            finally:
+                self._op = None
             ok = reply.get("ok")
             code, message = reply.get("code"), reply.get("message", "")
             valid = isinstance(ok, bool) and (
@@ -726,8 +733,10 @@ class WorkerHandle:
         with self._ctl_lock:
             ctl = self._ctl
             unsent = self._unsent
-            if ctl is not None and unsent is not None and not unsent.trim and unsent.gen <= ctl.gen:
-                self._unsent = None  # this run carries it
+            if ctl is not None and unsent is not None and unsent.gen <= ctl.gen:
+                self._unsent = None  # this run carries it ...
+                if unsent.trim:
+                    ctl = replace(ctl, trim=True)  # ... including a trim whose send failed
         if ctl is not None:
             msg["ctl"] = ctl.to_msg()
         self._usage = None
@@ -765,7 +774,11 @@ class WorkerHandle:
                 ctl = replace(ctl, trim=True)  # an earlier unsent trim is not lost
             self._unsent = ctl  # until a send succeeds
         conn, proc = self._conn, self._proc
-        if conn is not None and proc is not None and not self._closed:
+        # While a non-run op (load, stats, probe) is in flight the worker is not reading: writing
+        # would only fill the pipe and trip the watchdog on a healthy worker. The state stays in
+        # `_unsent` and the next run carries it.
+        busy = self._op not in (None, "run")
+        if conn is not None and proc is not None and not self._closed and not busy:
             self._send_ctl(conn, proc, ctl, wait=True)
         return ctl.gen
 
@@ -780,14 +793,20 @@ class WorkerHandle:
         """
         if not self._send_lock.acquire(blocking=wait, timeout=CTL_SEND_TIMEOUT_S if wait else -1):
             return False  # a newer state will be re-sent by the in-flight call (_flush_unsent)
-        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc,))
+        done = threading.Event()  # set before cancel(): a timer already firing must stand down
+        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, done))
         watchdog.daemon = True
         watchdog.start()
         try:
             _send(conn, ctl.to_msg())
-        except (OSError, ValueError):  # worker gone / closing: the next run carries the state
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+        ):  # worker gone / closing: the next run carries the state
             return False
         finally:
+            done.set()
             watchdog.cancel()
             self._send_lock.release()
         with self._ctl_lock:
@@ -796,9 +815,12 @@ class WorkerHandle:
                 self._unsent = None
         return True
 
-    def _abort_stuck_send(self, proc: BaseProcess) -> None:
+    def _abort_stuck_send(self, proc: BaseProcess, done: threading.Event) -> None:
         """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
-        worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`)."""
+        worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`).
+        No-op if the send finished meanwhile (Timer.cancel cannot stop a timer already firing)."""
+        if done.is_set():
+            return
         self._interrupt_gen += 1
         _kill_quietly(proc)
 
@@ -957,7 +979,14 @@ class WorkerHandle:
                 if proc.is_alive():
                     proc.kill()
         if conn is not None:
-            conn.close()
+            # a control() write may be mid-flight on this conn (the kill above unblocks it): let it
+            # finish before closing the fd; the watchdog bounds it, so proceed anyway on timeout
+            got = self._send_lock.acquire(timeout=CTL_SEND_TIMEOUT_S + 1)
+            try:
+                conn.close()
+            finally:
+                if got:
+                    self._send_lock.release()
         if proc is not None:
             proc.join(timeout=5)
         tmp, self._tmp_dir = self._tmp_dir, None

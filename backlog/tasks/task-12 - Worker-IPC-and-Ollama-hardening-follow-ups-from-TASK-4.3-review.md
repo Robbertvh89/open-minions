@@ -4,7 +4,7 @@ title: Worker IPC and Ollama hardening follow-ups (from TASK-4.3 review)
 status: To Do
 assignee: []
 created_date: '2026-10-16 03:29'
-updated_date: '2026-10-16 13:09'
+updated_date: '2026-10-16 18:23'
 labels:
   - executor
   - security
@@ -38,4 +38,6 @@ Leftover MINOR/LOW findings from TASK-4.3 review and security rounds 4:
 
 <!-- SECTION:NOTES:BEGIN -->
 TASK-4.4 (M3 bench): the worker sandbox denies writes to the com.apple.MetalPerformanceShadersGraph cache dir. Runs succeed, but stderr is noisy and there is no MPSGraph cache reuse, so bench numbers may be slightly pessimistic. Evaluate a narrowly scoped write allow for that cache dir (ADR-0009), or accept it explicitly.
+
+Narrowed (TASK-5.3): ctl sends are now bounded by a kill watchdog (CTL_SEND_TIMEOUT_S). Still open: _call's initial request send (up to 64 MiB, under _lock/_send_lock) has no time limit; a non-reading worker blocks the call thread until kill/interrupt. Fix with the same kill watchdog.
 <!-- SECTION:NOTES:END -->
