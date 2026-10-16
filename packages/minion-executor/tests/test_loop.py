@@ -2246,3 +2246,45 @@ async def test_priority_false_inside_the_grace_window_is_ignored(tmp_path: Path)
     await asyncio.sleep(0.3)
     worker.gate.set()
     assert await asyncio.wait_for(task, 10) == 1 and worker.interrupts == 0
+
+
+async def test_loop_writes_status_on_change_and_at_stop(tmp_path: Path) -> None:
+    import json
+    import stat
+
+    from minion_executor.capacity.status import STATUS_FILE, StatusFile, read_status
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    gov = FixedGovernor(BUDGET)
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gate = threading.Event()
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=gov, status_dir=state_dir,
+        status_interval_s=30.0,
+    )  # fmt: skip
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.started.is_set())
+
+    def current() -> StatusFile:
+        st = read_status(state_dir)
+        assert st is not None
+        return st
+
+    await until(lambda: (st := read_status(state_dir)) is not None and st.subtask is not None)
+    sub = current().subtask
+    assert sub is not None and (sub.subtask_id, sub.attempt, sub.records_total) == (0, 1, 3)
+    gov.update(dec(BUDGET, reason=PausedReason.THERMAL))  # a decision change: written at once
+    await until(lambda: current().paused_reason == "thermal")
+    gov.update(dec(BUDGET))
+    await until(lambda: current().paused_reason is None)
+    raw = (state_dir / STATUS_FILE).read_text()
+    assert stat.S_IMODE((state_dir / STATUS_FILE).stat().st_mode) == 0o600
+    for forbidden in ("token", "http", "acquirement", "input", "output_url", "text"):
+        assert forbidden not in raw.lower(), forbidden
+    assert json.loads(raw)["pid"] == os.getpid()
+    worker.gate.set()
+    assert await asyncio.wait_for(task, 10) == 1
+    final = current()
+    assert final.stopped and final.subtask is None
+    assert (final.today.subtasks, final.today.records) == (1, 3)

@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -48,6 +49,15 @@ from minion_executor import io
 from minion_executor.capacity.governor import Decision
 from minion_executor.capacity.profiles import GIB
 from minion_executor.capacity.runtime import FixedGovernor, Governor
+from minion_executor.capacity.safefile import SafeFileError
+from minion_executor.capacity.status import (
+    STATUS_INTERVAL_S,
+    StatusFile,
+    StatusSignals,
+    StatusSubtask,
+    StatusToday,
+    write_status,
+)
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
 from minion_executor.model_cache import MODEL_CACHE_FULL, ModelCache, ModelFetchError
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
@@ -201,6 +211,8 @@ class ExecutorLoop:
         downgrade_batch_s: float = 60.0,
         guard_interval_s: float = 2.0,
         priority_grace_s: float = 60.0,
+        status_dir: Path | None = None,
+        status_interval_s: float = STATUS_INTERVAL_S,
     ) -> None:
         self._cache = model_cache
         self._client = client
@@ -212,6 +224,17 @@ class ExecutorLoop:
         self._downgrade_batch_s = downgrade_batch_s  # FR-54: finish the batch, bounded
         self._guard_s = guard_interval_s  # footprint / priority sampling period (D7)
         self._prio_grace_s = priority_grace_s  # a new priority applies at the worker's next batch
+        self._status_dir = status_dir  # None: no status.json (tests, bench)
+        self._status_s = status_interval_s
+        self._status_kick = asyncio.Event()  # set when something status-relevant changed
+        self._status_note: str | None = None
+        self._started_at = datetime.now(UTC)
+        self._current: tuple[Assignment, Heartbeater] | None = None
+        self._today = (
+            datetime.now().astimezone().date().isoformat(),
+            0,
+            0,
+        )  # date, subtasks, records
         self._ctl_key: tuple[float, bool] | None = None  # last (duty, paused) pushed to the worker
         self._trim_pushed = False
         self._presence_key: tuple[object, object] | None = None
@@ -426,9 +449,12 @@ class ExecutorLoop:
         pid_prefix = f"{TMP_PREFIX}{os.getpid()}-"
         tmp = Path(tempfile.mkdtemp(prefix=pid_prefix, dir=self._tmp_root))  # mode 0700
         gov_task: asyncio.Task[None] | None = None
+        status_task: asyncio.Task[None] | None = None
         try:
             await self._gov.prime()  # a real first decision before anything is acquired
             gov_task = asyncio.create_task(self._gov.run())
+            if self._status_dir is not None:
+                status_task = asyncio.create_task(self._status_loop(self._status_dir))
             if self._register is not None:
                 await self._register_with_retry(self._register)
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
@@ -472,12 +498,14 @@ class ExecutorLoop:
                 if outcome is _Outcome.DONE:
                     self._fails = 0
                     done += 1
+                    self._note_done(assignment.record_count)
                 elif outcome is _Outcome.FAILED:
                     await self._back_off_after_failure()
         finally:
-            if gov_task is not None:
-                gov_task.cancel()
-                await asyncio.gather(gov_task, return_exceptions=True)
+            for bg in (status_task, gov_task):
+                if bg is not None:
+                    bg.cancel()
+                    await asyncio.gather(bg, return_exceptions=True)
             if self._grace_timer is not None:
                 self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
@@ -486,6 +514,9 @@ class ExecutorLoop:
             # a kill that already timed out means close/kill would wedge as well: skip them
             if not self._kill_timed_out and not await self._bounded_thread(self._worker.close):
                 await self._bounded_thread(self._worker.kill, is_kill=True)  # lock-free fallback
+            if self._status_dir is not None:  # leave a 'stopped' marker: no stale 'running'
+                sdir = self._status_dir
+                await self._bounded_thread(lambda: self._write_status(sdir, stopped=True))
             if self._owns_http:
                 await self._http.aclose()
         return done
@@ -575,6 +606,8 @@ class ExecutorLoop:
             initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
+        self._current = (a, hb)
+        self._status_kick.set()
         work = asyncio.create_task(self._execute(a, tmp, hb))
         stopper = asyncio.create_task(self._hard_stop.wait())
         beat = asyncio.create_task(hb.run())
@@ -651,6 +684,8 @@ class ExecutorLoop:
             if not work.done():
                 work.cancel()
             await asyncio.gather(stopper, beat, watch, work, return_exceptions=True)
+            self._current = None
+            self._status_kick.set()
             # The work task has truly finished (incl. a shielded file write): nothing may linger.
             for p in self._paths(a, tmp):
                 p.unlink(missing_ok=True)
@@ -750,6 +785,89 @@ class ExecutorLoop:
         await self._release(a, bound)
         # a priority violation is a local fault: back off so it cannot churn; the rest is policy
         return _Outcome.FAILED if v is _Verdict.PRIORITY else _Outcome.RELEASED
+
+    def _note_done(self, records: int) -> None:
+        today = datetime.now().astimezone().date().isoformat()
+        day, subtasks, total = self._today
+        self._today = (today, 1, records) if today != day else (day, subtasks + 1, total + records)
+        self._status_kick.set()
+
+    def _status_snapshot(self, *, stopped: bool = False) -> StatusFile:
+        """Ids and numbers only: no payload, URL, token or acquirement id (S-5)."""
+        d = self._gov.decision
+        sig = self._gov.snapshot
+        cur = self._current
+        day, subtasks, records = self._today
+        try:
+            share = self._worker.gpu_share()
+        except Exception:
+            share = None
+        return StatusFile(
+            pid=os.getpid(),
+            started_at=self._started_at,
+            updated_at=datetime.now(UTC),
+            stopped=stopped,
+            profile=d.profile,
+            profile_source=d.profile_source.value,
+            budget=d.budget,
+            held_below_nominal=d.budget != self._gov.nominal,
+            candidate=d.candidate,
+            candidate_since=d.candidate_since,
+            paused_reason=self._paused_reason(),
+            subtask=(
+                StatusSubtask(
+                    subtask_id=cur[0].subtask_id,
+                    attempt=cur[0].attempt,
+                    records_done=min(cur[1].records_done, cur[0].record_count),
+                    records_total=cur[0].record_count,
+                )
+                if cur is not None
+                else None
+            ),
+            gpu_share=share,
+            signals=(
+                StatusSignals(
+                    on_ac=sig.on_ac,
+                    battery_percent=sig.battery_percent,
+                    low_power_mode=sig.low_power_mode,
+                    thermal=sig.thermal.value,
+                    memory_pressure=sig.memory_pressure.value,
+                    hid_idle_s=round(sig.hid_idle_s, 1),
+                    taken_at=sig.taken_at,
+                )
+                if sig is not None
+                else None
+            ),
+            today=StatusToday(date=day, subtasks=subtasks, records=records),
+        )
+
+    def _write_status(self, state_dir: Path, *, stopped: bool = False) -> None:
+        """Blocking (fsync): call off-loop. A failure is logged once per distinct message."""
+        try:
+            write_status(state_dir, self._status_snapshot(stopped=stopped))
+        except (SafeFileError, OSError) as exc:
+            note = str(exc)
+            if note != self._status_note:
+                self._status_note = note
+                log.warning("status_write_failed", reason=note)
+        else:
+            self._status_note = None
+
+    async def _status_loop(self, state_dir: Path) -> None:
+        """Rewrite status.json on every decision change, subtask change and every interval."""
+        version = self._gov.version
+        while True:
+            self._status_kick.clear()
+            await asyncio.to_thread(self._write_status, state_dir)
+            change = asyncio.ensure_future(self._gov.wait_change(version, self._status_s))
+            kick = asyncio.ensure_future(self._status_kick.wait())
+            try:
+                await asyncio.wait({change, kick}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                change.cancel()
+                kick.cancel()
+                await asyncio.gather(change, kick, return_exceptions=True)
+            version = self._gov.version
 
     def _paused_reason(self) -> str | None:
         reason = self._gov.decision.paused_reason

@@ -1,4 +1,4 @@
-"""Executor CLI. `run` is the control loop; `bench` measures engines; `status` lands with M4."""
+"""Executor CLI. `run` is the control loop; `bench` measures engines; `status` reads status.json."""
 
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ from minion_executor.capacity.profiles import (
 from minion_executor.capacity.runtime import GovernorRuntime
 from minion_executor.capacity.safefile import SafeFileError, ensure_private_dir
 from minion_executor.capacity.signals import SignalSource, default_source
+from minion_executor.capacity.status import STATUS_FILE, read_status, running
+from minion_executor.capacity.status import render as render_status
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
@@ -298,6 +300,9 @@ async def _run(
             stop_grace_s=settings.stop_grace_s,
             governor=build_governor(plan) if plan is not None else None,
             presence_interval_s=settings.presence_interval_s,
+            downgrade_batch_s=settings.downgrade_batch_s,
+            guard_interval_s=settings.signal_poll_s,
+            status_dir=settings.state_dir,
             model_cache=ModelCache(
                 settings.model_cache_dir,
                 int(settings.model_cache_gb * 1024**3),
@@ -442,9 +447,25 @@ def profile_cmd(
 
 @app.command()
 def status() -> None:
-    """Show current budget, task and contribution."""
-    typer.echo("status not implemented yet")
-    raise typer.Exit(code=1)
+    """Show the running executor's profile, budget, pause reason, current subtask and signals.
+
+    Exit 1 when no executor is running (no status file, a stopped or stale one).
+    """
+    try:
+        settings = ExecutorSettings()
+        st = read_status(settings.state_dir)
+    except (ValueError, SafeFileError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    if st is None:
+        typer.echo(f"no executor is running (no {settings.state_dir / STATUS_FILE})")
+        raise typer.Exit(code=1)
+    alive, why = running(st)
+    if not alive:
+        typer.echo(f"no executor is running: {why}")
+    typer.echo(render_status(st))
+    if not alive:
+        raise typer.Exit(code=1)
 
 
 def _check_out_path(out: Path) -> None:
