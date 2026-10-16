@@ -1,9 +1,10 @@
 ---
 id: TASK-5.6
 title: 'M4.6 Measure NF-8 and NF-9, ADR-0006, docs'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-16 13:32'
+updated_date: '2026-10-16 23:24'
 labels:
   - M4
 dependencies: []

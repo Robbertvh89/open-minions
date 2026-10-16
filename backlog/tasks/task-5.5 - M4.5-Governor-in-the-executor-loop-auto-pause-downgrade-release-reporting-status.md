@@ -3,10 +3,10 @@ id: TASK-5.5
 title: >-
   M4.5 Governor in the executor loop: auto-pause, downgrade-release, reporting,
   status
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 22:18'
+updated_date: '2026-10-16 23:24'
 labels:
   - M4
 dependencies: []
