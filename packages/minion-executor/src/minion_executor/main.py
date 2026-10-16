@@ -1,23 +1,28 @@
-"""Executor CLI. `run` is the M1 control loop; `status` / `bench` land with M4 / M3."""
+"""Executor CLI. `run` is the control loop; `bench` measures engines; `status` lands with M4."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import signal
 import socket
 import subprocess
+import sys
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
 
 import httpx
+import structlog
 import typer
 from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
 from minion_common.schemas import RegisterRequest
 from pydantic import SecretStr
 
+from minion_executor import bench as bench_mod
 from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
@@ -278,3 +283,87 @@ def status() -> None:
     """Show current budget, task and contribution."""
     typer.echo("status not implemented yet")
     raise typer.Exit(code=1)
+
+
+@app.command()
+def bench(
+    models: Annotated[
+        Path, typer.Option("--models", help="Bench models file (see deploy/bench-models.yaml)")
+    ] = Path("deploy/bench-models.yaml"),
+    model: Annotated[
+        list[str] | None,
+        typer.Option("--model", help="model_id from the file (repeatable; default: all)"),
+    ] = None,
+    records: Annotated[int, typer.Option(help="Timed records per batch size")] = (
+        bench_mod.DEFAULT_RECORDS
+    ),
+    batch_sizes: Annotated[str, typer.Option(help="Comma-separated batch sizes")] = "1,8,32",
+    max_tokens: Annotated[int, typer.Option(help="Completion max_tokens")] = (
+        bench_mod.DEFAULT_MAX_TOKENS
+    ),
+    profile: Annotated[str, typer.Option(help="Capacity profile: light, balanced or full")] = (
+        "full"
+    ),
+    out: Annotated[Path | None, typer.Option(help="Also write the JSON report here")] = None,
+) -> None:
+    """Benchmark engines on this Mac through the real worker path. No server or token needed."""
+    try:
+        prof = parse_profile(profile)
+        config = bench_mod.BenchConfig(
+            records=records,
+            batch_sizes=bench_mod.parse_batch_sizes(batch_sizes),
+            max_tokens=max_tokens,
+        )
+        entries, pending = bench_mod.load_bench_models(models)
+        if model:
+            known = {e.model_id for e in entries} | {p.model_id for p in pending}
+            if unknown := [m for m in model if m not in known]:
+                raise ValueError(f"unknown model id(s): {', '.join(unknown)}")
+            entries = [e for e in entries if e.model_id in model]
+            pending = [p for p in pending if p.model_id in model]
+        if any(e.engine is Engine.FAKE for e in entries):
+            _require_dev_for_fake()
+        settings = ExecutorSettings()
+        fetch_env = FetchEnv.capture()
+    except (ValueError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    # stdout carries only the table; progress logs go to stderr
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+    restrict_environ()  # fetch_env holds the secrets; workers inherit none
+    base = budget_for(prof)
+    # sweep honestly: the profile's batch cap must not clamp the requested batch sizes
+    budget = base.model_copy(
+        update={"max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
+    )
+    engines = list(dict.fromkeys(e.engine for e in entries))
+    sandbox = sandbox_policy(settings, engines)
+
+    def factory(engine: Engine) -> WorkerHandle:
+        return WorkerHandle(
+            [engine],
+            nice=PROFILES[prof].nice,
+            sandbox=sandbox,
+            engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
+        )
+
+    cache = ModelCache(
+        settings.model_cache_dir,
+        int(settings.model_cache_gb * 1024**3),
+        fetch_env=fetch_env,
+        download_timeout_s=settings.download_timeout_s,
+        min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
+        nice=PROFILES[prof].nice,
+        sandbox=settings.fetch_sandbox,
+    )
+    try:
+        report = asyncio.run(
+            bench_mod.run_bench(cache, factory, entries, config, budget, pending=pending)
+        )
+    finally:
+        structlog.reset_defaults()  # do not leave a global logger bound to this stderr
+    typer.echo(bench_mod.render_table(report))
+    if out is not None:
+        out.write_text(json.dumps(report.to_json(), indent=2) + "\n", encoding="utf-8")
+    if not any(r.status == "ok" for r in report.results):
+        raise typer.Exit(code=1)

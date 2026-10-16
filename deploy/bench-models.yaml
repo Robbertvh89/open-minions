@@ -1,0 +1,45 @@
+# Models for `minion-executor bench`: the SAME model on every engine at matching precision, so the
+# numbers compare engines rather than models (D13, ADR-0005). Same schema as models.yaml.
+#   completion: Qwen2.5-0.5B-Instruct, 16-bit (mlx bf16, hf checkpoint bf16 run as fp16, ollama fp16)
+#   embedding:  all-MiniLM-L6-v2, 16-bit compute (mlx bf16 conversion; the hf checkpoint is stored
+#               as fp32 and the hf runner casts to fp16). See docs/bench for the caveat.
+# The `pending:` list holds models that cannot be benchmarked yet. Entries there are NOT validated
+# as ModelEntry (an Ollama manifest digest cannot be looked up without an Ollama install, which the
+# bench Mac does not have yet) and are reported by the bench as `unavailable` with the reason.
+# Once pinned, move an entry to `models:` with its `revision:` (64-hex digest from `ollama show`).
+models:
+  - model_id: qwen2.5-0.5b-mlx
+    type: completion
+    engine: mlx
+    ref: mlx-community/Qwen2.5-0.5B-Instruct-bf16
+    revision: 56d07e766edd7159fbe12ed12d9cf114bf38bf1e
+    memory_gb: 1.5
+  - model_id: qwen2.5-0.5b-hf
+    type: completion
+    engine: hf
+    ref: Qwen/Qwen2.5-0.5B-Instruct
+    revision: 7ae557604adf67be50417f59c2c2f167def9a775
+    memory_gb: 1.5
+  - model_id: minilm-mlx
+    type: embedding
+    engine: mlx
+    ref: mlx-community/all-MiniLM-L6-v2-bf16
+    revision: b6691709eacd8f0afcc3faace288cf50e611f3aa
+    memory_gb: 0.5
+  - model_id: minilm-hf
+    type: embedding
+    engine: hf
+    ref: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    memory_gb: 0.5
+pending:
+  - model_id: qwen2.5-0.5b-ollama
+    type: completion
+    engine: ollama
+    ref: qwen2.5:0.5b-instruct-fp16
+    reason: manifest digest not pinned (Ollama not installed on the bench Mac, pending approval)
+  - model_id: minilm-ollama
+    type: embedding
+    engine: ollama
+    ref: all-minilm:l6-v2
+    reason: manifest digest not pinned (Ollama not installed on the bench Mac, pending approval)
