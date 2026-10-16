@@ -108,6 +108,12 @@ FETCH_MACH_ALLOW: tuple[str, ...] = ("com.apple.trustd.agent",)
 # `plan total + margin`. Margin: hub-client bookkeeping, partial-file overhead.
 _STAGING_MARGIN_BYTES = 64 * 1024 * 1024
 _STAGING_MARGIN_FRACTION = 0.05
+
+
+def _staging_margin(needed: int) -> int:
+    return max(_STAGING_MARGIN_BYTES, int(needed * _STAGING_MARGIN_FRACTION))
+
+
 _STAGING_POLL_S = 1.0
 _STAGING_MAX_ENTRIES = 10_000  # files + dirs in a staging dir, before and after the plan
 
@@ -254,8 +260,6 @@ def _child_main(
     confine: dict[str, Any] | None = None,
 ) -> None:
     from minion_executor.worker.process import _watch_parent
-
-    seatbelt.new_session()
 
     if parent_pid is not None:  # the control process died: never keep downloading
         threading.Thread(target=_watch_parent, args=(parent_pid, 1.0), daemon=True).start()
@@ -730,14 +734,16 @@ class ModelCache:
                 continue
             local = host in ("localhost", "127.0.0.1", "::1")
             proxies.append(f"{'localhost' if local else '*'}:{port}")
-        if proxies:
+        no_proxy = any(self._fetch_env.values.get(n) for n in ("NO_PROXY", "no_proxy"))
+        if proxies and not no_proxy:
             return list(dict.fromkeys(proxies))
         ports = [443]
         endpoint = self._fetch_env.values.get("HF_ENDPOINT")
         if endpoint is not None:
             with contextlib.suppress(ValueError):
                 ports.append(urlsplit(endpoint.get_secret_value()).port or 443)
-        return [f"*:{p}" for p in dict.fromkeys(ports)]
+        direct = [f"*:{p}" for p in dict.fromkeys(ports)]
+        return list(dict.fromkeys(proxies + direct))
 
     async def _fetch_into(self, model: ModelEntry, final: Path) -> None:
         staging_root = self._root / ".staging"
@@ -795,6 +801,7 @@ class ModelCache:
         plan: dict[str, list[Any]] | None = None
         # Before the plan arrives only the margin is allowed (the child just lists the hub).
         limit = _STAGING_MARGIN_BYTES
+        limit_base = 0
         last_size_check = loop.time()
         try:
             while True:
@@ -806,7 +813,8 @@ class ModelCache:
                     if loop.time() - last_size_check >= _STAGING_POLL_S:
                         last_size_check = loop.time()
                         usage = await asyncio.to_thread(shutil.disk_usage, self._root)
-                        if usage.free < self._reserve(usage.total):
+                        # Normal overshoot (the margin the staging limit allows) must not trip it.
+                        if usage.free < self._reserve(usage.total) - _staging_margin(limit_base):
                             # unlinked-but-open files and fast writes show up here, not in a walk
                             log.error("model_staging_disk_reserve", repo=spec.repo)
                             raise ModelFetchError(
@@ -834,9 +842,8 @@ class ModelCache:
                     needed = int(msg[1])
                     await asyncio.to_thread(self.evict_for, needed, self._in_use)
                     parent.send("go")
-                    limit = needed + max(
-                        _STAGING_MARGIN_BYTES, int(needed * _STAGING_MARGIN_FRACTION)
-                    )
+                    limit_base = needed
+                    limit = needed + _staging_margin(needed)
                     last_size_check = loop.time()
                 elif kind == "done":
                     if plan is None:
@@ -855,7 +862,7 @@ class ModelCache:
         finally:  # also on CancelledError: stop/cancel must kill the download (invariant 6)
             parent.close()
             if proc.is_alive():
-                seatbelt.kill_tree(proc)
+                proc.kill()
             proc.join(5)
 
     def _verify_and_seal(

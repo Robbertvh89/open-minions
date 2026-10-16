@@ -32,7 +32,6 @@ import ctypes
 import ctypes.util
 import os
 import re
-import signal
 import sys
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
@@ -382,22 +381,6 @@ def apply(profile: str) -> None:
         if err.value:
             lib.sandbox_free_error(err)
         raise RunnerError(SANDBOX_FAILED, detail[:200])
-
-
-def new_session() -> None:
-    """Child side: become a session/process-group leader so `kill_tree` reaps stragglers."""
-    with contextlib.suppress(OSError):
-        os.setsid()
-
-
-def kill_tree(proc: Any) -> None:
-    """Parent side: SIGKILL the child's process group (set up by `new_session`), then the child
-    itself (covers the window before the child called `setsid`)."""
-    pid = getattr(proc, "pid", None)
-    if isinstance(pid, int) and pid > 1:
-        with contextlib.suppress(OSError):
-            os.killpg(pid, signal.SIGKILL)
-    proc.kill()
 
 
 def procargs_readable(pid: int) -> bool:

@@ -1236,6 +1236,19 @@ class _StubCache:
         self.released += 1
 
 
+async def test_ensure_model_runner_error_unpins_the_cache(tmp_path: Path) -> None:
+    class W(FakeWorker):
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
+            raise RunnerError("LOAD_FAILED", "x", retryable=False)
+
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), W(), model_cache=cache)
+    assert cache.released >= 1
+    assert next(r for k, r in client.calls if k == "fail").code == "LOAD_FAILED"
+
+
 async def test_model_path_from_cache_reaches_worker(tmp_path: Path) -> None:
     seen: list[Path | None] = []
 

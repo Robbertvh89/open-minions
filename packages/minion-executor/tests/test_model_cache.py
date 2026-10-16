@@ -888,6 +888,15 @@ def test_confine_spec_tcp_is_https_plus_proxy_only(tmp_path: Path) -> None:
     # with a proxy only the proxy port is allowed, not *:443
     assert tcp({"HTTPS_PROXY": "http://user:pw@proxy.corp:3128"}) == ["*:3128"]
     assert tcp({"HTTPS_PROXY": "http://127.0.0.1:8888"}) == ["localhost:8888"]
+    # NO_PROXY set next to a proxy: direct hub access is possible, so *:443 (and the
+    # HF_ENDPOINT port) is allowed as well
+    both = {"HTTPS_PROXY": "http://proxy.corp:3128", "NO_PROXY": "hub.example"}
+    assert tcp(both) == ["*:3128", "*:443"]
+    assert tcp({**both, "HF_ENDPOINT": "https://hub.example:8443"}) == [
+        "*:3128",
+        "*:443",
+        "*:8443",
+    ]
     assert tcp({"ALL_PROXY": "proxy.corp:8080"}) == ["*:8080"]
     # HTTP_PROXY is not used for https: never opens *:80
     assert tcp({"HTTP_PROXY": "http://proxy.corp"}) == ["*:443"]
@@ -926,7 +935,9 @@ async def test_staging_disk_reserve_kills_the_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("minion_executor.model_cache._STAGING_POLL_S", 0.05)
-    monkeypatch.setattr(ModelCache, "_reserve", lambda _self, total: total + 1)  # never met
+    monkeypatch.setattr(
+        ModelCache, "_reserve", lambda _self, total: total + 2**30
+    )  # never met, even with the margin
     monkeypatch.setattr(ModelCache, "_check_disk", lambda *_a, **_k: None)
 
     def slow(spec: FetchSpec, conn: Connection) -> None:
@@ -937,6 +948,25 @@ async def test_staging_disk_reserve_kills_the_child(
         await _cache(tmp_path, slow).ensure(_model())
     assert ei.value.code == MODEL_CACHE_FULL and ei.value.release and ei.value.local
     assert time.monotonic() - t0 < 20
+
+
+async def test_staging_poll_tolerates_overshoot_within_the_margin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Free space between reserve - margin and reserve (normal staging overshoot) is fine."""
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_POLL_S", 0.05)
+    free = shutil.disk_usage(tmp_path).free
+    reserve = free + 1024  # free is 1 KiB below the reserve, well within the margin
+    monkeypatch.setattr(ModelCache, "_reserve", lambda _self, _total: reserve)
+    monkeypatch.setattr(ModelCache, "_check_disk", lambda *_a, **_k: None)
+
+    def slow(spec: FetchSpec, conn: Connection) -> None:
+        time.sleep(1)
+        conn.send(("err", "X", "x", False, False))
+
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, slow).ensure(_model())
+    assert ei.value.code != MODEL_CACHE_FULL
 
 
 async def test_staging_entry_cap_applies_before_the_plan(

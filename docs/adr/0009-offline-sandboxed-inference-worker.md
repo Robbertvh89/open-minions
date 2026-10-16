@@ -123,10 +123,16 @@ together with `MINION_EXECUTOR_DEV=1`.
     exfiltrate what it can read (its staging dir, the fetch env including `HF_TOKEN`).
   - With a proxy configured the fetch child may reach `*:<proxyport>` (any host on that port, as
     Seatbelt does not filter by hostname) and no longer `*:443`; `HTTP_PROXY` is not honoured for
-    https fetches and opens nothing. Without a proxy it is `*:443` (plus the `HF_ENDPOINT` port).
+    https fetches and opens nothing. Without a proxy it is `*:443` (plus the `HF_ENDPOINT` port). If `NO_PROXY`/`no_proxy` is set
+    next to a proxy, direct access is legitimate, so `*:443` and the `HF_ENDPOINT` port are allowed
+    in addition to the proxy port.
   - Both profiles deny `process-fork`, `network-bind` and `network-inbound`, so a compromised child
     cannot leave a grandchild serving a fake local service (e.g. Ollama on 11434) after
-    `proc.kill()`. As belt and braces children are session leaders and teardown also `killpg`s them.
+    `proc.kill()`. Fork denial is the control; there are no process groups or sessions (`killpg`
+    on a reaped pid could hit an unrelated group after pid reuse). In the dev-only sandbox-off
+    mode grandchildren are not reaped (accepted, dev only).
+  - `needed` and the plan file sizes are child-reported, so a compromised fetch child could force
+    eviction of the cache (DoS only, bounded by the free-disk reserve).
   - The localhost deny covers `localhost` only: the rest of 127/8 and the Mac's own LAN IP are not
     covered.
   - Process listing (`KERN_PROC_ALL`) stays possible, as do `AF_ROUTE` and `AF_SYSTEM` sockets.
