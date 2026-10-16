@@ -264,3 +264,87 @@ async def test_fixed_governor_is_static_and_update_wakes() -> None:
     await asyncio.sleep(0)
     gov.update(gov.decision.__class__(**{**gov.decision.__dict__, "paused_reason": R.THERMAL}))
     assert await asyncio.wait_for(waiter, 1) == v + 1
+
+
+# --- fail closed: hung control read, stale decision, repeated poll errors -------------------------
+
+
+async def test_hung_control_read_is_one_daemon_thread_and_fails_closed(state_dir: Path) -> None:
+    import threading
+
+    release = threading.Event()
+    calls: list[int] = []
+
+    def reader(_: Path) -> None:
+        calls.append(1)
+        release.wait(10)
+
+    gov = make(state_dir, Source(), Clock(), control_timeout_s=0.05, control_reader=reader)
+    try:
+        d1 = await gov.poll_once()
+        assert d1.paused_reason is R.CONTROL_INVALID  # timed out: unusable, never "no file"
+        for _ in range(5):
+            d = await gov.poll_once()
+            assert d.paused_reason is R.CONTROL_INVALID
+        assert calls == [1]  # no further thread while the first read hangs
+        assert await asyncio.to_thread(lambda: 7) == 7  # the default pool is untouched
+    finally:
+        release.set()
+    await asyncio.sleep(0.05)
+    gov._read_control = lambda _: None  # recovered: reads work again
+    assert (await gov.poll_once()).paused_reason is None
+
+
+class Mono:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+async def test_stale_decision_is_paused_and_expires_to_a_release(state_dir: Path) -> None:
+    mono = Mono()
+    gov = make(state_dir, Source(), Clock(), mono=mono)  # stale after max(10, 3 x 2) s
+    await gov.prime()
+    assert gov.decision.paused_reason is None
+    mono.t += 9
+    assert gov.decision.paused_reason is None
+    mono.t += 2  # 11 s without a poll
+    d = gov.decision
+    assert d.paused_reason is R.SIGNALS_UNAVAILABLE and not d.pause_expired
+    mono.t += 60  # paused-stale for pause_release_after_s: the in-flight subtask is released
+    assert gov.decision.pause_expired
+    await gov.poll_once()  # a poll makes it fresh again
+    assert gov.decision.paused_reason is None and not gov.decision.pause_expired
+
+
+async def test_repeated_decide_errors_expire_the_pause(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.capacity.runtime as rt
+
+    mono = Mono()
+    gov = make(state_dir, Source(), Clock(), mono=mono, poll_s=0.01)
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(rt, "decide", boom)
+    task = asyncio.create_task(gov.run())
+    try:
+        for _ in range(200):
+            if gov._error_since is not None:  # the first failed poll happened
+                break
+            await asyncio.sleep(0.01)
+        assert gov.decision.paused_reason is R.SIGNALS_UNAVAILABLE
+        assert not gov.decision.pause_expired  # the first error: the pause just began
+        mono.t += 61
+        for _ in range(200):
+            if gov.decision.pause_expired:
+                break
+            await asyncio.sleep(0.01)
+        assert gov.decision.pause_expired  # ... and it has lasted 60 s: release in-flight work
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

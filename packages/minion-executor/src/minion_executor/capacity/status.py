@@ -9,20 +9,23 @@ executor is running".
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from minion_common.enums import CapacityProfile
+from minion_common.enums import CapacityProfile, PausedReason
 from minion_common.schemas import Budget
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
+from minion_executor.capacity.governor import ProfileSource
 from minion_executor.capacity.safefile import (
     SafeFileError,
     atomic_write_private,
     read_private_file,
 )
+from minion_executor.capacity.signals import MemPressure, Thermal
 
 STATUS_FILE = "status.json"
 MAX_STATUS_BYTES = 16384
@@ -47,8 +50,8 @@ class StatusSignals(_Model):
     on_ac: bool
     battery_percent: int | None
     low_power_mode: bool
-    thermal: str
-    memory_pressure: str
+    thermal: Thermal
+    memory_pressure: MemPressure
     hid_idle_s: float
     taken_at: AwareDatetime
 
@@ -56,24 +59,24 @@ class StatusSignals(_Model):
 class StatusToday(_Model):
     """Contribution of this executor process on `date` (local); resets at local midnight."""
 
-    date: str
+    date: dt.date
     subtasks: int = Field(ge=0)
     records: int = Field(ge=0)
 
 
 class StatusFile(_Model):
     version: Literal[1] = 1
-    pid: int
+    pid: int = Field(gt=0)
     started_at: AwareDatetime
     updated_at: AwareDatetime
     stopped: bool = False
     profile: CapacityProfile
-    profile_source: str
+    profile_source: ProfileSource
     budget: Budget
     held_below_nominal: bool
     candidate: CapacityProfile | None = None
     candidate_since: AwareDatetime | None = None
-    paused_reason: str | None = None
+    paused_reason: PausedReason | None = None
     subtask: StatusSubtask | None = None
     gpu_share: float | None = None
     signals: StatusSignals | None = None
@@ -97,7 +100,14 @@ def read_status(state_dir: Path) -> StatusFile | None:
         detail = "; ".join(
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
         )
-        raise SafeFileError(f"invalid status file ({detail})") from None
+        # a key name in the file is attacker-controlled text: never print it raw
+        raise SafeFileError(f"invalid status file ({safe_text(detail)})") from None
+
+
+def safe_text(text: str) -> str:
+    """Printable text only: control characters (ANSI escapes, CR, BEL, ...) become `?`. Newlines
+    are the caller's business (`render` sanitises per line)."""
+    return "".join(c if c.isprintable() else "?" for c in text)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -140,7 +150,7 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
     """Human-readable status (no payload by construction)."""
     now = now or datetime.now(UTC)
     b = st.budget
-    lines = [f"profile:   {st.profile.value} (source: {st.profile_source})"]
+    lines = [f"profile:   {st.profile.value} (source: {st.profile_source.value})"]
     if st.held_below_nominal:
         lines[0] += "  [held below nominal]"
     if st.candidate is not None and st.candidate != st.profile:
@@ -153,7 +163,7 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
         f"batch {b.max_batch_size}, cpu {prio}"
     )
     if st.paused_reason is not None:
-        lines.append(f"state:     paused ({st.paused_reason})")
+        lines.append(f"state:     paused ({st.paused_reason.value})")
     elif st.subtask is not None:
         t = st.subtask
         lines.append(
@@ -171,12 +181,13 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
             power += f" {g.battery_percent}%"
         extra = ", low power mode" if g.low_power_mode else ""
         lines.append(
-            f"signals:   {power}, thermal {g.thermal}, memory {g.memory_pressure}, "
+            f"signals:   {power}, thermal {g.thermal.value}, memory {g.memory_pressure.value}, "
             f"user idle {g.hid_idle_s:.0f}s{extra}"
         )
+    day = st.today.date.isoformat()
     lines.append(
-        f"today:     {st.today.subtasks} subtasks, {st.today.records} records ({st.today.date}, "
+        f"today:     {st.today.subtasks} subtasks, {st.today.records} records ({day}, "
         "since this executor started)"
     )
     lines.append(f"updated:   {_ago((now - st.updated_at).total_seconds())} (pid {st.pid})")
-    return "\n".join(lines)
+    return "\n".join(safe_text(line) for line in lines)

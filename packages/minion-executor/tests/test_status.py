@@ -159,3 +159,31 @@ def test_cli_status_unsafe_state_dir_exits_2(
     monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(d))
     r = runner.invoke(app, ["status"])
     assert r.exit_code == 2 and "writable" in r.output
+
+
+def test_status_fields_are_typed_not_free_strings() -> None:
+    with pytest.raises(ValueError):
+        status(profile_source="\x1b[31mevil")
+    with pytest.raises(ValueError):
+        status(paused_reason="whatever")
+    with pytest.raises(ValueError):
+        status(pid=0)
+    with pytest.raises(ValueError):
+        status(today=StatusToday(date="not-a-date", subtasks=0, records=0))
+
+
+def test_unknown_key_with_control_characters_is_not_echoed_raw(state_dir: Path) -> None:
+    good = status().model_dump_json()
+    evil = good[:-1] + ',"\\u001b[2Jx":1}'
+    (state_dir / STATUS_FILE).write_text(evil)
+    (state_dir / STATUS_FILE).chmod(0o600)
+    with pytest.raises(SafeFileError) as exc:
+        read_status(state_dir)
+    assert "\x1b" not in str(exc.value)
+
+
+def test_render_strips_control_characters() -> None:
+    from minion_executor.capacity.status import safe_text
+
+    assert safe_text("a\x1b[31mb\rc\x07") == "a?[31mb?c?"
+    assert "\x1b" not in render(status(), NOW)

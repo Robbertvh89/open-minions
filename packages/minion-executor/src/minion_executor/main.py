@@ -29,6 +29,7 @@ from minion_executor import bench as bench_mod
 from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
+from minion_executor.capacity.instance import acquire_instance_lock
 from minion_executor.capacity.profiles import (
     ProfileSpec,
     budget_for,
@@ -42,7 +43,7 @@ from minion_executor.capacity.signals import SignalSource, default_source
 from minion_executor.capacity.status import STATUS_FILE, read_status, running
 from minion_executor.capacity.status import render as render_status
 from minion_executor.heartbeat import check_interval
-from minion_executor.loop import ExecutorLoop
+from minion_executor.loop import ExecutorLoop, GovernorStoppedError
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
@@ -287,6 +288,9 @@ async def _run(
             sandbox=sandbox_policy(settings, available),
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
+        governor = build_governor(plan) if plan is not None else None
+        # fetch niceness follows the live cpu priority; fixed only without a governor
+        nice_fn = (lambda: nice_for(governor.decision.budget.cpu_priority)) if governor else None
         loop = ExecutorLoop(
             client,
             worker,
@@ -298,7 +302,7 @@ async def _run(
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
             stop_grace_s=settings.stop_grace_s,
-            governor=build_governor(plan) if plan is not None else None,
+            governor=governor,
             presence_interval_s=settings.presence_interval_s,
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,
@@ -310,6 +314,7 @@ async def _run(
                 download_timeout_s=settings.download_timeout_s,
                 min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
                 nice=nice,
+                nice_fn=nice_fn,
                 sandbox=settings.fetch_sandbox,
             ),
         )
@@ -376,12 +381,22 @@ def run(
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
+    try:  # one executor per state dir: held until this function returns (or the process dies)
+        lock_fd = acquire_instance_lock(settings.state_dir)
+    except SafeFileError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
         asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s, plan))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
+    except GovernorStoppedError as exc:  # nothing steers the budget: exit non-zero, never run on
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    finally:
+        os.close(lock_fd)
 
 
 def _warn(message: str) -> None:

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,12 @@ from minion_executor.main import app
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`run` takes the single-instance lock in the state dir: never the real one in tests."""
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(tmp_path / "autostate"))
 
 
 def test_help_lists_commands() -> None:
@@ -655,3 +662,49 @@ def test_build_governor_seeds_pinned_profile_and_timing(
     assert gov._timing.pause_release_after_s == 5.0 and gov._poll_s == 0.5
     assert gov.decision.profile is CapacityProfile.BALANCED  # seeded from the pin, fail-closed
     assert gov.decision.paused  # until the first poll
+
+
+def test_run_exits_2_when_another_executor_holds_the_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.main as m
+    from minion_executor.capacity.instance import acquire_instance_lock
+    from minion_executor.capacity.safefile import ensure_private_dir
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _cfg(tmp_path, monkeypatch, "")
+    state = tmp_path / "autostate"
+    ensure_private_dir(state)
+    ran: list[bool] = []
+
+    async def fake_run(*args: object) -> None:
+        ran.append(True)
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    fd = acquire_instance_lock(state)  # "the other executor"
+    try:
+        result = runner.invoke(app, ["run", "--runner", "fake"])
+    finally:
+        os.close(fd)
+    assert result.exit_code == 2 and "already running" in result.output and not ran
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 0 and ran  # lock freed
+
+
+def test_run_exits_1_when_the_governor_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.main as m
+    from minion_executor.loop import GovernorStoppedError
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _cfg(tmp_path, monkeypatch, "")
+
+    async def fake_run(*args: object) -> None:
+        raise GovernorStoppedError("the capacity governor stopped")
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run", "--runner", "fake"])
+    assert result.exit_code == 1 and "governor stopped" in result.output

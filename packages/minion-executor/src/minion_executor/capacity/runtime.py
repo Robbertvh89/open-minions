@@ -14,6 +14,9 @@ signal values beyond coarse state names, and no payload ever passes through.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +49,10 @@ log = structlog.get_logger("minion_executor.governor")
 
 DEFAULT_POLL_S = 2.0
 CONTROL_READ_TIMEOUT_S = 1.5
+STALE_FLOOR_S = 10.0  # a decision older than max(this, 3 x poll interval) is not trusted
+STALE_POLLS = 3.0
+
+ControlReader = Callable[[Path], "OwnerControl | ControlUnusable | None"]
 
 
 class Governor(Protocol):
@@ -188,6 +195,9 @@ class GovernorRuntime:
         control_timeout_s: float = CONTROL_READ_TIMEOUT_S,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         local_clock: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+        mono: Callable[[], float] = time.monotonic,
+        stale_after_s: float | None = None,
+        control_reader: ControlReader = read_control,
     ) -> None:
         self._source = source  # one object for the whole run: the read bound is per source
         self._cfg, self._specs = cfg, specs
@@ -196,6 +206,16 @@ class GovernorRuntime:
         self._poll_s, self._read_timeout_s = poll_s, read_timeout_s
         self._control_timeout_s = control_timeout_s
         self._clock, self._local_clock = clock, local_clock
+        self._mono = mono
+        self._stale_s = (
+            stale_after_s if stale_after_s is not None else max(STALE_FLOOR_S, STALE_POLLS * poll_s)
+        )
+        self._read_control = control_reader
+        self._control_inflight: (
+            concurrent.futures.Future[OwnerControl | ControlUnusable | None] | None
+        ) = None
+        self._decided_at = mono()  # monotonic time of the last publish (freshness)
+        self._error_since: float | None = None  # first of a run of failed polls
         # always the seeded state: a cold GovState() has no applied budget and skips the hold
         self._state: GovState = initial_state(cfg, pinned, specs=specs, total_gb=total_gb)
         self._waiters = _Waiters()
@@ -206,8 +226,11 @@ class GovernorRuntime:
 
     # --- state ---------------------------------------------------------------------------------
 
-    def _closed_decision(self) -> Decision:
-        """Fail-closed decision used before the first poll and after an unexpected error."""
+    def _closed_decision(self, since: float | None = None) -> Decision:
+        """Fail-closed decision used before the first poll, after an unexpected error and when the
+        published decision went stale. `since` (monotonic) is when the trouble began: once it has
+        lasted `pause_release_after_s` the in-flight subtask is released (`pause_expired`)."""
+        expired = since is not None and self._mono() - since >= self._timing.pause_release_after_s
         profile = self._state.profile or self._cfg.active_profile
         budget = self._state.applied or budget_for(profile, self._total_gb, self._specs)
         return Decision(
@@ -215,7 +238,7 @@ class GovernorRuntime:
             budget=budget,
             paused_reason=PausedReason.SIGNALS_UNAVAILABLE,
             release_now=False,
-            pause_expired=False,
+            pause_expired=expired,
             trim=False,
             profile_source=ProfileSource.PINNED if self._pinned else ProfileSource.ACTIVE,
             candidate=None,
@@ -224,6 +247,12 @@ class GovernorRuntime:
 
     @property
     def decision(self) -> Decision:
+        """The latest decision, unless it is older than the freshness bound (the polling task is
+        stuck or dead): then the fail-closed one, so the loop and the watcher never act on a stale
+        'running' verdict. Each poll, successful or not, refreshes it."""
+        stale_for = self._mono() - self._decided_at - self._stale_s
+        if stale_for > 0:
+            return self._closed_decision(since=self._decided_at + self._stale_s)
         return self._decision
 
     @property
@@ -244,6 +273,7 @@ class GovernorRuntime:
     def _publish(self, decision: Decision) -> None:
         old = self._decision
         self._decision = decision
+        self._decided_at = self._mono()
         if decision_key(decision) == decision_key(old):
             return
         self._waiters.bump()
@@ -275,13 +305,36 @@ class GovernorRuntime:
             log.info("signal_read_recovered")
         return snap
 
-    async def _read_owner(self) -> OwnerControl | ControlUnusable | None:
+    async def _read_control_bounded(self) -> OwnerControl | ControlUnusable | None:
+        """One read of control.json on a dedicated daemon thread, at most one in flight. A hung
+        read (dead mount, FIFO) is a failed read (fail closed); while it hangs no further thread
+        is started and the default `to_thread` pool is never used."""
+        prev = self._control_inflight
+        if prev is not None and not prev.done():
+            return ControlUnusable("previous read still hung")
+        fut: concurrent.futures.Future[OwnerControl | ControlUnusable | None] = (
+            concurrent.futures.Future()
+        )
+        self._control_inflight = fut
+
+        def _run() -> None:
+            if not fut.set_running_or_notify_cancel():
+                return
+            try:
+                fut.set_result(self._read_control(self._state_dir))
+            except BaseException as exc:  # delivered to the awaiting loop
+                fut.set_exception(exc)
+
+        threading.Thread(target=_run, name="control-read", daemon=True).start()
         try:
-            owner = await asyncio.wait_for(
-                asyncio.to_thread(read_control, self._state_dir), self._control_timeout_s
-            )
+            return await asyncio.wait_for(asyncio.wrap_future(fut), self._control_timeout_s)
         except TimeoutError:
-            owner = ControlUnusable("control read timed out")
+            return ControlUnusable("control read timed out")
+        except Exception as exc:  # a reader bug is an unusable file, never a crash
+            return ControlUnusable(f"control read failed ({type(exc).__name__})")
+
+    async def _read_owner(self) -> OwnerControl | ControlUnusable | None:
+        owner = await self._read_control_bounded()
         note = owner.reason if isinstance(owner, ControlUnusable) else None
         if note != self._control_note:  # once per change, never per poll
             if note is not None:
@@ -309,6 +362,7 @@ class GovernorRuntime:
         )
         self._snapshot = self._state.last_snapshot
         self._publish(decision)
+        self._error_since = None
         return decision
 
     async def prime(self) -> None:
@@ -321,6 +375,8 @@ class GovernorRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # a bug must not leave the last (open) decision in force
-                log.error("governor_poll_error", error=type(exc).__name__)
-                self._publish(self._closed_decision())
+                if self._error_since is None:  # log the start of a run of errors, not every poll
+                    log.error("governor_poll_error", error=type(exc).__name__)
+                    self._error_since = self._mono()
+                self._publish(self._closed_decision(since=self._error_since))
             await asyncio.sleep(self._poll_s)
