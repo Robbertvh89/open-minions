@@ -42,7 +42,7 @@ from enum import StrEnum
 from minion_common.enums import CapacityProfile, CpuPriority, PausedReason
 from minion_common.schemas import Budget
 
-from minion_executor.capacity.config import DAYS, ExecutorConfig, ScheduleEntry, resolve_profiles
+from minion_executor.capacity.config import DAYS, ExecutorConfig, ScheduleEntry
 from minion_executor.capacity.control import ControlUnusable, OwnerControl
 from minion_executor.capacity.profiles import ProfileSpec, budget_for
 from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
@@ -73,7 +73,8 @@ class GovernorTiming:
 class GovState:
     profile: CapacityProfile | None = None  # profile currently applied
     applied: Budget | None = None  # budget in force (a held minimum or the profile's budget)
-    # escalation or mixed change waiting out the hold; budget is the per-dimension min
+    # escalation or mixed change waiting out the hold; budget is the per-dimension min.
+    # May equal `profile` when the budget in force is below that profile's nominal budget.
     candidate: CapacityProfile | None = None
     candidate_since: datetime | None = None
     signal_reason: PausedReason | None = None  # held signal pause (hysteresis)
@@ -92,7 +93,8 @@ class Decision:
     pause_expired: bool  # paused for >= pause_release_after_s: release the in-flight subtask
     trim: bool  # free allocator caches (memory pressure warning or worse)
     profile_source: ProfileSource  # rule behind the target profile (may be held back, see below)
-    # escalation or mixed change waiting out the hold; budget is the per-dimension min
+    # escalation or mixed change waiting out the hold; budget is the per-dimension min.
+    # May equal `profile` when the budget in force is below that profile's nominal budget.
     candidate: CapacityProfile | None
     candidate_since: datetime | None
 
@@ -193,11 +195,19 @@ def _signal_reason(
 
 
 def initial_state(
-    cfg: ExecutorConfig, pinned: CapacityProfile | None = None, *, total_gb: float
+    cfg: ExecutorConfig,
+    pinned: CapacityProfile | None = None,
+    *,
+    specs: dict[CapacityProfile, ProfileSpec],
+    total_gb: float,
 ) -> GovState:
-    """Start state: the run's start profile is already applied, so escalation holds from startup."""
+    """Start state: the run's start profile is already applied, so escalation holds from startup.
+
+    A start profile missing from `specs` leaves `applied` unset (nothing to hold against).
+    """
     profile = pinned or cfg.active_profile
-    return GovState(profile=profile, applied=budget_for(profile, total_gb, resolve_profiles(cfg)))
+    applied = budget_for(profile, total_gb, specs) if profile in specs else None
+    return GovState(profile=profile, applied=applied)
 
 
 def _secs(later: datetime, earlier: datetime) -> float:
@@ -266,21 +276,21 @@ def decide(
 
     cur, cand, cand_since = state.profile, state.candidate, state.candidate_since
     target_b = budget_for(target, total_gb, specs)
-    if source in _EXPLICIT or cur is None or cur not in specs:
+    # budget in force: a held minimum may be below budget_for(cur); a config reload that dropped
+    # `cur` still holds against the last applied budget
+    in_force = state.applied
+    if in_force is None and cur is not None and cur in specs:
+        in_force = budget_for(cur, total_gb, specs)
+    if source in _EXPLICIT or in_force is None or _applies_at_once(target_b, in_force):
         applied, cand, cand_since, applied_b = target, None, None, target_b
     else:
-        # compare with the budget actually in force (a held minimum may be below budget_for(cur))
-        in_force = state.applied or budget_for(cur, total_gb, specs)
-        if _applies_at_once(target_b, in_force):
+        if cand != target or cand_since is None:
+            cand, cand_since = target, now
+        if _secs(now, cand_since) >= t.escalate_after_s:
             applied, cand, cand_since, applied_b = target, None, None, target_b
         else:
-            if cand != target or cand_since is None:
-                cand, cand_since = target, now
-            if _secs(now, cand_since) >= t.escalate_after_s:
-                applied, cand, cand_since, applied_b = target, None, None, target_b
-            else:
-                applied = cur
-                applied_b = _min_budget(in_force, target_b)
+            applied = cur if cur is not None else target
+            applied_b = _min_budget(in_force, target_b)
 
     mem = effective.memory_pressure if effective is not None else MemPressure.NORMAL
     decision = Decision(

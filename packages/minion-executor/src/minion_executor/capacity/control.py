@@ -111,7 +111,7 @@ def update_control(
     profile: CapacityProfile | None = None,
     clear_profile: bool = False,
     now: datetime | None = None,
-    warn: Callable[[str], None] | None = None,
+    warn: Callable[[str], None],
 ) -> OwnerControl:
     """Read-modify-write: change only the given fields and keep the rest of the owner's state.
 
@@ -121,7 +121,7 @@ def update_control(
     """
     current = read_control(state_dir)
     if isinstance(current, ControlUnusable):
-        if paused is None and warn is not None:
+        if paused is None:
             fix = (
                 "fix the state directory permissions (chmod 700 / chown), then retry"
                 if current.dir_unsafe
@@ -139,6 +139,6 @@ def update_control(
     elif profile is not None:
         fields["profile"] = profile
     new = OwnerControl.model_validate(fields)
-    if not write_control(state_dir, new) and warn is not None:
+    if not write_control(state_dir, new):
         warn(f"written but not durably synced: {state_dir / CONTROL_FILE}")
     return new

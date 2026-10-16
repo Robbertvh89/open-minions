@@ -62,16 +62,20 @@ def test_write_ignores_umask(sd: Path) -> None:
     assert stat.S_IMODE((sd / CONTROL_FILE).stat().st_mode) == 0o600
 
 
+def _nowarn(_msg: str) -> None:
+    pass
+
+
 def test_update_preserves_other_fields(sd: Path) -> None:
-    update_control(sd, profile=CapacityProfile.FULL, now=NOW)
-    c = update_control(sd, paused=True, pause_for=timedelta(hours=1), now=NOW)
+    update_control(sd, profile=CapacityProfile.FULL, now=NOW, warn=_nowarn)
+    c = update_control(sd, paused=True, pause_for=timedelta(hours=1), now=NOW, warn=_nowarn)
     assert c.profile is CapacityProfile.FULL and c.paused_until == NOW + timedelta(hours=1)
     assert c.is_paused(NOW) and not c.is_paused(NOW + timedelta(hours=1))
-    c = update_control(sd, paused=False)
+    c = update_control(sd, paused=False, warn=_nowarn)
     assert c.profile is CapacityProfile.FULL and not c.paused and c.paused_until is None
-    c = update_control(sd, clear_profile=True)
+    c = update_control(sd, clear_profile=True, warn=_nowarn)
     assert c.profile is None
-    c = update_control(sd, paused=True, now=NOW)
+    c = update_control(sd, paused=True, now=NOW, warn=_nowarn)
     assert c.is_paused(NOW + timedelta(days=999))  # indefinite
 
 

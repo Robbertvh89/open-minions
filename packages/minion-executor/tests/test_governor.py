@@ -51,7 +51,9 @@ class Gov:
         self.specs = resolve_profiles(self.cfg)
         pin = kw.get("pinned")
         assert pin is None or isinstance(pin, P)
-        self.state = initial_state(self.cfg, pin, total_gb=TOTAL) if start else GovState()
+        self.state = (
+            initial_state(self.cfg, pin, specs=self.specs, total_gb=TOTAL) if start else GovState()
+        )
         self.kw = kw
         self.t = T0
         self.d: Decision
@@ -489,8 +491,11 @@ def test_initial_state_holds_escalation_from_startup() -> None:
 
 def test_initial_state_uses_pin() -> None:
     cfg = ExecutorConfig()
-    assert initial_state(cfg, P.BALANCED, total_gb=TOTAL).profile is P.BALANCED
-    assert initial_state(cfg, total_gb=TOTAL).profile is cfg.active_profile
+    specs = resolve_profiles(cfg)
+    assert initial_state(cfg, P.BALANCED, specs=specs, total_gb=TOTAL).profile is P.BALANCED
+    assert initial_state(cfg, specs=specs, total_gb=TOTAL).profile is cfg.active_profile
+    missing = initial_state(cfg, P.CUSTOM, specs=specs, total_gb=TOTAL)  # not in specs
+    assert missing.profile is P.CUSTOM and missing.applied is None
 
 
 def test_backward_clock_jump_restarts_timers() -> None:
@@ -552,8 +557,55 @@ def test_mixed_hold_does_not_snap_back_to_nominal_memory() -> None:
     light = budget_for(P.LIGHT, TOTAL, g.specs)
     d = g.step(snap(hid_idle_s=IDLE, on_ac=False, battery_percent=80), 1)
     assert d.budget.memory_gb == light.memory_gb == 8.0
+    assert d.budget.gpu_duty_cycle == 0.2  # light's 0.30 must wait
     d = g.step(snap(hid_idle_s=IDLE, on_ac=True), 1)
     assert d.budget.memory_gb <= 8.0
     assert g.step(snap(hid_idle_s=IDLE, on_ac=True), 58).budget.memory_gb <= 8.0
     d = g.step(snap(hid_idle_s=IDLE, on_ac=True), 2)
     assert d.profile is P.CUSTOM and d.budget == nominal
+
+
+def test_reload_raising_custom_while_current_is_held() -> None:
+    g = Gov(_custom(0.5, 0.2, 16, "normal"))
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 61)
+    assert g.d.profile is P.CUSTOM
+    old = g.d.budget
+    g.cfg = _custom(0.7, 0.4, 32, "normal")  # executor.toml reload raises custom
+    g.specs = resolve_profiles(g.cfg)
+    d = g.step(snap(hid_idle_s=IDLE), 1)
+    assert d.budget == old and d.candidate is P.CUSTOM
+    assert g.step(snap(hid_idle_s=IDLE), 58).budget == old
+    d = g.step(snap(hid_idle_s=IDLE), 2)
+    assert d.budget.gpu_duty_cycle == 0.4 and d.candidate is None
+
+
+def test_owner_choice_records_applied_so_auto_later_holds() -> None:
+    g = Gov(start=True)
+    d = g.step(snap(hid_idle_s=IDLE), owner=OwnerControl(profile=P.LIGHT))
+    assert d.profile_source.name == "OWNER" and g.state.applied == d.budget
+    # owner clears the choice: auto wants FULL, which must wait out the hold
+    assert g.step(snap(hid_idle_s=IDLE), 1).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE), 58).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE), 2).profile is P.FULL
+
+
+def test_pinned_choice_records_applied() -> None:
+    g = Gov(pinned=P.LIGHT)
+    d = g.step(snap(hid_idle_s=IDLE))
+    assert d.profile_source.name == "PINNED" and g.state.applied == d.budget
+
+
+def test_dropped_profile_still_holds_against_applied() -> None:
+    g = Gov(_custom(0.1, 0.2, 4, "low"))
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 61)
+    assert g.d.profile is P.CUSTOM
+    old = g.d.budget
+    g.cfg = ExecutorConfig()  # reload drops custom; idle now means FULL
+    g.specs = resolve_profiles(g.cfg)
+    d = g.step(snap(hid_idle_s=IDLE), 1)
+    assert d.budget.memory_gb <= old.memory_gb and d.budget.gpu_duty_cycle <= old.gpu_duty_cycle
+    assert d.candidate is not None
+    d = g.step(snap(hid_idle_s=IDLE), 61)
+    assert d.profile is P.FULL and d.candidate is None
