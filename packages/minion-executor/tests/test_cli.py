@@ -58,6 +58,8 @@ def test_run_custom_profile_from_config(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
     _cfg(tmp_path, monkeypatch, CUSTOM_TOML)
+    # host-independent: the 75 % RAM cap would clip 6 GB on a small CI runner
+    monkeypatch.setattr("minion_executor.capacity.profiles.total_memory_gb", lambda: 32.0)
     seen: dict[str, object] = {}
 
     async def fake_run(*args: object) -> None:
