@@ -3,10 +3,10 @@ id: TASK-5.3
 title: >-
   M4.3 Live worker control: governor-driven pacer, pause, per-batch budget, CPU
   priority, footprint
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 17:41'
+updated_date: '2026-10-16 19:00'
 labels:
   - M4
 dependencies: []
