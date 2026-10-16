@@ -1672,6 +1672,29 @@ async def test_shutdown_budget_is_shared_across_complete_release_and_close(
     assert client.kinds()[-2:] == ["complete", "release"] and worker.killed
 
 
+async def test_complete_in_flight_at_grace_expiry_gets_budget_after_hard_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared budget starts at the hard stop, not at the first bounded call during grace."""
+    import minion_executor.loop as lp
+
+    monkeypatch.setattr(lp, "SHUTDOWN_BUDGET_S", 1.0)
+    monkeypatch.setattr(lp, "MIN_CALL_S", 0.1)
+
+    class SlowCompleteClient(FakeClient):
+        async def complete(self, aid: uuid.UUID, req: CompleteRequest) -> None:
+            self.calls.append(("complete", req))
+            await asyncio.sleep(1.5)  # outlives grace (1.0) but fits in hard stop + budget
+
+    client, worker = SlowCompleteClient([assignment()]), SlowWorker(0.3)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=1.0)
+    task = asyncio.create_task(loop.run())
+    await _until_running(worker)
+    loop.stop()  # work finishes at ~0.3 inside grace; its kill must not start the budget
+    assert await asyncio.wait_for(task, 10) == 1
+    assert client.kinds()[-1] == "complete" and "release" not in client.kinds()
+
+
 async def test_acquire_in_flight_at_stop_is_abandoned_within_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1696,6 +1719,39 @@ async def test_acquire_in_flight_at_stop_is_abandoned_within_budget(
     assert await asyncio.wait_for(task, 5) == 0
     assert asyncio.get_running_loop().time() - t0 < 1.5
     assert client.kinds() == ["acquire"] and worker.closed
+
+
+async def test_register_in_flight_at_stop_is_abandoned_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.loop as lp
+
+    monkeypatch.setattr(lp, "SHUTDOWN_BUDGET_S", 0.3)
+    client, worker = FakeClient([]), FakeWorker()
+    entered = asyncio.Event()
+
+    async def hang(req: Any) -> None:
+        client.calls.append(("register", None))
+        entered.set()
+        await asyncio.sleep(60)
+
+    client.register = hang  # type: ignore[method-assign]
+    loop = make_loop(
+        client,
+        worker,
+        FakeS3(),
+        tmp_path,
+        [],
+        stop_grace_s=0.0,
+        register=object(),
+    )
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    t0 = asyncio.get_running_loop().time()
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert asyncio.get_running_loop().time() - t0 < 1.5
+    assert client.kinds() == ["register"] and worker.closed
 
 
 async def test_second_sigterm_during_blocking_probe_exits_cleanly(

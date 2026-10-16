@@ -194,8 +194,11 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   running: the bound relies on every worker-lock holder aborting once the handle is `_closed`.
   An `acquire` or `register` still in flight when the first signal arrives is abandoned after
   10 s and the executor exits; an acquirement that had landed server-side is left to the watchdog
-  (no heartbeat ever arrives, so it is reclaimed). When the work finishes during the grace period the worker is killed before
-  `complete` so GPU memory is freed promptly. launchd `ExitTimeOut` must be at least grace + 15 s (grace + 10 s budget + slack),
+  (no heartbeat ever arrives, so it is reclaimed as EXPIRED, which uses up one of that
+  subtask's attempts). Bounded calls made during grace each get a full budget; the shared
+  deadline is fixed only at the hard stop (or at the final cleanup). When the work finishes
+  during the grace period the worker is killed before `complete` so GPU memory is freed
+  promptly. launchd `ExitTimeOut` must be at least grace + 15 s (grace + 10 s budget + slack),
   and launchd's default is only 20 s (below the default 30 s grace), so the M5 plist must set it.
   A second signal during the startup engine probe kills the probe worker and exits 0.
 - **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,

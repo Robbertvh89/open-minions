@@ -224,11 +224,12 @@ class ExecutorLoop:
 
     def _left(self) -> float:
         """Seconds left of the shared shutdown budget, floored at MIN_CALL_S so a call still gets
-        a real attempt. Without a hard stop (a plain stop, or a normal return from `run`) the
-        budget starts now."""
-        if self._deadline is None:
-            self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
-        return max(MIN_CALL_S, self._deadline - time.monotonic())
+        a real attempt. Before the hard stop (a call during grace) each call gets a full budget
+        of its own; the shared deadline is only fixed by `_set_hard_stop` or `run`'s cleanup."""
+        deadline = self._deadline
+        if deadline is None:
+            deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+        return max(MIN_CALL_S, deadline - time.monotonic())
 
     def _call_timeout(self) -> float | None:
         """Bound for a server call: the shared budget once stopping, else unbounded."""
@@ -359,14 +360,16 @@ class ExecutorLoop:
             if self._grace_timer is not None:
                 self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
+            if self._deadline is None:  # close and its fallback kill share one budget
+                self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
             # a kill that already timed out means close/kill would wedge as well: skip them
             if not self._kill_timed_out and not await self._bounded_thread(self._worker.close):
-                await self._bounded_thread(self._worker.kill)  # lock-free fallback
+                await self._bounded_thread(self._worker.kill, is_kill=True)  # lock-free fallback
             if self._owns_http:
                 await self._http.aclose()
         return done
 
-    async def _bounded_thread(self, fn: Callable[[], object]) -> bool:
+    async def _bounded_thread(self, fn: Callable[[], object], *, is_kill: bool = False) -> bool:
         """Run a blocking worker call off-loop, waiting at most the rest of the shared shutdown
         budget. Returns whether it completed.
 
@@ -378,7 +381,7 @@ class ExecutorLoop:
             await asyncio.wait_for(asyncio.to_thread(fn), self._left())
         except TimeoutError:
             log.warning("worker_call_timed_out", call=getattr(fn, "__name__", "?"))
-            if getattr(fn, "__name__", "") == "kill":
+            if is_kill:
                 self._kill_timed_out = True
             return False
         except Exception as exc:  # shutdown must continue
@@ -442,7 +445,7 @@ class ExecutorLoop:
                     break
                 if stopper.done():
                     # Grace over / second signal: reclaim worker memory, hand the subtask back.
-                    await self._bounded_thread(self._worker.kill)
+                    await self._bounded_thread(self._worker.kill, is_kill=True)
                     if self._cache is not None:
                         self._cache.release_in_use()
                     finished = work.done()  # raced the kill: its result is still good
@@ -475,7 +478,7 @@ class ExecutorLoop:
                 await self._report_failure(a, err, bound)
                 return _Outcome.FAILED
             if self.stopping:  # exiting: free GPU memory now, before the (possibly slow) complete
-                await self._bounded_thread(self._worker.kill)
+                await self._bounded_thread(self._worker.kill, is_kill=True)
                 if self._cache is not None:
                     self._cache.release_in_use()
             return await self._complete(a, result, bound)
