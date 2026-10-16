@@ -280,6 +280,7 @@ class ExecutorLoop:
         self._clock = clock
         self._last_work = clock()
         self._unloaded = False
+        self._ensure_started = False
 
     def stop(self) -> None:
         """First call: stop acquiring and give the in-flight subtask `stop_grace_s` to finish
@@ -582,10 +583,12 @@ class ExecutorLoop:
     async def _unload_idle(self, reason: str) -> None:
         self._unloaded = True
         self._loaded = None
+        pinned = self._cache.in_use if self._cache is not None else None
         try:
             await asyncio.to_thread(self._worker.unload)
-            if self._cache is not None:
-                self._cache.release_in_use()  # unpin: the model is no longer in memory
+            # unpin only the model that was unloaded: a subtask may have pinned its own meanwhile
+            if self._cache is not None and self._cache.in_use == pinned:
+                self._cache.release_in_use()
             log.info(
                 "worker_unloaded_idle" if reason == "idle" else "worker_unloaded", reason=reason
             )
@@ -639,6 +642,7 @@ class ExecutorLoop:
         self._current = (a, hb)
         self._status_kick.set()
         self._batch_budget = None
+        self._ensure_started = False
         self._infer_done = asyncio.Event()
         self._infer_ok = False
         work = asyncio.create_task(self._execute(a, tmp, hb))
@@ -795,7 +799,14 @@ class ExecutorLoop:
                 # OOM; just unload it when it no longer fits the budget.
                 over = 0
                 drop_since = None
-                await self._enforce_idle_budget()
+                loaded = self._loaded
+                if (
+                    not self._ensure_started
+                    and loaded is not None
+                    and loaded != a.model
+                    and loaded.memory_gb > d.budget.memory_gb
+                ):
+                    await self._unload_idle("budget_downgrade")
             now = clock()
             downgrading = a.model.memory_gb > d.budget.memory_gb
             if downgrading:
@@ -817,7 +828,7 @@ class ExecutorLoop:
                 # against the larger of the two (this also covers a downgrade, whose verdict
                 # fires at the same time); after that against the live budget
                 ref_gb = d.budget.memory_gb
-                if drop_since is not None and now - drop_since < self._downgrade_batch_s:
+                if drop_since is not None:
                     ref_gb = max(ref_gb, batch.memory_gb)
                 limit = ref_gb * GIB * MEMORY_GUARD_FACTOR
                 if footprint is not None and footprint > limit:
@@ -826,6 +837,15 @@ class ExecutorLoop:
                         return _Verdict.OOM
                 else:
                     over = 0
+                    if (
+                        footprint is not None
+                        and drop_since is not None
+                        and now - drop_since >= self._downgrade_batch_s
+                        and footprint > d.budget.memory_gb * GIB * MEMORY_GUARD_FACTOR
+                    ):
+                        # the owner's budget fell and the batch did not finish in time: that is
+                        # policy, not the subtask's fault - release, do not burn an attempt
+                        return _Verdict.DOWNGRADE_TIMEOUT
                 if prio_ok is False and now >= self._grace_until:
                     return _Verdict.PRIORITY
             wake = next_sample - clock()
@@ -1174,6 +1194,7 @@ class ExecutorLoop:
             budget = self._gov.decision.budget
             if a.model.memory_gb > budget.memory_gb:
                 raise _DowngradeError  # the budget fell while the model was being fetched
+            self._ensure_started = True  # the watcher no longer unloads under ensure_model
             self._batch_budget = budget  # the load may respawn the worker: guard and grace follow
             self._grace_until = self._clock() + self._prio_grace_s
             try:
@@ -1187,6 +1208,7 @@ class ExecutorLoop:
                     self._cache.release_in_use()  # a failed load holds no model: unpin it
                 raise
             self._loaded = a.model
+            self._unloaded = False
             i = 0
             while i < len(records):
                 await self._wait_unpaused()

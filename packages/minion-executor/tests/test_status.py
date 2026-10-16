@@ -95,6 +95,22 @@ def test_absent_is_none_and_garbage_or_unsafe_is_an_error(state_dir: Path) -> No
         read_status(state_dir)
 
 
+def test_read_ignores_unknown_keys_but_write_model_forbids_them(state_dir: Path) -> None:
+    import json
+
+    st = status()
+    write_status(state_dir, st)
+    path = state_dir / STATUS_FILE
+    raw = json.loads(path.read_text())
+    raw["from_the_future"] = 1
+    raw["today"]["extra"] = 2
+    raw["budget"]["new_knob"] = 3
+    path.write_text(json.dumps(raw))
+    assert read_status(state_dir) == st
+    with pytest.raises(ValueError):
+        StatusFile(**{**st.model_dump(), "from_the_future": 1})
+
+
 def test_running_detection() -> None:
     st = status()
     assert running(st, NOW + timedelta(seconds=5)) == (True, "")
@@ -172,14 +188,12 @@ def test_status_fields_are_typed_not_free_strings() -> None:
         status(today=StatusToday(date="not-a-date", subtasks=0, records=0))
 
 
-def test_unknown_key_with_control_characters_is_not_echoed_raw(state_dir: Path) -> None:
+def test_unknown_key_with_control_characters_is_ignored_on_read(state_dir: Path) -> None:
     good = status().model_dump_json()
     evil = good[:-1] + ',"\\u001b[2Jx":1}'
     (state_dir / STATUS_FILE).write_text(evil)
     (state_dir / STATUS_FILE).chmod(0o600)
-    with pytest.raises(SafeFileError) as exc:
-        read_status(state_dir)
-    assert "\x1b" not in str(exc.value)
+    assert read_status(state_dir) == status()  # dropped before validation: never echoed
 
 
 def test_render_strips_control_characters() -> None:

@@ -1304,6 +1304,7 @@ class _StubCache:
         self.exc, self.path = exc, path
         self.ensures = 0
         self.released = 0
+        self.in_use: Path | None = None
 
     async def ensure(self, model: ModelEntry) -> Path | None:
         self.ensures += 1
@@ -2063,6 +2064,7 @@ async def test_idle_sleep_wakes_on_pause_and_unloads_under_pressure(tmp_path: Pa
 class FakeCache:
     def __init__(self) -> None:
         self.unpins = 0
+        self.in_use: Path | None = None
 
     async def ensure(self, model: ModelEntry) -> None:
         return None
@@ -2783,6 +2785,85 @@ class _GatedCache(FakeCache):
         return None
 
 
+async def cycles(loop: ExecutorLoop, n: int = 3) -> None:
+    """Wait until the watcher ran `n` more guard cycles (it evaluated the latest decision)."""
+    real = loop._push_control
+    count = 0
+
+    async def counting() -> None:
+        nonlocal count
+        count += 1
+        await real()
+
+    loop._push_control = counting  # type: ignore[method-assign]
+    try:
+        await until(lambda: count >= n)
+    finally:
+        loop._push_control = real  # type: ignore[method-assign]
+
+
+async def test_unloaded_flag_stale_idle_unload_works_after_the_subtask(tmp_path: Path) -> None:
+    gib = 1024**3
+    gov = FixedGovernor(BUDGET)
+    first = assignment()
+    first = first.model_copy(update={"model": first.model.model_copy(update={"memory_gb": 8})})
+    client, worker = FakeClient([first, assignment()]), FakeWorker()
+    worker.footprints = [7 * gib]
+    cache = _GatedCache()
+    cache.block_on = 2
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=gov, model_cache=cache,
+        guard_interval_s=0.02,
+    )  # fmt: skip
+    task = asyncio.create_task(loop.run(max_subtasks=2))
+    await until(lambda: cache.calls == 2)
+    gov.update(dec(small(4.0)))
+    await until(lambda: worker.unloads >= 1)
+    cache.release.set()
+    assert await asyncio.wait_for(task, 10) == 2
+    assert loop._loaded is not None and not loop._unloaded
+    before = worker.unloads
+    await loop._unload_idle("idle")  # what _maybe_unload does once idle: must not be skipped
+    assert worker.unloads == before + 1
+
+
+async def test_idle_unload_keeps_a_newer_pin(tmp_path: Path) -> None:
+    """A watcher unload of a stale warm model must not unpin the subtask's own new pin."""
+    client, worker, cache = FakeClient([]), FakeWorker(), FakeCache()
+    old, new = tmp_path / "old", tmp_path / "new"
+    cache.in_use = old
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], model_cache=cache)
+
+    def unload_and_repin() -> None:
+        cache.in_use = new  # the subtask's ensure() pinned its own model during the unload
+
+    worker.unload = unload_and_repin  # type: ignore[method-assign]
+    await loop._unload_idle("budget_downgrade")
+    assert cache.unpins == 0
+
+
+async def test_two_step_downgrade_releases_never_oom(tmp_path: Path) -> None:
+    gib = 1024**3
+    gov = FixedGovernor(BUDGET)  # 8 GB
+    a = assignment()
+    a = a.model_copy(update={"model": a.model.model_copy(update={"memory_gb": 6})})
+    client, worker = FakeClient([a]), FakeWorker(block=True)
+    worker.footprints = [int(6.5 * gib)]
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=gov,
+        guard_interval_s=0.02, downgrade_batch_s=0.4,
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    task = asyncio.create_task(loop.run())
+    await until(lambda: worker.started.is_set())
+    gov.update(dec(small(7.0)))  # still fits the model: the allowance clock starts
+    await sampled(worker, 3)
+    await asyncio.sleep(0.3)  # let the first drop's allowance almost run out (a real-time bound)
+    gov.update(dec(small(4.0)))  # a real downgrade: the allowance carries on until the release
+    await asyncio.wait_for(task, 10)
+    assert "fail" not in client.kinds() and "release" in client.kinds()
+
+
 async def test_warm_worker_over_a_dropped_budget_is_unloaded_not_counted_as_oom(
     tmp_path: Path,
 ) -> None:
@@ -2802,11 +2883,12 @@ async def test_warm_worker_over_a_dropped_budget_is_unloaded_not_counted_as_oom(
     await until(lambda: cache.calls == 2)
     gov.update(dec(small(4.0)))
     await until(lambda: worker.unloads >= 1)
-    await asyncio.sleep(0.15)  # several guard cycles: the old code failed the subtask as OOM
+    await cycles(loop, 5)  # several guard cycles: the old code failed the subtask as OOM
     assert "fail" not in client.kinds() and worker.interrupts == 0
     cache.release.set()
     assert await asyncio.wait_for(task, 10) == 2
     assert "fail" not in client.kinds()
+    assert loop._loaded is not None and not loop._unloaded  # the flag follows the new load
 
 
 async def test_budget_drop_allowance_lasts_only_downgrade_batch_s(tmp_path: Path) -> None:
@@ -2822,11 +2904,11 @@ async def test_budget_drop_allowance_lasts_only_downgrade_batch_s(tmp_path: Path
     task = asyncio.create_task(loop.run())
     await until(lambda: worker.started.is_set())
     gov.update(dec(small(4.0)))  # the model (0.1 GB) still fits: no downgrade, the batch goes on
-    await asyncio.sleep(0.15)
+    await sampled(worker, 3)  # samples inside the allowance (0.4 s vs 0.02 s guard)
     assert worker.interrupts == 0 and "fail" not in client.kinds()  # within the allowance
     await asyncio.wait_for(task, 10)
-    req = _fail_req(client)
-    assert (req.retryable, req.code) == (True, "OOM")  # after it: against the live budget
+    # after it the owner's policy, not the subtask's fault: released, no attempt burnt
+    assert "fail" not in client.kinds() and "release" in client.kinds()
 
 
 async def test_pause_stops_a_new_model_fetch_from_starting(tmp_path: Path) -> None:
@@ -2843,7 +2925,7 @@ async def test_pause_stops_a_new_model_fetch_from_starting(tmp_path: Path) -> No
     loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, model_cache=cache)
     task = asyncio.create_task(loop.run(max_subtasks=1))
     await until(lambda: "acquire" in client.kinds())
-    await asyncio.sleep(0.2)
+    await cycles(loop, 5)
     assert cache.calls == 0 and not task.done()  # no download started while paused
     gov.update(dec())
     assert await asyncio.wait_for(task, 10) == 1

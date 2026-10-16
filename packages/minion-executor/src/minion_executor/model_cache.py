@@ -475,6 +475,11 @@ class ModelCache:
             raise
         return final
 
+    @property
+    def in_use(self) -> Path | None:
+        """The protected in-use model directory, if any."""
+        return self._in_use
+
     def release_in_use(self) -> None:
         """Forget the protected in-use model (call after the worker holding it was unloaded)
         and drop the cross-process pin."""

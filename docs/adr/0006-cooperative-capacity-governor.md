@@ -119,8 +119,11 @@ may fit it, and `max_attempts` bounds the retries. *Implemented in TASK-5.5* in 
 watcher (every `MINION_EXECUTOR_SIGNAL_POLL_S`; `None` = no live worker resets the count). The guard is
 never suspended. It measures against the budget the *running batch* started with (a drop that
 still fits the model, say full to light, only takes effect at the next batch boundary, so the worker
-legitimately sits between the two): `max(batch budget, live budget)`; during a downgrade window
-`max(model.memory_gb, batch budget)`. The window is bounded by D6. The Ollama daemon's memory is outside the worker
+legitimately sits between the two): `max(batch budget, live budget)` for as long as the live budget is
+below the batch's. OOM fails only when the footprint exceeds 1.1x the budget the batch started with.
+If the batch is still running `downgrade_batch_s` after the drop and the footprint is over 1.1x the
+live budget, that is the owner's policy, not the subtask's fault: the subtask is released
+(`BUDGET_DOWNGRADE`, no attempt burnt), not failed. A downgrade is bounded by D6. The Ollama daemon's memory is outside the worker
 and stays the documented caveat of ADR-0009.
 
 **D8 CPU priority.** `Budget.cpu_priority` (`background|low|normal`, optional on the wire so older

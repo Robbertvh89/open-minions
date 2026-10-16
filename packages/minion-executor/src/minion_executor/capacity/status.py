@@ -15,7 +15,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from minion_common.enums import CapacityProfile, CpuPriority, PausedReason
 from minion_common.schemas import Budget
@@ -128,6 +128,20 @@ def _split_unknown_enums(raw: dict[str, Any]) -> dict[tuple[str, ...], _Unknown]
     return found
 
 
+def _drop_unknown_keys(node: dict[str, Any], model: type[BaseModel]) -> None:
+    """Remove keys `model` (and its nested models) does not declare."""
+    fields = model.model_fields
+    for key in [k for k in node if k not in fields]:
+        del node[key]
+    for key, val in node.items():
+        if not isinstance(val, dict):
+            continue
+        for arg in (fields[key].annotation, *get_args(fields[key].annotation)):
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                _drop_unknown_keys(val, arg)
+                break
+
+
 def read_status(state_dir: Path) -> StatusFile | None:
     """The status file, or None when absent. Raises SafeFileError when unsafe or invalid.
 
@@ -146,6 +160,7 @@ def read_status(state_dir: Path) -> StatusFile | None:
         if ver != 1:
             raise SafeFileError(f"unsupported status format v{safe_text(str(ver)[:16])}")
         unknown = _split_unknown_enums(raw)
+        _drop_unknown_keys(raw, StatusFile)  # a newer executor may add keys: ignore on read only
         data = json.dumps(raw).encode("utf-8")
     try:
         st = StatusFile.model_validate_json(data)

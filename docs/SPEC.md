@@ -283,7 +283,10 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   code), unloads and unpins the cache; an idle warm worker above the budget is unloaded at once. A
   worker footprint above 1.1x the memory budget on two consecutive samples fails the subtask as a
   retryable `OOM`. The guard measures against the budget the running batch started with, so a drop
-  that still fits the model (full to light) does not trip it before the next batch boundary. Once
+  that still fits the model (full to light) does not trip it before the next batch boundary; if the
+  batch outlives `downgrade_batch_s` (60 s) after the drop with the footprint over 1.1x the live
+  budget, the subtask is released (owner's policy), not failed. OOM fails only above 1.1x the budget
+  the batch started with. Once
   inference is over, upload and complete are never cut short by the governor.
 - FR-55. **Reporting.** The executor sends its current profile, budget and pause reason with every
   `acquire` and `heartbeat`; the server uses `memory_gb` for admission filtering and records it for
