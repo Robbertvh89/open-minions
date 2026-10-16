@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import math
 import os
 import random
 import re
@@ -57,6 +58,9 @@ MODEL_NOT_ADMISSIBLE = "MODEL_NOT_ADMISSIBLE"
 TMP_PREFIX = "minion-exec-"
 # Refresh the output URL with one synchronous heartbeat when it expires within this margin.
 UPLOAD_URL_MARGIN_S = 60.0
+# After a hard stop (grace over / second signal) every server call and thread hop is bounded by
+# this, so a slow server or wedged worker cannot hold the exit past grace + ~10 s.
+SHUTDOWN_CALL_TIMEOUT_S = 5.0
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
 # Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
 # (HTTP status errors, unexpected bodies) is a retryable `fail` so max_attempts bounds it.
@@ -127,6 +131,10 @@ class _SignalledError(Exception):
         self.signal = signal
 
 
+class _HardStoppedError(Exception):
+    """A server call was abandoned because the hard stop fired and its time ran out."""
+
+
 class _FailureError(Exception):
     """A subtask failed locally. `release` hands it back without burning the retry budget."""
 
@@ -195,7 +203,7 @@ class ExecutorLoop:
             self._hard_stop.set()
             return
         self._stop.set()
-        if self._grace_s <= 0:
+        if not math.isfinite(self._grace_s) or self._grace_s <= 0:
             self._hard_stop.set()
             return
         try:
@@ -273,6 +281,9 @@ class ExecutorLoop:
                     await self._maybe_unload()
                     await self._sleep()
                     continue
+                if self.stopping:  # acquired while a stop arrived: hand it back untouched
+                    await self._release(assignment, log.bind(subtask_id=assignment.subtask_id))
+                    break
                 self._idle = 0
                 self._unloaded = False
                 outcome = await self._handle(assignment, tmp)
@@ -286,10 +297,25 @@ class ExecutorLoop:
             if self._grace_timer is not None:
                 self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
-            await asyncio.to_thread(self._worker.close)
+            if not await self._bounded_thread(self._worker.close):
+                await self._bounded_thread(self._worker.kill)  # lock-free fallback
             if self._owns_http:
                 await self._http.aclose()
         return done
+
+    @staticmethod
+    async def _bounded_thread(fn: Callable[[], object]) -> bool:
+        """Run a blocking worker call off-loop, giving up after SHUTDOWN_CALL_TIMEOUT_S.
+        Returns whether it completed."""
+        try:
+            await asyncio.wait_for(asyncio.to_thread(fn), SHUTDOWN_CALL_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("worker_call_timed_out", call=getattr(fn, "__name__", "?"))
+            return False
+        except Exception as exc:  # shutdown must continue
+            log.warning("worker_call_failed", error=type(exc).__name__)
+            return False
+        return True
 
     async def _maybe_unload(self) -> None:
         """Free model memory once idle for `idle_unload_s` (invariant 6); 0 disables."""
@@ -347,11 +373,14 @@ class ExecutorLoop:
                     break
                 if stopper.done():
                     # Grace over / second signal: reclaim worker memory, hand the subtask back.
-                    await asyncio.to_thread(self._worker.kill)
+                    await self._bounded_thread(self._worker.kill)
                     if self._cache is not None:
                         self._cache.release_in_use()
+                    finished = work.done()  # raced the kill: its result is still good
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
+                    if finished and not work.cancelled() and work.exception() is None:
+                        return await self._complete(a, work.result(), bound)
                     await self._release(a, bound)
                     return _Outcome.STOPPED
                 if beat.cancelled() or beat.exception() is not None:
@@ -376,6 +405,10 @@ class ExecutorLoop:
                 err = _FailureError(True, "EXECUTOR_ERROR", "unexpected executor error")
                 await self._report_failure(a, err, bound)
                 return _Outcome.FAILED
+            if self.stopping:  # exiting: free GPU memory now, before the (possibly slow) complete
+                await self._bounded_thread(self._worker.kill)
+                if self._cache is not None:
+                    self._cache.release_in_use()
             return await self._complete(a, result, bound)
         finally:
             stopper.cancel()
@@ -425,9 +458,15 @@ class ExecutorLoop:
         saw_5xx = False
         while True:
             try:
-                await self._client.complete(a.acquirement_id, result)
+                await self._call_complete(a, result)
                 bound.info("subtask_completed", records=result.record_count)
                 return _Outcome.DONE
+            except _HardStoppedError:
+                # The call may have reached the server: never claim success. If it did, the
+                # release below gets a 409 (handled); if not, the subtask requeues at once.
+                bound.warning("complete_abandoned_at_hard_stop")
+                await self._release(a, bound)
+                return _Outcome.STOPPED
             except StaleAcquirementError:
                 bound.info("stale_discarded")
                 return _Outcome.DISCARDED
@@ -456,6 +495,24 @@ class ExecutorLoop:
                 # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
             await self._pause(self._delay(attempt - 1), until=self._hard_stop)
+
+    async def _call_complete(self, a: Assignment, result: CompleteRequest) -> None:
+        """`client.complete`, but once a hard stop is set (or arrives mid-call) the call gets only
+        SHUTDOWN_CALL_TIMEOUT_S more; then `_HardStoppedError` (outcome unknown)."""
+        call = asyncio.ensure_future(self._client.complete(a.acquirement_id, result))
+        stopper = asyncio.ensure_future(self._hard_stop.wait())
+        try:
+            await asyncio.wait({call, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if not call.done():
+                await asyncio.wait({call}, timeout=SHUTDOWN_CALL_TIMEOUT_S)
+                if not call.done():
+                    raise _HardStoppedError
+            call.result()
+        finally:
+            stopper.cancel()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, stopper, return_exceptions=True)
 
     def _check_url(self, url: str) -> None:
         try:
@@ -607,8 +664,9 @@ class ExecutorLoop:
             bound.warning("fail_report_failed", error=type(exc).__name__)
 
     async def _release(self, a: Assignment, bound: Any) -> None:
+        timeout = SHUTDOWN_CALL_TIMEOUT_S if self._stop.is_set() else None
         try:
-            await self._client.release(a.acquirement_id)
+            await asyncio.wait_for(self._client.release(a.acquirement_id), timeout)
             bound.info("subtask_released")
-        except (httpx.HTTPError, ApiError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("release_failed", error=type(exc).__name__)

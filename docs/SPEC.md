@@ -142,7 +142,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
   period (default 30 s), then exit. Releasing = explicit `release` call so it re-queues immediately
   instead of waiting for the watchdog **[ours]**. Implemented (M4.2, TASK-5.2): the grace is
   `MINION_EXECUTOR_STOP_GRACE_S` (default 30, 0..300; 0 = stop at once); a second signal stops
-  immediately. Under launchd set `ExitTimeOut` to at least grace + 10 s (plist ships in M5).
+  immediately. Exit follows within about grace + 10 s. launchd's default `ExitTimeOut` is 20 s, so the plist (M5) must set it to at least grace + 15 s.
 - FR-18. When and how much the executor works is governed by the capacity rules in §4.6 (the paper
   only lets users stop the executor entirely).
 

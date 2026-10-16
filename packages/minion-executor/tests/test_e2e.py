@@ -304,8 +304,9 @@ async def test_sigterm_releases_inflight_subtask_after_grace(live: Live, tmp_pat
 async def test_sigterm_lets_short_subtask_finish_within_grace(live: Live, tmp_path: Path) -> None:
     """FR-17: a subtask that finishes inside the grace period is SUCCEEDED; exit 0, no release."""
     body = b'{"id":"nap0","text":"x","sleep_s":2}\n' + _records("s", 2)
-    rc, _ = await _run_sigterm(live, tmp_path, "gentle", body, grace_s=30)
+    rc, took = await _run_sigterm(live, tmp_path, "gentle", body, grace_s=30)
     assert rc == 0
+    assert took < 10  # finished and exited promptly, did not wait out the grace
     att = await live.rows("SELECT outcome FROM minion_subtask_attempt WHERE task_name='gentle'")
     assert [a[0] for a in att] == ["SUCCEEDED"]
     assert await live.task_status("gentle") == "SUCCEEDED"

@@ -457,3 +457,19 @@ def test_sandbox_failure_at_probe_exits_2(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(m, "WorkerHandle", Broken)
     result = runner.invoke(app, ["run"])
     assert result.exit_code == 2 and "SANDBOX_FAILED" in result.output
+
+
+def test_kill_active_probe_kills_the_running_probe_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    from minion_executor import main as m
+
+    class H:
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    h = H()
+    m.kill_active_probe()  # no probe running: a no-op
+    monkeypatch.setattr(m, "_active_probe", h)
+    m.kill_active_probe()
+    assert h.killed

@@ -182,9 +182,16 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   interrupts it. If it finishes in time it is uploaded and completed as usual. At the deadline, on
   a second signal, or with grace 0, the work task is cancelled, the worker killed to reclaim memory
   and the subtask `release`d with its own `acquirement_id` (immediate requeue, not a failure). An
-  upload cut off at the deadline publishes nothing complete: only `complete` makes a result final,
-  and the re-run overwrites the same attempt-scoped key (invariant 5). launchd `ExitTimeOut` must
-  be at least grace + 10 s (plist in M5).
+  upload cut off at the deadline publishes nothing final: only `complete` promotes an object, and
+  the re-run is a new attempt with its own attempt-scoped key (invariant 5), so a cut attempt's
+  leftover object, if any, is never promoted. An acquire that returns after the stop is released
+  untouched (no download, no model load). Once the hard stop is set, the in-flight `complete` gets
+  5 s more (then the subtask is released; a 409 there means `complete` had won) and `release`,
+  worker kill and close are bounded by 5 s each, so exit is within about grace + 10 s even with a
+  slow server. When the work finishes during the grace period the worker is killed before
+  `complete` so GPU memory is freed promptly. launchd `ExitTimeOut` must be at least grace + 15 s,
+  and launchd's default is only 20 s (below the default 30 s grace), so the M5 plist must set it.
+  A second signal during the startup engine probe kills the probe worker and exits 0.
 - **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
   not a fixed 10–30 s band. Resets on the first assignment.
 - **Worker** (`worker/process.py`): `multiprocessing` `spawn` context, framed JSON over a `Pipe`. The
