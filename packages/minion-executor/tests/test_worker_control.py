@@ -811,6 +811,57 @@ def test_state_set_during_a_non_run_op_applies_at_the_next_run_with_its_trim(
     assert worker.stats()["trim_errors"] == 1  # the trim travelled with the run
 
 
+def test_state_set_during_a_non_run_op_is_delivered_after_it_without_a_run(
+    worker: WorkerHandle,
+) -> None:
+    worker.ensure_model(MODEL, _budget())
+    worker.run([{"id": 1, "fail_trim": 1, "text": "a"}])
+    worker._op = "stats"  # pretend a non-run op is in flight
+    worker.control(duty=0.5, paused=False, trim=True)
+    worker._op = None
+    assert worker._unsent is not None
+    assert worker.stats()["trim_errors"] == 0  # the trim was not yet sent when stats ran
+    assert worker._unsent is None and worker._sent_gen > 0  # flushed after its final reply
+    assert worker.stats()["trim_errors"] == 1  # applied with no further run
+
+
+@pytest.mark.parametrize("op", ["stats", "load"])
+def test_a_tick_outside_a_run_is_a_protocol_violation(op: str) -> None:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_adversary, args=(child, b'{"tick": 1}'), daemon=True)
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE], step_timeout_s=5.0)
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    with pytest.raises(WorkerCrashed):
+        w._call({"op": op}, 5.0)
+    assert not proc.is_alive() and w.pid is None
+
+
+def test_an_ack_for_a_generation_never_delivered_is_a_protocol_violation() -> None:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    payload = b'{"tick": 1, "ack": 2, "paused": false}'
+    proc = ctx.Process(target=_adversary, args=(child, payload), daemon=True)
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE], step_timeout_s=5.0)
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    w._op = "stats"  # gens 1 and 2 are issued but suppressed (never written)
+    w.control(duty=0.5, paused=False)
+    w.control(duty=0.4, paused=False)
+    w._op = None
+    assert w._ctl_gen == 2 and w._sent_gen == 0
+    with pytest.raises(WorkerCrashed):
+        w._call({"op": "run", "batch": []}, 5.0)
+    assert not proc.is_alive() and w.last_ack() is None
+
+
 def test_a_failing_trim_is_counted_and_never_fatal(worker: WorkerHandle) -> None:
     worker.ensure_model(MODEL, _budget())
     worker.run([{"id": 1, "fail_trim": 1, "text": "a"}])

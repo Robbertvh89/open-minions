@@ -366,10 +366,10 @@ def worker_main(
                 params: TaskParams = parse_params(model.type, msg.get("params") or {})
                 if msg.get("ctl") is not None:
                     sent = WorkerCtl.from_msg(msg["ctl"])
+                    if sent.trim:  # a trim whose own send failed rides on the run (idempotent)
+                        safe_trim()
                     if cur_ctl is None or sent.gen > cur_ctl.gen:
                         cur_ctl = sent
-                        if sent.trim:  # a trim whose own send failed rides on the run
-                            safe_trim()
                 start = cur_ctl or WorkerCtl(gen=0, duty=budget.gpu_duty_cycle, paused=False)
                 ctl = _Ctl(
                     conn,
@@ -472,6 +472,7 @@ class WorkerHandle:
         self._ctl_lock = threading.Lock()
         self._ctl_gen = 0  # last live-control generation issued
         self._ctl: WorkerCtl | None = None  # latest-wins state, re-sent with every run
+        self._wire_gen = 0  # newest generation handed to the pipe (or carried by a run): ack bound
         self._sent_gen = 0  # newest generation known to be written to the current worker's pipe
         self._unsent: WorkerCtl | None = None  # newest state whose send failed (+ trim)
         self._op: str | None = None  # op of the call in flight (None: worker idle in its main loop)
@@ -565,6 +566,8 @@ class WorkerHandle:
             op = msg.get("op")
             self._op = op if isinstance(op, str) else ""
             try:
+                if op == "run" and isinstance(msg.get("ctl"), dict):
+                    self._wire_gen = max(self._wire_gen, int(msg["ctl"].get("gen", 0)))
                 with self._send_lock:
                     _send(conn, msg)
                 deadline = time.monotonic() + timeout_s
@@ -603,9 +606,11 @@ class WorkerHandle:
                         raise WorkerCrashed("malformed worker reply")
                     if "tick" not in reply:
                         break
+                    if op != "run":  # ticks only exist inside a run: anything else is a lie
+                        raise WorkerCrashed("unexpected tick outside a run")
                     try:  # new tick fields are validated strictly (a lie is a protocol violation)
                         usage = parse_usage(reply)
-                        ack = parse_ack(reply, issued=self._ctl_gen, at=time.monotonic())
+                        ack = parse_ack(reply, issued=self._wire_gen, at=time.monotonic())
                     except ValueError:
                         raise WorkerCrashed("malformed worker reply") from None
                     deadline = time.monotonic() + timeout_s  # liveness: restart the clock
@@ -646,6 +651,8 @@ class WorkerHandle:
             if not valid:
                 self._reset()
                 raise WorkerCrashed("malformed worker reply")
+            if op not in ("run", "shutdown"):  # back in the worker's main loop, reading
+                self._flush_unsent(conn, proc)  # state saved during this op, without a run
             if not ok:
                 raise RunnerError(
                     str(code),
@@ -798,12 +805,10 @@ class WorkerHandle:
         watchdog.daemon = True
         watchdog.start()
         try:
+            self._wire_gen = max(self._wire_gen, ctl.gen)  # before the write: the ack may race it
             _send(conn, ctl.to_msg())
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-        ):  # worker gone / closing: the next run carries the state
+        except (OSError, ValueError, TypeError):
+            # worker gone / closing: the next run carries the state
             return False
         finally:
             done.set()
@@ -818,7 +823,9 @@ class WorkerHandle:
     def _abort_stuck_send(self, proc: BaseProcess, done: threading.Event) -> None:
         """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
         worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`).
-        No-op if the send finished meanwhile (Timer.cancel cannot stop a timer already firing)."""
+        No-op if the send finished meanwhile. The `done` check narrows the gap but cannot close it:
+        a write completing exactly at the deadline may still be killed, which is acceptable (the
+        next call sees a dead worker and respawns)."""
         if done.is_set():
             return
         self._interrupt_gen += 1
@@ -973,6 +980,7 @@ class WorkerHandle:
         self._ack = None
         with self._ctl_lock:
             self._sent_gen, self._unsent = self._ctl_gen, None  # the next run carries the state
+            self._wire_gen = 0
         ref, self._ollama_ref = self._ollama_ref, None
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
@@ -982,11 +990,13 @@ class WorkerHandle:
             # a control() write may be mid-flight on this conn (the kill above unblocks it): let it
             # finish before closing the fd; the watchdog bounds it, so proceed anyway on timeout
             got = self._send_lock.acquire(timeout=CTL_SEND_TIMEOUT_S + 1)
-            try:
-                conn.close()
-            finally:
-                if got:
+            if got:
+                try:
+                    conn.close()
+                finally:
                     self._send_lock.release()
+            # else: a writer may still hold the fd; closing it could hit a recycled descriptor,
+            # so leave the connection to the garbage collector
         if proc is not None:
             proc.join(timeout=5)
         tmp, self._tmp_dir = self._tmp_dir, None
