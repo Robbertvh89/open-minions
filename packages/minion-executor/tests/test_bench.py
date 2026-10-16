@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -318,6 +319,47 @@ def test_all_records_failing_is_error_status(tmp_path: Path) -> None:
     assert "| errors |" in table and "| error (every record failed) | 10 |" in table
 
 
+def test_failed_records_do_not_count_toward_rates(tmp_path: Path) -> None:
+    class Mixed(WorkerHandle):
+        def run(self, records: list[Any], params: Any) -> list[Any]:  # type: ignore[override]
+            return [
+                {"id": r["id"], "error": "boom", "prompt_tokens": 7, "completion_tokens": 9}
+                if i % 2
+                else {"id": r["id"], "prompt_tokens": 3, "completion_tokens": 5}
+                for i, r in enumerate(records)
+            ]
+
+    class Failing(WorkerHandle):
+        def run(self, records: list[Any], params: Any) -> list[Any]:  # type: ignore[override]
+            return [
+                {"id": r["id"], "error": "boom", "prompt_tokens": 7, "completion_tokens": 9}
+                for r in records
+            ]
+
+    def go(handle: type[WorkerHandle]) -> bench.BenchResult:
+        cache = ModelCache(tmp_path / "cache", 10**9, sandbox=False)
+        report = asyncio.run(
+            bench.run_bench(
+                cache,
+                lambda e: handle([e]),
+                [fake_entry(TaskType.COMPLETION)],
+                bench.BenchConfig(records=10, batch_sizes=(2,), max_tokens=8),
+                BUDGET,
+                environment={},
+            )
+        )
+        return report.results[0]
+
+    mixed = go(Mixed)
+    assert mixed.status == "ok" and mixed.error_records == 5
+    assert (mixed.prompt_tokens, mixed.completion_tokens) == (15, 25)
+    failing = go(Failing)
+    assert failing.status == "error"
+    assert (failing.prompt_tokens, failing.completion_tokens) == (0, 0)
+    assert failing.tok_s is None and failing.prompt_tok_s is None
+    assert failing.records_per_h is None
+
+
 def test_cache_oserror_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def boom(self: ModelCache, model: ModelEntry) -> None:
         raise PermissionError("nope")
@@ -357,7 +399,51 @@ def test_cli_out_validated_before_run(tmp_path: Path, monkeypatch: pytest.Monkey
     target.write_text("x")
     link = tmp_path / "link.json"
     link.symlink_to(target)
-    for bad in (link, tmp_path / "nodir" / "o.json"):
+    a_dir = tmp_path / "adir"
+    a_dir.mkdir()
+    cases = [
+        (link, "must not be a symlink"),
+        (tmp_path / "nodir" / "o.json", "not a writable directory"),
+        (a_dir, "must be a regular file"),
+    ]
+    for bad, text in cases:
         result = CliRunner().invoke(app, ["bench", "--models", str(models), "--out", str(bad)])
         assert result.exit_code == 2, result.output
+        assert text in result.output
     assert target.read_text() == "x"
+
+
+def test_cli_out_overwrites_existing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    models = _cli_env(tmp_path, monkeypatch)
+    out = tmp_path / "o.json"
+    out.write_text("old content that is long" * 1000)
+    result = CliRunner().invoke(
+        app,
+        [
+            "bench",
+            "--models",
+            str(models),
+            "--records",
+            "2",
+            "--batch-sizes",
+            "1",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out.read_text())
+    assert data["results"][0]["model_id"] == "f"
+
+
+def test_write_out_refuses_fifo(tmp_path: Path) -> None:
+    import minion_executor.main as m
+
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError, match="regular file"):
+            m._write_out(fifo, "x")
+    finally:
+        os.close(reader)

@@ -342,14 +342,17 @@ def _bench_one_size(
     if res.error_records == res.records:
         res.status = "error"
         res.detail = "every record failed"
-    # embedding runners report per-record `tokens` (input tokens); completions `prompt_tokens`
+    # embedding runners report per-record `tokens` (input tokens); completions `prompt_tokens`.
+    # Failed records are excluded from every count so they cannot inflate throughput.
+    good = [r for r in done if "error" not in r]
     res.prompt_tokens = _count(
-        done, "tokens" if entry.type is TaskType.EMBEDDING else "prompt_tokens"
+        good, "tokens" if entry.type is TaskType.EMBEDDING else "prompt_tokens"
     )
-    res.completion_tokens = _count(done, "completion_tokens")
-    res.tok_s, res.prompt_tok_s, res.records_per_h = rates(
-        len(timed) - res.error_records, run_s, res.prompt_tokens, res.completion_tokens
-    )
+    res.completion_tokens = _count(good, "completion_tokens")
+    if res.status != "error":
+        res.tok_s, res.prompt_tok_s, res.records_per_h = rates(
+            len(good), run_s, res.prompt_tokens, res.completion_tokens
+        )
     res.engine_peak_gb = stats.get("peak_bytes", 0) / GIB
     res.worker_rss_peak_gb = stats.get("max_rss_bytes", 0) / GIB
     return res

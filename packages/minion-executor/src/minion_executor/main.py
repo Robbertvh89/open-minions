@@ -8,6 +8,7 @@ import os
 import platform
 import signal
 import socket
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -287,7 +288,7 @@ def status() -> None:
 
 def _check_out_path(out: Path) -> None:
     """Fail before the (long) run if the report cannot be written. Symlinks are refused."""
-    parent = out.parent if str(out.parent) else Path()
+    parent = out.parent
     if not parent.is_dir() or not os.access(parent, os.W_OK):
         raise ValueError(f"--out directory is not a writable directory: {parent}")
     if out.is_symlink():
@@ -297,7 +298,12 @@ def _check_out_path(out: Path) -> None:
 
 
 def _write_out(out: Path, text: str) -> None:
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    # O_NONBLOCK so a FIFO cannot hang the open; O_TRUNC only after the S_ISREG check below
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("--out must be a regular file")
+    os.ftruncate(fd, 0)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
 
@@ -349,34 +355,34 @@ def bench(
         raise typer.Exit(code=2) from None
     # stdout carries only the table; progress logs go to stderr
     saved_log_config = structlog.get_config()
-    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
-    restrict_environ()  # fetch_env holds the secrets; workers inherit none
-    base = budget_for(prof)
-    # sweep honestly: the profile's batch cap must not clamp the requested batch sizes
-    budget = Budget.model_validate(
-        {**base.model_dump(), "max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
-    )
-    engines = list(dict.fromkeys(e.engine for e in entries))
-    sandbox = sandbox_policy(settings, engines)
-
-    def factory(engine: Engine) -> WorkerHandle:
-        return WorkerHandle(
-            [engine],
-            nice=PROFILES[prof].nice,
-            sandbox=sandbox,
-            engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
-        )
-
-    cache = ModelCache(
-        settings.model_cache_dir,
-        int(settings.model_cache_gb * 1024**3),
-        fetch_env=fetch_env,
-        download_timeout_s=settings.download_timeout_s,
-        min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
-        nice=PROFILES[prof].nice,
-        sandbox=settings.fetch_sandbox,
-    )
     try:
+        structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+        restrict_environ()  # fetch_env holds the secrets; workers inherit none
+        base = budget_for(prof)
+        # sweep honestly: the profile's batch cap must not clamp the requested batch sizes
+        budget = Budget.model_validate(
+            {**base.model_dump(), "max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
+        )
+        engines = list(dict.fromkeys(e.engine for e in entries))
+        sandbox = sandbox_policy(settings, engines)
+
+        def factory(engine: Engine) -> WorkerHandle:
+            return WorkerHandle(
+                [engine],
+                nice=PROFILES[prof].nice,
+                sandbox=sandbox,
+                engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
+            )
+
+        cache = ModelCache(
+            settings.model_cache_dir,
+            int(settings.model_cache_gb * 1024**3),
+            fetch_env=fetch_env,
+            download_timeout_s=settings.download_timeout_s,
+            min_free_bytes=int(settings.min_free_disk_gb * 1024**3),
+            nice=PROFILES[prof].nice,
+            sandbox=settings.fetch_sandbox,
+        )
         report = asyncio.run(
             bench_mod.run_bench(cache, factory, entries, config, budget, pending=pending)
         )
