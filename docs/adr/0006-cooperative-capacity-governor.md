@@ -34,10 +34,27 @@ Latest-wins; each `run` message also carries it. The worker applies it at the ne
 mid pacer-sleep) and acks with a tick-shaped message, so liveness and the GPU share come from the same
 channel. Outside a run the worker applies ctl silently, never replies. Inference stays in the worker
 (invariant 7); the control side only sends ctl.
+*Implemented in TASK-5.3* (`worker/control.py`, `WorkerHandle.control/last_ack/gpu_share`): `control()`
+assigns the generation, stores the state (re-sent with every `run`, so a respawned worker is never out
+of date) and writes under a send lock, never under the call lock. The ack is a tick,
+`{"tick", "ack": gen, "paused", "busy_s", "wall_s"}`; every field of a ctl message, ack and usage is
+validated strictly on both sides (a bad ack, an ack for a generation never issued, NaN or a negative
+time is a protocol violation: worker killed, `WorkerCrashed`). A run that starts paused does no work
+until resumed. While paused the worker blocks in the checkpoint polling the pipe and keeps ticking, so
+the inactivity timeout never fires. The pacer sleep is a `conn.poll(timeout)`, so a pause or duty change
+cuts it short and the owed sleep is re-derived. Pause time counts as neither busy nor wall time, and a
+late wake-up is credited against the next sleep (capped at 5 s), which keeps `busy_s / wall_s` on the
+target on a loaded machine. Known limit (TASK-12): a `control()` write blocks if the worker stops
+reading for longer than the pipe buffer holds (messages are tiny and sent on change only).
 
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
 memory/wired limits and batch caps; `Runner.trim` frees allocator caches. The loop re-slices records
 with the current `max_batch_size` before each batch (FR-54 "next batch").
+*Implemented in TASK-5.3* at the worker level: `WorkerHandle.run(..., budget=)` sends it, the worker
+calls `set_budget` only when it differs from the one in force and re-applies CPU priority; all six
+runners implement `set_budget`/`trim` (MLX: memory, cache and wired limits; HF: MPS memory fraction;
+Ollama and fake: the fan-out cap, the daemon owns the memory). If `control()` was ever called, its duty
+overrides `Budget.gpu_duty_cycle`. The loop passes the budget per batch from TASK-5.5.
 
 **D5 Pause semantics (FR-53).** Pause applies at once: no new acquires; the worker pauses at its next
 checkpoint. **Resume needs the condition clear for 10 s** (`RESUME_AFTER_S`). Profile escalation keeps
@@ -55,7 +72,7 @@ kill), and frees the cache pin. An idle warm worker whose model no longer fits i
 
 **D7 Memory guard (NF-8 safety net).** `mx.set_memory_limit` is a soft guideline in MLX and RSS also
 holds the Python heap, so the control side samples the worker footprint (darwin `proc_pid_rusage`,
-linux `/proc/<pid>/status`) every poll. More than `memory_gb * 1.10` on 2 consecutive samples
+linux `/proc/<pid>/statm` resident set; `worker/footprint.py`, TASK-5.3) every poll. More than `memory_gb * 1.10` on 2 consecutive samples
 interrupts the worker and fails the subtask as **retryable `OOM`**: another Mac with a bigger budget
 may fit it, and `max_attempts` bounds the retries. The Ollama daemon's memory is outside the worker
 and stays the documented caveat of ADR-0009.
@@ -65,6 +82,12 @@ clients are still accepted; the executor always sets it). In the worker: `backgr
 background QoS (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, what `taskpolicy -b` does) plus
 nice 15; `low` is nice 10; `normal` is 0. Raising priority is impossible unprivileged, so it takes
 effect at the next worker spawn (conservative; invariant 6 safe). `OMP_NUM_THREADS=2` for non-normal.
+*Implemented in TASK-5.3* (`worker/priority.py`): the worker applies the priority of each run's budget
+after reading back what the OS holds. Raising niceness works live (it only ever goes up); the Darwin
+background QoS is reversible both ways; lowering nice (to a higher priority) is `EACCES`, so that part
+waits for a respawn. No sandbox rule is needed: the profile is `(allow default)` plus denials, none of
+which cover `setpriority`/`nice` on the process itself (tested inside the Seatbelt sandbox).
+`OMP_NUM_THREADS=2` is set at spawn when the spawn niceness is above 0.
 The fetch subprocess nice derives from the same value (TASK-5.1: `nice_for`).
 Rollout order: upgrade the server before the executors. `Budget` is `extra=forbid`, so an old
 server answers 422 to a new executor's `cpu_priority`.

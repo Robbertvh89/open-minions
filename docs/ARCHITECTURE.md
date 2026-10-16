@@ -415,10 +415,17 @@ executor therefore enforces the owner's budget cooperatively, at four levers (SP
 2. **GPU duty cycle** — `StepControl.checkpoint()` (→ `throttle.step_done()`) after each step: measure GPU-synchronized step time `t`
    (`mx.eval` + `mx.synchronize`), then sleep `t·(1−d)/d` for duty `d`. Short bursts (one decode step
    ≈ 10–50 ms) keep the window server and video encoders getting GPU time between bursts. Batch size is
-   the second knob: smaller batch → shorter bursts → smoother foreground.
+   the second knob: smaller batch → shorter bursts → smoother foreground. The duty and a pause can change
+   while a batch runs: `WorkerHandle.control()` sends a latest-wins `ctl` message over the worker pipe; the
+   worker reads it at the next checkpoint (or mid pacer-sleep), acks it, and while paused blocks in the
+   checkpoint, still ticking (ADR-0006 D3; implemented in M4.3).
 3. **Batch size** — capped by `budget.max_batch_size`; also bounds KV-cache memory.
-4. **CPU priority** — worker started via `taskpolicy -b` (background QoS → E-cores, throttled I/O) for
-   `background`, `nice 10` for `low`; tokenizer threads = 2 (`TOKENIZERS_PARALLELISM`, `OMP_NUM_THREADS`).
+4. **CPU priority** — set by the worker on itself (`worker/priority.py`): Darwin background QoS
+   (`setpriority(PRIO_DARWIN_PROCESS, …, PRIO_DARWIN_BG)`, the `taskpolicy -b` equivalent; E-cores,
+   throttled I/O) for `background`, `nice` 10 / 15 for `low` / `background`; `OMP_NUM_THREADS=2` when
+   throttled. Raising niceness and toggling background QoS work live, also inside the sandbox; lowering
+   nice needs a respawn. The control side samples the worker's memory footprint
+   (`worker/footprint.py`: `proc_pid_rusage` on macOS, `/proc` on Linux).
 
 **Optional adaptive mode (Q5):** read total GPU utilization from IORegistry
 (`AGXAccelerator` → `PerformanceStatistics` → `Device Utilization %`, no sudo) and lower duty cycle

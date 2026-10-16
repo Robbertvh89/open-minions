@@ -252,7 +252,7 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   and bad values exit 2) and the `custom` profile (`[profiles.custom]`, all dimensions required) are
   implemented, with the 75 % cap on every profile. `cpu_priority` is part of the budget on the wire
   (optional for older clients) and derives the worker/fetch `nice` (15 / 10 / 0); background QoS
-  (`taskpolicy -b`) lands in M4.3. FR-52..FR-55 enforcement is M4.2..M4.5; `POST /executor/presence`
+  (`taskpolicy -b`) is applied by the worker since M4.3 (live, also inside the sandbox). FR-52..FR-55 enforcement is M4.2..M4.5; `POST /executor/presence`
   exists (FR-55); FR-56 is partially met (`run --profile` only). Proposed (ADR-0006 D10): there is no
   implicit `balanced` default; `run` without `--profile` is adaptive (FR-52), and `--profile
   <name>` pins a profile.
@@ -270,6 +270,9 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
 - FR-54. **Budget changes mid-subtask.** Duty cycle, batch size and CPU priority apply at the next
   generation step / batch. A memory budget below the loaded model's `memory_gb` causes the executor to
   finish the current batch, `release` the subtask (immediate requeue, not a failure), and unload the model.
+  **Status (TASK-5.3):** the worker side is implemented: a running batch takes a new duty cycle or a
+  pause at its next checkpoint (also mid pacer-sleep, acked per generation), and each batch can carry a
+  new budget (memory limits, batch cap, CPU priority). Wiring the governor to it is M4.5.
 - FR-55. **Reporting.** The executor sends its current profile, budget and pause reason with every
   `acquire` and `heartbeat`; the server uses `memory_gb` for admission filtering and records it for
   Grafana. A paused executor does not poll (it only sends a low-frequency presence ping).
