@@ -231,6 +231,36 @@ def test_nice_derived_from_cpu_priority() -> None:
     assert nice_for(CpuPriority.BACKGROUND) == 15
     assert nice_for(CpuPriority.LOW) == 10
     assert nice_for(CpuPriority.NORMAL) == 0
-    assert nice_for(None) == 0
+    assert nice_for(None) == 10  # unknown counts as LOW (conservative)
     # built-ins keep the M1 values
     assert [nice_for(PROFILES[p].cpu_priority) for p in PROFILES] == [15, 10, 0]
+
+
+def test_deeply_nested_toml_is_a_config_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="nesting too deep"):
+        load_config(_write(tmp_path, "a = " + "[" * 30_000 + "]" * 30_000))
+
+
+def test_unknown_day_error_does_not_echo_value(tmp_path: Path) -> None:
+    text = "[[schedule]]\nprofile = 'full'\nstart = '01:00'\nend = '07:00'\ndays = ['hunter2']"
+    with pytest.raises(ConfigError, match="unknown day; use mon") as ei:
+        load_config(_write(tmp_path, text))
+    assert "hunter2" not in str(ei.value)
+
+
+def test_symlink_target_directory_is_checked(tmp_path: Path) -> None:
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    real = loose / "executor.toml"
+    real.write_text("")
+    real.chmod(0o600)
+    link = safe / "executor.toml"
+    link.symlink_to(real)
+    loose.chmod(0o775)
+    try:
+        with pytest.raises(ConfigError, match="directory"):
+            load_config(link)
+    finally:
+        loose.chmod(0o700)

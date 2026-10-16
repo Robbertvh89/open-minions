@@ -104,8 +104,8 @@ class ScheduleEntry(_Strict):
         if self.days is not None:
             if not self.days or len(set(self.days)) != len(self.days):
                 raise ValueError("days must be a non-empty list without duplicates")
-            if bad := [d for d in self.days if d not in DAYS]:
-                raise ValueError(f"unknown day(s) {bad}; use {', '.join(DAYS)}")
+            if any(d not in DAYS for d in self.days):
+                raise ValueError(f"unknown day; use {', '.join(DAYS)}")
         return self
 
     @property
@@ -174,7 +174,11 @@ def _read_safely(path: Path) -> bytes:
             raise ConfigError(f"config {path} is not a regular file")
         _check_mode(st, "config", path)
         try:
-            _check_mode(path.parent.stat(), "config directory", path.parent)
+            # Symlinks are followed on purpose (dotfile managers); check the link's directory
+            # and the target's directory.
+            real_parent = Path(os.path.realpath(path)).parent
+            for d in dict.fromkeys((path.parent, real_parent)):
+                _check_mode(d.stat(), "config directory", d)
         except OSError as exc:
             raise ConfigError(f"cannot stat config directory: {exc.strerror}") from None
         with os.fdopen(fd, "rb") as f:
@@ -204,6 +208,8 @@ def load_config(path: Path | None = None) -> ExecutorConfig:
     data = _read_safely(p)
     try:
         raw = tomllib.loads(data.decode("utf-8"))
+    except RecursionError:
+        raise ConfigError(f"invalid TOML in {p}: nesting too deep") from None
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"invalid TOML in {p}: {exc}") from None
     try:

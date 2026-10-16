@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from minion_common.schemas import AcquireRequest, Budget
+from minion_common.enums import PausedReason
+from minion_common.schemas import AcquireRequest, Budget, HeartbeatRequest, PresenceRequest
 from minion_server.app import create_app
 from pydantic import SecretStr
 from sqlalchemy import text
@@ -140,3 +141,32 @@ async def test_acquire_without_cpu_priority_still_accepted(http: tuple[AsyncClie
         f"{BASE}/acquire", json={"engines": ["mlx"], "budget": old}, headers=_auth(token)
     )
     assert r.status_code in (200, 204), r.text
+
+
+@pytest.mark.integration
+async def test_presence_cannot_target_another_executor(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    [(a, tok_a), (b, _)] = await make_executors(sm, 2)
+    before = await _row(sm, b.executor_id)
+    r = await c.post(
+        f"{BASE}/presence",
+        json={"budget": BUDGET, "executor_id": str(b.executor_id)},
+        headers=_auth(tok_a),
+    )
+    assert r.status_code == 422
+    r = await c.post(
+        f"{BASE}/presence",
+        json={"budget": BUDGET, "paused_reason": "thermal"},
+        headers=_auth(tok_a),
+    )
+    assert r.status_code == 204
+    assert (await _row(sm, a.executor_id)).paused_reason == "thermal"
+    after = await _row(sm, b.executor_id)
+    assert tuple(after) == tuple(before)
+
+
+def test_every_paused_reason_matches_wire_pattern() -> None:
+    for reason in PausedReason:
+        PresenceRequest(budget=Budget.model_validate(BUDGET), paused_reason=reason.value)
+        HeartbeatRequest(paused_reason=reason.value)

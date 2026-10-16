@@ -194,9 +194,14 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   (all TASK-4.3) and the test-only `fake` (`runners/fake.py`, never advertised as a real engine). The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
   work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
   control process (invariant 7).
-- **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
-  Memory is `min(fraction, 75 %) × RAM`, sent in `Budget`. CPU priority is applied only as a POSIX
-  `nice` value in the worker (15 / 10 / 0); there is no `Budget` field for it and no `taskpolicy`.
+- **Profiles** (`capacity/profiles.py`, `capacity/config.py`, FR-51): `light` / `balanced` / `full`
+  plus `custom` (defined in `executor.toml`). Memory is `min(fraction, 75 %) × RAM` (also for
+  `custom`), sent in `Budget`. `Budget.cpu_priority` (`background|low|normal`) is on the wire and
+  the worker/fetch `nice` is derived from it (15 / 10 / 0; unknown counts as `low`).
+  `executor.toml` (`~/.config/minion/executor.toml` or `$MINION_EXECUTOR_CONFIG`) must be owned by
+  the user and not group/world-writable; unknown keys are errors. `run` without `--profile` is
+  adaptive: it starts on the file's `active_profile` (default `light`; the bare run used to be
+  `balanced`). `custom` is accepted when `[profiles.custom]` is defined.
 - **Token and CLI** (`secrets.py`, `main.py`): token from `$MINION_EXECUTOR_TOKEN`, else the macOS
   Keychain item `open-minions-executor` via `/usr/bin/security` (run with a scrubbed environment).
   Token is never logged. `run` exits 2
@@ -208,7 +213,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden
   `--runner fake`) needs `MINION_EXECUTOR_DEV=1`. Subtasks whose engine/memory is not admissible, or
   whose engine turns out unavailable at load (`ENGINE_UNAVAILABLE`), are released, not failed.
-  `--profile` accepts `light|balanced|full` (`custom` is rejected until M4).
+  `--profile` accepts `light|balanced|full|custom`.
 - **Idle unload** (`loop.py`, FR-13, invariant 6): after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600 s; 0
   disables) without a subtask, the loop calls `worker.unload()` to free model memory; the same check
   runs on the acquire-error path.

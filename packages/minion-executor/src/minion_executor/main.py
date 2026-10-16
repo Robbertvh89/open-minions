@@ -24,7 +24,7 @@ from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
-from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
+from minion_executor.capacity.config import load_config, resolve_profiles
 from minion_executor.capacity.profiles import budget_for, nice_for, parse_profile, total_memory_gb
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
@@ -157,11 +157,9 @@ async def _run(
     profile: CapacityProfile,
     requested: list[Engine],
     token: SecretStr,
+    budget: Budget,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
-    config: ExecutorConfig | None = None,
 ) -> None:
-    specs = resolve_profiles(config or ExecutorConfig())
-    budget = budget_for(profile, specs=specs)
     nice = nice_for(budget.cpu_priority)
     settings = ExecutorSettings()
     try:
@@ -280,13 +278,14 @@ def run(
         config = load_config(settings.config_path)  # before restrict_environ(); exit 2 if unsafe
         specs = resolve_profiles(config)
         prof = parse_profile(profile if profile is not None else config.active_profile, specs)
+        budget = budget_for(prof, specs=specs)
         token = load_token()  # fail fast, before starting anything
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
-        asyncio.run(_run(server, prof, requested, token, heartbeat_interval_s, config))
+        asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None

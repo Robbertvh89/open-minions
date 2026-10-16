@@ -8,15 +8,6 @@ from typer.testing import CliRunner
 runner = CliRunner()
 
 
-@pytest.fixture(autouse=True)
-def _no_user_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never read the developer's real ~/.config/minion/executor.toml."""
-    monkeypatch.delenv("MINION_EXECUTOR_CONFIG", raising=False)
-    monkeypatch.setattr(
-        "minion_executor.capacity.config.default_config_path", lambda: tmp_path / "absent.toml"
-    )
-
-
 def test_help_lists_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -70,16 +61,14 @@ def test_run_custom_profile_from_config(tmp_path: Path, monkeypatch: pytest.Monk
 
     async def fake_run(*args: object) -> None:
         seen["profile"] = args[1]
-        seen["config"] = args[5]
+        seen["budget"] = args[4]
 
     monkeypatch.setattr(m, "_run", fake_run)
     result = runner.invoke(app, ["run", "--runner", "fake", "--profile", "custom"])
     assert result.exit_code == 0, result.output
     assert seen["profile"] == "custom"
-    from minion_executor.capacity.config import resolve_profiles
-
-    spec = resolve_profiles(seen["config"])[CapacityProfile.CUSTOM]  # type: ignore[arg-type]
-    assert (spec.memory_gb, spec.cpu_priority) == (6, CpuPriority.LOW)
+    budget = seen["budget"]
+    assert (budget.memory_gb, budget.cpu_priority) == (6, CpuPriority.LOW)  # type: ignore[attr-defined]
 
 
 def test_run_without_profile_is_adaptive_and_starts_on_active_profile(

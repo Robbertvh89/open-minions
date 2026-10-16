@@ -66,6 +66,8 @@ background QoS (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, what `tas
 nice 15; `low` is nice 10; `normal` is 0. Raising priority is impossible unprivileged, so it takes
 effect at the next worker spawn (conservative; invariant 6 safe). `OMP_NUM_THREADS=2` for non-normal.
 The fetch subprocess nice derives from the same value (TASK-5.1: `nice_for`).
+Rollout order: upgrade the server before the executors. `Budget` is `extra=forbid`, so an old
+server answers 422 to a new executor's `cpu_priority`.
 
 **D9 Configuration (FR-51/52/53).** `~/.config/minion/executor.toml` (or `MINION_EXECUTOR_CONFIG`),
 parsed with `tomllib` into a Pydantic model with `extra=forbid`: `active_profile`, `idle_profile`,

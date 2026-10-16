@@ -56,8 +56,8 @@ def total_memory_gb() -> float:
 
 
 def nice_for(priority: CpuPriority | None) -> int:
-    """Nice increment for a CPU priority (None, an old budget, counts as normal)."""
-    return NICE_BY_PRIORITY[priority or CpuPriority.NORMAL]
+    """Nice increment for a CPU priority (None, an old budget, counts as the conservative LOW)."""
+    return NICE_BY_PRIORITY[priority or CpuPriority.LOW]
 
 
 def parse_profile(
