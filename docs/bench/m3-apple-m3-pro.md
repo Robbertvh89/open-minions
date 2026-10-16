@@ -34,9 +34,19 @@ uv run minion-executor bench --models deploy/bench-models.yaml \
   32.8k possible completion tokens per row; exact counts in the JSON), so tok/s is comparable across rows.
   Embedding: default params.
 - `tok_s` = completion tokens / `run_s`; `prompt_tok_s` = prompt tokens / `run_s`;
-  `records_per_h` = records / `run_s` * 3600. Embedding runners report no token counts, so those are `-`.
-- `engine peak GB`: `mx.get_peak_memory` (mlx) or max `torch.mps.driver_allocated_memory` (hf);
-  `worker RSS peak GB`: `ru_maxrss` of the worker process.
+  `records_per_h` = records / `run_s` * 3600. For embeddings the runners report per-record input `tokens`; the bench counts them as prompt tokens, so `prompt tok/s` is the embedding input rate and `tok/s` stays `-`. (The committed numbers below predate this fix and show `-`; they are refreshed on the next bench run.)
+- `engine peak GB`: `mx.get_peak_memory` (mlx, active allocations) or `torch.mps.driver_allocated_memory`
+  sampled at checkpoints (hf, driver pool). These are **not comparable across engines**; compare only
+  within an engine. Cross-engine memory conclusions use `worker RSS peak GB` (`ru_maxrss` of the worker
+  process).
+- `load_s` covers worker spawn, sandbox setup, engine import and weight load (weights already on disk).
+- Embedding models: larger `--records` (2048) may be used because 256 records finish in under a second;
+  the per-row `records` column is authoritative.
+- `bench` ignores the `run --engines ollama` opt-in: putting an ollama entry under `models:` makes the
+  bench pull into `~/.ollama`, outside the model cache cap (ADR-0009).
+- Stderr during mlx/hf runs shows sandbox-denied writes to the `com.apple.MetalPerformanceShadersGraph`
+  cache directory. Runs succeed, but without MPSGraph cache reuse the numbers may be slightly
+  pessimistic.
 - Models, same model at matching precision (see `deploy/bench-models.yaml`):
   - Qwen2.5-0.5B-Instruct: mlx `mlx-community/Qwen2.5-0.5B-Instruct-bf16` (56d07e76), hf
     `Qwen/Qwen2.5-0.5B-Instruct` (7ae55760), both 16-bit.
@@ -74,10 +84,10 @@ uv run minion-executor bench --models deploy/bench-models.yaml \
   batch 1.
 - Embeddings: MLX is 1.9x faster at batch 1 and 1.1x to 2.1x at larger batches. Runs last 0.3 to 1.4 s,
   so these numbers are noisy (batch 8 vs 32 on MLX is within noise); use them as order of magnitude.
-- Memory: MLX engine peak is 1.0 to 1.4 GB for the 0.5B model (weights about 1 GB plus KV cache); HF
-  stays at 1.0 GB until batch 32 (2.2 GB) and its worker RSS is 2.3 GB vs 1.4 GB for MLX (torch
-  runtime). The HF embedding peak (1.02 GB for a 45 MB model) is the MPS driver allocation pool, not
-  model size. All rows fit well inside the `balanced` 40% budget on this 36 GB Mac.
+- Memory (based on worker RSS, the only cross-engine comparable column): the HF worker peaks at 2.3 GB
+  vs 1.4 GB for MLX on the 0.5B model (torch runtime), and 0.5 GB vs 0.4 GB for MiniLM. The engine-peak
+  columns are per-engine allocator views (see Method); the HF embedding value (1.02 GB for a 45 MB
+  model) is the MPS driver pool, not model size. All rows fit well inside the `balanced` 40% budget on this 36 GB Mac.
 - Conclusion for ADR-0005: MLX as the default engine is confirmed on this hardware for both task types.
   HF remains a reasonable fallback (about 55% of MLX throughput at batch 32). The Ollama comparison is
   outstanding until Ollama is installed on a bench Mac (needs the user's approval); re-run with the two

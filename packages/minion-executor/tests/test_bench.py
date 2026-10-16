@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from minion_common.enums import CapacityProfile, Engine, TaskType
@@ -144,6 +145,7 @@ def test_unavailable_engine_is_reported_not_raised(tmp_path: Path) -> None:
     assert by_id["p"].status == "unavailable" and "not pinned" in by_id["p"].detail
     assert "unavailable" in bench.render_table(report)
     assert report.results[0].records_per_h is None
+    assert by_id["f"].status == "unavailable"
 
 
 def test_model_failure_is_reported_not_raised(tmp_path: Path) -> None:
@@ -177,6 +179,14 @@ def test_config_validation() -> None:
     with pytest.raises(ValueError):
         bench.BenchConfig(records=0)
     with pytest.raises(ValueError):
+        bench.BenchConfig(records=bench.MAX_RECORDS + 1)
+    with pytest.raises(ValueError):
+        bench.BenchConfig(batch_sizes=(5000,))
+    with pytest.raises(ValueError):
+        bench.parse_batch_sizes("0")
+    with pytest.raises(ValueError):
+        bench.parse_batch_sizes("4097")
+    with pytest.raises(ValueError):
         bench.parse_batch_sizes("1,x")
     assert bench.parse_batch_sizes("1, 8,32") == (1, 8, 32)
 
@@ -186,6 +196,9 @@ def test_cli_bench_with_fake_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     models.write_text(
         "models:\n  - {model_id: f, type: embedding, engine: fake, ref: fake, memory_gb: 0.1}\n"
     )
+    import minion_executor.main as m
+
+    monkeypatch.setattr(m, "restrict_environ", lambda: None)  # would wipe the pytest env
     monkeypatch.setenv("MINION_EXECUTOR_SANDBOX", "0")
     monkeypatch.setenv("MINION_EXECUTOR_FETCH_SANDBOX", "0")
     monkeypatch.setenv("MINION_EXECUTOR_MODEL_CACHE_DIR", str(tmp_path / "cache"))
@@ -215,3 +228,136 @@ def test_cli_bench_unknown_model(tmp_path: Path) -> None:
         app, ["bench", "--models", str(root / "deploy" / "bench-models.yaml"), "--model", "nope"]
     )
     assert result.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "models: [unclosed",
+        "- a\n- b\n",
+        "models: 3\n",
+        "models: {a: b}\n",
+        "pending: 3\n",
+        "models:\n  - 5\n",
+        "pending:\n  - {model_id: x}\n",
+        "pending:\n  - 5\n",
+        "pending:\n  - {model_id: x, type: nope, engine: ollama, ref: r}\n",
+    ],
+)
+def test_load_bench_models_rejects_bad_files(tmp_path: Path, text: str) -> None:
+    f = tmp_path / "b.yaml"
+    f.write_text(text)
+    with pytest.raises(ValueError):
+        bench.load_bench_models(f)
+
+
+def test_embedding_tokens_counted_as_prompt_tokens(tmp_path: Path) -> None:
+    class Tokens(WorkerHandle):
+        def run(self, records: list[Any], params: Any) -> list[Any]:  # type: ignore[override]
+            return [{"id": r["id"], "embedding": [0.0], "tokens": 7} for r in records]
+
+    cache = ModelCache(tmp_path / "cache", 10**9, sandbox=False)
+    report = asyncio.run(
+        bench.run_bench(
+            cache,
+            lambda e: Tokens([e]),
+            [fake_entry(TaskType.EMBEDDING)],
+            CONFIG,
+            BUDGET,
+            environment={},
+        )
+    )
+    for r in report.results:
+        assert r.prompt_tokens == 7 * r.records and r.prompt_tok_s is not None
+        assert r.completion_tokens == 0 and r.tok_s is None
+
+
+def test_probe_failure_is_reported(tmp_path: Path) -> None:
+    from minion_executor.runners.base import RunnerError
+    from minion_executor.worker.process import WorkerCrashed
+
+    for exc in (RunnerError("boom", "x"), WorkerCrashed("died")):
+
+        class Failing(WorkerHandle):
+            def probe(self, timeout_s: float = 90.0, exc: Exception = exc) -> dict[str, str | None]:
+                raise exc
+
+        cache = ModelCache(tmp_path / "cache", 10**9, sandbox=False)
+        report = asyncio.run(
+            bench.run_bench(
+                cache,
+                lambda e: Failing([e]),
+                [fake_entry(TaskType.COMPLETION)],
+                CONFIG,
+                BUDGET,
+                environment={},
+            )
+        )
+        assert report.results[0].status == "unavailable"
+        assert "probe failed" in report.results[0].detail
+
+
+def test_all_records_failing_is_error_status(tmp_path: Path) -> None:
+    class Erroring(WorkerHandle):
+        def run(self, records: list[Any], params: Any) -> list[Any]:  # type: ignore[override]
+            return [{"id": r["id"], "error": "boom"} for r in records]
+
+    cache = ModelCache(tmp_path / "cache", 10**9, sandbox=False)
+    report = asyncio.run(
+        bench.run_bench(
+            cache,
+            lambda e: Erroring([e]),
+            [fake_entry(TaskType.COMPLETION)],
+            CONFIG,
+            BUDGET,
+            environment={},
+        )
+    )
+    assert all(r.status == "error" and r.error_records == r.records for r in report.results)
+    table = bench.render_table(report)
+    assert "| errors |" in table and "| error (every record failed) | 10 |" in table
+
+
+def test_cache_oserror_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def boom(self: ModelCache, model: ModelEntry) -> None:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(ModelCache, "ensure", boom)
+    report = run(tmp_path, [fake_entry(TaskType.COMPLETION)])
+    assert report.results[0].status == "error"
+    assert "model fetch failed: PermissionError" in report.results[0].detail
+
+
+def _cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory_gb: float = 0.1) -> Path:
+    import minion_executor.main as m
+
+    monkeypatch.setattr(m, "restrict_environ", lambda: None)
+    models = tmp_path / "m.yaml"
+    models.write_text(
+        "models:\n  - {model_id: f, type: embedding, engine: fake, ref: fake, "
+        f"memory_gb: {memory_gb}}}\n"
+    )
+    monkeypatch.setenv("MINION_EXECUTOR_SANDBOX", "0")
+    monkeypatch.setenv("MINION_EXECUTOR_FETCH_SANDBOX", "0")
+    monkeypatch.setenv("MINION_EXECUTOR_MODEL_CACHE_DIR", str(tmp_path / "cache"))
+    return models
+
+
+def test_cli_exit_1_when_no_row_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    models = _cli_env(tmp_path, monkeypatch, memory_gb=1000)
+    result = CliRunner().invoke(
+        app, ["bench", "--models", str(models), "--records", "2", "--batch-sizes", "1"]
+    )
+    assert result.exit_code == 1, result.output
+
+
+def test_cli_out_validated_before_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    models = _cli_env(tmp_path, monkeypatch)
+    target = tmp_path / "real.json"
+    target.write_text("x")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    for bad in (link, tmp_path / "nodir" / "o.json"):
+        result = CliRunner().invoke(app, ["bench", "--models", str(models), "--out", str(bad)])
+        assert result.exit_code == 2, result.output
+    assert target.read_text() == "x"

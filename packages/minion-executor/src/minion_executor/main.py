@@ -19,7 +19,7 @@ import structlog
 import typer
 from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
-from minion_common.schemas import RegisterRequest
+from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
@@ -285,6 +285,23 @@ def status() -> None:
     raise typer.Exit(code=1)
 
 
+def _check_out_path(out: Path) -> None:
+    """Fail before the (long) run if the report cannot be written. Symlinks are refused."""
+    parent = out.parent if str(out.parent) else Path()
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise ValueError(f"--out directory is not a writable directory: {parent}")
+    if out.is_symlink():
+        raise ValueError("--out must not be a symlink")
+    if out.exists() and not out.is_file():
+        raise ValueError("--out must be a regular file")
+
+
+def _write_out(out: Path, text: str) -> None:
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 @app.command()
 def bench(
     models: Annotated[
@@ -323,18 +340,21 @@ def bench(
             pending = [p for p in pending if p.model_id in model]
         if any(e.engine is Engine.FAKE for e in entries):
             _require_dev_for_fake()
+        if out is not None:
+            _check_out_path(out)
         settings = ExecutorSettings()
         fetch_env = FetchEnv.capture()
     except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     # stdout carries only the table; progress logs go to stderr
+    saved_log_config = structlog.get_config()
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
     restrict_environ()  # fetch_env holds the secrets; workers inherit none
     base = budget_for(prof)
     # sweep honestly: the profile's batch cap must not clamp the requested batch sizes
-    budget = base.model_copy(
-        update={"max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
+    budget = Budget.model_validate(
+        {**base.model_dump(), "max_batch_size": max(base.max_batch_size, *config.batch_sizes)}
     )
     engines = list(dict.fromkeys(e.engine for e in entries))
     sandbox = sandbox_policy(settings, engines)
@@ -361,9 +381,13 @@ def bench(
             bench_mod.run_bench(cache, factory, entries, config, budget, pending=pending)
         )
     finally:
-        structlog.reset_defaults()  # do not leave a global logger bound to this stderr
+        structlog.configure(**saved_log_config)  # do not leave a logger bound to this stderr
     typer.echo(bench_mod.render_table(report))
     if out is not None:
-        out.write_text(json.dumps(report.to_json(), indent=2) + "\n", encoding="utf-8")
+        try:
+            _write_out(out, json.dumps(report.to_json(), indent=2) + "\n")
+        except OSError as exc:
+            typer.echo(f"error: cannot write --out: {exc}", err=True)
+            raise typer.Exit(code=1) from None
     if not any(r.status == "ok" for r in report.results):
         raise typer.Exit(code=1)

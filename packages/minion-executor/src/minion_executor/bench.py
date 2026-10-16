@@ -41,6 +41,8 @@ PROBE_TIMEOUT_S = 90.0
 DEFAULT_RECORDS = 256
 DEFAULT_BATCH_SIZES = (1, 8, 32)
 DEFAULT_MAX_TOKENS = 128
+MAX_RECORDS = 100_000
+MAX_BATCH_SIZE = 4096
 LIBRARIES = ("mlx", "mlx-lm", "torch", "transformers", "safetensors")
 
 Status = Literal["ok", "unavailable", "error"]
@@ -117,10 +119,10 @@ class BenchConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if self.records < 1:
-            raise ValueError("records must be >= 1")
-        if not self.batch_sizes or any(b < 1 for b in self.batch_sizes):
-            raise ValueError("batch sizes must be >= 1")
+        if not 1 <= self.records <= MAX_RECORDS:
+            raise ValueError(f"records must be in 1..{MAX_RECORDS}")
+        if not self.batch_sizes or any(not 1 <= b <= MAX_BATCH_SIZE for b in self.batch_sizes):
+            raise ValueError(f"batch sizes must be in 1..{MAX_BATCH_SIZE}")
         if not 1 <= self.max_tokens <= 4096:
             raise ValueError("max_tokens must be in 1..4096")
 
@@ -199,25 +201,35 @@ def parse_batch_sizes(raw: str) -> tuple[int, ...]:
         sizes = tuple(int(p) for p in raw.split(",") if p.strip())
     except ValueError:
         raise ValueError("batch sizes must be comma-separated integers") from None
-    if not sizes or any(s < 1 for s in sizes):
-        raise ValueError("batch sizes must be positive integers")
+    if not sizes or any(not 1 <= s <= MAX_BATCH_SIZE for s in sizes):
+        raise ValueError(f"batch sizes must be integers in 1..{MAX_BATCH_SIZE}")
     return sizes
 
 
 def load_bench_models(path: Path) -> tuple[list[ModelEntry], list[PendingModel]]:
     """Read the bench file: strict `models:` plus optional `pending:` (reported unavailable)."""
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    entries = [ModelEntry.model_validate(m) for m in raw.get("models", [])]
-    pending = [
-        PendingModel(
-            model_id=str(p["model_id"]),
-            type=TaskType(p["type"]),
-            engine=Engine(p["engine"]),
-            ref=str(p["ref"]),
-            reason=str(p.get("reason", "not pinned")),
-        )
-        for p in raw.get("pending", [])
-    ]
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict):
+            raise ValueError("top level must be a mapping")
+        models, pend = raw.get("models") or [], raw.get("pending") or []
+        if not isinstance(models, list) or not isinstance(pend, list):
+            raise ValueError("`models` and `pending` must be lists")
+        entries = [ModelEntry.model_validate(m) for m in models]
+        pending = [
+            PendingModel(
+                model_id=str(p["model_id"]),
+                type=TaskType(p["type"]),
+                engine=Engine(p["engine"]),
+                ref=str(p["ref"]),
+                reason=str(p.get("reason", "not pinned")),
+            )
+            for p in pend
+        ]
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML in bench models file: {type(exc).__name__}") from None
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"invalid bench models file: {type(exc).__name__}: {exc}") from None
     ids = [e.model_id for e in entries] + [p.model_id for p in pending]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate model_id in bench models file")
@@ -270,7 +282,7 @@ def rates(
     records: int, run_s: float, prompt_tokens: int, completion_tokens: int
 ) -> tuple[float | None, float | None, float | None]:
     """`(tok_s, prompt_tok_s, records_per_h)` for a timed run. Token rates are `None` when the
-    engine reported no tokens of that kind (embeddings)."""
+    engine reported no tokens of that kind (e.g. completion tokens for embeddings)."""
     if run_s <= 0:
         return None, None, None
     tok_s = completion_tokens / run_s if completion_tokens else None
@@ -327,7 +339,13 @@ def _bench_one_size(
     res.run_s = run_s
     res.records = len(timed)
     res.error_records = sum(1 for r in done if "error" in r)
-    res.prompt_tokens = _count(done, "prompt_tokens")
+    if res.error_records == res.records:
+        res.status = "error"
+        res.detail = "every record failed"
+    # embedding runners report per-record `tokens` (input tokens); completions `prompt_tokens`
+    res.prompt_tokens = _count(
+        done, "tokens" if entry.type is TaskType.EMBEDDING else "prompt_tokens"
+    )
     res.completion_tokens = _count(done, "completion_tokens")
     res.tok_s, res.prompt_tok_s, res.records_per_h = rates(
         len(timed) - res.error_records, run_s, res.prompt_tokens, res.completion_tokens
@@ -409,7 +427,7 @@ async def _bench_model(
     out: list[BenchResult] = []
     try:
         path = await cache.ensure(entry)
-    except RunnerError as exc:  # ModelFetchError is a RunnerError
+    except (RunnerError, OSError) as exc:  # ModelFetchError is a RunnerError
         return [_failure(entry, "error", f"model fetch failed: {_code(exc)}")]
     try:
         for size in config.batch_sizes:
@@ -450,15 +468,16 @@ def _f(v: float | None, digits: int = 1) -> str:
 def render_table(report: BenchReport) -> str:
     """Markdown table, one row per (model, batch size)."""
     head = (
-        "| model | engine | type | batch | status | load s | run s | tok/s | prompt tok/s "
+        "| model | engine | type | batch | status | errors | load s | run s | tok/s | prompt tok/s "
         "| records/h | engine peak GB | worker RSS peak GB |"
     )
-    lines = [head, "|" + "---|" * 12]
+    lines = [head, "|" + "---|" * 13]
     for r in report.results:
         status = r.status if not r.detail else f"{r.status} ({r.detail})"
         batch = "-" if r.batch_size is None else str(r.batch_size)
         lines.append(
-            f"| {r.model_id} | {r.engine} | {r.type} | {batch} | {status} | {_f(r.load_s, 2)} "
+            f"| {r.model_id} | {r.engine} | {r.type} | {batch} | {status} | {r.error_records} "
+            f"| {_f(r.load_s, 2)} "
             f"| {_f(r.run_s, 2)} | {_f(r.tok_s)} | {_f(r.prompt_tok_s)} | {_f(r.records_per_h, 0)} "
             f"| {_f(r.engine_peak_gb, 2)} | {_f(r.worker_rss_peak_gb, 2)} |"
         )
