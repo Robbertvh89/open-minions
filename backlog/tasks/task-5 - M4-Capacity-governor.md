@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: 'M4: Capacity governor'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-15 17:52'
+updated_date: '2026-10-16 13:19'
 labels:
   - milestone
   - M4
