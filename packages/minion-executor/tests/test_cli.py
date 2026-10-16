@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from minion_common.enums import Engine
 from minion_executor.main import app
@@ -65,7 +67,7 @@ def test_auto_with_no_engines_exits_2_and_never_fake(monkeypatch: pytest.MonkeyP
     _no_restrict(monkeypatch)
     asked: list[list[Engine]] = []
 
-    def none_available(requested: list[Engine]) -> list[Engine]:
+    def none_available(requested: list[Engine], sandbox: object = None) -> list[Engine]:
         asked.append(requested)
         return []
 
@@ -86,7 +88,7 @@ def test_probe_runs_after_environ_restricted_with_short_timeout(
     seen: dict[str, object] = {}
 
     class FakeProbe:
-        def __init__(self, engines: list[Engine]) -> None:
+        def __init__(self, engines: list[Engine], **_kw: object) -> None:
             seen["requested"] = list(engines)
 
         def probe(self, timeout_s: float) -> dict[str, str | None]:
@@ -107,7 +109,7 @@ def test_probe_runner_error_exits_2_without_traceback(monkeypatch: pytest.Monkey
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     _no_restrict(monkeypatch)
 
-    def boom(requested: list[Engine]) -> list[Engine]:
+    def boom(requested: list[Engine], sandbox: object = None) -> list[Engine]:
         raise RunnerError("PROBE_FAILED", "x")
 
     monkeypatch.setattr(m, "probe_available", boom)
@@ -167,7 +169,9 @@ def test_explicit_engines_are_intersected_with_probe(monkeypatch: pytest.MonkeyP
         def stop(self) -> None:
             pass
 
-    monkeypatch.setattr(m, "probe_available", lambda req: [e for e in req if e is Engine.OLLAMA])
+    monkeypatch.setattr(
+        m, "probe_available", lambda req, sandbox=None: [e for e in req if e is Engine.OLLAMA]
+    )
     monkeypatch.setattr(m, "ExecutorLoop", StopLoop)
     result = runner.invoke(app, ["run", "--engines", "mlx,ollama"])
     assert result.exit_code == 0, result.output
@@ -245,7 +249,7 @@ def test_runtime_errors_are_not_mapped_to_exit_2(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     _no_restrict(monkeypatch)
-    monkeypatch.setattr(m, "probe_available", lambda requested: list(requested))
+    monkeypatch.setattr(m, "probe_available", lambda requested, sandbox=None: list(requested))
 
     async def boom(self: object) -> None:
         raise WorkerCrashed("died mid-run")
@@ -263,8 +267,90 @@ def test_probe_failure_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     _no_restrict(monkeypatch)
 
-    def crash(requested: list[Engine]) -> list[Engine]:
+    def crash(requested: list[Engine], sandbox: object = None) -> list[Engine]:
         raise WorkerCrashed("probe died")
 
     monkeypatch.setattr(m, "probe_available", crash)
     assert runner.invoke(app, ["run"]).exit_code == 2
+
+
+def test_sandbox_policy_reaches_probe_and_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_MODEL_CACHE_DIR", str(tmp_path))
+    _no_restrict(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def probe(requested: list[Engine], sandbox: object = None) -> list[Engine]:
+        seen["probe"] = sandbox
+        return [Engine.OLLAMA]
+
+    class StopLoop:
+        def __init__(self, client: object, worker: object, *a: object, **k: object) -> None:
+            seen["worker"] = worker
+
+        async def run(self) -> int:
+            return 0
+
+        def stop(self) -> None:
+            pass
+
+    class Handle:
+        def __init__(self, engines: list[Engine], **kw: object) -> None:
+            seen["handle_sandbox"] = kw.get("sandbox")
+
+    monkeypatch.setattr(m, "probe_available", probe)
+    monkeypatch.setattr(m, "ExecutorLoop", StopLoop)
+    monkeypatch.setattr(m, "WorkerHandle", Handle)
+    assert runner.invoke(app, ["run", "--engines", "ollama"]).exit_code == 0
+    policy = seen["probe"]
+    assert policy is not None and policy.cache_root == tmp_path  # type: ignore[attr-defined]
+    assert seen["handle_sandbox"] == policy
+
+
+def test_sandbox_off_without_dev_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_SANDBOX", "0")
+    monkeypatch.delenv("MINION_EXECUTOR_DEV", raising=False)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 2 and "SANDBOX" in result.output
+
+
+def test_sandbox_off_with_dev_passes_no_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_SANDBOX", "0")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _no_restrict(monkeypatch)
+    seen: list[object] = []
+
+    def probe(requested: list[Engine], sandbox: object = None) -> list[Engine]:
+        seen.append(sandbox)
+        return []
+
+    monkeypatch.setattr(m, "probe_available", probe)
+    assert runner.invoke(app, ["run"]).exit_code == 2  # no engine, but the probe ran
+    assert seen == [None]
+
+
+def test_sandbox_failure_at_probe_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+    from minion_executor.runners.base import RunnerError
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    _no_restrict(monkeypatch)
+
+    class Broken:
+        def __init__(self, engines: list[Engine], **_kw: object) -> None:
+            pass
+
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            raise RunnerError("SANDBOX_FAILED", "sandbox_init: boom")
+
+    monkeypatch.setattr(m, "WorkerHandle", Broken)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 2 and "SANDBOX_FAILED" in result.output

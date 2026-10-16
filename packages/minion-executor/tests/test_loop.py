@@ -148,7 +148,9 @@ class FakeWorker:
         self.ensured: list[tuple[ModelEntry, Budget]] = []
         self.unloads = 0
 
-    def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
+    def ensure_model(
+        self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+    ) -> None:
         self.ensured.append((model, budget))
 
     def unload(self) -> None:
@@ -487,7 +489,9 @@ async def test_success_resets_failure_streak(tmp_path: Path) -> None:
     class Flaky(FakeWorker):
         n = 0
 
-        def ensure_model(self, model: ModelEntry, budget: Budget) -> None:
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
             Flaky.n += 1  # once per assignment
             if Flaky.n in (1, 3):  # fail, succeed, fail: never two failures in a row
                 raise WorkerCrashed("x")
@@ -674,11 +678,11 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     first, second = assignment(), assignment()
     client, s3 = FakeClient([first, second]), FakeS3()
     client.hb_script = [hb_resp(cancel=True)]
-    worker = FakeWorker(block=True)
+    worker, cache = FakeWorker(block=True), _StubCache()
     sleeps: list[float] = []
     loop = make_loop(
         client, worker, s3, tmp_path, sleeps,
-        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []), model_cache=cache,
     )  # fmt: skip
     client.on_empty = loop.stop
     # the second assignment must run normally: the worker stops blocking once interrupted
@@ -692,6 +696,7 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     worker.run = run  # type: ignore[method-assign,assignment]
     assert await loop.run() == 1
     assert worker.interrupted and not worker.killed
+    assert cache.released >= 1  # the interrupted worker no longer holds the pinned model
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire", "complete", "acquire"]
     assert len(s3.puts) == 1  # only the second subtask uploads
     assert len(sleeps) == 1  # only the final empty-queue sleep: no failure backoff for CANCELLED
@@ -1213,3 +1218,212 @@ async def test_idle_unload_disabled_with_zero(tmp_path: Path) -> None:
     client.on_empty = tick
     await loop.run()
     assert worker.unloads == 0
+
+
+class _StubCache:
+    def __init__(self, exc: Exception | None = None, path: Path | None = None) -> None:
+        self.exc, self.path = exc, path
+        self.ensures = 0
+        self.released = 0
+
+    async def ensure(self, model: ModelEntry) -> Path | None:
+        self.ensures += 1
+        if self.exc:
+            raise self.exc
+        return self.path
+
+    def release_in_use(self) -> None:
+        self.released += 1
+
+
+async def test_ensure_model_runner_error_unpins_the_cache(tmp_path: Path) -> None:
+    class W(FakeWorker):
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
+            raise RunnerError("LOAD_FAILED", "x", retryable=False)
+
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), W(), model_cache=cache)
+    assert cache.released >= 1
+    assert next(r for k, r in client.calls if k == "fail").code == "LOAD_FAILED"
+
+
+async def test_model_path_from_cache_reaches_worker(tmp_path: Path) -> None:
+    seen: list[Path | None] = []
+
+    class W(FakeWorker):
+        def ensure_model(
+            self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+        ) -> None:
+            seen.append(model_path)
+
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), W(), model_cache=cache)
+    assert seen == [tmp_path / "snap"] and "complete" in client.kinds()
+
+
+@pytest.mark.parametrize(
+    ("code", "retryable", "release"),
+    [
+        ("MODEL_DOWNLOAD_FAILED", True, True),
+        ("MODEL_DOWNLOAD_FAILED", True, False),
+        ("MODEL_INTEGRITY", True, False),
+        ("MODEL_CACHE_FULL", True, False),
+        ("MODEL_UNSUPPORTED", False, False),
+    ],
+)
+async def test_model_fetch_errors_map_to_release_or_fail(
+    tmp_path: Path, code: str, retryable: bool, release: bool
+) -> None:
+    from minion_executor.model_cache import ModelFetchError
+
+    worker = FakeWorker()
+    cache = _StubCache(ModelFetchError(code, "x", retryable=retryable, release=release))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert worker.ensured == []
+    if release:
+        assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    else:
+        req = next(r for k, r in client.calls if k == "fail")
+        assert (req.code, req.retryable) == (code, retryable)
+
+
+async def test_cache_full_by_loaded_model_unloads_worker_and_retries_once(tmp_path: Path) -> None:
+    from minion_executor.model_cache import MODEL_CACHE_FULL, ModelFetchError
+
+    events: list[str] = []
+
+    class W(FakeWorker):
+        def unload(self) -> None:
+            events.append("unload")
+            super().unload()
+
+    class Cache(_StubCache):
+        async def ensure(self, model: ModelEntry) -> Path | None:
+            events.append("ensure")
+            if self.ensures == 0:
+                self.ensures += 1
+                raise ModelFetchError(MODEL_CACHE_FULL, "x", blocked_by_in_use=True)
+            self.ensures += 1
+            return self.path
+
+        def release_in_use(self) -> None:
+            events.append("release")
+
+    worker = W()
+    cache = Cache(path=tmp_path / "snap")
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert events == ["ensure", "unload", "release", "ensure"]
+    assert "complete" in client.kinds() and "fail" not in client.kinds()
+
+
+async def test_cache_full_that_unloading_cannot_fix_fails_without_looping(
+    tmp_path: Path,
+) -> None:
+    from minion_executor.model_cache import MODEL_CACHE_FULL, ModelFetchError
+
+    worker = FakeWorker()
+    # too large for the cap regardless: not flagged, so no unload and a single ensure
+    cache = _StubCache(ModelFetchError(MODEL_CACHE_FULL, "x"))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert cache.ensures == 1 and worker.unloads == 0
+    assert next(r for k, r in client.calls if k == "fail").code == MODEL_CACHE_FULL
+
+    # flagged on both attempts: retried exactly once, then reported
+    worker2 = FakeWorker()
+    cache2 = _StubCache(ModelFetchError(MODEL_CACHE_FULL, "x", blocked_by_in_use=True))
+    client2, _ = await _run_one(tmp_path, _asn(), worker2, model_cache=cache2)
+    assert cache2.ensures == 2 and worker2.unloads == 1
+    assert next(r for k, r in client2.calls if k == "fail").code == MODEL_CACHE_FULL
+
+
+async def test_stop_during_ensure_cancels_it_releases_once_and_reports_stopped(
+    tmp_path: Path,
+) -> None:
+    from minion_executor.loop import _Outcome
+
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    class HangingCache(_StubCache):
+        async def ensure(self, model: ModelEntry) -> Path | None:
+            self.ensures += 1
+            entered.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return None
+
+    worker, cache = FakeWorker(), HangingCache()
+    client = FakeClient([assignment()])
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], model_cache=cache)
+    outcomes: list[Any] = []
+    handle = loop._handle
+
+    async def spy(a: Assignment, tmp: Path) -> Any:
+        outcomes.append(await handle(a, tmp))
+        return outcomes[-1]
+
+    loop._handle = spy  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert cancelled.is_set()
+    assert outcomes == [_Outcome.STOPPED]
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert cache.released == 1  # pin dropped together with the killed worker
+    assert worker.ensured == []
+
+
+async def test_local_oserror_from_ensure_is_released_as_local_io_error(tmp_path: Path) -> None:
+    worker = FakeWorker()
+    cache = _StubCache(PermissionError("cache dir"))
+    client, _ = await _run_one(tmp_path, _asn(), worker, model_cache=cache)
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert worker.ensured == []
+
+
+async def test_idle_unload_releases_the_cache_pin(tmp_path: Path) -> None:
+    now = [0.0]
+    worker, client = FakeWorker(), FakeClient([])
+    cache = _StubCache()
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], idle_unload_s=60, clock=lambda: now[0],
+        model_cache=cache,
+    )  # fmt: skip
+
+    def tick() -> None:
+        now[0] += 100
+        if worker.unloads:
+            loop.stop()
+
+    client.on_empty = tick
+    await loop.run()
+    assert worker.unloads == 1 and cache.released == 1
+
+
+async def test_uncached_engine_assignment_drops_the_stale_pin(tmp_path: Path) -> None:
+    cache = _StubCache(path=None)  # Ollama / fake: the cache manages nothing
+    await _run_one(tmp_path, _asn(), FakeWorker(), model_cache=cache)
+    assert cache.released >= 1
+
+
+async def test_worker_crash_drops_the_cache_pin(tmp_path: Path) -> None:
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(
+        tmp_path, _asn(), FakeWorker(exc=WorkerCrashed("boom")), model_cache=cache
+    )
+    assert cache.released == 1
+    assert next(r for k, r in client.calls if k == "fail").code == "WORKER_CRASHED"
+
+
+async def test_sandbox_failure_is_released_not_burned(tmp_path: Path) -> None:
+    from minion_executor.worker.sandbox import SANDBOX_FAILED
+
+    client, _ = await _run_one(
+        tmp_path, _asn(), FakeWorker(exc=RunnerError(SANDBOX_FAILED, "x", retryable=True))
+    )
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()

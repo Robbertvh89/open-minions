@@ -115,6 +115,25 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 
 **M3 update (TASK-4.1 S3).** `run --engines auto|mlx,ollama,hf` (default `auto`) probes engines in a worker subprocess and registers/acquires with the available ones; none available exits 2, and `fake` is never implicit (needs `--engines fake` plus `MINION_EXECUTOR_DEV=1`). The loop validates task params (`BAD_PARAMS`, non-retryable), releases subtasks whose engine is not advertised or whose model exceeds the memory budget (`MODEL_NOT_ADMISSIBLE`; always released, bounded server-side by `MINION_RELEASE_LIMIT`). `MODEL_NOT_ADMISSIBLE` and `ENGINE_UNAVAILABLE` (engine missing or not yet implemented on this Mac, also released) are logged executor-side only, because `release` carries no reason body. The loop also honours `RunnerError.retryable`, stamps `model` and `model_revision` on every output line, treats per-record `PROMPT_TOO_LONG` error lines as records (not a subtask failure), and unloads the worker after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600; 0 disables) without work, including after acquire errors such as a server outage (FR-13, invariant 6). The profile's `gpu_duty_cycle` is applied by the worker's static pacer.
 
+**M3 update (TASK-4.2, model cache; FR-12).** MLX/HF models are fetched by the control side in a killable, Seatbelt-sandboxed `spawn` subprocess (network allowed; writes only to its staging dir; no HOME reads, exec, LaunchServices or AppleEvents), pinned to `ModelEntry.revision` and verified (LFS sha256, git blob sha1 for non-LFS files, no symlinks, no `auto_map` in any JSON) before the worker, which is offline and sandboxed (ADR-0009), loads it. Settings: `MINION_EXECUTOR_MODEL_CACHE_DIR` (absolute, `~` expanded), `MINION_EXECUTOR_MODEL_CACHE_GB` (LRU cap, default 50), `MINION_EXECUTOR_MIN_FREE_DISK_GB` (default 10: a download must leave at least max(this, 10% of the disk) free), `MINION_EXECUTOR_DOWNLOAD_TIMEOUT_S`; `MINION_EXECUTOR_FETCH_SANDBOX=0` is dev-only (needs `MINION_EXECUTOR_DEV=1`). A model that is loaded is pinned with a shared `flock`, so no executor process sharing the cache evicts it. Provisioning outcomes (release = `release` call, no retry budget burnt; fail = `fail` with the code):
+
+| Code | Outcome | When |
+|---|---|---|
+| `MODEL_DOWNLOAD_FAILED` | release | network down, proxy error, fetch process died, download timeout |
+| `MODEL_DOWNLOAD_FAILED` | fail, retryable | hub answered with another HTTP error (404, 5xx) |
+| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 403, or 401 when no `HF_TOKEN` is set (this Mac has no valid token) |
+| `MODEL_DOWNLOAD_FAILED` | release, not remembered | hub 401 with `HF_TOKEN` set (bad, expired or revoked token on this Mac; a rotated token works on the next assignment) |
+| `MODEL_INTEGRITY` | fail, retryable | sha256/blob-sha1/size mismatch, file set differs from the hub listing, symlink, hub returned another revision |
+| `MODEL_UNSUPPORTED` | fail, non-retryable | no safetensors, disallowed file type, `auto_map` / bad JSON (would need remote code) |
+| `MODEL_CACHE_FULL` | release, remembered 10 min | model larger than `MODEL_CACHE_GB` |
+| `MODEL_CACHE_FULL` | release (not remembered) | the space is held by models other executor processes have loaded |
+| `MODEL_CACHE_FULL` | release, remembered 10 min | free-disk reserve not met, or `ENOSPC` while downloading/sealing (staging is deleted first) |
+| `MODEL_CACHE_FULL` | internal retry once | the only blocker is this executor's own loaded model: the worker is unloaded and the fetch retried |
+| `SANDBOX_FAILED` | release, remembered 1 h | the fetch sandbox could not be applied (fail closed: nothing is downloaded unconfined) |
+| `LOCAL_IO_ERROR` | release | the cache directory itself is unreadable or unwritable (`OSError` from the cache) |
+
+A 401 with a token set is released rather than failed because the credential is a property of this Mac, not of the subtask; it is not remembered so that fixing the token takes effect at once. "Remembered" means the executor keeps a bounded in-memory (model, revision) to reason map, so repeated assignments of that model are released immediately without network or disk work; the server's `MINION_RELEASE_LIMIT` still bounds how often one subtask bounces. A full or unusable local disk is a property of this Mac, not of the subtask, which is why it is a release and not a (retry-burning) failure.
+
 **M2 update (TASK-3.3).** FR-14 is implemented (heartbeater, 429 non-fatal, cancel and 409 interrupt the worker). FR-17 remains partial.
 
 ### 4.3 Acquisition protocol **[paper]**
@@ -319,6 +338,30 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   to executors. `MINION_S3_PUBLIC_ENDPOINT_URL` (the host that presigned URLs point at) must be `https`
   unless it is a loopback host; the server refuses to start otherwise. Presigned URLs use the configured
   TTL (`MINION_PRESIGN_TTL_S`, default 900 s, max 3600 s).
+- S-10. Inference worker confinement **[ours]** (ADR-0009). Models are fetched by a separate killable
+  subprocess at a pinned revision, safetensors-only, sha256-verified; `HF_TOKEN`, proxy and CA settings
+  reach only that subprocess. The worker is offline (`HF_HUB_OFFLINE=1`) and runs inside a macOS
+  Seatbelt sandbox applied before any engine import: no network (except the loopback Ollama port,
+  granted to Ollama loads only), no process exec, no LaunchServices/AppleEvents/distributed
+  notifications/preferences/foreign signals, Mach lookups deny-default with a six-service Metal and
+  logging allow-list (no Keychain, tccd, pasteboard, WindowServer, mds, nsurlsessiond), writes denied
+  except the worker's tmp dir, a few `/dev` nodes and the Python Metal cache, reads denied for HOME,
+  `/Users`, `/Volumes`, `/private/tmp`, `/private/var/folders`, `/Library` and the Homebrew data
+  dirs (`/opt/homebrew/{var,etc}`, `/usr/local/{var,etc}`) except the current model
+  dir, the Python prefixes/site-packages/editable source roots and the tmp dir. Other processes' launch
+  arguments/environment (`KERN_PROCARGS2`, `process-info`) are unreadable. A self-test after
+  applying the profile aborts the worker (exit 78, mapped to `SANDBOX_FAILED`, released) if HOME is
+  listable, an outside write succeeds, another process's procargs are readable or (worker) an
+  outbound TCP connect to `1.1.1.1:443` is not refused with EPERM/EACCES. The model-fetch child has
+  the same profile with network re-opened only for DNS (mDNSResponder socket), outbound TCP to
+  `*:443` (or the `HF_ENDPOINT` port) and the configured proxy port; loopback (unless the proxy is
+  local) and every other unix socket (docker.sock, SSH agent) are denied; CA bundles are granted as
+  single files, an `SSL_CERT_DIR` under HOME is refused, and its staging dir is size-capped to the
+  hub's listing (`MODEL_INTEGRITY`). If the
+  sandbox cannot be applied the worker fails (`SANDBOX_FAILED`) and `run` exits 2; off macOS only the
+  fake engine runs. `MINION_EXECUTOR_SANDBOX=0` requires `MINION_EXECUTOR_DEV=1`. Residual: the profile
+  is allow-default outside the denied areas, so non-denied system paths (`/etc`, `/opt`, ...) stay
+  readable (ADR-0009).
 
 ## 9. Non-functional requirements
 

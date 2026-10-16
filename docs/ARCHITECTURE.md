@@ -105,6 +105,7 @@ minion_executor/
   worker/
     process.py         # spawns + supervises inference subprocess; IPC via multiprocessing Pipe
     throttle.py        # duty-cycle pacer used inside the worker between steps/batches
+    sandbox.py         # Seatbelt profile (pure build_profile) + sandbox_init via ctypes (ADR-0009)
   runners/             # run INSIDE the worker subprocess only
     base.py            # Runner protocol v2: load(model, path, budget, EngineConfig) /
                        # run(batch, params, StepControl) -> results / memory_in_use() / unload();
@@ -113,7 +114,9 @@ minion_executor/
     mlx_embedding.py   # mlx-embeddings (default)
     ollama.py          # fallback: Ollama HTTP (localhost:11434)
     hf.py              # fallback: transformers / sentence-transformers on mps
-  model_cache.py       # HF hub cache + LRU size bound; Ollama models tracked by tag
+  model_cache.py       # pinned, sha256-verified HF snapshots in a killable fetch subprocess;
+                       # LRU size bound (MINION_EXECUTOR_MODEL_CACHE_GB); Ollama models tracked by tag
+  settings.py          # ExecutorSettings (MINION_EXECUTOR_*): cache, timeouts, idle unload, sandbox
   host.py              # capabilities: chip, unified memory, engines installed
   bench.py             # engine × model throughput / memory benchmark
   io.py                # streaming download/upload via presigned URLs
@@ -123,6 +126,14 @@ minion_executor/
   subprocess* (spawned with `multiprocessing` `spawn`) that owns Metal/MLX and the loaded model. The
   worker is reused across subtasks of the same model and killed to reclaim memory on budget downgrade,
   model switch, idle timeout or crash. Worker crash → subtask reported `fail(retryable=true)`.
+- **Model supply chain and sandbox (ADR-0009).** Before a load, `ModelCache.ensure` fetches the pinned
+  revision in a separate `spawn` subprocess (the only process that gets `HF_TOKEN`/proxy/CA env); a
+  stop or cancel kills it. When the new model fits the cache only if the loaded one goes, the loop
+  unloads the worker, unprotects that model and retries `ensure` once. The worker then starts offline,
+  applies the Seatbelt profile (no HOME, no network but the Ollama loopback port, no exec, no
+  securityd, cache read-only, one tmp dir) and only afterwards imports the engine. A sandboxed worker's
+  grants are fixed per spawn, so every load uses a fresh worker. Sandbox failure is fail-closed
+  (`SANDBOX_FAILED`); the startup probe runs sandboxed, so `run` exits 2 if it is broken.
 - Worker process runs with background QoS / `nice` per `cpu_priority`; MLX allocator limits set at
   model load from `budget.memory_gb`.
 - Uses `caffeinate`-free design: it does **not** prevent sleep. If the Mac sleeps, heartbeats stop and
@@ -464,4 +475,5 @@ token in macOS Keychain.
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
 - [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
 - [ADR-0008](adr/0008-fault-tolerance-reclaim-and-cancel.md): Fault-tolerance deviations: SKIP LOCKED reclaim, budget, lazy cancel, max lease, executor interrupt — **Accepted**
+- [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*

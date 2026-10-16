@@ -55,7 +55,7 @@ mypy_path = "$MYPY_CONFIG_FILE_DIR/migrations"
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*"]
+module = ["testcontainers.*", "mlx", "mlx.*"]  # mlx: optional extra, absent on Linux CI
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -65,5 +65,7 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: needs Docker (Postgres/MinIO via testcontainers)",
+    "macos: needs macOS (Seatbelt sandbox); auto-skipped elsewhere",
+    "model: downloads a real tiny model from the Hugging Face hub (opt in: pytest -m model)",
 ]
 addopts = "--import-mode=importlib"

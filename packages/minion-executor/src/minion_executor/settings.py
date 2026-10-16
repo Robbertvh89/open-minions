@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
-from pydantic import Field
+import os
+from pathlib import Path
+from typing import Self
+
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from minion_executor.model_cache import default_cache_dir
 
 
 class ExecutorSettings(BaseSettings):
@@ -12,3 +18,37 @@ class ExecutorSettings(BaseSettings):
     # Seconds without work before the worker is unloaded to free model memory (invariant 6).
     # 0 disables idle unload.
     idle_unload_s: float = Field(default=600.0, ge=0, allow_inf_nan=False)
+
+    # Model cache (D6). Ollama models live in Ollama's own store and are not counted.
+    model_cache_dir: Path = Field(default_factory=default_cache_dir)
+    model_cache_gb: float = Field(default=50.0, gt=0, allow_inf_nan=False)
+    # Free space that must remain on the cache volume after a download (the larger of this and
+    # 10% of the disk); otherwise the subtask is released with MODEL_CACHE_FULL.
+    min_free_disk_gb: float = Field(default=10.0, ge=0, allow_inf_nan=False)
+    # Wall-clock limit for one model download (fetch subprocess); on expiry the subtask is released.
+    download_timeout_s: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
+
+    # Run the inference worker inside the Seatbelt sandbox (ADR-0009). Turning it off is a dev
+    # escape hatch only and requires MINION_EXECUTOR_DEV=1.
+    sandbox: bool = True
+    # Same for the model-fetch subprocess (network allowed, writes only to its staging dir).
+    fetch_sandbox: bool = True
+
+    @field_validator("model_cache_dir")
+    @classmethod
+    def _cache_dir_absolute(cls, v: Path) -> Path:
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("MINION_EXECUTOR_MODEL_CACHE_DIR must be an absolute path")
+        return v
+
+    @model_validator(mode="after")
+    def _sandbox_off_needs_dev(self) -> Self:
+        dev = os.environ.get("MINION_EXECUTOR_DEV") == "1"
+        if not self.sandbox and not dev:
+            raise ValueError("MINION_EXECUTOR_SANDBOX=0 is only allowed with MINION_EXECUTOR_DEV=1")
+        if not self.fetch_sandbox and not dev:
+            raise ValueError(
+                "MINION_EXECUTOR_FETCH_SANDBOX=0 is only allowed with MINION_EXECUTOR_DEV=1"
+            )
+        return self

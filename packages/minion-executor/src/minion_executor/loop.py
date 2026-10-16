@@ -44,8 +44,10 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
+from minion_executor.model_cache import MODEL_CACHE_FULL, ModelCache, ModelFetchError
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
+from minion_executor.worker.sandbox import SANDBOX_FAILED
 
 log = structlog.get_logger("minion_executor.loop")
 
@@ -102,7 +104,9 @@ def cleanup_stale_tmp(root: Path | None = None) -> int:
 
 
 class Worker(Protocol):
-    def ensure_model(self, model: ModelEntry, budget: Budget) -> None: ...
+    def ensure_model(
+        self, model: ModelEntry, budget: Budget, model_path: Path | None = None
+    ) -> None: ...
     def run(
         self,
         batch: list[Record],
@@ -152,7 +156,9 @@ class ExecutorLoop:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         idle_unload_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
+        model_cache: ModelCache | None = None,
     ) -> None:
+        self._cache = model_cache
         self._client = client
         self._worker = worker
         self._budget = budget
@@ -273,6 +279,8 @@ class ExecutorLoop:
         self._unloaded = True
         try:
             await asyncio.to_thread(self._worker.unload)
+            if self._cache is not None:
+                self._cache.release_in_use()  # unpin: the model is no longer in memory
             log.info("worker_unloaded_idle")
         except Exception as exc:  # a failed unload must not stop the loop
             log.warning("idle_unload_failed", error=type(exc).__name__)
@@ -319,6 +327,8 @@ class ExecutorLoop:
                 if stopper.done():
                     # SIGTERM/stop mid-subtask: reclaim worker memory, hand the subtask back.
                     await asyncio.to_thread(self._worker.kill)
+                    if self._cache is not None:
+                        self._cache.release_in_use()
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
                     await self._release(a, bound)
@@ -377,6 +387,8 @@ class ExecutorLoop:
         """
         if interrupt:  # a signal after the work finished leaves the warm worker alone
             await asyncio.to_thread(self._worker.interrupt)
+            if self._cache is not None:
+                self._cache.release_in_use()  # the killed worker no longer holds the model
         work.cancel()
         await asyncio.gather(work, return_exceptions=True)
         if sig is HeartbeatSignal.CANCEL:
@@ -489,6 +501,27 @@ class ExecutorLoop:
             in_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
 
+    async def _ensure_cached(self, model: ModelEntry) -> Path | None:
+        if self._cache is None:
+            return None
+        try:
+            try:
+                path = await self._cache.ensure(model)
+                if path is None:  # Ollama / fake: nothing cached, so no stale pin on an old model
+                    self._cache.release_in_use()
+                return path
+            except ModelFetchError as exc:
+                if not (exc.code == MODEL_CACHE_FULL and exc.blocked_by_in_use):
+                    raise
+            # The new model fits the cap only if the loaded model's files may go: drop the warm
+            # worker (frees its memory too), unprotect that model and retry once.
+            log.info("model_cache_unload_for_space")
+            await asyncio.to_thread(self._worker.unload)
+            self._cache.release_in_use()
+            return await self._cache.ensure(model)
+        except OSError as exc:  # cache dir unreadable / unwritable: local, not the subtask's fault
+            raise _FailureError(True, "LOCAL_IO_ERROR", type(exc).__name__, release=True) from None
+
     async def _run_batches(
         self, a: Assignment, records: list[Record], hb: Heartbeater, params: TaskParams
     ) -> list[Record]:
@@ -508,7 +541,18 @@ class ExecutorLoop:
             hb.records_done = max(hb.records_done, n)
 
         try:
-            await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
+            model_path = await self._ensure_cached(a.model)
+            try:
+                if model_path is None:
+                    await asyncio.to_thread(self._worker.ensure_model, a.model, self._budget)
+                else:
+                    await asyncio.to_thread(
+                        self._worker.ensure_model, a.model, self._budget, model_path
+                    )
+            except RunnerError:
+                if self._cache is not None:
+                    self._cache.release_in_use()  # a failed load holds no model: unpin it
+                raise
             for i in range(0, len(records), step):
                 batch = records[i : i + step]
                 outputs.extend(
@@ -516,13 +560,16 @@ class ExecutorLoop:
                 )
                 hb.records_done = len(outputs)
         except WorkerCrashed:
+            if self._cache is not None:
+                self._cache.release_in_use()  # the dead worker no longer holds the model
             raise _FailureError(True, "WORKER_CRASHED", "worker process died") from None
         except RunnerError as exc:
             code = exc.code[:64] or "RUNNER_ERROR"
             # Engine missing on this Mac is executor-local: release, don't burn an attempt.
-            raise _FailureError(
-                exc.retryable, code, "runner failed", release=exc.code == ENGINE_UNAVAILABLE
-            ) from None
+            release = exc.code in (ENGINE_UNAVAILABLE, SANDBOX_FAILED) or (
+                isinstance(exc, ModelFetchError) and exc.release
+            )
+            raise _FailureError(exc.retryable, code, "runner failed", release=release) from None
         return outputs
 
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:
