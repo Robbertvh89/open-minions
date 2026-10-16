@@ -9,9 +9,8 @@ from minion_common.enums import Engine, TaskType
 
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, EngineConfig, Runner, RunnerError
 
-# Engines `create_runner` can build. TASK-4.3 adds MLX/Ollama/HF here together with their
-# runners; until then they probe as unavailable so they are never advertised.
-SUPPORTED: frozenset[Engine] = frozenset({Engine.FAKE})
+# Engines `create_runner` can build (a probe still decides which are advertised).
+SUPPORTED: frozenset[Engine] = frozenset({Engine.FAKE, Engine.MLX, Engine.OLLAMA, Engine.HF})
 
 
 def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = False) -> Runner:
@@ -21,11 +20,31 @@ def create_runner(engine: Engine, task_type: TaskType, *, test_hooks: bool = Fal
         from minion_executor.runners.fake import FakeRunner
 
         return FakeRunner(test_hooks=test_hooks)
-    raise RunnerError(ENGINE_UNAVAILABLE, engine.value)  # mlx/ollama/hf land in TASK-4.3
+    if engine is Engine.MLX:
+        if task_type is TaskType.EMBEDDING:
+            from minion_executor.runners.mlx_embedding import MlxEmbeddingRunner
+
+            return MlxEmbeddingRunner()
+        from minion_executor.runners.mlx_completion import MlxCompletionRunner
+
+        return MlxCompletionRunner()
+    if engine is Engine.OLLAMA:
+        from minion_executor.runners.ollama import OllamaRunner
+
+        return OllamaRunner()
+    if engine is Engine.HF:
+        if task_type is TaskType.EMBEDDING:
+            from minion_executor.runners.hf import HfEmbeddingRunner
+
+            return HfEmbeddingRunner()
+        from minion_executor.runners.hf import HfCompletionRunner
+
+        return HfCompletionRunner()
+    raise RunnerError(ENGINE_UNAVAILABLE, engine.value)
 
 
 _PROBE_MODULES: dict[Engine, tuple[str, ...]] = {
-    Engine.MLX: ("mlx.core", "mlx_lm", "mlx_embeddings"),
+    Engine.MLX: ("mlx.core", "transformers", "mlx_lm"),
     Engine.HF: ("torch", "transformers"),
 }
 
@@ -47,16 +66,25 @@ def _probe(engine: Engine, cfg: EngineConfig) -> str | None:
     if engine is Engine.OLLAMA:
         import httpx
 
+        from minion_executor.runners.ollama import check_loopback
+
         try:
-            r = httpx.get(f"{cfg.ollama_url}/api/version", timeout=2.0)
+            url = check_loopback(cfg.ollama_url)
+            r = httpx.get(f"{url}/api/version", timeout=2.0, trust_env=False)
             version = r.json().get("version")
             return str(version) if r.status_code == 200 and version else None
-        except (httpx.HTTPError, ValueError, AttributeError):
+        except (httpx.HTTPError, ValueError, AttributeError, RunnerError):
             return None
+    if engine is Engine.HF:
+        from minion_executor.runners.hf import confine_caches
+
+        confine_caches()
     try:
         mods = [importlib.import_module(m) for m in _PROBE_MODULES[engine]]
     except Exception:  # missing extra, wrong platform, broken install
         return None
+    if engine is Engine.HF and not mods[0].backends.mps.is_available():
+        return None  # torch without the Apple GPU cannot run the hf runners
     return str(getattr(mods[-1], "__version__", "unknown"))
 
 

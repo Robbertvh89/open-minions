@@ -28,7 +28,7 @@ stop sending heartbeats.
 | Server | FastAPI + Pydantic v2, SQLAlchemy 2.x (async) + asyncpg, Alembic migrations |
 | Database | PostgreSQL 16 |
 | Object storage | S3 API (SeaweedFS for local dev) via `boto3`; executors use presigned URLs only |
-| Executor inference | **MLX by default**: `mlx-lm` (batched generation) for completions, `mlx-embeddings` for embeddings. Fallback engines: Ollama HTTP API, HF `transformers` on `mps` — [ADR-0005](docs/adr/0005-mlx-default-inference-engine.md) |
+| Executor inference | **MLX by default**: `mlx-lm` (batched generation) for completions, a small BERT encoder on `mlx` for embeddings (not the heavy `mlx-embeddings` package). Fallback engines: Ollama HTTP API, HF `transformers` on `mps` — [ADR-0005](docs/adr/0005-mlx-default-inference-engine.md) |
 | Executor host integration | `pyobjc` (IOKit / Foundation) for user-idle time, power source, thermal state, memory pressure |
 | Observability | Grafana reading PostgreSQL; structured JSON logs (`structlog`) |
 | Tests | `pytest`, `pytest-asyncio`, `testcontainers` (Postgres, S3) |
@@ -51,7 +51,7 @@ docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
 
 ```bash
 uv sync                                   # install workspace
-uv sync --package minion-executor --extra mlx  # optional: MLX engine (Apple Silicon; extra is per package)
+uv sync --package minion-executor --extra mlx --extra hf  # optional engines: mlx, hf (Apple Silicon; extras are per package)
 cp .env.example .env                      # dev settings (database_url is required)
 docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana
 uv run alembic upgrade head               # migrate
@@ -61,10 +61,11 @@ uv run minion-server-admin --help          # operator CLI (typer); subcommands b
 uv run minion-server-admin generate-api-key --name <who> --teams a,b   # prints key once + keys-file entry
 uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]  # prints token once
 uv run minion-server-admin revoke-executor-token --executor-id <uuid>
-uv run minion-executor run --server http://localhost:8080 --profile balanced [--engines auto|mlx,ollama,hf] [--heartbeat-interval SECONDS]  # heartbeat default 300 s (server timeout >= 2-3x); token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (`--engines auto` (default) probes mlx/ollama/hf in a worker subprocess and advertises what works, exit 2 if none; the `fake` engine is never implicit: `MINION_EXECUTOR_DEV=1 uv run minion-executor run --engines fake ...`; idle worker unloaded after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600, 0 disables); worker runs in a Seatbelt sandbox, `MINION_EXECUTOR_SANDBOX=0` only with `MINION_EXECUTOR_DEV=1`, else exit 2; models fetched by a pinned, sha256-verified fetch subprocess into `MINION_EXECUTOR_MODEL_CACHE_DIR` (LRU cap `MINION_EXECUTOR_MODEL_CACHE_GB`, 50; `HF_TOKEN`/proxy/CA go only to that subprocess; worker runs offline); profiles: light|balanced|full)
-# uv run minion-executor bench --model <id>  # not implemented yet (M3); was: engine/throughput benchmark on this Mac (not implemented yet, M3)
+uv run minion-executor run --server http://localhost:8080 --profile balanced [--engines auto|mlx,ollama,hf] [--heartbeat-interval SECONDS]  # heartbeat default 300 s (server timeout >= 2-3x); token: $MINION_EXECUTOR_TOKEN, else Keychain item open-minions-executor; exit 2 if missing or insecure URL (`--engines auto` (default) probes mlx and hf in a worker subprocess and advertises what works, exit 2 if none; Ollama is opt-in (`--engines ollama`) because its daemon runs outside the sandbox and `/api/pull` writes to `~/.ollama` outside the cache cap (ADR-0009); the `fake` engine is never implicit: `MINION_EXECUTOR_DEV=1 uv run minion-executor run --engines fake ...`; idle worker unloaded after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600, 0 disables); worker runs in a Seatbelt sandbox, `MINION_EXECUTOR_SANDBOX=0` only with `MINION_EXECUTOR_DEV=1`, else exit 2; models fetched by a pinned, sha256-verified fetch subprocess into `MINION_EXECUTOR_MODEL_CACHE_DIR` (LRU cap `MINION_EXECUTOR_MODEL_CACHE_GB`, 50; `HF_TOKEN`/proxy/CA go only to that subprocess; worker runs offline); profiles: light|balanced|full)
+# uv run minion-executor bench --model <id>  # not implemented yet (TASK-4.4): engine/throughput benchmark on this Mac
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only (the `macos` sandbox tests run on darwin, skip elsewhere)
+uv run pytest -m "gpu or model"            # real MLX models on this Mac (mlx extra + network once); auto-skipped elsewhere
 uv run pytest -m model                    # real tiny hub download (network; skipped by default)
 uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py
 ```

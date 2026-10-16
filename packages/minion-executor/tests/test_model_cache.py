@@ -22,7 +22,6 @@ from minion_executor.model_cache import (
     MANIFEST_NAME,
     MODEL_CACHE_FULL,
     MODEL_DOWNLOAD_FAILED,
-    MODEL_INTEGRITY,
     MODEL_UNSUPPORTED,
     SAFE_PATTERNS,
     FetchEnv,
@@ -34,6 +33,7 @@ from minion_executor.model_cache import (
     _HashCancelledError,
     allowed_file,
 )
+from minion_executor.runners.base import MODEL_INTEGRITY
 from minion_executor.worker.process import FORCED_WORKER_ENV, scrub_env
 
 REV = "a" * 40

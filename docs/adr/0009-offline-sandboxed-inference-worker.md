@@ -144,6 +144,42 @@ together with `MINION_EXECUTOR_DEV=1`.
     not enforced).
   - Seatbelt does not filter by hostname; the Ollama grant is a loopback port, so a hostile local
     service on that port is trusted.
+  - **Ollama daemon outside the sandbox (confused deputy).** The Ollama runner only talks HTTP to a
+    loopback daemon. `/api/pull` makes that unsandboxed daemon download weights from its own
+    registry (into `~/.ollama`, outside the model-cache cap), and it then runs inference outside our
+    Seatbelt profile and capacity budget. Therefore **Ollama is opt-in**: `--engines auto` probes
+    mlx and hf only, and Ollama needs `--engines ollama` (or a list containing it). Mitigations: a
+    `ModelEntry` ref must carry an explicit tag and must not name a registry host (a first path
+    segment with `.` or `:`, `localhost`, or an IP is rejected), so pulls come from Ollama's default
+    library; the model is pinned by manifest digest, which the runner checks against `/api/tags`
+    after every load **and after every run** (TOCTOU: a swapped model must not get its outputs
+    stamped). A mismatch is executor-local trouble (this Mac's store), so the subtask is released
+    (`MODEL_INTEGRITY`, retryable, no output stamped) rather than failed. The pull timeout stays
+    below the worker's load timeout, so a large pull is a release, never a killed worker. The
+    runner refuses non-loopback URLs and never logs prompts or responses.
+  - **Ollama deviations.** The daemon cannot return unnormalised embeddings: the server rejects
+    `normalize=false` for ollama models with 422 `INVALID_PARAMS`, and the runner fails it
+    non-retryably (`PARAMS_UNSUPPORTED`; no other engine is tried because the server already
+    refused such tasks). Embedding `tokens` is `prompt_eval_count` per text (one `/api/embed` call
+    each) and can under-report when the prompt cache holds a shared prefix. Over-long prompts are
+    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines); `num_ctx` is the constant
+    `max_prompt_tokens + 4096` (constant so the daemon never reloads for a changed context; the cost
+    is KV cache for that whole window per request). Requests carry a bounded `keep_alive`. The
+    worker unloads the model (`keep_alive: 0`) on idle unload and on a model switch, under a total
+    wall-clock deadline that always ends in a kill (a hostile reply or tick flood cannot keep it
+    alive). After a hard kill (stop, cancel, 409, a failed or timed-out step, a model switch) the control side sends a best-effort
+    `keep_alive: 0` (short timeout, `trust_env=False`); if that fails the daemon drops the weights
+    when `keep_alive` expires (at most 300 s). A budget downgrade (M4) will reuse the same path.
+    Load-phase 5xx and transport errors are releases (the daemon is this Mac's problem); a run-phase
+    404 (model removed locally) is a release too.
+  - MLX workers are spawned with `USE_TORCH=0`, so `transformers` (used only for tokenisation) never
+    imports `torch`; MLX loads pass `trust_remote_code=False` and `local_files_only` explicitly.
+  - The HF runner (`torch` 2.14 / `transformers` 5.20 on `mps`) runs under the same profile with
+    **no extra grants**: weights load from the read-only model dir, and every cache variable
+    torch/transformers might write (`TORCH_HOME`, `TORCHINDUCTOR_CACHE_DIR`, `XDG_CACHE_HOME`,
+    `HF_MODULES_CACHE`, ...) is pointed into the worker tmp dir by `runners/hf.confine_caches`
+    before `import torch`, with `torch.compile`/dynamo disabled. MPSGraph logs a harmless
+    "Error creating directory" for its debug dumps; it also does so unsandboxed.
   - The profile is validated on macOS 27 / Apple Silicon with mlx 0.32 only; other macOS releases may
     need extra allows (the failure mode is `SANDBOX_FAILED`/engine error, never silent widening).
 - **`sandbox_init` is deprecated** by Apple. It is still shipped and is what Chromium, Firefox and

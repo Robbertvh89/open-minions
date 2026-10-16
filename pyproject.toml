@@ -55,8 +55,15 @@ mypy_path = "$MYPY_CONFIG_FILE_DIR/migrations"
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*", "mlx", "mlx.*"]  # mlx: optional extra, absent on Linux CI
+module = ["testcontainers.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# mlx/mlx_lm: optional extra, absent on Linux CI. follow_imports=skip makes the Mac (extras
+# installed) and CI (absent) type-check identically instead of depending on the libs' own hints.
+module = ["mlx", "mlx.*", "mlx_lm", "mlx_lm.*", "transformers", "transformers.*", "torch", "torch.*", "safetensors", "safetensors.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 testpaths = ["packages"]
@@ -66,6 +73,8 @@ asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: needs Docker (Postgres/MinIO via testcontainers)",
     "macos: needs macOS (Seatbelt sandbox); auto-skipped elsewhere",
+    "gpu: needs an Apple GPU and the mlx extra (pytest -m gpu); auto-skipped unless selected/available",
+    "ollama: needs a live local Ollama daemon (opt in: pytest -m ollama); auto-skipped otherwise",
     "model: downloads a real tiny model from the Hugging Face hub (opt in: pytest -m model)",
 ]
 addopts = "--import-mode=importlib"

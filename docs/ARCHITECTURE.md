@@ -110,8 +110,10 @@ minion_executor/
     base.py            # Runner protocol v2: load(model, path, budget, EngineConfig) /
                        # run(batch, params, StepControl) -> results / memory_in_use() / unload();
                        # worker ops also include probe (engine versions) and stats
-    mlx_completion.py  # mlx-lm BatchGenerator (default)
-    mlx_embedding.py   # mlx-embeddings (default)
+    prompts.py         # pure: record -> chat messages / embedding text, BAD_INPUT rules
+    mlx_common.py      # memory/wired-limit levers (invariant 6), OOM detection, pooling mode
+    mlx_completion.py  # mlx-lm BatchGenerator (default); checkpoint() every step
+    mlx_embedding.py   # BERT encoder on mlx (no mlx-embeddings: its mlx-vlm/audio tree is huge)
     ollama.py          # fallback: Ollama HTTP (localhost:11434)
     hf.py              # fallback: transformers / sentence-transformers on mps
   model_cache.py       # pinned, sha256-verified HF snapshots in a killable fetch subprocess;
@@ -141,8 +143,8 @@ minion_executor/
 
 #### Executor implementation (M1, TASK-2.3)
 Implemented: `main.py` (`run`), `loop.py`, `io.py`, `secrets.py`, `capacity/profiles.py`,
-`runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Not yet: governor/signals, MLX/Ollama/HF
-runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
+`runners/{base,fake}.py`, `worker/process.py`, `heartbeat.py` (TASK-3.3). Later: MLX/Ollama/HF runners (TASK-4.3,
+listed under the worker bullets below). Not yet: governor/signals, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
 
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
   `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
@@ -188,8 +190,8 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   clients are built (they read proxy env at construction) and before any spawn, so the control
   process itself holds no `HF_TOKEN`/`AWS_*`/`DATABASE_URL`,
   bounded IPC messages (`max_message_bytes`, oversize = crash) and exits by itself if the control
-  process dies (parent-pid watch). Only the fake runner exists in M1 (`runners/fake.py`, engine
-  `fake`, never advertised as a real engine); its `fail` / `sleep_s` / `echo_env` per-record hooks
+  process dies (parent-pid watch). Runners: `mlx` (completion and embedding), `ollama` (opt-in, loopback only), `hf` (mps)
+  (all TASK-4.3) and the test-only `fake` (`runners/fake.py`, never advertised as a real engine). The fake's `fail` / `sleep_s` / `echo_env` per-record hooks
   work only when constructed with `test_hooks=True` and use fixed codes. Inference never runs in the
   control process (invariant 7).
 - **Profiles** (`capacity/profiles.py`, FR-51): static `light` / `balanced` (default) / `full`.
@@ -200,7 +202,7 @@ runners, `status`/`bench` (stub), `register`/`prefer`/`pause` CLI commands.
   Token is never logged. `run` exits 2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
   missing token or unknown runner. The token is removed from `os.environ` right after loading, before
-  any child process. `--engines auto` (default) or a list such as `mlx,ollama`: after the environ is
+  any child process. `--engines auto` (default; probes mlx and hf, Ollama is opt-in) or a list such as `mlx,ollama`: after the environ is
   restricted, a short-lived worker subprocess (90 s timeout) probes which engines work (only engines
   `create_runner` implements, see `runners.SUPPORTED`) and the executor registers with those; none
   available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden

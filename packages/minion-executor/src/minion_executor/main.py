@@ -22,7 +22,7 @@ from minion_executor.capacity.profiles import PROFILES, budget_for, parse_profil
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
-from minion_executor.runners.base import RunnerError
+from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
@@ -52,9 +52,14 @@ DEV_ENV = "MINION_EXECUTOR_DEV"
 TEST_HOOKS_ENV = "MINION_EXECUTOR_TEST_HOOKS"
 SERVER_TIMEOUT_ENV = "MINION_HEARTBEAT_TIMEOUT_S"  # server/watchdog setting; optional sanity check
 MIN_TIMEOUT_FACTOR = 2.0
-REAL_ENGINES = [Engine.MLX, Engine.OLLAMA, Engine.HF]
+# `--engines auto` never includes Ollama: its daemon runs outside our sandbox and `/api/pull`
+# writes to ~/.ollama outside the cache cap, so it needs an explicit `--engines ollama` (ADR-0009).
+AUTO_ENGINES = [Engine.MLX, Engine.HF]
+MAX_KEEP_ALIVE_S = 300
 NO_ENGINE_MSG = (
-    "no inference engine available (mlx/ollama/hf runners land in a later release; "
+    "no inference engine available (on Apple Silicon install the MLX extra: "
+    "`uv sync --package minion-executor --extra mlx` (or `--extra hf`), or start Ollama and pass "
+    "`--engines ollama`; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )
 
@@ -80,7 +85,7 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
         _require_dev_for_fake()
         return [Engine.FAKE]
     if engines.strip().lower() == "auto":
-        return list(REAL_ENGINES)
+        return list(AUTO_ENGINES)
     out: list[Engine] = []
     for name in (n.strip().lower() for n in engines.split(",")):
         try:
@@ -97,6 +102,12 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
 
 
 PROBE_TIMEOUT_S = 90.0
+
+
+def keep_alive_s(idle_unload_s: float) -> int:
+    """How long Ollama may keep a model after a request: the idle unload time, capped. With idle
+    unload disabled (0) it still gets a short bounded value, never "forever"."""
+    return max(1, min(int(idle_unload_s), MAX_KEEP_ALIVE_S)) if idle_unload_s > 0 else 60
 
 
 def sandbox_policy(settings: ExecutorSettings, engines: list[Engine]) -> SandboxPolicy | None:
@@ -184,6 +195,7 @@ async def _run(
             nice=PROFILES[profile].nice,
             test_hooks=hooks,
             sandbox=sandbox_policy(settings, available),
+            engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
         loop = ExecutorLoop(
             client,
@@ -223,7 +235,10 @@ def run(
     engines: Annotated[
         str,
         typer.Option(
-            help="Engines to offer: auto (probe mlx, ollama, hf) or a list such as mlx,ollama"
+            help=(
+                "Engines to offer: auto (probe mlx and hf; Ollama is opt-in) "
+                "or a list such as mlx,ollama"
+            )
         ),
     ] = "auto",
     runner: Annotated[

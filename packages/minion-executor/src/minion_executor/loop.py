@@ -566,9 +566,7 @@ class ExecutorLoop:
         except RunnerError as exc:
             code = exc.code[:64] or "RUNNER_ERROR"
             # Engine missing on this Mac is executor-local: release, don't burn an attempt.
-            release = exc.code in (ENGINE_UNAVAILABLE, SANDBOX_FAILED) or (
-                isinstance(exc, ModelFetchError) and exc.release
-            )
+            release = exc.code in (ENGINE_UNAVAILABLE, SANDBOX_FAILED) or exc.release
             raise _FailureError(exc.retryable, code, "runner failed", release=release) from None
         return outputs
 

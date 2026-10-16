@@ -405,6 +405,20 @@ async def test_complete_non_stale_409_is_discarded(tmp_path: Path) -> None:
     assert client.kinds().count("complete") == 1
 
 
+async def test_runner_release_error_releases_without_failing(tmp_path: Path) -> None:
+    from minion_executor.runners.base import RunnerError
+
+    class RelWorker(FakeWorker):
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
+            raise RunnerError("MODEL_INTEGRITY", "x", release=True)
+
+    client = FakeClient([assignment()])
+    loop = make_loop(client, RelWorker(), FakeS3(), tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+
+
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
     class ShortWorker(FakeWorker):
         def run(self, batch: list[Record], *_: Any) -> list[Record]:
@@ -1152,7 +1166,7 @@ async def test_budget_duty_cycle_reaches_worker(tmp_path: Path) -> None:
 
 async def test_engine_not_advertised_or_too_big_is_always_released(tmp_path: Path) -> None:
     worker = FakeWorker()
-    a = _asn(model={**MODEL, "engine": "ollama", "revision": "sha256:" + "b" * 64})
+    a = _asn(model={**MODEL, "engine": "ollama", "ref": "o/m:t", "revision": "b" * 64})
     client, _ = await _run_one(tmp_path, a, worker)
     assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
     assert worker.ensured == []

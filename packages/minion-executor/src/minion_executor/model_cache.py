@@ -47,7 +47,7 @@ from minion_common.enums import Engine
 from minion_common.schemas import ModelEntry
 from pydantic import SecretStr
 
-from minion_executor.runners.base import RunnerError
+from minion_executor.runners.base import MODEL_INTEGRITY, RunnerError
 from minion_executor.worker import sandbox as seatbelt
 
 log = structlog.get_logger(__name__)
@@ -65,7 +65,6 @@ SAFE_PATTERNS: tuple[str, ...] = (
 )
 
 MODEL_DOWNLOAD_FAILED = "MODEL_DOWNLOAD_FAILED"
-MODEL_INTEGRITY = "MODEL_INTEGRITY"
 MODEL_CACHE_FULL = "MODEL_CACHE_FULL"
 MODEL_UNSUPPORTED = "MODEL_UNSUPPORTED"
 

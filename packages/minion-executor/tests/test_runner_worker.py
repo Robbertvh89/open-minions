@@ -8,6 +8,7 @@ import threading
 import time
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from minion_common.enums import CapacityProfile, Engine, TaskType
@@ -98,15 +99,18 @@ def test_fake_memory_in_use_zeros() -> None:
     assert _fake().memory_in_use() == {"active_bytes": 0, "peak_bytes": 0}
 
 
-def test_unavailable_engine_and_unknown() -> None:
-    with pytest.raises(RunnerError) as ei:
-        create_runner(Engine.MLX, TaskType.EMBEDDING)  # real engines land in TASK-4.3
-    assert ei.value.code == "ENGINE_UNAVAILABLE"
+def test_missing_hf_extra_is_never_advertised_and_unknown_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
     from minion_executor.runners import probe_engines
 
-    # not implemented => never advertised, even if the module imports / the daemon answers
-    probed = probe_engines([Engine.MLX, Engine.OLLAMA, Engine.HF, Engine.FAKE], EngineConfig())
-    assert probed == {"mlx": None, "ollama": None, "hf": None, "fake": "fake"}
+    def no_module(name: str) -> object:
+        raise ImportError(name)
+
+    monkeypatch.setattr(importlib, "import_module", no_module)
+    assert probe_engines([Engine.HF, Engine.FAKE], EngineConfig()) == {"hf": None, "fake": "fake"}
     with pytest.raises(ValueError):
         Engine("nope")
 
@@ -582,6 +586,206 @@ def test_stats_and_unload() -> None:
         w.close()
 
 
+def test_unload_asks_the_worker_to_unload_before_the_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner gets a graceful `unload` op (Ollama `keep_alive: 0`) with a short timeout."""
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(), BUDGET)
+        proc = w._proc
+        assert proc is not None
+        sent: list[tuple[str, float]] = []
+        real_call = w._call
+
+        def spy(msg: dict[str, object], timeout_s: float, **kw: object) -> dict:  # type: ignore[type-arg]
+            sent.append((str(msg["op"]), timeout_s))
+            assert kw.get("hard_deadline") is not None  # ticks cannot extend the unload
+            return real_call(msg, timeout_s, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(w, "_call", spy)
+        w.unload()
+        assert sent == [("unload", 5.0)]
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        w.close()
+
+
+def test_unload_still_kills_when_the_graceful_unload_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(), BUDGET)
+        proc = w._proc
+        assert proc is not None
+
+        def hang(*a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            raise WorkerCrashed("worker timed out")
+
+        monkeypatch.setattr(w, "_call", hang)
+        w.unload()
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        w.close()
+
+
+def test_unload_without_a_model_does_not_spawn_a_worker() -> None:
+    w = WorkerHandle([Engine.FAKE])
+    w.unload()
+    assert w.pid is None
+
+
+def test_worker_unload_op_drops_the_runner_and_release_flag_crosses_the_pipe() -> None:
+    import multiprocessing as mp
+
+    from minion_executor.worker.process import DEFAULT_MAX_MESSAGE_BYTES, _recv, _send, worker_main
+
+    parent, child = mp.get_context("spawn").Pipe()
+    t = threading.Thread(target=worker_main, args=(child, ["fake"]), daemon=True)
+    t.start()
+
+    def call(msg: dict[str, object]) -> dict[str, object]:
+        _send(parent, msg)
+        assert parent.poll(10)
+        return _recv(parent, DEFAULT_MAX_MESSAGE_BYTES)
+
+    model = _model().model_dump(mode="json")
+    assert call({"op": "load", "model": model, "budget": BUDGET.model_dump(mode="json")})["ok"]
+    assert call({"op": "unload"}) == {"ok": True, "result": None}
+    assert call({"op": "run", "batch": [], "params": {}})["code"] == "not_loaded"
+    assert call({"op": "shutdown"})["ok"]
+    t.join(5)
+
+
+def test_runner_error_release_flag_crosses_the_pipe() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(_model(TaskType.COMPLETION, "c"), BUDGET)
+        with pytest.raises(RunnerError) as ei:
+            w.run([{"id": 1, "fail": "x", "release": True}])
+        assert ei.value.release is True
+        with pytest.raises(RunnerError) as ei:
+            w.run([{"id": 1, "fail": "x"}])
+        assert ei.value.release is False
+    finally:
+        w.close()
+
+
+def test_model_integrity_error_resets_the_worker() -> None:
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(_model(), BUDGET)
+        assert w.pid is not None
+
+        def boom(*a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            raise RunnerError("MODEL_INTEGRITY", "x", release=True)
+
+        w._call = boom  # type: ignore[method-assign]
+        with pytest.raises(RunnerError):
+            w.run([])
+        assert w.pid is None
+    finally:
+        w.close()
+
+
+def test_model_switch_sends_unload_before_the_respawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_model(mid="a"), BUDGET)
+        first = w._proc
+        assert first is not None
+        ops: list[str] = []
+        real_call = w._call
+
+        def spy(msg: dict, *a: object, **k: object) -> dict:  # type: ignore[type-arg]
+            ops.append(str(msg["op"]))
+            return real_call(msg, *a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(w, "_call", spy)
+        w.ensure_model(_model(mid="b"), BUDGET)
+        assert ops == ["unload", "load"]
+        assert not first.is_alive() and w.loaded_model_id == "b"
+    finally:
+        w.close()
+
+
+def _hostile_worker(mode: str) -> tuple[WorkerHandle, BaseProcess]:
+    """A handle whose 'worker' is a thread-less fake pipe peer misbehaving on `unload`."""
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    proc = w._proc
+    assert proc is not None
+    real_send_conn = w._conn
+
+    class Peer:
+        """Replaces the control-side Connection: answers `unload` hostilely."""
+
+        def __init__(self) -> None:
+            self.sent = 0
+
+        def send_bytes(self, data: bytes) -> None:
+            self.sent += 1
+
+        def poll(self, timeout: float = 0.0) -> bool:
+            time.sleep(min(timeout, 0.01))
+            return True
+
+        def recv_bytes(self, maxlength: int) -> bytes:
+            return {
+                "list": b"[]",
+                "no_ok": b'{"result": 1}',
+                "garbage": b"not json",
+                "ticks": b'{"tick": 1}',
+            }[mode]
+
+        def close(self) -> None:
+            if real_send_conn is not None:
+                real_send_conn.close()
+
+    w._conn = Peer()  # type: ignore[assignment]
+    return w, proc
+
+
+@pytest.mark.parametrize("mode", ["list", "no_ok", "garbage", "ticks"])
+def test_hostile_unload_reply_still_kills_the_worker_within_the_deadline(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.worker.process as wp
+
+    monkeypatch.setattr(wp, "UNLOAD_TIMEOUT_S", 0.5)
+    w, proc = _hostile_worker(mode)
+    t0 = time.monotonic()
+    w.unload()
+    assert time.monotonic() - t0 < 5
+    assert not proc.is_alive() and w.pid is None
+
+
+def test_kill_releases_an_ollama_model_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append((url, ref)))
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "qwen2.5:0.5b"
+    w.interrupt()
+    w.kill()
+    assert seen and seen[0][1] == "qwen2.5:0.5b"
+    w.close()
+
+
+def test_mlx_workers_get_use_torch_off_and_others_do_not() -> None:
+    w = WorkerHandle([Engine.MLX, Engine.HF])
+    assert w._engine_env == {}
+    mlx = ModelEntry(
+        model_id="m", type=TaskType.EMBEDDING, engine=Engine.MLX, ref="o/m",
+        revision="a" * 40, memory_gb=1,
+    )  # fmt: skip
+    w._call = lambda *a, **k: {"ok": True}  # type: ignore[method-assign]
+    w.ensure_model(mlx, BUDGET)
+    assert w._engine_env == {"USE_TORCH": "0"}
+    hf = mlx.model_copy(update={"engine": Engine.HF, "model_id": "h"})
+    w.ensure_model(hf, BUDGET)
+    assert w._engine_env == {}
+
+
 def test_worker_run_without_load_and_prompt_too_long() -> None:
     w = WorkerHandle([Engine.FAKE], engine_config=EngineConfig(max_prompt_tokens=300))
     try:
@@ -640,3 +844,117 @@ def test_probe_sandbox_spec_carries_the_ollama_port(
     monkeypatch.setattr(no_ollama, "_ensure_started", lambda: None)
     spec = no_ollama._sandbox_spec(None, None)
     assert spec is not None and spec["ollama_port"] is None
+
+
+# -- adversarial workers: partial frames must not defeat the deadlines --------------------------
+def _adversary(conn: object, mode: str) -> None:  # runs in a forked child
+    import struct
+
+    c: Any = conn
+    c.recv_bytes()  # the request
+    fd = c.fileno()
+    if mode == "drip":
+        for b in struct.pack("!i", 12) + b'{"ok": true}':
+            os.write(fd, bytes([b]))
+            time.sleep(1.0)
+    elif mode == "header":
+        os.write(fd, b"\x00\x00")
+    elif mode == "body":
+        for _ in range(3):
+            c.send_bytes(b'{"tick": 1}')
+            time.sleep(0.1)
+        os.write(fd, struct.pack("!i", 100) + b"abc")
+    elif mode == "huge":
+        os.write(fd, struct.pack("!i", 64 * 1024 * 1024))
+    time.sleep(60)
+
+
+def _adversarial_handle(mode: str, step_timeout_s: float) -> tuple[WorkerHandle, BaseProcess]:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_adversary, args=(child, mode), daemon=True)
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE], step_timeout_s=step_timeout_s)
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    return w, proc
+
+
+@pytest.mark.parametrize("mode", ["drip", "header", "body", "huge"])
+def test_partial_frame_stall_on_unload_ends_in_a_kill_within_the_deadline(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.worker.process as wp
+
+    monkeypatch.setattr(wp, "UNLOAD_TIMEOUT_S", 1.0)
+    w, proc = _adversarial_handle(mode, 300.0)
+    t0 = time.monotonic()
+    w.unload()
+    assert time.monotonic() - t0 < 4
+    assert not proc.is_alive() and w.pid is None
+
+
+@pytest.mark.parametrize("mode", ["drip", "header", "body", "huge"])
+def test_partial_frame_stall_on_run_ends_in_a_kill_within_the_step_timeout(mode: str) -> None:
+    w, proc = _adversarial_handle(mode, 1.0)
+    t0 = time.monotonic()
+    with pytest.raises(WorkerCrashed):
+        w.run([{"id": 1}])
+    assert time.monotonic() - t0 < 4
+    assert not proc.is_alive() and w.pid is None
+
+
+def test_deeply_nested_json_reply_is_a_crash_not_an_exception() -> None:
+    w, proc = _hostile_worker("garbage")
+    depth = 200_000
+    real = w._conn
+
+    class Nest:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+        def poll(self, timeout: float = 0.0) -> bool:
+            return True
+
+        def send_bytes(self, data: bytes) -> None:
+            pass
+
+        def recv_bytes(self, maxlength: int) -> bytes:
+            return b"[" * depth + b"]" * depth
+
+    w._conn = Nest()  # type: ignore[assignment]
+    with pytest.raises(WorkerCrashed):
+        w.run([{"id": 1}])
+    assert not proc.is_alive()
+
+
+def test_run_requires_a_list_of_dicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    proc = w._proc
+    assert proc is not None
+    monkeypatch.setattr(w, "_call", lambda *a, **k: {"ok": True, "result": [1, 2]})
+    with pytest.raises(WorkerCrashed, match="malformed"):
+        w.run([{"id": 1}])
+    assert not proc.is_alive()
+
+
+def test_hard_reset_releases_an_ollama_model_and_graceful_unload_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[str] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append(ref))
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "q:1"
+    w._reset()  # e.g. a timed-out step
+    assert seen == ["q:1"]
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "q:2"
+    w.unload()  # worker's runner released it already
+    assert seen == ["q:1"]
+    w.close()
