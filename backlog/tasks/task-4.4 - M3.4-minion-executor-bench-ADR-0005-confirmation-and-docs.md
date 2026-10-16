@@ -1,10 +1,10 @@
 ---
 id: TASK-4.4
 title: 'M3.4: minion-executor bench, ADR-0005 confirmation and docs'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-16 13:09'
+updated_date: '2026-10-16 13:18'
 labels:
   - M3
 dependencies:

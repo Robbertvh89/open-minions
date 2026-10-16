@@ -1,10 +1,10 @@
 ---
 id: TASK-4
 title: 'M3: Real inference + engine benchmark'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-16 00:52'
+updated_date: '2026-10-16 13:18'
 labels:
   - milestone
   - M3
@@ -20,7 +20,7 @@ MLX completion (BatchGenerator) and embedding runners, Ollama/HF fallbacks, mode
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 bench reports tok/s, records/h, peak memory for mlx vs ollama vs hf on same model
+- [x] #1 bench reports tok/s, records/h, peak memory for mlx vs hf on same model (Ollama measurement deferred to TASK-13 by project decision; results in docs/bench/)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -449,11 +449,5 @@ Also: `backlog task edit 9 --notes "Items #1 (revision pin) and #3 (params allow
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Carry-over from M1 (TASK-2.3 reviews): (1) Runner protocol needs per-step cancel/pause hook (duty cycling), streaming/progress, memory_in_use() before real engines; (2) worker sandboxing (sandbox-exec profile or separate user) — compromised model code can read Keychain/~/.aws as same user; (3) worker env allowlist must gain proxy/CA (HTTPS_PROXY, SSL_CERT_FILE/REQUESTS_CA_BUNDLE), HF_HUB_*/HF_ENDPOINT/HF_TOKEN, OLLAMA_HOST handling — decide on credential-bearing proxy URLs (TODO(M3) in worker/process.py); (4) default --runner mlx currently exits 2 'unknown runner' — M3 must ship it; (5) separate load/run timeouts sized for large MLX loads; (6) TASK-9 model revision pinning.
-
-Orchestrator decisions on plan open questions (2026-10-15): (1) model revision NOT stored on task in M3 — output lines carry model + model_revision; new revision = new model id; (2) over-long prompt → per-record error line (SPEC FR-6 change), not subtask failure; (3) static GPU duty-cycle throttle via per-step hook ships in M3 (invariant 6); (4) credential-bearing proxy URLs allowed ONLY for the fetch subprocess, never worker/logs; (5) NO macOS CI job for now (cost decision left to user) — sandbox/gpu/model tests run locally during verify. Also: evaluate avoiding mlx-embeddings if its mlx-vlm dependency tree (opencv, fastapi, mlx-audio) cannot be trimmed — own pooling on mlx is acceptable (record in ADR). Ollama not installed on this Mac: needed for AC#1 bench (TASK-4.4) — ask user before installing.
-
-TASK-4.2 (model cache, fetch subprocess, worker sandbox) is done. Ready for TASK-4.3: the Ollama loopback port is passed to the worker sandbox (ollama_port) and the SUPPORTED hook in runners/__init__.py gates which engines probe as available.
-
-TASK-4.3 done (MLX, Ollama, HF runners). Informal throughput on M3 Pro, not a bench result: mlx Qwen2.5-0.5B-4bit about 1000 tok/s at batch 8, about 1800 tok/s at batch 32, peak 0.63 GB; mlx bge-small about 920 records/s.
+M3 done: TASK-4.1..4.4 merged (PRs #12-#15). Bench: docs/bench/m3-apple-m3-pro.md; ADR-0005 confirmed. Ollama bench deferred to TASK-13.
 <!-- SECTION:NOTES:END -->
