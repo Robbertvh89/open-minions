@@ -175,9 +175,13 @@ def _read_safely(path: Path) -> bytes:
         _check_mode(st, "config", path)
         try:
             # Symlinks are followed on purpose (dotfile managers); check the link's directory
-            # and the target's directory.
-            real_parent = Path(os.path.realpath(path)).parent
-            for d in dict.fromkeys((path.parent, real_parent)):
+            # and the final target's directory (not intermediate hops of a link chain). The
+            # resolved target must be the file we opened, else the link changed underneath us.
+            real = Path(os.path.realpath(path))
+            rst = real.stat()
+            if (rst.st_dev, rst.st_ino) != (st.st_dev, st.st_ino):
+                raise ConfigError(f"config {path} changed while being read")
+            for d in dict.fromkeys((path.parent, real.parent)):
                 _check_mode(d.stat(), "config directory", d)
         except OSError as exc:
             raise ConfigError(f"cannot stat config directory: {exc.strerror}") from None

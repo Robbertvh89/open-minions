@@ -198,7 +198,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   plus `custom` (defined in `executor.toml`). Memory is `min(fraction, 75 %) × RAM` (also for
   `custom`), sent in `Budget`. `Budget.cpu_priority` (`background|low|normal`) is on the wire and
   the worker/fetch `nice` is derived from it (15 / 10 / 0; unknown counts as `low`).
-  `executor.toml` (`~/.config/minion/executor.toml` or `$MINION_EXECUTOR_CONFIG`) must be owned by
+  `executor.toml` (`~/.config/minion/executor.toml` or `$MINION_EXECUTOR_CONFIG`; an empty value counts as unset) must be owned by
   the user and not group/world-writable; unknown keys are errors. `run` without `--profile` is
   adaptive: it starts on the file's `active_profile` (default `light`; the bare run used to be
   `balanced`). `custom` is accepted when `[profiles.custom]` is defined.

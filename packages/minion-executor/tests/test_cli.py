@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from minion_common.enums import CapacityProfile, CpuPriority, Engine
+from minion_common.schemas import Budget
 from minion_executor.main import app
 from typer.testing import CliRunner
 
@@ -68,7 +69,8 @@ def test_run_custom_profile_from_config(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.exit_code == 0, result.output
     assert seen["profile"] == "custom"
     budget = seen["budget"]
-    assert (budget.memory_gb, budget.cpu_priority) == (6, CpuPriority.LOW)  # type: ignore[attr-defined]
+    assert isinstance(budget, Budget)
+    assert (budget.memory_gb, budget.cpu_priority) == (6, CpuPriority.LOW)
 
 
 def test_run_without_profile_is_adaptive_and_starts_on_active_profile(
