@@ -125,7 +125,7 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 | `MODEL_DOWNLOAD_FAILED` | release, not remembered | hub 401 with `HF_TOKEN` set (bad, expired or revoked token on this Mac; a rotated token works on the next assignment) |
 | `MODEL_INTEGRITY` | fail, retryable | sha256/blob-sha1/size mismatch, file set differs from the hub listing, symlink, hub returned another revision |
 | `MODEL_UNSUPPORTED` | fail, non-retryable | no safetensors, disallowed file type, `auto_map` / bad JSON (would need remote code) |
-| `MODEL_CACHE_FULL` | release, remembered 1 h | model larger than `MODEL_CACHE_GB` |
+| `MODEL_CACHE_FULL` | release, remembered 10 min | model larger than `MODEL_CACHE_GB` |
 | `MODEL_CACHE_FULL` | release (not remembered) | the space is held by models other executor processes have loaded |
 | `MODEL_CACHE_FULL` | release, remembered 10 min | free-disk reserve not met, or `ENOSPC` while downloading/sealing (staging is deleted first) |
 | `MODEL_CACHE_FULL` | internal retry once | the only blocker is this executor's own loaded model: the worker is unloaded and the fetch retried |
