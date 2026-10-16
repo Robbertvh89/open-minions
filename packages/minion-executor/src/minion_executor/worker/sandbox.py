@@ -8,7 +8,9 @@ unprivileged, in-process, self-imposed sandbox (Chromium, Firefox and Bazel rely
 Policy (profile order matters: the last matching rule wins). The base is `(allow default)`
 because Metal, IOKit and dyld cannot be enumerated for every Mac; the profile then *denies
 whole classes* and re-allows the minimum, validated against a real MLX GPU run (macos tests):
-  * network: none, except outbound TCP to loopback `ollama_port` (Ollama workers only)
+  * network: none, except outbound TCP to loopback `ollama_port` (Ollama workers only); the fetch
+    child gets DNS, TCP to :443 and a configured proxy port only (`_network_rules`)
+  * other processes' launch env (KERN_PROCARGS2): denied (three rules, all required)
   * process-exec: none
   * LaunchServices (`lsopen`), AppleEvents, distributed notifications, other-process signals:
     denied (these are the "launch an app / drive an app / talk to other processes" escapes)
@@ -29,6 +31,7 @@ import contextlib
 import ctypes
 import ctypes.util
 import os
+import re
 import sys
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
@@ -71,6 +74,11 @@ READ_DENY_ROOTS = (
     "/private/var/tmp",
     "/private/var/folders",
     "/Library",
+    # Homebrew data: service configs and databases (often with credentials), logs.
+    "/opt/homebrew/var",
+    "/opt/homebrew/etc",
+    "/usr/local/var",
+    "/usr/local/etc",
 )
 # Nothing under /Library is re-allowed: ablation on macOS 27 showed MLX (GPU matmul, mx.compile
 # and a custom Metal kernel) needs no /Library path, only /System, /usr and the Python prefix.
@@ -97,6 +105,40 @@ def sbpl_quote(value: str) -> str:
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
         raise ValueError("control character in sandbox path")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# The only unix socket the fetch child may connect to: DNS resolution goes through mDNSResponder.
+MDNS_SOCKET = "/private/var/run/mDNSResponder"
+# Fetch child default: HTTPS to anywhere (the hub and its CDN hosts vary), nothing else.
+DEFAULT_FETCH_TCP = ("*:443",)
+_LOCAL_HOSTS = ("localhost", "127.0.0.1")
+_TCP_REMOTE = re.compile(r"^(\*|localhost|127\.0\.0\.1|[0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$")
+
+
+def _network_rules(tcp_remotes: Sequence[str] | None) -> list[str]:
+    """Fetch-child network policy: outbound is denied wholesale (this includes every unix
+    socket: docker.sock, the SSH agent, ...), then re-allowed for DNS (mDNSResponder socket) and
+    outbound TCP to `tcp_remotes` (`host:port`, host `*`, an IPv4 literal or `localhost`).
+    Loopback is denied even where `*:port` would match it, except for explicit local entries
+    (a proxy on this Mac), which come last."""
+    remotes = list(DEFAULT_FETCH_TCP if tcp_remotes is None else tcp_remotes)
+    remote_hosts: list[str] = []
+    local: list[str] = []
+    for r in remotes:
+        m = _TCP_REMOTE.match(r)
+        if m is None or not 0 < int(m.group(3)) < 65536:
+            raise ValueError("bad tcp remote")
+        (local if m.group(1) in _LOCAL_HOSTS else remote_hosts).append(r)
+    lines = [
+        "(deny network-outbound)",
+        f"(allow network-outbound (remote unix-socket (path-literal {sbpl_quote(MDNS_SOCKET)})))",
+    ]
+    lines += [f'(allow network-outbound (remote tcp "{r}"))' for r in dict.fromkeys(remote_hosts)]
+    lines.append('(deny network-outbound (remote ip "localhost:*"))')
+    for r in dict.fromkeys(local):
+        port = r.rsplit(":", 1)[1]
+        lines.append(f'(allow network-outbound (remote tcp "localhost:{port}"))')
+    return lines
 
 
 def _subpath(p: str) -> str:
@@ -128,18 +170,24 @@ def build_profile(
     metal_cache: str | None = None,
     allow_network: bool = False,
     mach_extra: Sequence[str] = (),
+    tcp_remotes: Sequence[str] | None = None,
+    allow_read_files: Sequence[str] = (),
 ) -> str:
     """SBPL profile text. Pure: paths must already be absolute and symlink-resolved (Seatbelt
     matches resolved paths); see `resolve_paths`. `metal_cache` is the per-user cache dir
     (`DARWIN_USER_CACHE_DIR`) whose `com.apple.metal` subdirectories may be written.
     `allow_network` keeps outbound network (the model-fetch child; everything else is still
-    confined) and `mach_extra` adds Mach services to the allow list."""
+    confined) but only to DNS and `tcp_remotes` (default HTTPS anywhere, see `_network_rules`);
+    `mach_extra` adds Mach services to the allow list and `allow_read_files` grants single
+    files (CA bundles) read-only."""
     homes = [home] if isinstance(home, str) else list(home)
     homes = list(dict.fromkeys(h for h in homes if h and h != "/"))
     lines = ["(version 1)", "(allow default)"]
 
     if not allow_network:
         lines.append("(deny network*)")
+    else:
+        lines += _network_rules(tcp_remotes)
     if ollama_port is not None:
         if not 0 < ollama_port < 65536:
             raise ValueError("bad ollama port")
@@ -151,6 +199,14 @@ def build_profile(
     # `(deny signal (target others))` is accepted but does NOT deny (verified: SIGCONT to the
     # parent still succeeds); deny-all plus an allow for self does.
     lines += ["(deny signal)", "(allow signal (target self))"]
+
+    # Other processes' launch arguments and environment (KERN_PROCARGS2) would leak secrets set
+    # in a parent's launch env. Verified: only the three rules together close it.
+    lines += [
+        "(deny process-info*)",
+        "(allow process-info* (target self))",
+        '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))',
+    ]
 
     lines.append("(deny mach-lookup)")
     names = " ".join(f"(global-name {sbpl_quote(n)})" for n in (*MACH_ALLOW, *mach_extra))
@@ -166,7 +222,8 @@ def build_profile(
     roots = list(dict.fromkeys([*homes, *READ_DENY_ROOTS]))
     for r in roots:
         lines.append(f"(deny file-read* {_subpath(r)})")
-    reads = list(dict.fromkeys([*allow_read, *allow_write]))
+    files = list(dict.fromkeys(allow_read_files))
+    reads = list(dict.fromkeys([*allow_read, *allow_write, *files]))
     metadata: list[str] = []
     for p in reads:
         if any(_under(p, r) for r in roots):
@@ -176,6 +233,8 @@ def build_profile(
             lines.append(f"(allow file-read-metadata (literal {sbpl_quote(d)}))")
     for p in dict.fromkeys(allow_read):
         lines.append(f"(allow file-read* {_subpath(p)})")
+    for p in files:
+        lines.append(f"(allow file-read* (literal {sbpl_quote(p)}))")
     for p in dict.fromkeys(allow_write):
         lines.append(f"(allow file-read* file-write* {_subpath(p)})")
     if metal_cache:
@@ -214,9 +273,18 @@ def _pth_roots(site_dir: Path) -> list[str]:
             if not line or line.startswith(("#", "import ", "import\t")):
                 continue
             cand = site_dir / line  # absolute `line` replaces site_dir
-            if cand.is_dir():
+            if cand.is_dir() and _pth_root_ok(os.path.realpath(cand)):
                 out.append(str(cand))
     return out
+
+
+def _pth_root_ok(root: str) -> bool:
+    """A `.pth` root must be a source dir, not a project root: an ancestor of `sys.prefix` (the
+    checkout holding `.venv`) or a directory containing `.env` / `.git` would expose secrets."""
+    for prefix in (sys.prefix, sys.base_prefix):
+        if _under(os.path.realpath(prefix), root):
+            return False
+    return not any((Path(root) / name).exists() for name in (".env", ".git"))
 
 
 def python_read_paths() -> list[str]:
@@ -311,8 +379,30 @@ def apply(profile: str) -> None:
         raise RunnerError(SANDBOX_FAILED, detail[:200])
 
 
-def _self_test(homes: Sequence[str]) -> None:
-    """After `apply`: HOME must be unlistable and a write outside the grant must fail, else the
+def procargs_readable(pid: int) -> bool:
+    """True if `sysctl(KERN_PROCARGS2)` for `pid` (its launch arguments and environment) works."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t(1 << 16)
+    buf = ctypes.create_string_buffer(size.value)
+    return bool(libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0)
+
+
+def _connect_denied(host: str, port: int) -> bool:
+    """True if a non-blocking connect fails at once with EPERM/EACCES (the sandbox). A timeout or
+    EINPROGRESS is ambiguous (offline vs allowed), so it does not count as denied."""
+    import errno
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setblocking(False)
+        err = s.connect_ex((host, port))
+    return err in (errno.EPERM, errno.EACCES)
+
+
+def _self_test(homes: Sequence[str], network: bool = False) -> None:
+    """After `apply`: HOME must be unlistable, a write outside the grant must fail, other
+    processes' procargs must be unreadable and (worker) outbound TCP must be refused, else the
     sandbox is not doing its job and the worker exits (never continue unconfined)."""
     ok = True
     for h in homes:
@@ -328,6 +418,13 @@ def _self_test(homes: Sequence[str]) -> None:
         Path(probe).unlink()
     except OSError:
         pass
+    try:
+        if procargs_readable(os.getppid()):
+            ok = False
+        if not network and not _connect_denied("1.1.1.1", 443):
+            ok = False
+    except (OSError, AttributeError):
+        ok = False
     if not ok:
         os._exit(SELF_TEST_EXIT_CODE)
 
@@ -355,6 +452,8 @@ def apply_from_spec(spec: dict[str, Any]) -> None:
             metal_cache=user_cache_dir() if spec.get("metal", True) else None,
             allow_network=bool(spec.get("network", False)),
             mach_extra=[str(n) for n in spec.get("mach_extra", [])],
+            tcp_remotes=[str(r) for r in spec["net_tcp"]] if "net_tcp" in spec else None,
+            allow_read_files=resolve_paths(spec.get("read_files", []), home=homes),
         )
     except (ValueError, TypeError) as exc:
         raise RunnerError(SANDBOX_FAILED, f"bad profile: {type(exc).__name__}") from None
@@ -372,7 +471,7 @@ def apply_from_spec(spec: dict[str, Any]) -> None:
     ]
     sys.path_importer_cache.clear()
     apply(profile)
-    _self_test(homes)
+    _self_test(homes, network=bool(spec.get("network", False)))
 
 
 def check_model_dir(path: Path, homes: Iterable[str] | None = None) -> str:

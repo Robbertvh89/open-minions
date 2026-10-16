@@ -121,7 +121,7 @@ governor (M4). ARCHITECTURE §2.2 describes the executor as built.
 |---|---|---|
 | `MODEL_DOWNLOAD_FAILED` | release | network down, proxy error, fetch process died, download timeout |
 | `MODEL_DOWNLOAD_FAILED` | fail, retryable | hub answered with another HTTP error (404, 5xx) |
-| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 401/403 (this Mac has no valid token) |
+| `MODEL_DOWNLOAD_FAILED` | release, remembered 1 h | hub 403, or 401 when no `HF_TOKEN` is set (this Mac has no valid token); with a token set, 401 is a plain retryable failure |
 | `MODEL_INTEGRITY` | fail, retryable | sha256/blob-sha1/size mismatch, file set differs from the hub listing, symlink, hub returned another revision |
 | `MODEL_UNSUPPORTED` | fail, non-retryable | no safetensors, disallowed file type, `auto_map` / bad JSON (would need remote code) |
 | `MODEL_CACHE_FULL` | release, remembered 1 h | model larger than `MODEL_CACHE_GB` |
@@ -345,9 +345,18 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   notifications/preferences/foreign signals, Mach lookups deny-default with a six-service Metal and
   logging allow-list (no Keychain, tccd, pasteboard, WindowServer, mds, nsurlsessiond), writes denied
   except the worker's tmp dir, a few `/dev` nodes and the Python Metal cache, reads denied for HOME,
-  `/Users`, `/Volumes`, `/private/tmp`, `/private/var/folders` and `/Library` except the current model
-  dir, the Python prefixes/site-packages/editable source roots and the tmp dir. A self-test after
-  applying the profile aborts the worker if HOME is listable or an outside write succeeds. If the
+  `/Users`, `/Volumes`, `/private/tmp`, `/private/var/folders`, `/Library` and the Homebrew data
+  dirs (`/opt/homebrew/{var,etc}`, `/usr/local/{var,etc}`) except the current model
+  dir, the Python prefixes/site-packages/editable source roots and the tmp dir. Other processes' launch
+  arguments/environment (`KERN_PROCARGS2`, `process-info`) are unreadable. A self-test after
+  applying the profile aborts the worker (exit 78, mapped to `SANDBOX_FAILED`, released) if HOME is
+  listable, an outside write succeeds, another process's procargs are readable or (worker) an
+  outbound TCP connect to `1.1.1.1:443` is not refused with EPERM/EACCES. The model-fetch child has
+  the same profile with network re-opened only for DNS (mDNSResponder socket), outbound TCP to
+  `*:443` (or the `HF_ENDPOINT` port) and the configured proxy port; loopback (unless the proxy is
+  local) and every other unix socket (docker.sock, SSH agent) are denied; CA bundles are granted as
+  single files, an `SSL_CERT_DIR` under HOME is refused, and its staging dir is size-capped to the
+  hub's listing (`MODEL_INTEGRITY`). If the
   sandbox cannot be applied the worker fails (`SANDBOX_FAILED`) and `run` exits 2; off macOS only the
   fake engine runs. `MINION_EXECUTOR_SANDBOX=0` requires `MINION_EXECUTOR_DEV=1`. Residual: the profile
   is allow-default outside the denied areas, so non-denied system paths (`/etc`, `/opt`, ...) stay

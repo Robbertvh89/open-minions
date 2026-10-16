@@ -47,6 +47,7 @@ from minion_executor.heartbeat import Heartbeater, HeartbeatSignal
 from minion_executor.model_cache import MODEL_CACHE_FULL, ModelCache, ModelFetchError
 from minion_executor.runners.base import ENGINE_UNAVAILABLE, Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
+from minion_executor.worker.sandbox import SANDBOX_FAILED
 
 log = structlog.get_logger("minion_executor.loop")
 
@@ -386,6 +387,8 @@ class ExecutorLoop:
         """
         if interrupt:  # a signal after the work finished leaves the warm worker alone
             await asyncio.to_thread(self._worker.interrupt)
+            if self._cache is not None:
+                self._cache.release_in_use()  # the killed worker no longer holds the model
         work.cancel()
         await asyncio.gather(work, return_exceptions=True)
         if sig is HeartbeatSignal.CANCEL:
@@ -503,7 +506,10 @@ class ExecutorLoop:
             return None
         try:
             try:
-                return await self._cache.ensure(model)
+                path = await self._cache.ensure(model)
+                if path is None:  # Ollama / fake: nothing cached, so no stale pin on an old model
+                    self._cache.release_in_use()
+                return path
             except ModelFetchError as exc:
                 if not (exc.code == MODEL_CACHE_FULL and exc.blocked_by_in_use):
                     raise
@@ -549,11 +555,13 @@ class ExecutorLoop:
                 )
                 hb.records_done = len(outputs)
         except WorkerCrashed:
+            if self._cache is not None:
+                self._cache.release_in_use()  # the dead worker no longer holds the model
             raise _FailureError(True, "WORKER_CRASHED", "worker process died") from None
         except RunnerError as exc:
             code = exc.code[:64] or "RUNNER_ERROR"
             # Engine missing on this Mac is executor-local: release, don't burn an attempt.
-            release = exc.code == ENGINE_UNAVAILABLE or (
+            release = exc.code in (ENGINE_UNAVAILABLE, SANDBOX_FAILED) or (
                 isinstance(exc, ModelFetchError) and exc.release
             )
             raise _FailureError(exc.retryable, code, "runner failed", release=release) from None

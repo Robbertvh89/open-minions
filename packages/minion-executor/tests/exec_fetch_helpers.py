@@ -62,6 +62,8 @@ def sandbox_probe_fetch(spec: FetchSpec, conn: Connection) -> None:
         "read_ca": _allowed(lambda p: Path(p).read_bytes(), os.environ.get("SSL_CERT_FILE", "")),
         "exec": False,
         "net": False,
+        "unix": False,
+        "procargs": False,
     }
     try:
         subprocess.run(["/usr/bin/true"], check=True)
@@ -75,6 +77,18 @@ def sandbox_probe_fetch(spec: FetchSpec, conn: Connection) -> None:
             result["net"] = True
         except OSError:
             pass
+    sock = os.environ.get("HF_HUB_PROBE_UNIX")
+    if sock:  # e.g. docker.sock / the SSH agent
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(3)
+                s.connect(sock)
+            result["unix"] = True
+        except OSError:
+            pass
+    from minion_executor.worker.sandbox import procargs_readable
+
+    result["procargs"] = procargs_readable(os.getppid())
     _send_files(
         spec, conn, {"w.safetensors": b"x" * 10, "config.json": json.dumps(result).encode()}
     )

@@ -68,6 +68,10 @@ FORCED_WORKER_ENV: Mapping[str, str] = {
 }
 
 
+class _SelfTestFailedError(Exception):
+    """The worker exited with `SELF_TEST_EXIT_CODE`: its sandbox did not confine it."""
+
+
 class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
     """The worker process died or its pipe closed unexpectedly."""
 
@@ -91,6 +95,11 @@ def restrict_environ() -> None:
     """
     for name in [k for k in os.environ if not env_allowed(k)]:
         del os.environ[name]
+
+
+def _self_test_error() -> RunnerError:
+    """Retryable (another Mac may sandbox fine) and released by the loop: this Mac cannot."""
+    return RunnerError(sbx.SANDBOX_FAILED, "sandbox self-test failed", retryable=True)
 
 
 def _send(conn: Connection, msg: dict[str, Any]) -> None:
@@ -365,6 +374,8 @@ class WorkerHandle:
                         if abortable and (self._closed or self._interrupt_gen != gen):
                             raise WorkerCrashed("worker handle is stopped")
                         if not proc.is_alive() and not conn.poll(0):
+                            if proc.exitcode == sbx.SELF_TEST_EXIT_CODE:
+                                raise _SelfTestFailedError
                             raise WorkerCrashed(f"worker exited with code {proc.exitcode}")
                         if time.monotonic() > deadline:
                             raise WorkerCrashed("worker timed out")
@@ -377,9 +388,15 @@ class WorkerHandle:
                     if on_progress is not None and isinstance(done, int):
                         with contextlib.suppress(Exception):  # a bad callback must not kill a run
                             on_progress(done)
+            except _SelfTestFailedError:
+                self._reset()
+                raise _self_test_error() from None
             except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
+                proc.join(1)  # let the exit code settle
                 code = proc.exitcode
                 self._reset()
+                if code == sbx.SELF_TEST_EXIT_CODE:
+                    raise _self_test_error() from None
                 raise WorkerCrashed(f"worker pipe closed (exit code {code})") from e
             except WorkerCrashed:
                 self._reset()
@@ -425,7 +442,11 @@ class WorkerHandle:
         if self._tmp_dir is None:  # pragma: no cover - _ensure_started guarantees it
             raise WorkerCrashed("worker tmp dir missing")
         # Loopback access to Ollama only for an Ollama load, from the same config the runner uses.
-        ollama = model is not None and model.engine == Engine.OLLAMA
+        ollama = (
+            model.engine == Engine.OLLAMA
+            if model is not None
+            else Engine.OLLAMA.value in self._engines
+        )
         return sbx.sandbox_spec(
             self._sandbox,
             model_path=model_path,

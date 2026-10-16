@@ -770,3 +770,150 @@ async def test_sandbox_failure_fails_closed_and_releases(
         await cache.ensure(_model())
     assert ei.value.code == "SANDBOX_FAILED" and ei.value.release and ei.value.local
     assert not ran.exists()  # the fetch never ran unconfined
+
+
+async def test_hub_401_with_a_token_is_a_plain_retryable_failure(tmp_path: Path) -> None:
+    spawned = tmp_path / "spawned"
+
+    class Resp:
+        status_code = 401
+
+    class HubError(Exception):
+        response = Resp()
+
+    def hub(spec: FetchSpec, conn: Connection) -> None:
+        with spawned.open("a") as f:
+            f.write("x\n")
+        raise HubError("detail")
+
+    cache = _cache(tmp_path, hub, fetch_env=FetchEnv.capture({"HF_TOKEN": "hf_x"}))
+    for _ in range(2):  # not remembered either: a fixed token should work next time
+        with pytest.raises(ModelFetchError) as ei:
+            await cache.ensure(_model())
+        assert ei.value.release is False and ei.value.local is False and ei.value.retryable
+    assert spawned.read_text().count("x") == 2
+
+
+def _entry(cache: ModelCache, name: str, size: int, mtime: float) -> Path:
+    d = cache.root / "hf" / f"org--{name}" / REV
+    d.mkdir(parents=True)
+    (d / "w.safetensors").write_bytes(b"x" * size)
+    (d / MANIFEST_NAME).write_text(json.dumps({"files": {"w.safetensors": {"size": size}}}))
+    os.utime(d / MANIFEST_NAME, (mtime, mtime))
+    return d
+
+
+def test_evict_for_checks_disk_with_planned_evictions_before_deleting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = _cache(tmp_path, fake_fetch(), cap=250, min_free_bytes=100)
+    old = _entry(cache, "old", 100, 1)
+    new = _entry(cache, "new", 100, 2)
+    # free 150, need 100: 150 - 100 = 50 < reserve 100, but evicting `old` frees 100 more
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(1000, 0, 150))
+    assert cache.evict_for(100) == [old]
+    assert not old.exists() and new.exists()
+
+
+def test_evict_for_disk_failure_deletes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = _cache(tmp_path, fake_fetch(), cap=250, min_free_bytes=1000)
+    old = _entry(cache, "old", 100, 1)
+    new = _entry(cache, "new", 100, 2)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: _Usage(1000, 0, 150))
+    with pytest.raises(ModelFetchError) as ei:
+        cache.evict_for(100)
+    assert ei.value.code == MODEL_CACHE_FULL and ei.value.release and ei.value.local
+    assert old.exists() and new.exists()
+
+
+async def test_staging_overflow_kills_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_MARGIN_BYTES", 100)
+    monkeypatch.setattr("minion_executor.model_cache._STAGING_POLL_S", 0.05)
+
+    def flood(spec: FetchSpec, conn: Connection) -> None:
+        conn.send(("plan", 10, {"w.safetensors": [10, _sha(b"x" * 10), None]}))
+        assert conn.recv() == "go"
+        (Path(spec.staging) / "w.safetensors").write_bytes(b"x" * 10_000)
+        time.sleep(60)
+
+    t0 = time.monotonic()
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, flood).ensure(_model())
+    assert ei.value.code == MODEL_INTEGRITY and ei.value.release
+    assert time.monotonic() - t0 < 20
+    assert not (tmp_path / "c" / ".staging").exists()
+
+
+async def test_fetch_child_self_test_exit_maps_to_sandbox_failed(tmp_path: Path) -> None:
+    from minion_executor.worker.sandbox import SANDBOX_FAILED, SELF_TEST_EXIT_CODE
+
+    def die(spec: FetchSpec, conn: Connection) -> None:
+        os._exit(SELF_TEST_EXIT_CODE)
+
+    with pytest.raises(ModelFetchError) as ei:
+        await _cache(tmp_path, die).ensure(_model())
+    assert ei.value.code == SANDBOX_FAILED and ei.value.release and ei.value.local
+
+
+def test_pin_sets_in_use_only_after_the_flock_succeeds(tmp_path: Path) -> None:
+    import fcntl
+
+    cache = _cache(tmp_path, fake_fetch())
+    entry = _entry(cache, "a", 10, 1)
+    fd = os.open(entry / MANIFEST_NAME, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # e.g. another process evicting it
+    try:
+        cache._pin(entry)
+        assert cache._in_use is None and cache._pin_fd is None
+    finally:
+        os.close(fd)
+    cache._pin(entry)
+    assert cache._in_use == entry and cache._pin_fd is not None
+    cache.release_in_use()
+
+
+def test_confine_spec_tcp_is_https_plus_proxy_only(tmp_path: Path) -> None:
+    def tcp(env: dict[str, str]) -> list[str]:
+        c = _cache(tmp_path, fake_fetch(), sandbox=True, fetch_env=FetchEnv.capture(env))
+        spec = c._confine_spec(tmp_path / "st")
+        assert spec is not None
+        return list(spec["net_tcp"])
+
+    assert tcp({}) == ["*:443"]
+    assert tcp({"HF_ENDPOINT": "https://hub.example:8443"}) == ["*:443", "*:8443"]
+    assert tcp({"HTTPS_PROXY": "http://user:pw@proxy.corp:3128"}) == ["*:443", "*:3128"]
+    assert tcp({"HTTPS_PROXY": "http://127.0.0.1:8888"}) == ["*:443", "localhost:8888"]
+    assert tcp({"ALL_PROXY": "proxy.corp:8080"}) == ["*:443", "*:8080"]
+
+
+def test_confine_spec_ca_files_are_literals_and_home_cert_dirs_refused(tmp_path: Path) -> None:
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x")
+    c = _cache(
+        tmp_path, fake_fetch(), sandbox=True, fetch_env=FetchEnv.capture({"SSL_CERT_FILE": str(ca)})
+    )
+    spec = c._confine_spec(tmp_path / "st")
+    assert spec is not None and spec["read_files"] == [str(ca)] and str(ca) not in spec["read"]
+
+    homedir = Path.home() / "certs"
+    bad = _cache(
+        tmp_path,
+        fake_fetch(),
+        sandbox=True,
+        fetch_env=FetchEnv.capture({"SSL_CERT_DIR": str(homedir)}),
+    )
+    with pytest.raises(ModelFetchError) as ei:
+        bad._confine_spec(tmp_path / "st")
+    assert ei.value.local and ei.value.release and "SSL_CERT_DIR" in ei.value.message
+    ok = _cache(
+        tmp_path,
+        fake_fetch(),
+        sandbox=True,
+        fetch_env=FetchEnv.capture({"SSL_CERT_DIR": "/etc/ssl/certs"}),
+    )
+    spec = ok._confine_spec(tmp_path / "st")
+    assert spec is not None and os.path.realpath("/etc/ssl/certs") in spec["read"]

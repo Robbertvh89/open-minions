@@ -678,11 +678,11 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     first, second = assignment(), assignment()
     client, s3 = FakeClient([first, second]), FakeS3()
     client.hb_script = [hb_resp(cancel=True)]
-    worker = FakeWorker(block=True)
+    worker, cache = FakeWorker(block=True), _StubCache()
     sleeps: list[float] = []
     loop = make_loop(
         client, worker, s3, tmp_path, sleeps,
-        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []),
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(1, []), model_cache=cache,
     )  # fmt: skip
     client.on_empty = loop.stop
     # the second assignment must run normally: the worker stops blocking once interrupted
@@ -696,6 +696,7 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     worker.run = run  # type: ignore[method-assign,assignment]
     assert await loop.run() == 1
     assert worker.interrupted and not worker.killed
+    assert cache.released >= 1  # the interrupted worker no longer holds the pinned model
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire", "complete", "acquire"]
     assert len(s3.puts) == 1  # only the second subtask uploads
     assert len(sleeps) == 1  # only the final empty-queue sleep: no failure backoff for CANCELLED
@@ -1389,3 +1390,27 @@ async def test_idle_unload_releases_the_cache_pin(tmp_path: Path) -> None:
     client.on_empty = tick
     await loop.run()
     assert worker.unloads == 1 and cache.released == 1
+
+
+async def test_uncached_engine_assignment_drops_the_stale_pin(tmp_path: Path) -> None:
+    cache = _StubCache(path=None)  # Ollama / fake: the cache manages nothing
+    await _run_one(tmp_path, _asn(), FakeWorker(), model_cache=cache)
+    assert cache.released >= 1
+
+
+async def test_worker_crash_drops_the_cache_pin(tmp_path: Path) -> None:
+    cache = _StubCache(path=tmp_path / "snap")
+    client, _ = await _run_one(
+        tmp_path, _asn(), FakeWorker(exc=WorkerCrashed("boom")), model_cache=cache
+    )
+    assert cache.released == 1
+    assert next(r for k, r in client.calls if k == "fail").code == "WORKER_CRASHED"
+
+
+async def test_sandbox_failure_is_released_not_burned(tmp_path: Path) -> None:
+    from minion_executor.worker.sandbox import SANDBOX_FAILED
+
+    client, _ = await _run_one(
+        tmp_path, _asn(), FakeWorker(exc=RunnerError(SANDBOX_FAILED, "x", retryable=True))
+    )
+    assert client.kinds().count("release") == 1 and "fail" not in client.kinds()

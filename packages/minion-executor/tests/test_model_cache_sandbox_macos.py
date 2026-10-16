@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import socket
+import tempfile
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -42,6 +43,27 @@ def home_ca() -> Iterator[Path]:
         shutil.rmtree(d, ignore_errors=True)
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_probe() -> Iterator[None]:
+    yield
+    (Path.home() / ".minion-fetch-sandbox-probe").unlink(missing_ok=True)
+
+
+@pytest.fixture
+def unix_socket() -> Iterator[str]:
+    """A listening AF_UNIX socket in a dir we create (short path: sun_path is limited)."""
+    d = tempfile.mkdtemp(prefix="mx-", dir="/tmp")
+    path = str(Path(d) / "s.sock")
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(8)  # connect() succeeds against the backlog without an accept loop
+    try:
+        yield path
+    finally:
+        srv.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 @pytest.fixture
 def loopback_port() -> Iterator[int]:
     srv = socket.socket()
@@ -65,29 +87,72 @@ def loopback_port() -> Iterator[int]:
         srv.close()
 
 
-async def test_fetch_child_is_confined_but_has_network_and_ca(
+async def _probe(tmp_path: Path, env: dict[str, str]) -> dict[str, bool]:
+    import exec_fetch_helpers as h
+
+    cache = ModelCache(
+        tmp_path / "c",
+        10**6,
+        fetch_env=FetchEnv.capture(env),
+        fetch=h.sandbox_probe_fetch,
+        min_free_bytes=0,
+    )
+    path = await cache.ensure(MODEL)
+    assert path is not None
+    got: dict[str, bool] = json.loads((path / "config.json").read_text())
+    return got
+
+
+async def test_fetch_child_is_confined_and_loopback_and_unix_sockets_denied(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     home_ca: Path,
     loopback_port: int,
+    unix_socket: str,
 ) -> None:
     monkeypatch.syspath_prepend(str(Path(__file__).parent))
-    import exec_fetch_helpers as h
+    # baseline: the listeners are reachable from this (unsandboxed) process
+    socket.create_connection(("127.0.0.1", loopback_port), timeout=3).close()
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(unix_socket)
 
-    fe = FetchEnv.capture({"SSL_CERT_FILE": str(home_ca), "HF_HUB_PROBE_PORT": str(loopback_port)})
-    cache = ModelCache(
-        tmp_path / "c", 10**6, fetch_env=fe, fetch=h.sandbox_probe_fetch, min_free_bytes=0
+    got = await _probe(
+        tmp_path / "a",
+        {
+            "SSL_CERT_FILE": str(home_ca),
+            "HF_HUB_PROBE_PORT": str(loopback_port),
+            "HF_HUB_PROBE_UNIX": unix_socket,
+        },
     )
-    path = await cache.ensure(MODEL)
-    assert path is not None
-    got = json.loads((path / "config.json").read_text())
     assert got == {
         "list_home": False,  # HOME unreadable
         "write_outside": False,  # writes only to the staging dir
         "write_tmp": False,
         "write_staging": True,
-        "read_ca": True,  # a CA bundle under HOME is re-allowed
+        "read_ca": True,  # a CA bundle under HOME is re-allowed (as a file literal)
         "exec": False,
-        "net": True,  # outbound network stays on (hub / proxy)
+        "net": False,  # localhost is denied (only https and a configured proxy are open)
+        "unix": False,  # docker.sock / ssh-agent style sockets are denied
+        "procargs": False,  # other processes' launch env is unreadable
     }
     assert not (Path.home() / ".minion-fetch-sandbox-probe").exists()
+
+
+async def test_fetch_child_may_reach_a_configured_local_proxy_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loopback_port: int
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).parent))
+    other = socket.socket()
+    other.bind(("127.0.0.1", 0))
+    other.listen(1)
+    try:
+        env = {"HTTPS_PROXY": f"http://127.0.0.1:{loopback_port}"}
+        assert (await _probe(tmp_path / "a", {**env, "HF_HUB_PROBE_PORT": str(loopback_port)}))[
+            "net"
+        ] is True
+        other_port = str(other.getsockname()[1])
+        assert (await _probe(tmp_path / "b", {**env, "HF_HUB_PROBE_PORT": other_port}))[
+            "net"
+        ] is False
+    finally:
+        other.close()

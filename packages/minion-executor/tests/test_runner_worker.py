@@ -593,3 +593,50 @@ def test_worker_run_without_load_and_prompt_too_long() -> None:
         assert out == [{"id": 1, "error": "PROMPT_TOO_LONG"}, {"id": 2, "completion": "ok"}]
     finally:
         w.close()
+
+
+def test_self_test_exit_code_maps_to_sandbox_failed_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import multiprocessing as mp
+
+    from minion_executor.worker.sandbox import SANDBOX_FAILED, SELF_TEST_EXIT_CODE
+
+    class DeadProc:
+        exitcode = SELF_TEST_EXIT_CODE
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None: ...
+
+    for close_pipe in (False, True):  # exited while silent, and pipe EOF
+        w = WorkerHandle([Engine.FAKE])
+        ours, theirs = mp.Pipe()
+        if close_pipe:
+            theirs.close()
+        w._proc = DeadProc()  # type: ignore[assignment]
+        monkeypatch.setattr(w, "_ensure_started", lambda c=ours: c)
+        with pytest.raises(RunnerError) as ei:
+            w.stats()
+        assert ei.value.code == SANDBOX_FAILED and ei.value.retryable
+        assert w._proc is None  # reset
+
+
+def test_probe_sandbox_spec_carries_the_ollama_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.runners.base import EngineConfig
+    from minion_executor.worker.sandbox import SandboxPolicy
+
+    cfg = EngineConfig(ollama_url="http://127.0.0.1:23456")
+    w = WorkerHandle([Engine.OLLAMA, Engine.FAKE], engine_config=cfg, sandbox=SandboxPolicy())
+    w._tmp_dir = tmp_path
+    monkeypatch.setattr(w, "_ensure_started", lambda: None)
+    spec = w._sandbox_spec(None, None)
+    assert spec is not None and spec["ollama_port"] == 23456
+    no_ollama = WorkerHandle([Engine.FAKE], engine_config=cfg, sandbox=SandboxPolicy())
+    no_ollama._tmp_dir = tmp_path
+    monkeypatch.setattr(no_ollama, "_ensure_started", lambda: None)
+    spec = no_ollama._sandbox_spec(None, None)
+    assert spec is not None and spec["ollama_port"] is None

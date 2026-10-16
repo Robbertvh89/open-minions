@@ -91,6 +91,18 @@ together with `MINION_EXECUTOR_DEV=1`.
 
 ## Consequences
 
+- Network: the worker has none (`(deny network*)` covers TCP, UDP and unix sockets; verified with
+  a real AF_UNIX listener). The fetch child, which needs the hub, gets `(deny network-outbound)`
+  plus DNS via the mDNSResponder socket, TCP to `*:443` (and the `HF_ENDPOINT` port), and the
+  configured proxy's port; loopback is denied unless the proxy itself is local. Seatbelt cannot
+  filter hostnames, so any host on :443 is reachable from the fetch child.
+- Other processes' launch environment is closed with all three rules together
+  (`(deny process-info*)`, `(allow process-info* (target self))`,
+  `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))`); any one or two alone leave
+  `KERN_PROCARGS2` readable. Self-test checks this and outbound TCP (worker).
+- The fetch child's staging dir is polled and the child killed if it exceeds the hub's announced
+  total plus a small margin. CA bundles are granted as file literals; `SSL_CERT_DIR` under HOME is
+  refused.
 - A compromised worker cannot read HOME secrets or other users' data under `/Users`, reach the
   Keychain, launch or script apps, read preferences or the pasteboard, signal other processes, exec
   tools, open outside sockets, or write anywhere except its tmp dir, a few `/dev` nodes and the Python
@@ -101,6 +113,14 @@ together with `MINION_EXECUTOR_DEV=1`.
     most other operations (sysctl, IOKit, other Mach-free syscalls) remain possible. Nothing under
     those roots is a per-user secret by default, but a Mac with secrets in e.g. `/opt` or `/etc` is
     exposed.
+  - Homebrew data dirs (`/opt/homebrew/{var,etc}`, `/usr/local/{var,etc}`) are denied, but other
+    paths under `/opt` and `/usr/local` (e.g. `/opt/homebrew/Cellar` configs, `/usr/local/share`)
+    remain readable.
+  - The per-process Metal shader cache (`com.apple.metal`) is writable and shared by all Python
+    workers of the user: a compromised worker could plant a poisoned shader cache entry for later
+    workers. Accepted and documented only; not mitigated.
+  - The fetch child reaches any host on port 443 (and the proxy), so a compromised fetch child can
+    exfiltrate what it can read (its staging dir, the fetch env including `HF_TOKEN`).
   - Allowed Mach services (above) and the `com.apple.metal` cache are shared system surface; a bug in
     Metal's compiler service is reachable from the worker.
   - A malicious model can still burn CPU/GPU up to the budget and can fill its tmp dir (disk quota is

@@ -305,4 +305,107 @@ def test_self_test_passes_when_both_fail(monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setattr(os, "listdir", deny)
     monkeypatch.setattr(os, "open", deny)
     monkeypatch.setattr(os, "_exit", no_exit)
+    monkeypatch.setattr(sandbox, "procargs_readable", lambda _pid: False)
+    monkeypatch.setattr(sandbox, "_connect_denied", lambda _h, _p: True)
     sandbox._self_test([str(tmp_path)])
+
+
+@pytest.mark.parametrize("network", [False, True])
+def test_self_test_exits_when_procargs_readable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, network: bool
+) -> None:
+    codes: list[int] = []
+
+    def deny(*_a: object, **_k: object) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "listdir", deny)
+    monkeypatch.setattr(os, "open", deny)
+    monkeypatch.setattr(os, "_exit", codes.append)
+    monkeypatch.setattr(sandbox, "procargs_readable", lambda _pid: True)
+    monkeypatch.setattr(sandbox, "_connect_denied", lambda _h, _p: True)
+    sandbox._self_test([str(tmp_path)], network=network)
+    assert codes == [sandbox.SELF_TEST_EXIT_CODE]
+
+
+def test_self_test_worker_requires_outbound_tcp_denied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    codes: list[int] = []
+
+    def deny(*_a: object, **_k: object) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "listdir", deny)
+    monkeypatch.setattr(os, "open", deny)
+    monkeypatch.setattr(os, "_exit", codes.append)
+    monkeypatch.setattr(sandbox, "procargs_readable", lambda _pid: False)
+    monkeypatch.setattr(sandbox, "_connect_denied", lambda _h, _p: False)
+    sandbox._self_test([str(tmp_path)])  # worker: a connect that is not refused is a failure
+    assert codes == [sandbox.SELF_TEST_EXIT_CODE]
+    codes.clear()
+    sandbox._self_test([str(tmp_path)], network=True)  # fetch child legitimately has network
+    assert codes == []
+
+
+def test_profile_denies_procargs_and_other_process_info() -> None:
+    for network in (False, True):
+        prof = build_profile("/Users/me", [], [], allow_network=network)
+        assert "(deny process-info*)" in prof
+        assert "(allow process-info* (target self))" in prof
+        assert '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))' in prof
+
+
+def test_fetch_profile_network_rules() -> None:
+    prof = build_profile("/Users/me", [], [], allow_network=True)
+    lines = prof.splitlines()
+    assert "(deny network*)" not in lines
+    assert "(deny network-outbound)" in lines  # includes unix sockets
+    assert '(allow network-outbound (remote tcp "*:443"))' in lines
+    assert any("mDNSResponder" in ln and "unix-socket" in ln for ln in lines)
+    # loopback denied after the wildcard allow; a local proxy is allowed after that deny
+    prof = build_profile(
+        "/Users/me", [], [], allow_network=True, tcp_remotes=["*:443", "localhost:3128"]
+    )
+    lines = prof.splitlines()
+    deny = lines.index('(deny network-outbound (remote ip "localhost:*"))')
+    assert lines.index('(allow network-outbound (remote tcp "*:443"))') < deny
+    assert lines.index('(allow network-outbound (remote tcp "localhost:3128"))') > deny
+    with pytest.raises(ValueError):
+        build_profile("/Users/me", [], [], allow_network=True, tcp_remotes=['*:1") (allow default'])
+
+
+def test_worker_profile_has_no_network_allow_except_ollama() -> None:
+    prof = build_profile("/Users/me", [], [])
+    assert "(deny network*)" in prof and "remote tcp" not in prof
+    assert "unix-socket" not in prof
+
+
+def test_read_deny_roots_cover_homebrew_data() -> None:
+    for r in ("/opt/homebrew/var", "/opt/homebrew/etc", "/usr/local/var", "/usr/local/etc"):
+        assert r in sandbox.READ_DENY_ROOTS
+        assert f'(deny file-read* (subpath "{r}"))' in build_profile("/Users/me", [], [])
+
+
+def test_file_grants_are_literals() -> None:
+    prof = build_profile("/Users/me", [], [], allow_read_files=["/Users/me/ca.pem"])
+    assert '(allow file-read* (literal "/Users/me/ca.pem"))' in prof
+    assert '(allow file-read-metadata (literal "/Users/me"))' in prof
+
+
+def test_pth_roots_drop_project_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site = tmp_path / "proj" / ".venv" / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    src = tmp_path / "proj" / "packages" / "a" / "src"
+    src.mkdir(parents=True)
+    gitroot = tmp_path / "other"
+    (gitroot / ".git").mkdir(parents=True)
+    envroot = tmp_path / "envroot"
+    envroot.mkdir()
+    (envroot / ".env").write_text("SECRET=1")
+    (site / "x.pth").write_text(
+        "\n".join([str(src), str(tmp_path / "proj"), str(gitroot), str(envroot)])
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "proj" / ".venv"))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "py"))
+    assert sandbox._pth_roots(site) == [str(src)]
