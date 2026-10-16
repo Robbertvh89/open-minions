@@ -428,7 +428,7 @@ class ModelCache:
         self._pin_fd: int | None = None
         self._min_free = min_free_bytes
         self._nice = nice
-        self._nice_fn = nice_fn  # live niceness for each fetch (follows the cpu priority)
+        self._nice_fn = nice_fn  # niceness taken per fetch at spawn, not live
         self._sandbox = sandbox
         self._clock = clock
         # (repo, revision) -> (expires_at, code, message); bounded, oldest first

@@ -348,3 +348,19 @@ async def test_repeated_decide_errors_expire_the_pause(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recovery_from_staleness_wakes_waiters_even_with_an_unchanged_decision(
+    state_dir: Path,
+) -> None:
+    mono = Mono()
+    gov = make(state_dir, Source(), Clock(), mono=mono)
+    await gov.prime()
+    await gov.poll_once()
+    v = gov.version
+    await gov.poll_once()  # same decision, fresh: nothing to announce
+    assert gov.version == v
+    mono.t += 30  # the polling task stalled: `decision` reads fail-closed meanwhile
+    assert gov.decision.paused_reason is R.SIGNALS_UNAVAILABLE
+    await gov.poll_once()  # same decision key as before, but what `decision` returns changed
+    assert gov.version == v + 1 and gov.decision.paused_reason is None

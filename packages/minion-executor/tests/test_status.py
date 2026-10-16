@@ -187,3 +187,39 @@ def test_render_strips_control_characters() -> None:
 
     assert safe_text("a\x1b[31mb\rc\x07") == "a?[31mb?c?"
     assert "\x1b" not in render(status(), NOW)
+
+
+def _raw(state_dir: Path, **patch: object) -> None:
+    import json
+
+    doc = json.loads(status().model_dump_json())
+    for key, val in patch.items():
+        if "." in key:
+            outer, inner = key.split(".")
+            doc[outer][inner] = val
+        else:
+            doc[key] = val
+    (state_dir / STATUS_FILE).write_text(json.dumps(doc))
+    (state_dir / STATUS_FILE).chmod(0o600)
+
+
+def test_read_accepts_enum_values_a_newer_executor_wrote(state_dir: Path) -> None:
+    _raw(
+        state_dir,
+        profile="turbo",
+        paused_reason="solar_flare",
+        **{"budget.cpu_priority": "x\x1b1"},
+    )
+    st = read_status(state_dir)
+    assert st is not None
+    out = render(st, NOW)
+    assert "turbo" in out and "solar_flare" in out and "\x1b" not in out
+
+
+def test_read_stays_strict_about_types_and_refuses_unknown_versions(state_dir: Path) -> None:
+    _raw(state_dir, pid=0, profile="turbo")
+    with pytest.raises(SafeFileError, match="invalid status file"):
+        read_status(state_dir)
+    _raw(state_dir, version=2)
+    with pytest.raises(SafeFileError, match="unsupported status format v2"):
+        read_status(state_dir)

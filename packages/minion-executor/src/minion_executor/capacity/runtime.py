@@ -272,9 +272,13 @@ class GovernorRuntime:
 
     def _publish(self, decision: Decision) -> None:
         old = self._decision
+        now = self._mono()
+        # recovering from staleness changes what `decision` returns (fail-closed -> this one)
+        # even when the published key is the same: wake the waiters
+        was_stale = now - self._decided_at > self._stale_s
         self._decision = decision
-        self._decided_at = self._mono()
-        if decision_key(decision) == decision_key(old):
+        self._decided_at = now
+        if decision_key(decision) == decision_key(old) and not was_stale:
             return
         self._waiters.bump()
         log.info(

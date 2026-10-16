@@ -10,12 +10,14 @@ executor is running".
 from __future__ import annotations
 
 import datetime as dt
+import enum
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from minion_common.enums import CapacityProfile, PausedReason
+from minion_common.enums import CapacityProfile, CpuPriority, PausedReason
 from minion_common.schemas import Budget
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
@@ -88,13 +90,65 @@ def write_status(state_dir: Path, status: StatusFile) -> bool:
     return atomic_write_private(state_dir / STATUS_FILE, status.model_dump_json().encode("utf-8"))
 
 
+class _Unknown(str):
+    """An enum value this version does not know (a newer executor wrote the file). Displayed via
+    `render`, which sanitises it; it never reaches the write path."""
+
+    @property
+    def value(self) -> str:
+        return str(self)
+
+
+def _enum_fields() -> dict[tuple[str, ...], type[enum.Enum]]:
+    return {
+        ("profile",): CapacityProfile,
+        ("profile_source",): ProfileSource,
+        ("candidate",): CapacityProfile,
+        ("paused_reason",): PausedReason,
+        ("signals", "thermal"): Thermal,
+        ("signals", "memory_pressure"): MemPressure,
+        ("budget", "cpu_priority"): CpuPriority,
+    }
+
+
+def _split_unknown_enums(raw: dict[str, Any]) -> dict[tuple[str, ...], _Unknown]:
+    """Replace enum strings this version does not know by a known member (so the strict model
+    validates) and return what was replaced."""
+    found: dict[tuple[str, ...], _Unknown] = {}
+    for path, enum_cls in _enum_fields().items():
+        node: Any = raw
+        for key in path[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            continue
+        val = node.get(path[-1])
+        if isinstance(val, str) and val not in {m.value for m in enum_cls}:
+            found[path] = _Unknown(val[:64])
+            node[path[-1]] = next(iter(enum_cls)).value
+    return found
+
+
 def read_status(state_dir: Path) -> StatusFile | None:
-    """The status file, or None when absent. Raises SafeFileError when unsafe or invalid."""
+    """The status file, or None when absent. Raises SafeFileError when unsafe or invalid.
+
+    Lenient on read only: an enum value this version does not know (written by a newer executor)
+    is kept as text so the file still displays; an unknown `version` is refused."""
     data = read_private_file(state_dir / STATUS_FILE, "status file", MAX_STATUS_BYTES)
     if data is None:
         return None
+    unknown: dict[tuple[str, ...], _Unknown] = {}
     try:
-        return StatusFile.model_validate_json(data)
+        raw = json.loads(data)
+    except ValueError:
+        raw = None  # not JSON: the validation below reports it
+    if isinstance(raw, dict):
+        ver = raw.get("version", 1)
+        if ver != 1:
+            raise SafeFileError(f"unsupported status format v{safe_text(str(ver)[:16])}")
+        unknown = _split_unknown_enums(raw)
+        data = json.dumps(raw).encode("utf-8")
+    try:
+        st = StatusFile.model_validate_json(data)
     except ValidationError as exc:
         # loc + message only: pydantic's default text echoes the offending input
         detail = "; ".join(
@@ -102,6 +156,20 @@ def read_status(state_dir: Path) -> StatusFile | None:
         )
         # a key name in the file is attacker-controlled text: never print it raw
         raise SafeFileError(f"invalid status file ({safe_text(detail)})") from None
+    return _with_unknown(st, unknown) if unknown else st
+
+
+def _with_unknown(st: StatusFile, unknown: dict[tuple[str, ...], _Unknown]) -> StatusFile:
+    top: dict[str, Any] = {}
+    nested: dict[str, dict[str, Any]] = {}
+    for path, val in unknown.items():
+        if len(path) == 1:
+            top[path[0]] = val
+        else:
+            nested.setdefault(path[0], {})[path[1]] = val
+    for name, upd in nested.items():
+        top[name] = getattr(st, name).model_copy(update=upd)
+    return st.model_copy(update=top)
 
 
 def safe_text(text: str) -> str:

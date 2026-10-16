@@ -61,3 +61,18 @@ def test_symlinked_lock_file_is_refused(state_dir: Path, tmp_path: Path) -> None
     (state_dir / LOCK_FILE).symlink_to(target)
     with pytest.raises(SafeFileError):
         acquire_instance_lock(state_dir)
+
+
+def test_other_flock_errors_are_not_reported_as_already_running(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+    import fcntl
+
+    def boom(fd: int, op: int) -> None:
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(fcntl, "flock", boom)
+    with pytest.raises(SafeFileError, match="cannot lock") as ei:
+        acquire_instance_lock(state_dir)
+    assert not isinstance(ei.value, AlreadyRunningError)

@@ -299,7 +299,10 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   and source, budget, `held below nominal`, paused reason, current subtask id and progress, GPU share,
   a signals summary, subtasks/records completed today by this process); it exits 1 when no executor
   is running (no file, `stopped`, not updated for 30 s, or the pid is gone). No payload, URL or token
-  is ever written to it.
+  is ever written to it. **One executor per state directory:** the executor takes an exclusive
+  `flock` on `executor.lock` there for its whole lifetime; a second one exits 2 (the lock dies with
+  the process). `status` accepts enum values it does not know (a newer executor's file) and rejects
+  an unknown `version` with a clear message (exit 2).
 
 ## 5. Subtask & task state machines
 

@@ -776,6 +776,7 @@ class ExecutorLoop:
         version = gov.version
         over = 0
         downgrade_since: float | None = None
+        drop_since: float | None = None  # when the live budget fell below the running batch's
         next_sample = clock() + self._guard_s
         while True:
             if self._infer_done.is_set():
@@ -788,6 +789,13 @@ class ExecutorLoop:
                 return _Verdict.MEMORY_CRITICAL
             if d.pause_expired:
                 return _Verdict.PAUSE_EXPIRED
+            if self._batch_budget is None:
+                # No batch runs yet (the model is still being fetched or loaded): a warm worker
+                # of the previous model is not this subtask's footprint. Never count it toward
+                # OOM; just unload it when it no longer fits the budget.
+                over = 0
+                drop_since = None
+                await self._enforce_idle_budget()
             now = clock()
             downgrading = a.model.memory_gb > d.budget.memory_gb
             if downgrading:
@@ -796,18 +804,21 @@ class ExecutorLoop:
                     return _Verdict.DOWNGRADE_TIMEOUT
             else:
                 downgrade_since = None
-            if now >= next_sample:
+            batch = self._batch_budget
+            if batch is not None and d.budget.memory_gb < batch.memory_gb:
+                drop_since = now if drop_since is None else drop_since
+            else:
+                drop_since = None
+            if batch is not None and now >= next_sample:
                 next_sample = now + self._guard_s
                 footprint, prio_ok = await asyncio.to_thread(self._sample_worker)
-                # the running batch started under `_batch_budget`: a budget drop that still fits
-                # the model only takes effect at the next batch boundary, so measure against the
-                # larger of the two; while downgrading the model itself is the floor (the guard
-                # stays on, never off)
+                # the running batch started under `batch`: a budget drop only takes effect at the
+                # next batch boundary, so for at most `downgrade_batch_s` from the drop measure
+                # against the larger of the two (this also covers a downgrade, whose verdict
+                # fires at the same time); after that against the live budget
                 ref_gb = d.budget.memory_gb
-                if self._batch_budget is not None:
-                    ref_gb = max(ref_gb, self._batch_budget.memory_gb)
-                if downgrading:
-                    ref_gb = max(ref_gb, a.model.memory_gb)
+                if drop_since is not None and now - drop_since < self._downgrade_batch_s:
+                    ref_gb = max(ref_gb, batch.memory_gb)
                 limit = ref_gb * GIB * MEMORY_GUARD_FACTOR
                 if footprint is not None and footprint > limit:
                     over += 1
@@ -820,6 +831,8 @@ class ExecutorLoop:
             wake = next_sample - clock()
             if downgrade_since is not None:
                 wake = min(wake, downgrade_since + self._downgrade_batch_s - clock())
+            if drop_since is not None:
+                wake = min(wake, drop_since + self._downgrade_batch_s - clock())
             version = await gov.wait_change(version, max(0.01, wake))
 
     async def _on_verdict(
@@ -847,13 +860,21 @@ class ExecutorLoop:
         await asyncio.gather(work, return_exceptions=True)
         if finished and not work.cancelled() and work.exception() is None:
             return await self._complete(a, work.result(), bound)
+        if finished and not work.cancelled():
+            exc = work.exception()
+            if isinstance(exc, _FailureError) and exc.code != "WORKER_CRASHED":
+                # a real failure that raced the interrupt (not the crash the interrupt causes)
+                await self._report_failure(a, exc, bound)
+                return _Outcome.FAILED
         if v is _Verdict.OOM:
             err = _FailureError(True, "OOM", "worker memory exceeded the budget")
             await self._report_failure(a, err, bound)
             return _Outcome.FAILED
         await self._release(a, bound)
-        # a priority violation is a local fault: back off so it cannot churn; the rest is policy
-        return _Outcome.FAILED if v is _Verdict.PRIORITY else _Outcome.RELEASED
+        # a priority violation / crashed watcher is a local fault: back off so it cannot churn;
+        # the rest is policy
+        local = v in (_Verdict.PRIORITY, _Verdict.WATCHER_FAILED)
+        return _Outcome.FAILED if local else _Outcome.RELEASED
 
     def _roll_today(self) -> tuple[date, int, int]:
         """Today's tally, reset at local midnight."""
@@ -872,7 +893,7 @@ class ExecutorLoop:
         d = self._gov.decision
         sig = self._gov.snapshot
         cur = self._current
-        day, subtasks, records = self._roll_today()
+        day, subtasks, records = self._today  # read only: rolled on the event loop
         try:
             share = self._worker.gpu_share()
         except Exception:
@@ -934,6 +955,7 @@ class ExecutorLoop:
         version = self._gov.version
         while True:
             self._status_kick.clear()
+            self._roll_today()  # on the event loop: the snapshot (a thread) only reads
             try:
                 await asyncio.to_thread(self._write_status, state_dir)
             except Exception as exc:  # e.g. the thread pool refused: keep the loop alive
@@ -1144,6 +1166,9 @@ class ExecutorLoop:
             hb.records_done = max(hb.records_done, n)
 
         try:
+            # a pause stops a new download from starting (one in flight runs on; its niceness is
+            # fixed at spawn), the watcher bounds the wait
+            await self._wait_unpaused()
             model_path = await self._ensure_cached(a.model)
             await self._wait_unpaused()  # no model load while paused (the watcher bounds this)
             budget = self._gov.decision.budget

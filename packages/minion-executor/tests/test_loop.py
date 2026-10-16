@@ -2392,28 +2392,89 @@ async def test_verdict_during_upload_still_completes(tmp_path: Path, flags: dict
     assert "release" not in client.kinds() and "fail" not in client.kinds()
 
 
+class _RacingWorker(FakeWorker):
+    """interrupt() opens the gate (the batch finishes while we interrupt) and then waits, on
+    events only, until `until_fn` holds."""
+
+    def __init__(self, until_fn: Callable[[], bool], exc: Exception | None = None) -> None:
+        super().__init__(exc=exc)
+        self.gate = threading.Event()
+        self.until_fn = until_fn
+        self.proceed = threading.Event()  # never set: a timed wait without sleeping
+
+    def interrupt(self) -> None:
+        super().interrupt()
+        assert self.gate is not None
+        self.gate.set()
+        deadline = time.monotonic() + 5
+        while not self.until_fn() and time.monotonic() < deadline:
+            self.proceed.wait(0.005)
+
+
+def _track_work_done(loop: ExecutorLoop) -> threading.Event:
+    """Set (thread-safe) once the loop's work coroutine has returned or raised."""
+    done = threading.Event()
+    orig = loop._execute
+
+    async def wrapped(*args: Any, **kw: Any) -> Any:
+        try:
+            return await orig(*args, **kw)
+        finally:
+            done.set()
+
+    loop._execute = wrapped  # type: ignore[method-assign]
+    return done
+
+
 async def test_verdict_racing_work_completion_completes(tmp_path: Path) -> None:
     gov = FixedGovernor(BUDGET)
     client, s3 = FakeClient([assignment()]), FakeS3()
+    done: threading.Event | None = None
+    worker = _RacingWorker(lambda: done is not None and done.is_set())
+    loop = make_loop(client, worker, s3, tmp_path, [], governor=gov)
+    done = _track_work_done(loop)  # write, upload and the work task all finish during interrupt
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.started.is_set())
+    gov.update(dec(pause_expired=True))
+    assert await asyncio.wait_for(task, 10) == 1
+    assert "complete" in client.kinds() and "release" not in client.kinds()
+    assert len(s3.puts) == 1
 
-    class RacingWorker(FakeWorker):
-        def interrupt(self) -> None:
-            super().interrupt()
-            assert self.gate is not None
-            self.gate.set()  # the batch finishes while we are interrupting ...
-            deadline = time.monotonic() + 5
-            while not s3.puts and time.monotonic() < deadline:
-                time.sleep(0.01)
-            time.sleep(0.3)  # ... and so do write, upload and the work task
 
-    worker = RacingWorker()
-    worker.gate = threading.Event()
+async def test_verdict_while_the_upload_is_in_flight_lets_it_complete(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client, s3 = FakeClient([assignment()]), SlowUploadS3()
+    worker = _RacingWorker(lambda: bool(s3.puts))  # inference over, the work not yet done
     loop = make_loop(client, worker, s3, tmp_path, [], governor=gov)
     task = asyncio.create_task(loop.run(max_subtasks=1))
     await until(lambda: worker.started.is_set())
-    gov.update(dec(pause_expired=True))  # not paused: the batch loop carries on to the upload
+    gov.update(dec(pause_expired=True))
+    await asyncio.wait_for(s3.put_started.wait(), 5)
+    await until(lambda: worker.interrupts == 1)
+    s3.release_put.set()
     assert await asyncio.wait_for(task, 10) == 1
     assert "complete" in client.kinds() and "release" not in client.kinds()
+
+
+async def test_real_failure_racing_a_verdict_is_reported_with_its_own_code(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client = FakeClient([assignment()])
+    done: threading.Event | None = None
+    worker = _RacingWorker(
+        lambda: done is not None and done.is_set(),
+        exc=RunnerError("MODEL_BROKEN", "x", retryable=False),
+    )
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov)
+    done = _track_work_done(loop)
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.started.is_set())
+    gov.update(dec(pause_expired=True))
+    await until(lambda: "fail" in client.kinds() or "release" in client.kinds())
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+    req = _fail_req(client)
+    assert (req.retryable, req.code) == (False, "MODEL_BROKEN")
+    assert "release" not in client.kinds()
 
 
 async def test_crashed_watcher_before_inference_ends_releases(tmp_path: Path) -> None:
@@ -2614,7 +2675,7 @@ async def test_status_failures_are_logged_once_and_never_stop_the_loop(tmp_path:
     assert [e["event"] for e in logs].count("status_write_failed") == 1
 
 
-async def test_today_rolls_over_at_local_midnight_in_the_snapshot_too(
+async def test_today_rolls_over_at_local_midnight_on_the_event_loop_snapshot_only_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import datetime as dt
@@ -2628,6 +2689,8 @@ async def test_today_rolls_over_at_local_midnight_in_the_snapshot_too(
     snap = loop._status_snapshot()
     assert (snap.today.date, snap.today.subtasks, snap.today.records) == (days[0], 1, 5)
     days[0] = dt.date(2026, 10, 15)  # midnight passes while idle
+    assert loop._status_snapshot().today.date == dt.date(2026, 10, 14)  # a read never rolls
+    loop._roll_today()  # what _status_loop does on the event loop before the thread
     snap = loop._status_snapshot()
     assert (snap.today.date, snap.today.subtasks, snap.today.records) == (days[0], 0, 0)
 
@@ -2687,3 +2750,101 @@ async def test_sigterm_during_a_downgrade_lets_a_finishing_batch_release_gracefu
     assert await asyncio.wait_for(task, 10) == 0
     assert "release" in client.kinds() and "complete" not in client.kinds()
     assert not worker.killed or worker.closed
+
+
+async def test_crashed_watcher_backs_off_like_a_local_fault(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client, worker, sleeps = FakeClient([assignment()]), FakeWorker(block=True), list[float]()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, sleeps, governor=gov, backoff=(30.0, 30.0))
+
+    async def boom() -> None:
+        raise RuntimeError("watcher bug")
+
+    loop._push_control = boom  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run())
+    await until(lambda: "release" in client.kinds())
+    await until(lambda: len(sleeps) >= 1)  # FAILED outcome: back-off, though it was released
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+    assert "fail" not in client.kinds()
+
+
+class _GatedCache(FakeCache):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.block_on: int | None = None
+        self.release = asyncio.Event()
+
+    async def ensure(self, model: ModelEntry) -> None:
+        self.calls += 1
+        if self.calls == self.block_on:
+            await self.release.wait()
+        return None
+
+
+async def test_warm_worker_over_a_dropped_budget_is_unloaded_not_counted_as_oom(
+    tmp_path: Path,
+) -> None:
+    gib = 1024**3
+    gov = FixedGovernor(BUDGET)  # 8 GB
+    first = assignment()
+    first = first.model_copy(update={"model": first.model.model_copy(update={"memory_gb": 8})})
+    client, worker = FakeClient([first, assignment()]), FakeWorker()
+    worker.footprints = [7 * gib]  # the warm 8 GB model: over a 4 GB budget's 4.4 GiB guard
+    cache = _GatedCache()
+    cache.block_on = 2  # the second subtask is still fetching its (small) model
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=gov, model_cache=cache,
+        guard_interval_s=0.02,
+    )  # fmt: skip
+    task = asyncio.create_task(loop.run(max_subtasks=2))
+    await until(lambda: cache.calls == 2)
+    gov.update(dec(small(4.0)))
+    await until(lambda: worker.unloads >= 1)
+    await asyncio.sleep(0.15)  # several guard cycles: the old code failed the subtask as OOM
+    assert "fail" not in client.kinds() and worker.interrupts == 0
+    cache.release.set()
+    assert await asyncio.wait_for(task, 10) == 2
+    assert "fail" not in client.kinds()
+
+
+async def test_budget_drop_allowance_lasts_only_downgrade_batch_s(tmp_path: Path) -> None:
+    gib = 1024**3
+    gov = FixedGovernor(BUDGET)  # 8 GB while the batch runs
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    worker.footprints = [5 * gib]  # fits 8 GB, over a 4 GB budget's 4.4 GiB guard
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=gov,
+        guard_interval_s=0.02, downgrade_batch_s=0.4,
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    task = asyncio.create_task(loop.run())
+    await until(lambda: worker.started.is_set())
+    gov.update(dec(small(4.0)))  # the model (0.1 GB) still fits: no downgrade, the batch goes on
+    await asyncio.sleep(0.15)
+    assert worker.interrupts == 0 and "fail" not in client.kinds()  # within the allowance
+    await asyncio.wait_for(task, 10)
+    req = _fail_req(client)
+    assert (req.retryable, req.code) == (True, "OOM")  # after it: against the live budget
+
+
+async def test_pause_stops_a_new_model_fetch_from_starting(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+
+    class PausingClient(FakeClient):
+        async def acquire(self, req: AcquireRequest) -> Assignment | None:
+            item = await super().acquire(req)
+            if item is not None:
+                gov.update(dec(reason=PausedReason.THERMAL))  # paused right after the acquire
+            return item
+
+    client, worker, cache = PausingClient([assignment()]), FakeWorker(), _GatedCache()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, model_cache=cache)
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: "acquire" in client.kinds())
+    await asyncio.sleep(0.2)
+    assert cache.calls == 0 and not task.done()  # no download started while paused
+    gov.update(dec())
+    assert await asyncio.wait_for(task, 10) == 1
+    assert cache.calls == 1

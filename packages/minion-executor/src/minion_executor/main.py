@@ -289,7 +289,7 @@ async def _run(
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
         governor = build_governor(plan) if plan is not None else None
-        # fetch niceness follows the live cpu priority; fixed only without a governor
+        # fetch niceness is read per fetch (at spawn), not live; fixed only without a governor
         nice_fn = (lambda: nice_for(governor.decision.budget.cpu_priority)) if governor else None
         loop = ExecutorLoop(
             client,

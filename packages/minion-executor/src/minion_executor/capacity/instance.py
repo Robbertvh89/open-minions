@@ -9,6 +9,7 @@ the holder runs the loop, hence only the holder ever writes the `stopped` marker
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import os
 import stat
@@ -51,7 +52,11 @@ def acquire_instance_lock(state_dir: Path) -> int:
         os.fchmod(fd, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise SafeFileError(
+                    f"cannot lock {state_dir / LOCK_FILE}: {exc.strerror}"
+                ) from None
             raise AlreadyRunningError(
                 f"another minion-executor is already running with state directory {state_dir} "
                 "(see `minion-executor status`); stop it first"
