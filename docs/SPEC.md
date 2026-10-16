@@ -266,6 +266,8 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   - thermal state `serious` or `critical`;
   - on battery (default) or battery < 30 % (if `allow_on_battery = true`); Low Power Mode on;
   - owner-triggered `minion-executor pause [--for 1h]`;
+  - an unusable owner `control.json` (fails closed; `paused_reason` `control_invalid`, listed right
+    after `user_paused` in the priority order);
   - optional: listed foreground apps active (e.g. screen sharing, `zoom.us`) → drop to `light` or pause.
 - FR-54. **Budget changes mid-subtask.** Duty cycle, batch size and CPU priority apply at the next
   generation step / batch. A memory budget below the loaded model's `memory_gb` causes the executor to

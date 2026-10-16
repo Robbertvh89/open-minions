@@ -9,8 +9,14 @@ import pytest
 from minion_common.enums import CapacityProfile as P
 from minion_common.enums import PausedReason as R
 from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
-from minion_executor.capacity.control import OwnerControl
-from minion_executor.capacity.governor import Decision, GovernorTiming, GovState, decide
+from minion_executor.capacity.control import ControlUnusable, OwnerControl
+from minion_executor.capacity.governor import (
+    Decision,
+    GovernorTiming,
+    GovState,
+    decide,
+    initial_state,
+)
 from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
 
 T0 = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)  # a Wednesday
@@ -37,10 +43,14 @@ IDLE = 11 * 60.0  # past the 10 min default
 class Gov:
     """Drives `decide` step by step with a fake clock."""
 
-    def __init__(self, cfg: ExecutorConfig | None = None, **kw: object) -> None:
+    def __init__(
+        self, cfg: ExecutorConfig | None = None, start: bool = False, **kw: object
+    ) -> None:
         self.cfg = cfg or ExecutorConfig()
         self.specs = resolve_profiles(self.cfg)
-        self.state = GovState()
+        pin = kw.get("pinned")
+        assert pin is None or isinstance(pin, P)
+        self.state = initial_state(self.cfg, pin) if start else GovState()
         self.kw = kw
         self.t = T0
         self.d: Decision
@@ -49,7 +59,7 @@ class Gov:
         self,
         s: SignalSnapshot | None,
         dt: float = 0.0,
-        owner: OwnerControl | None = None,
+        owner: OwnerControl | ControlUnusable | None = None,
         local: datetime | None = None,
     ) -> Decision:
         self.t += timedelta(seconds=dt)
@@ -203,7 +213,7 @@ def test_schedule_end_of_window_deescalates_at_once() -> None:
         ({"low_power_mode": True}, {}, R.LOW_POWER_MODE),
         ({"on_ac": False, "battery_percent": 90}, {}, R.ON_BATTERY),
         ({"on_ac": False, "battery_percent": 29}, {"allow_on_battery": True}, R.LOW_BATTERY),
-        ({"on_ac": False}, {"allow_on_battery": True}, None),  # percent unknown: no rule
+        ({"on_ac": False}, {"allow_on_battery": True}, R.LOW_BATTERY),  # unknown %: closed
         ({"on_ac": False, "battery_percent": 30}, {"allow_on_battery": True}, None),
         ({"on_ac": True, "battery_percent": 5}, {}, None),  # charging
         ({"thermal": Thermal.FAIR}, {}, None),
@@ -382,3 +392,124 @@ def test_decide_is_pure() -> None:
     a = decide(s, g.cfg, g.specs, None, T0, T0, GovState(), total_gb=TOTAL)
     b = decide(s, g.cfg, g.specs, None, T0, T0, GovState(), total_gb=TOTAL)
     assert a == b
+
+
+# --- resolved-budget comparison (escalation vs de-escalation) ----------------------------------
+
+
+def _custom(mem: float, duty: float, batch: int, cpu: str) -> ExecutorConfig:
+    return ExecutorConfig(
+        idle_profile=P.CUSTOM,
+        profiles={
+            "custom": {
+                "memory_fraction": mem,
+                "gpu_duty_cycle": duty,
+                "max_batch_size": batch,
+                "cpu_priority": cpu,
+            }
+        },
+    )
+
+
+def test_user_return_from_mixed_custom_applies_at_once() -> None:
+    # reviewer repro: custom (0.7 mem, duty 0.2, batch 32, normal) -> light lowers memory + cpu
+    g = Gov(_custom(0.7, 0.2, 32, "normal"))
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 61)
+    assert g.d.profile is P.CUSTOM
+    d = g.step(snap(hid_idle_s=1.0), 0.5)
+    assert d.profile is P.LIGHT and d.candidate is None
+
+
+@pytest.mark.parametrize(
+    ("custom", "at_once"),
+    [
+        ((0.25, 0.30, 4, "background"), True),  # equal in every dimension
+        ((0.20, 0.20, 2, "background"), False),  # lower everywhere: light is an escalation
+        ((0.30, 0.50, 8, "normal"), True),  # higher everywhere: light is lower -> at once
+        ((0.20, 0.50, 8, "background"), False),  # mixed, memory/cpu not lowered
+        ((0.20, 0.50, 8, "low"), True),  # mixed, but light lowers the cpu priority
+        ((0.30, 0.20, 2, "background"), True),  # mixed, memory goes down
+    ],
+)
+def test_escalation_table(custom: tuple[float, float, int, str], at_once: bool) -> None:
+    # current = custom (applied via the pin of a previous owner choice), target = light (active)
+    cfg = _custom(*custom)
+    g = Gov(cfg)
+    g.step(snap(), owner=OwnerControl(profile=P.CUSTOM))
+    assert g.d.profile is P.CUSTOM
+    d = g.step(snap(), 1, owner=OwnerControl())  # owner back to auto: target light, automatic
+    assert (d.profile is P.LIGHT) is at_once
+    if not at_once:
+        assert d.candidate is P.LIGHT and d.candidate_since is not None
+        assert g.step(snap(), 60).profile is P.LIGHT
+
+
+def test_decision_reports_profile_source() -> None:
+    g = Gov(pinned=P.BALANCED)
+    assert g.step(snap()).profile_source.value == "pinned"
+    assert g.step(snap(), owner=OwnerControl(profile=P.FULL)).profile_source.value == "owner"
+    g2 = Gov()
+    assert g2.step(snap(hid_idle_s=IDLE)).profile_source.value == "idle"
+    assert g2.step(snap(), 1).profile_source.value == "active"
+
+
+# --- clock, initial state, battery, control_invalid ---------------------------------------------
+
+
+def test_initial_state_holds_escalation_from_startup() -> None:
+    g = Gov(start=True)
+    assert g.step(snap(hid_idle_s=IDLE)).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE), 59).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE), 1).profile is P.FULL
+
+
+def test_initial_state_uses_pin() -> None:
+    cfg = ExecutorConfig()
+    assert initial_state(cfg, P.BALANCED).profile is P.BALANCED
+    assert initial_state(cfg).profile is cfg.active_profile
+
+
+def test_backward_clock_jump_restarts_timers() -> None:
+    g = Gov(start=True)
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 50)
+    g.t -= timedelta(hours=1)  # clock stepped back
+    assert g.step(snap(hid_idle_s=IDLE)).profile is P.LIGHT
+    assert g.state.candidate_since == g.t  # restarted at now
+    assert g.step(snap(hid_idle_s=IDLE), 59).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE), 1).profile is P.FULL
+    # pause/clear timers too
+    g2 = Gov()
+    g2.step(snap(thermal=Thermal.SERIOUS))
+    g2.step(snap(), 1)
+    g2.step(snap(), 5)
+    g2.t -= timedelta(hours=1)
+    assert g2.step(snap()).paused_reason is R.THERMAL
+    assert g2.state.clear_since == g2.t and g2.state.paused_since == g2.t
+
+
+@pytest.mark.parametrize("owner", [ControlUnusable("bad"), None])
+def test_control_unusable_pauses_with_control_invalid(owner: ControlUnusable | None) -> None:
+    g = Gov(pinned=P.BALANCED)
+    d = g.step(snap(), owner=owner)
+    if owner is None:
+        assert d.paused_reason is None
+        return
+    assert d.paused_reason is R.CONTROL_INVALID and d.profile is P.BALANCED  # auto -> the pin
+    # signal conditions rank below it
+    assert g.step(snap(thermal=Thermal.SERIOUS), 1, owner=owner).paused_reason is R.CONTROL_INVALID
+    # fixed file: resumes after the signal clear window only if a signal pause was latched
+    assert g.step(snap(), 1, owner=OwnerControl()).paused_reason is R.THERMAL  # latched, clearing
+    assert g.step(snap(), 11, owner=OwnerControl()).paused_reason is None
+
+
+def test_user_pause_reported_for_valid_control() -> None:
+    g = Gov()
+    assert g.step(snap(), owner=OwnerControl(paused=True)).paused_reason is R.USER_PAUSED
+
+
+def test_control_unusable_ignores_owner_profile_and_idle() -> None:
+    g = Gov()
+    d = g.step(snap(hid_idle_s=IDLE), owner=ControlUnusable("x"))
+    assert d.paused_reason is R.CONTROL_INVALID and d.profile is P.FULL  # idle rule, not owner

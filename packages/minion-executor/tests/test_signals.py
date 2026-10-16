@@ -190,3 +190,53 @@ def test_default_source_off_mac_is_null(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(sg, "sys", types.SimpleNamespace(platform="linux"))
     assert isinstance(default_source(None), NullSignals)
+
+
+async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_works() -> None:
+    import threading
+
+    release = threading.Event()
+
+    class Hung:
+        calls = 0
+
+        def read(self) -> SignalSnapshot:
+            Hung.calls += 1
+            release.wait(5)
+            return NullSignals().read()
+
+    src = Hung()
+    before = threading.active_count()
+    with pytest.raises(SignalError, match="timed out"):
+        await read_with_timeout(src, 0.05)
+    for _ in range(10):
+        with pytest.raises(SignalError, match="previous read still hung"):
+            await read_with_timeout(src, 0.05)
+    assert Hung.calls == 1
+    assert threading.active_count() <= before + 1
+    assert await asyncio.to_thread(lambda: 7) == 7  # the default pool is untouched
+    release.set()
+    for _ in range(100):  # the abandoned read finishes; the next read goes through again
+        await asyncio.sleep(0.02)
+        try:
+            await read_with_timeout(src, 1.0)
+            break
+        except SignalError:
+            continue
+    else:
+        pytest.fail("source never recovered")
+
+
+async def test_read_errors_propagate_and_signal_threads_are_daemons() -> None:
+    import threading
+
+    seen: list[bool] = []
+
+    class Boom:
+        def read(self) -> SignalSnapshot:
+            seen.append(threading.current_thread().daemon)
+            raise SignalError("nope")
+
+    with pytest.raises(SignalError, match="nope"):
+        await read_with_timeout(Boom(), 1.0)
+    assert seen == [True]

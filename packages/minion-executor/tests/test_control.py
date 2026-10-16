@@ -12,6 +12,7 @@ import pytest
 from minion_common.enums import CapacityProfile
 from minion_executor.capacity.control import (
     CONTROL_FILE,
+    ControlUnusable,
     OwnerControl,
     parse_duration,
     read_control,
@@ -49,7 +50,7 @@ def test_write_creates_private_dir_and_file(sd: Path) -> None:
     assert stat.S_IMODE(f.stat().st_mode) == 0o600
     assert not [p for p in sd.iterdir() if p.name != CONTROL_FILE]  # no tmp left behind
     got = read_control(sd)
-    assert got is not None and got.paused and got.written_at is not None
+    assert isinstance(got, OwnerControl) and got.paused and got.written_at is not None
 
 
 def test_write_ignores_umask(sd: Path) -> None:
@@ -79,15 +80,15 @@ def test_atomic_replace_keeps_old_file_when_write_fails(
 ) -> None:
     write_control(sd, OwnerControl(paused=True))
 
-    def boom(self: Path, target: object) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(Path, "replace", boom)
+    monkeypatch.setattr(os, "replace", boom)
     with pytest.raises(SafeFileError):
         write_control(sd, OwnerControl(paused=False))
     monkeypatch.undo()
     c = read_control(sd)
-    assert c is not None and c.paused
+    assert isinstance(c, OwnerControl) and c.paused
     assert [p.name for p in sd.iterdir()] == [CONTROL_FILE]
 
 
@@ -108,19 +109,60 @@ def test_read_missing_is_none(sd: Path) -> None:
         "[]",
     ],
 )
-def test_invalid_control_is_ignored(sd: Path, payload: str) -> None:
+def test_invalid_control_is_unusable(sd: Path, payload: str) -> None:
     write_control(sd, OwnerControl())
     f = sd / CONTROL_FILE
     f.write_text(payload)
     f.chmod(0o600)
-    assert read_control(sd) is None
+    assert isinstance(read_control(sd), ControlUnusable)
+
+
+def test_newer_version_is_unusable(sd: Path) -> None:
+    write_control(sd, OwnerControl())
+    f = sd / CONTROL_FILE
+    f.write_text('{"version": 2, "paused": false}')
+    f.chmod(0o600)
+    assert isinstance(read_control(sd), ControlUnusable)
+
+
+def test_missing_state_dir_is_silently_absent(sd: Path) -> None:
+    assert read_control(sd) is None  # the dir does not exist yet: no warning, no unusable
+
+
+def test_unreadable_or_non_regular_is_unusable(sd: Path) -> None:
+    write_control(sd, OwnerControl())
+    f = sd / CONTROL_FILE
+    f.chmod(0o000)
+    if os.geteuid() != 0:
+        assert isinstance(read_control(sd), ControlUnusable)
+    f.unlink()
+    f.mkdir()
+    assert isinstance(read_control(sd), ControlUnusable)
+
+
+def test_profile_on_unusable_file_keeps_the_pause(sd: Path) -> None:
+    write_control(sd, OwnerControl())
+    f = sd / CONTROL_FILE
+    f.write_text("{")
+    f.chmod(0o600)
+    warnings: list[str] = []
+    c = update_control(sd, profile=CapacityProfile.FULL, warn=warnings.append)
+    assert c.paused and c.profile is CapacityProfile.FULL
+    assert len(warnings) == 1 and "pause is kept" in warnings[0]
+    got = read_control(sd)
+    assert isinstance(got, OwnerControl) and got.paused
+    # resume is the explicit way out, and does not warn
+    f.write_text("{")
+    warnings.clear()
+    c = update_control(sd, paused=False, warn=warnings.append)
+    assert not c.paused and not warnings
 
 
 def test_unsafe_files_are_ignored(sd: Path, tmp_path: Path) -> None:
     write_control(sd, OwnerControl(paused=True))
     f = sd / CONTROL_FILE
     f.chmod(0o666)
-    assert read_control(sd) is None  # world-writable
+    assert isinstance(read_control(sd), ControlUnusable)  # world-writable
     f.chmod(0o600)
     assert read_control(sd) is not None
     # symlink at the file: never followed
@@ -129,12 +171,12 @@ def test_unsafe_files_are_ignored(sd: Path, tmp_path: Path) -> None:
     real.chmod(0o600)
     f.unlink()
     f.symlink_to(real)
-    assert read_control(sd) is None
+    assert isinstance(read_control(sd), ControlUnusable)
     f.unlink()
     # group/world-writable state dir
     write_control(sd, OwnerControl(paused=True))
     sd.chmod(0o770)
-    assert read_control(sd) is None
+    assert isinstance(read_control(sd), ControlUnusable)
     with pytest.raises(SafeFileError):
         write_control(sd, OwnerControl())
 
@@ -146,7 +188,7 @@ def test_symlinked_state_dir_is_refused(tmp_path: Path) -> None:
     link.symlink_to(real)
     with pytest.raises(SafeFileError):
         write_control(link, OwnerControl())
-    assert read_control(link) is None
+    assert isinstance(read_control(link), ControlUnusable)
 
 
 def test_oversized_control_ignored(sd: Path) -> None:
@@ -154,7 +196,7 @@ def test_oversized_control_ignored(sd: Path) -> None:
     f = sd / CONTROL_FILE
     f.write_text(" " * 5000 + "{}")
     f.chmod(0o600)
-    assert read_control(sd) is None
+    assert isinstance(read_control(sd), ControlUnusable)
 
 
 def test_symlink_at_target_is_replaced_not_followed(sd: Path, tmp_path: Path) -> None:

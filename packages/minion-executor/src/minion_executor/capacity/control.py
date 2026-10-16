@@ -1,18 +1,22 @@
 """Owner control (SPEC FR-56, ADR-0006 D11): `control.json` in the state directory.
 
 `minion-executor pause|resume|profile` write it atomically (0600); the governor polls it with the
-signals. Files that are not ours, are writable by others or fail the strict schema are ignored with
-a warning and never crash the loop. No payloads are ever in this file.
+signals. A file that is present but not usable (not ours, writable by others, oversized, not
+regular, unreadable, bad schema, newer version) is reported as `ControlUnusable`: the governor
+fails closed (paused, `control_invalid`) rather than guessing the owner's intent. Nothing here
+logs; the reader returns a reason string and the runtime (M4.5) must log it once per change, not on
+every poll. A missing file or state directory is simply "absent". No payloads are ever in this file.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-import structlog
 from minion_common.enums import CapacityProfile
 from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 
@@ -22,8 +26,6 @@ from minion_executor.capacity.safefile import (
     ensure_private_dir,
     read_private_file,
 )
-
-log = structlog.get_logger()
 
 CONTROL_FILE = "control.json"
 MAX_CONTROL_BYTES = 4096
@@ -64,8 +66,15 @@ def parse_duration(text: str) -> timedelta:
     return delta
 
 
-def read_control(state_dir: Path) -> OwnerControl | None:
-    """The current owner control, or None when absent, unsafe or invalid (warning logged)."""
+@dataclass(frozen=True)
+class ControlUnusable:
+    """control.json exists but cannot be trusted. `reason` carries no file contents."""
+
+    reason: str
+
+
+def read_control(state_dir: Path) -> OwnerControl | ControlUnusable | None:
+    """Tri-state: None (absent), a valid `OwnerControl`, or `ControlUnusable` (fail closed)."""
     path = state_dir / CONTROL_FILE
     try:
         data = read_private_file(path, "control file", MAX_CONTROL_BYTES)
@@ -73,14 +82,13 @@ def read_control(state_dir: Path) -> OwnerControl | None:
             return None
         return OwnerControl.model_validate_json(data)
     except SafeFileError as exc:
-        log.warning("control_file_ignored", reason=str(exc))
+        return ControlUnusable(str(exc))
     except ValidationError as exc:
         # loc + message only: pydantic's default text echoes the offending input
         detail = "; ".join(
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
         )
-        log.warning("control_file_ignored", reason=f"invalid schema: {detail}")
-    return None
+        return ControlUnusable(f"invalid schema: {detail}")
 
 
 def write_control(state_dir: Path, ctl: OwnerControl) -> None:
@@ -98,10 +106,23 @@ def update_control(
     profile: CapacityProfile | None = None,
     clear_profile: bool = False,
     now: datetime | None = None,
+    warn: Callable[[str], None] | None = None,
 ) -> OwnerControl:
-    """Read-modify-write: change only the given fields and keep the rest of the owner's state."""
-    current = read_control(state_dir) or OwnerControl()
-    fields = current.model_dump()
+    """Read-modify-write: change only the given fields and keep the rest of the owner's state.
+
+    An unusable existing file never silently drops a pause: unless the call sets `paused`
+    explicitly, the result is paused (no end time) and `warn` is told why. `resume` is the
+    explicit way out.
+    """
+    current = read_control(state_dir)
+    if isinstance(current, ControlUnusable):
+        if paused is None and warn is not None:
+            warn(
+                f"existing control file was unreadable ({current.reason}); "
+                "the pause is kept, run `minion-executor resume` to lift it"
+            )
+        current = OwnerControl(paused=True)
+    fields = (current or OwnerControl()).model_dump()
     if paused is not None:
         now = now or datetime.now(UTC)
         fields["paused"] = paused

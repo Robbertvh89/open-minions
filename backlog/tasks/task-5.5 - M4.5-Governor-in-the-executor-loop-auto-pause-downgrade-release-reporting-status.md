@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-16 13:32'
-updated_date: '2026-10-16 17:50'
+updated_date: '2026-10-16 19:49'
 labels:
   - M4
 dependencies: []
@@ -28,4 +28,6 @@ ordinal: 28000
 
 <!-- SECTION:NOTES:BEGIN -->
 From TASK-5.3 fix round: wire WorkerHandle.priority_ok() into the governor poll (False = worker less throttled than its budget: interrupt/respawn), with a grace window of about one batch after a budget change since the worker applies a new priority only when its next run starts. Also poll WorkerHandle.footprint_bytes() (None = no live worker) for the D7 memory guard.
+
+From TASK-5.4 fix round: (1) at startup, if the state dir fails ownership/mode checks (open_private_dir raises SafeFileError other than MissingDirError) exit 2. (2) read_control returns None | OwnerControl | ControlUnusable and never logs; log the unusable reason ONCE PER CHANGE (not every poll). (3) pass a UTC now to decide(); seed with initial_state(cfg, pinned); Decision.release_now/pause_expired are level-triggered, act idempotently; Decision.profile_source/candidate/candidate_since are available for status. (4) read_with_timeout raises SignalError('previous read still hung') while a read is wedged: counts as a failure.
 <!-- SECTION:NOTES:END -->

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import threading
+
 import pytest
 from minion_executor.capacity.signals import (
     MacSignals,
@@ -10,6 +13,7 @@ from minion_executor.capacity.signals import (
     Thermal,
     default_source,
 )
+from minion_executor.worker.footprint import process_footprint_bytes
 
 pytestmark = pytest.mark.macos
 
@@ -35,3 +39,23 @@ def test_mac_signals_repeat_reads_and_default_source() -> None:
 def test_mac_signals_carry_no_identifying_data() -> None:
     s = MacSignals().read()
     assert not any(isinstance(v, str) and len(v) > 20 for v in vars(s).values())
+
+
+def test_mac_signals_reads_do_not_leak_core_foundation_objects() -> None:
+    """5000 reads on a bare worker thread (as the runtime does) must not grow the footprint."""
+    src = MacSignals()
+    fp: dict[str, int] = {}
+
+    def work() -> None:
+        for _ in range(2000):  # warm up
+            src.read()
+        fp["before"] = process_footprint_bytes(os.getpid()) or 0
+        for _ in range(5000):
+            src.read()
+        fp["after"] = process_footprint_bytes(os.getpid()) or 0
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join()
+    assert fp["before"] > 0
+    assert fp["after"] - fp["before"] < 1_000_000

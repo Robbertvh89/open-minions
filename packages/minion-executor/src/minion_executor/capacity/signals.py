@@ -14,10 +14,12 @@ Reads are synchronous and fast (microseconds); the async runtime wraps them in
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ctypes
 import ctypes.util
 import os
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -108,9 +110,13 @@ class NullSignals:
         return SignalSnapshot(0.0, True, None, False, Thermal.NOMINAL, MemPressure.NORMAL, _now())
 
 
+_CF_RETAINED: dict[str, Any] = {"retval": {"already_cfretained": True}}
+
+
 class MacSignals:
     """Real macOS readers. Raises SignalError at construction if a framework is unusable."""
 
+    _objc: Any
     _quartz: Any
     _foundation: Any
     _iokit: dict[str, Any]
@@ -132,8 +138,9 @@ class MacSignals:
                 bundle,
                 iokit,
                 [
-                    ("IOPSCopyPowerSourcesInfo", b"@"),
-                    ("IOPSCopyPowerSourcesList", b"@@"),
+                    # "Copy" functions return +1 CF objects: tell pyobjc to adopt (not retain) them
+                    ("IOPSCopyPowerSourcesInfo", b"@", "", _CF_RETAINED),
+                    ("IOPSCopyPowerSourcesList", b"@@", "", _CF_RETAINED),
                     ("IOPSGetProvidingPowerSourceType", b"@@"),
                     ("IOPSGetPowerSourceDescription", b"@@@"),
                 ],
@@ -145,6 +152,7 @@ class MacSignals:
             ) from None
         if "IOPSCopyPowerSourcesInfo" not in iokit:
             raise SignalError("IOKit power source functions unavailable")
+        self._objc = objc
         self._quartz = Quartz
         self._foundation = Foundation
         self._iokit = iokit
@@ -195,17 +203,19 @@ class MacSignals:
 
     def read(self) -> SignalSnapshot:
         try:
-            info = self._foundation.NSProcessInfo.processInfo()
-            on_ac, percent = self._power()
-            return SignalSnapshot(
-                hid_idle_s=self._hid_idle_s(),
-                on_ac=on_ac,
-                battery_percent=percent,
-                low_power_mode=bool(info.isLowPowerModeEnabled()),
-                thermal=thermal_from_ns(int(info.thermalState())),
-                memory_pressure=self._memory_pressure(),
-                taken_at=_now(),
-            )
+            # reads run on a bare worker thread with no ambient pool: drain autoreleased objects
+            with self._objc.autorelease_pool():
+                info = self._foundation.NSProcessInfo.processInfo()
+                on_ac, percent = self._power()
+                return SignalSnapshot(
+                    hid_idle_s=self._hid_idle_s(),
+                    on_ac=on_ac,
+                    battery_percent=percent,
+                    low_power_mode=bool(info.isLowPowerModeEnabled()),
+                    thermal=thermal_from_ns(int(info.thermalState())),
+                    memory_pressure=self._memory_pressure(),
+                    taken_at=_now(),
+                )
         except SignalError:
             raise
         except Exception as exc:  # any pyobjc/ctypes failure is "unreadable", never a crash
@@ -274,11 +284,43 @@ def default_source(fake_signals: Path | None) -> SignalSource:
     return src
 
 
+# At most one read in flight per source (keyed by id): a wedged framework call must not pile up
+# threads, and its thread must not keep the interpreter alive (daemon, so SIGTERM exits cleanly).
+_inflight: dict[int, concurrent.futures.Future[SignalSnapshot]] = {}
+
+
 async def read_with_timeout(
     source: SignalSource, timeout_s: float = DEFAULT_READ_TIMEOUT_S
 ) -> SignalSnapshot:
-    """Read in a worker thread; a hung read becomes a SignalError instead of stalling the loop."""
+    """Read on a dedicated daemon thread; a hung read becomes a SignalError, never a stall.
+
+    While a previous read of the same source is still running, no new thread is started and
+    SignalError("previous read still hung") is raised at once. The default `to_thread` pool is
+    never used, so a hung read cannot starve it.
+    """
+    key = id(source)
+    prev = _inflight.get(key)
+    if prev is not None and not prev.done():
+        raise SignalError("previous read still hung")
+    fut: concurrent.futures.Future[SignalSnapshot] = concurrent.futures.Future()
+    _inflight[key] = fut
+
+    def _forget(f: concurrent.futures.Future[SignalSnapshot]) -> None:
+        if _inflight.get(key) is f:
+            del _inflight[key]
+
+    fut.add_done_callback(_forget)
+
+    def _run() -> None:
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(source.read())
+        except BaseException as exc:  # delivered to the awaiting loop
+            fut.set_exception(exc)
+
+    threading.Thread(target=_run, name="signal-read", daemon=True).start()
     try:
-        return await asyncio.wait_for(asyncio.to_thread(source.read), timeout_s)
+        return await asyncio.wait_for(asyncio.wrap_future(fut), timeout_s)
     except TimeoutError:
         raise SignalError("signal read timed out") from None

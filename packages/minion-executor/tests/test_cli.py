@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from minion_common.enums import CapacityProfile, CpuPriority, Engine
 from minion_common.schemas import Budget
+from minion_executor.capacity.control import OwnerControl
 from minion_executor.main import app
 from typer.testing import CliRunner
 
@@ -525,22 +526,47 @@ def test_pause_resume_roundtrip(state_dir: Path) -> None:
     r = runner.invoke(app, ["pause"])
     assert r.exit_code == 0, r.output
     c = read_control(state_dir)
-    assert c is not None and c.paused and c.paused_until is None
+    assert isinstance(c, OwnerControl) and c.paused and c.paused_until is None
     r = runner.invoke(app, ["pause", "--for", "2h30m"])
     assert r.exit_code == 0 and "until" in r.output
     c = read_control(state_dir)
-    assert c is not None and c.paused_until is not None
+    assert isinstance(c, OwnerControl) and c.paused_until is not None
     r = runner.invoke(app, ["resume"])
     assert r.exit_code == 0
     c = read_control(state_dir)
-    assert c is not None and not c.paused and c.paused_until is None
+    assert isinstance(c, OwnerControl) and not c.paused and c.paused_until is None
 
 
-@pytest.mark.parametrize("bad", ["abc", "0m", "99d", "10"])
-def test_pause_rejects_bad_duration(state_dir: Path, bad: str) -> None:
-    r = runner.invoke(app, ["pause", "--for", bad])
-    assert r.exit_code == 2 and "duration" in r.output
+@pytest.mark.parametrize("bad", ["abc", "0m", "99d", "10", "-5m", "99999d", "", "0s", "1.5h"])
+@pytest.mark.parametrize("style", ["split", "equals"])
+def test_pause_rejects_bad_duration(state_dir: Path, bad: str, style: str) -> None:
+    args = ["pause", "--for", bad] if style == "split" else ["pause", f"--for={bad}"]
+    r = runner.invoke(app, args)
+    assert r.exit_code == 2, r.output
+    assert "duration" in r.output
     assert not state_dir.exists()
+
+
+def test_commands_print_the_control_file_path(state_dir: Path) -> None:
+    for args in (["pause"], ["resume"], ["profile", "full"], ["profile", "auto"]):
+        r = runner.invoke(app, args)
+        assert r.exit_code == 0 and str(state_dir / "control.json") in r.output, args
+
+
+def test_first_cli_run_with_missing_dir_has_no_warning(state_dir: Path) -> None:
+    r = runner.invoke(app, ["profile", "auto"])
+    assert r.exit_code == 0 and "warning" not in r.output.lower()
+
+
+def test_profile_on_unusable_file_warns_and_keeps_pause(state_dir: Path) -> None:
+    from minion_executor.capacity.control import read_control
+
+    runner.invoke(app, ["pause"])
+    (state_dir / "control.json").write_text("{")
+    r = runner.invoke(app, ["profile", "full"])
+    assert r.exit_code == 0 and "pause is kept" in r.output
+    c = read_control(state_dir)
+    assert isinstance(c, OwnerControl) and c.paused
 
 
 def test_profile_sets_and_auto_clears(state_dir: Path) -> None:
@@ -548,11 +574,11 @@ def test_profile_sets_and_auto_clears(state_dir: Path) -> None:
 
     assert runner.invoke(app, ["profile", "full"]).exit_code == 0
     c = read_control(state_dir)
-    assert c is not None and c.profile is CapacityProfile.FULL
+    assert isinstance(c, OwnerControl) and c.profile is CapacityProfile.FULL
     runner.invoke(app, ["pause"])
     assert runner.invoke(app, ["profile", "auto"]).exit_code == 0
     c = read_control(state_dir)
-    assert c is not None and c.profile is None and c.paused  # pause kept
+    assert isinstance(c, OwnerControl) and c.profile is None and c.paused  # pause kept
 
 
 def test_profile_rejects_unknown_and_undefined_custom(state_dir: Path) -> None:
