@@ -1,10 +1,10 @@
 ---
 id: TASK-4.2
 title: 'M3.2: Model cache, fetch subprocess and worker sandbox'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 20:42'
-updated_date: '2026-10-16 00:52'
+updated_date: '2026-10-16 00:59'
 labels:
   - M3
   - security
