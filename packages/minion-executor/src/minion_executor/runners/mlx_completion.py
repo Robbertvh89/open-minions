@@ -69,6 +69,15 @@ class MlxCompletionRunner:
         self._context = _context_window(conf)
         self._budget, self._cfg = budget, cfg
 
+    def set_budget(self, budget: Budget) -> None:
+        common.apply_memory_limits(budget)
+        self.wired_limit_bytes = common.clamp_wired_limit(budget)
+        self._budget = budget  # batch caps are read per run
+
+    def trim(self) -> None:
+        with contextlib.suppress(ImportError):
+            common.trim_cache()
+
     def _encode(self, rec: Record, params: TaskParams) -> list[int]:
         messages = build_messages(rec, params)
         text = self._tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

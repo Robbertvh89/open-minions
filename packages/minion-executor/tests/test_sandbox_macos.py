@@ -470,3 +470,58 @@ def test_mlx_gpu_matmul_works_in_sandboxed_worker(hardened: tuple[WorkerHandle, 
     assert abs(float(r["softmax_sum"]) - 1.0) < 1e-4  # type: ignore[arg-type]
     # and the sandbox is really on for that same process
     assert _run(hardened, list_dir=str(Path.home()))["ok"] is False
+
+
+def test_cpu_priority_changes_live_inside_the_sandbox(model_dir: Path) -> None:
+    """The Seatbelt profile (unchanged) must not deny `setpriority`/`nice` on the worker itself:
+    raising to LOW and BACKGROUND works after confinement, Darwin background QoS is reversible,
+    and nice is never lowered (unprivileged)."""
+    from minion_common.enums import CpuPriority
+
+    def at(prio: CpuPriority) -> Budget:
+        return BUDGET.model_copy(update={"cpu_priority": prio})
+
+    h = _handle(model_dir)
+    try:
+        h.ensure_model(MODEL, at(CpuPriority.NORMAL), model_dir)
+        (base,) = h.run([{"id": 1, "report_state": 1}], budget=at(CpuPriority.NORMAL))
+        (low,) = h.run([{"id": 1, "report_state": 1}], budget=at(CpuPriority.LOW))
+        assert low["nice"] == max(base["nice"], 10) and low["background"] is False, low
+        (bg,) = h.run([{"id": 1, "report_state": 1}], budget=at(CpuPriority.BACKGROUND))
+        assert bg["nice"] == max(base["nice"], 15) and bg["background"] is True, bg
+        (back,) = h.run([{"id": 1, "report_state": 1}], budget=at(CpuPriority.LOW))
+        assert back["background"] is False and back["nice"] == bg["nice"], back
+        # still confined after all that
+        r = _probe(h, model_dir, exec=["/usr/bin/true"])
+        assert r["ok"] is False, r
+    finally:
+        h.close()
+
+
+def test_live_control_works_inside_the_sandbox(model_dir: Path) -> None:
+    import time as _time
+
+    h = _handle(model_dir)
+    try:
+        h.ensure_model(MODEL, BUDGET, model_dir)
+        gen = h.control(duty=1.0, paused=True)
+        seen: list[int] = []
+        t = threading.Thread(
+            target=lambda: h.run(
+                [{"id": i, "text": "x"} for i in range(5)], None, seen.append, budget=BUDGET
+            ),
+            daemon=True,
+        )
+        t.start()
+        end = _time.monotonic() + 10
+        while _time.monotonic() < end and not ((a := h.last_ack()) and a.gen == gen):
+            _time.sleep(0.02)
+        ack = h.last_ack()
+        assert ack is not None and ack.paused is True
+        _time.sleep(0.3)
+        assert t.is_alive() and not any(seen)  # started paused: no work done
+        h.control(duty=1.0, paused=False)
+        t.join(10)
+        assert not t.is_alive() and max(seen) == 5
+    finally:
+        h.close()

@@ -198,6 +198,17 @@ class HfEmbeddingRunner:
         vecs: list[list[float]] = pooled.cpu().tolist()
         return vecs, counts
 
+    def set_budget(self, budget: Budget) -> None:
+        torch = _import_torch()
+        _apply_memory_limit(torch, budget)
+
+    def trim(self) -> None:
+        with contextlib.suppress(ImportError):
+            import torch
+
+            if torch.backends.mps.is_available():
+                _release(torch)
+
     def memory_in_use(self) -> MemoryStats:
         return self._mem.sample()
 
@@ -393,6 +404,18 @@ class HfCompletionRunner:
                     break
             res.append((item, (self._tok.decode(toks), reason), len(toks)))
         return res
+
+    def set_budget(self, budget: Budget) -> None:
+        torch = _import_torch()
+        _apply_memory_limit(torch, budget)
+        self._budget = budget
+
+    def trim(self) -> None:
+        with contextlib.suppress(ImportError):
+            import torch
+
+            if torch.backends.mps.is_available():
+                _release(torch)
 
     def memory_in_use(self) -> MemoryStats:
         return self._mem.sample()

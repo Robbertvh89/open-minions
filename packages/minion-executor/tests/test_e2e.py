@@ -212,11 +212,13 @@ class CrashOnceWorker(WorkerHandle):
         super().__init__([Engine.FAKE])
         self.killed_pid: int | None = None
 
-    def run(self, batch: Any, params: Any = None, on_progress: Any = None) -> Any:
+    def run(
+        self, batch: Any, params: Any = None, on_progress: Any = None, budget: Any = None
+    ) -> Any:
         if self.killed_pid is None and self.pid is not None:
             self.killed_pid = self.pid
             os.kill(self.pid, signal.SIGKILL)
-        return super().run(batch, params, on_progress)
+        return super().run(batch, params, on_progress, budget)
 
 
 async def test_worker_sigkill_is_retried_to_success(live: Live, tmp_path: Path) -> None:

@@ -59,8 +59,9 @@ class StepControl(Protocol):
     def checkpoint(self, records_done: int | None = None) -> None:
         """Call between generation steps / embedding batches.
 
-        Applies static GPU duty-cycle pacing, emits a rate-limited progress/liveness tick to the
-        control process, and is the seam where later milestones poll pause/budget messages.
+        Applies GPU duty-cycle pacing, emits a rate-limited progress/liveness tick to the control
+        process, and is where live pause / duty-cycle changes take effect (it may block while the
+        executor is paused).
         """
         ...
 
@@ -71,6 +72,15 @@ class Runner(Protocol):
     ) -> None: ...
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]: ...
+
+    def set_budget(self, budget: Budget) -> None:
+        """Re-apply `budget` (memory / wired limits, batch cap) before the next `run`. Called
+        between batches, never during one; a lower memory limit takes effect for new allocations."""
+        ...
+
+    def trim(self) -> None:
+        """Free cached memory that is not needed to keep the model loaded. Safe at a checkpoint."""
+        ...
 
     def memory_in_use(self) -> MemoryStats: ...
 

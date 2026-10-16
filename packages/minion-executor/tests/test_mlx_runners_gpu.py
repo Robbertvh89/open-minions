@@ -23,7 +23,7 @@ from typing import Any
 import httpx
 import pytest
 import yaml
-from minion_common.enums import CapacityProfile
+from minion_common.enums import CapacityProfile, Engine
 from minion_common.schemas import (
     Assignment,
     Budget,
@@ -445,3 +445,77 @@ async def test_e2e_embedding_through_sandboxed_worker(cache: ModelCache, tmp_pat
     assert _cos(out[0]["embedding"], out[1]["embedding"]) > _cos(
         out[0]["embedding"], out[2]["embedding"]
     )
+
+
+# --- live budget changes (TASK-5.3): set_budget / trim on the real MLX runners -----------------
+
+
+def _mx_limits() -> tuple[int, int]:
+    """(memory limit, cache limit) as MLX holds them (setters return the previous value)."""
+    import mlx.core as mx
+
+    mem, cache = int(mx.set_memory_limit(1 << 40)), int(mx.set_cache_limit(1 << 40))
+    mx.set_memory_limit(mem)
+    mx.set_cache_limit(cache)
+    return mem, cache
+
+
+def _budget_gb(gb: float, batch: int = 4) -> Budget:
+    return Budget(
+        profile=CapacityProfile.BALANCED, memory_gb=gb, gpu_duty_cycle=1.0, max_batch_size=batch
+    )
+
+
+def test_set_budget_updates_the_mlx_limits_completion(completion: MlxCompletionRunner) -> None:
+    assert _mx_limits()[0] == int(BUDGET.memory_gb * GIB)
+    smaller = _budget_gb(1, batch=2)
+    completion.set_budget(smaller)
+    mem, cache = _mx_limits()
+    assert mem == 1 * GIB and cache <= mem // 8
+    assert 0 < (completion.wired_limit_bytes or 0) <= 1 * GIB
+    assert current_wired_limit() <= 1 * GIB
+    out = completion.run(_recs(PROMPTS[:2]), CompletionParams(max_tokens=8), Ctl())
+    assert all(isinstance(o["completion"], str) for o in out)  # still runs under the new caps
+    bigger = _budget_gb(3)
+    completion.set_budget(bigger)
+    assert _mx_limits()[0] == 3 * GIB
+
+
+def test_set_budget_updates_the_mlx_limits_embedding(embedding: MlxEmbeddingRunner) -> None:
+    embedding.set_budget(_budget_gb(1))
+    assert _mx_limits()[0] == 1 * GIB
+    out = embedding.run(
+        [{"id": f"e{i}", "text": t} for i, t in enumerate(TEXTS[:2])], EmbeddingParams(), Ctl()
+    )
+    assert len(out) == 2
+
+
+def test_trim_frees_the_mlx_buffer_cache_but_keeps_the_model(
+    completion: MlxCompletionRunner,
+) -> None:
+    import mlx.core as mx
+
+    completion.run(_recs(PROMPTS), CompletionParams(max_tokens=16), Ctl())
+    assert mx.get_cache_memory() > 0  # freed buffers kept for reuse
+    completion.trim()
+    assert mx.get_cache_memory() == 0
+    assert completion.memory_in_use()["active_bytes"] > 0  # weights are still resident
+    out = completion.run(_recs(PROMPTS[:1]), CompletionParams(max_tokens=8), Ctl())
+    assert out[0]["completion"]
+
+
+def test_worker_applies_the_run_budget_to_mlx_in_the_subprocess(qwen_path: Path) -> None:
+    """End to end through the worker: a live budget drop reaches mx in the child and the run
+    still completes; the batch cap and duty come from the new budget."""
+    h = WorkerHandle(
+        [Engine.MLX],
+        engine_config=EngineConfig(max_prompt_tokens=512),
+        tick_interval_s=0.2,
+    )
+    try:
+        h.ensure_model(QWEN, BUDGET, qwen_path)
+        out = h.run(_recs(PROMPTS), CompletionParams(max_tokens=8), budget=_budget_gb(1, batch=2))
+        assert [o["id"] for o in out] == [f"r{i}" for i in range(len(PROMPTS))]
+        assert h.stats()["active_bytes"] > 0
+    finally:
+        h.close()

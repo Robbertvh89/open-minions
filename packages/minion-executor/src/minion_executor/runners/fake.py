@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -95,6 +96,20 @@ def _sandbox_probe(rec: Record) -> dict[str, object]:
     return {"ok": False, "error": "unknown"}
 
 
+def _report_state(runner: FakeRunner) -> dict[str, object]:
+    """Test hook: the live state the worker holds (budget, trims, OS priority)."""
+    from minion_executor.capacity.priority import current_priority
+
+    prio = current_priority()
+    b = runner.budget
+    return {
+        "budget": b.model_dump(mode="json") if b is not None else None,
+        "trims": runner.trims,
+        "nice": prio.nice,
+        "background": prio.background,
+    }
+
+
 def _sandbox_check(op: str, path: object) -> dict[str, object]:
     """`sandbox_check(getpid(), op, [PATH filter, path])`: 0 = the operation would be allowed.
     Asks the kernel policy without performing the operation (nothing is ever written). `path`
@@ -174,6 +189,9 @@ class FakeRunner:
         self._model: ModelEntry | None = None
         self._cfg = EngineConfig()
         self._hooks = test_hooks
+        self.budget: Budget | None = None
+        self.trims = 0
+        self._fail_trim = False
 
     def load(
         self, model: ModelEntry, model_path: Path | None, budget: Budget, cfg: EngineConfig
@@ -182,6 +200,15 @@ class FakeRunner:
             raise RunnerError("oom", "model exceeds budget")
         self._model = model
         self._cfg = cfg
+        self.budget = budget
+
+    def set_budget(self, budget: Budget) -> None:
+        self.budget = budget
+
+    def trim(self) -> None:
+        self.trims += 1
+        if self._fail_trim:
+            raise RuntimeError("trim failed")
 
     def run(self, batch: list[Record], params: TaskParams, ctl: StepControl) -> list[Record]:
         if self._model is None:
@@ -202,6 +229,16 @@ class FakeRunner:
                     for _ in range(min(int(rec["sleep_steps"]), 1000)):
                         time.sleep(min(float(rec.get("step_s", 0.1)), 10.0))
                         ctl.checkpoint(len(out))
+                if rec.get("fail_trim"):  # make later trim() calls raise (worker must survive)
+                    self._fail_trim = True
+                if (
+                    rec.get("clear_bg") and sys.platform == "darwin"
+                ):  # a worker shedding its throttle
+                    os.setpriority(os.PRIO_DARWIN_PROCESS, 0, 0)
+                if rec.get("report_state"):  # budget / trim / priority as the worker sees them
+                    out.append({"id": rec.get("id"), **_report_state(self)})
+                    ctl.checkpoint(len(out))
+                    continue
                 if any(k in rec for k in _SANDBOX_PROBES):
                     out.append({"id": rec.get("id"), **_sandbox_probe(rec)})
                     ctl.checkpoint(len(out))
