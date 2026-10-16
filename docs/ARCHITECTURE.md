@@ -475,5 +475,5 @@ token in macOS Keychain.
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
 - [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
 - [ADR-0008](adr/0008-fault-tolerance-reclaim-and-cancel.md): Fault-tolerance deviations: SKIP LOCKED reclaim, budget, lazy cancel, max lease, executor interrupt — **Accepted**
-- [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Proposed**
+- [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*
