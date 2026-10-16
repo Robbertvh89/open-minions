@@ -8,6 +8,7 @@ import threading
 import time
 from multiprocessing.process import BaseProcess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from minion_common.enums import CapacityProfile, Engine, TaskType
@@ -843,3 +844,117 @@ def test_probe_sandbox_spec_carries_the_ollama_port(
     monkeypatch.setattr(no_ollama, "_ensure_started", lambda: None)
     spec = no_ollama._sandbox_spec(None, None)
     assert spec is not None and spec["ollama_port"] is None
+
+
+# -- adversarial workers: partial frames must not defeat the deadlines --------------------------
+def _adversary(conn: object, mode: str) -> None:  # runs in a forked child
+    import struct
+
+    c: Any = conn
+    c.recv_bytes()  # the request
+    fd = c.fileno()
+    if mode == "drip":
+        for b in struct.pack("!i", 12) + b'{"ok": true}':
+            os.write(fd, bytes([b]))
+            time.sleep(1.0)
+    elif mode == "header":
+        os.write(fd, b"\x00\x00")
+    elif mode == "body":
+        for _ in range(3):
+            c.send_bytes(b'{"tick": 1}')
+            time.sleep(0.1)
+        os.write(fd, struct.pack("!i", 100) + b"abc")
+    elif mode == "huge":
+        os.write(fd, struct.pack("!i", 64 * 1024 * 1024))
+    time.sleep(60)
+
+
+def _adversarial_handle(mode: str, step_timeout_s: float) -> tuple[WorkerHandle, BaseProcess]:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(target=_adversary, args=(child, mode), daemon=True)
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE], step_timeout_s=step_timeout_s)
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    return w, proc
+
+
+@pytest.mark.parametrize("mode", ["drip", "header", "body", "huge"])
+def test_partial_frame_stall_on_unload_ends_in_a_kill_within_the_deadline(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.worker.process as wp
+
+    monkeypatch.setattr(wp, "UNLOAD_TIMEOUT_S", 1.0)
+    w, proc = _adversarial_handle(mode, 300.0)
+    t0 = time.monotonic()
+    w.unload()
+    assert time.monotonic() - t0 < 4
+    assert not proc.is_alive() and w.pid is None
+
+
+@pytest.mark.parametrize("mode", ["drip", "header", "body", "huge"])
+def test_partial_frame_stall_on_run_ends_in_a_kill_within_the_step_timeout(mode: str) -> None:
+    w, proc = _adversarial_handle(mode, 1.0)
+    t0 = time.monotonic()
+    with pytest.raises(WorkerCrashed):
+        w.run([{"id": 1}])
+    assert time.monotonic() - t0 < 4
+    assert not proc.is_alive() and w.pid is None
+
+
+def test_deeply_nested_json_reply_is_a_crash_not_an_exception() -> None:
+    w, proc = _hostile_worker("garbage")
+    depth = 200_000
+    real = w._conn
+
+    class Nest:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+        def poll(self, timeout: float = 0.0) -> bool:
+            return True
+
+        def send_bytes(self, data: bytes) -> None:
+            pass
+
+        def recv_bytes(self, maxlength: int) -> bytes:
+            return b"[" * depth + b"]" * depth
+
+    w._conn = Nest()  # type: ignore[assignment]
+    with pytest.raises(WorkerCrashed):
+        w.run([{"id": 1}])
+    assert not proc.is_alive()
+
+
+def test_run_requires_a_list_of_dicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    proc = w._proc
+    assert proc is not None
+    monkeypatch.setattr(w, "_call", lambda *a, **k: {"ok": True, "result": [1, 2]})
+    with pytest.raises(WorkerCrashed, match="malformed"):
+        w.run([{"id": 1}])
+    assert not proc.is_alive()
+
+
+def test_hard_reset_releases_an_ollama_model_and_graceful_unload_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[str] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append(ref))
+    w = WorkerHandle([Engine.FAKE])
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "q:1"
+    w._reset()  # e.g. a timed-out step
+    assert seen == ["q:1"]
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "q:2"
+    w.unload()  # worker's runner released it already
+    assert seen == ["q:1"]
+    w.close()

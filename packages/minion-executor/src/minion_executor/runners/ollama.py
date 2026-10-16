@@ -53,7 +53,10 @@ _TICK_S = 1.0  # checkpoint cadence while requests are in flight (duty cycle, pa
 _REQUEST_TIMEOUT = httpx.Timeout(600.0, connect=5.0)
 _PULL_MARGIN_S = 60.0  # a pull must end this long before the worker's load timeout
 _UNLOAD_TIMEOUT = httpx.Timeout(3.0, connect=1.0)  # < worker UNLOAD_TIMEOUT_S
+# phases sum to 3 s: the control-side release (loopback, tiny reply) is bounded by that in total
+_RELEASE_TIMEOUT = httpx.Timeout(connect=0.8, write=0.4, read=1.4, pool=0.4)
 _NUM_CTX_HEADROOM = 4096  # constant context headroom (output tokens) on top of the prompt cap
+_NOT_FOUND_MARKERS = ("manifest unknown", "file does not exist", "not found")
 _OOM_MARKERS = ("more system memory", "out of memory", "insufficient memory")
 
 
@@ -89,10 +92,10 @@ def release_model(url: str, ref: str) -> None:
             base_url=check_loopback(url), trust_env=False, follow_redirects=False
         ) as client,
     ):
-        client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_UNLOAD_TIMEOUT)
+        client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_RELEASE_TIMEOUT)
 
 
-def _status_error(resp: httpx.Response) -> RunnerError:
+def _status_error(resp: httpx.Response, *, pull: bool = False) -> RunnerError:
     """Map an HTTP error status to a RunnerError. The body may echo the prompt: it is only
     pattern-matched for out-of-memory, never copied into the message."""
     status = resp.status_code
@@ -102,6 +105,8 @@ def _status_error(resp: httpx.Response) -> RunnerError:
         text = resp.text.lower()
     except (httpx.HTTPError, ValueError):
         text = ""
+    if pull and any(m in text for m in _NOT_FOUND_MARKERS):  # unknown tag: no Mac can pull it
+        return RunnerError(ENGINE_REJECTED, f"ollama http {status}", retryable=False)
     if any(m in text for m in _OOM_MARKERS):
         return RunnerError(OOM, "ollama out of memory", retryable=True)
     return RunnerError(ENGINE_ERROR, f"ollama http {status}", retryable=True)
@@ -142,11 +147,13 @@ class OllamaRunner:
         except httpx.HTTPError as exc:  # transport, timeout, protocol: never echo the message
             raise _unavailable(type(exc).__name__) from None
 
-    def _json(self, resp: httpx.Response, *, run_phase: bool = False) -> dict[str, Any]:
+    def _json(
+        self, resp: httpx.Response, *, run_phase: bool = False, pull: bool = False
+    ) -> dict[str, Any]:
         if run_phase and resp.status_code == 404:  # model removed from this Mac's store
             raise _release("ollama model not found")
         if resp.status_code >= 400:
-            raise _status_error(resp)
+            raise _status_error(resp, pull=pull)
         try:
             data = resp.json()
         except ValueError:
@@ -179,7 +186,7 @@ class OllamaRunner:
                     {"model": model.ref, "stream": False},
                     timeout=httpx.Timeout(limit, connect=5.0),
                 )
-                self._json(pulled)
+                self._json(pulled, pull=True)
             elif show.status_code >= 400:
                 raise _status_error(show)
             self._check_digest()
@@ -338,8 +345,10 @@ class OllamaRunner:
 
     def memory_in_use(self) -> MemoryStats:
         """Bytes Ollama holds for our model (`/api/ps`); the daemon's memory is not ours."""
-        if self._client is None:
+        if self._budget is None:
             return {"active_bytes": 0, "peak_bytes": 0}
+        if self._client is None:  # closed by a failed run's abort: reconnect, as `run` does
+            self._client = self._new_client()
         try:
             data = self._json(self._request("GET", "/api/ps"))
         except RunnerError:
@@ -352,6 +361,8 @@ class OllamaRunner:
 
     def unload(self) -> None:
         client, ref = self._client, self._ref
+        if client is None and ref and self._base:  # a failed run closed it: still release
+            release_model(self._base, ref)
         if client is not None and ref:
             # best effort: ask the daemon to drop the weights now
             with contextlib.suppress(httpx.HTTPError):

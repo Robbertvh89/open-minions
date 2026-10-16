@@ -538,3 +538,65 @@ def test_live_daemon_tiny_model() -> None:
         assert out[0]["id"] == 1 and out[0]["completion_tokens"] > 0
     finally:
         r.unload()
+
+
+def test_unload_after_a_failed_run_still_sends_keep_alive_zero_and_ps_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    d = Daemon()
+    r = _loaded(d)
+    d.chat_hook = lambda: (_ for _ in ()).throw(httpx.ReadTimeout("x"))
+    with pytest.raises(RunnerError):
+        r.run([{"id": 1, "prompt": "x"}], CompletionParams(), Ctl())
+    d.chat_hook = None
+    assert r._client is None
+    assert r.memory_in_use()["active_bytes"] == 1234  # lazily reconnected
+    r._client = None
+    released: list[tuple[str, str]] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: released.append((url, ref)))
+    r.unload()
+    assert released == [(r._base, REF)]
+
+
+def test_release_model_sends_keep_alive_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[dict[str, object]] = []
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(req.content))
+        return httpx.Response(200)
+
+    class C(httpx.Client):
+        def __init__(self, **kw: object) -> None:
+            super().__init__(
+                base_url=str(kw["base_url"]),
+                transport=httpx.MockTransport(handle),
+            )
+
+    monkeypatch.setattr(httpx, "Client", C)
+    om.release_model("http://127.0.0.1:11434", REF)
+    assert seen == [{"model": REF, "keep_alive": 0}]
+    t = om._RELEASE_TIMEOUT
+    parts = [t.connect, t.write, t.read, t.pool]
+    assert sum(p for p in parts if p is not None) <= 3.0
+
+
+@pytest.mark.parametrize(
+    "marker", ["manifest unknown", "file does not exist", "pull model manifest: Not Found"]
+)
+def test_pull_not_found_is_a_hard_failure_without_echo(marker: str) -> None:
+    d = Daemon(present=False)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/pull":
+            return httpx.Response(500, text=f"{marker} SECRET")
+        return d(req)
+
+    r = OllamaRunner(transport=httpx.MockTransport(handler))
+    with pytest.raises(RunnerError) as ei:
+        r.load(MODEL, None, _budget(), EngineConfig())
+    assert ei.value.code == "ENGINE_REJECTED" and not ei.value.retryable
+    assert not ei.value.release and "SECRET" not in str(ei.value)

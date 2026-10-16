@@ -113,6 +113,11 @@ def _recv(conn: Connection, maxlength: int) -> dict[str, Any]:
     return msg
 
 
+def _kill_quietly(proc: BaseProcess) -> None:
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        proc.kill()
+
+
 def _watch_parent(parent_pid: int, interval_s: float) -> None:
     """Hard-exit if the control process disappears (even while a long `run` is in progress)."""
     while True:
@@ -407,7 +412,19 @@ class WorkerHandle:
                         if hard_deadline is not None and time.monotonic() > hard_deadline:
                             raise WorkerCrashed("worker exceeded its deadline")
                         continue
-                    reply = _recv(conn, self._max_message_bytes)
+                    # `poll` only says a byte arrived; `recv_bytes` then blocks for the whole
+                    # frame. A watchdog kills the worker at the deadline so a partial or dripped
+                    # frame ends in EOF (-> WorkerCrashed) instead of hanging this thread.
+                    limit = deadline if hard_deadline is None else min(deadline, hard_deadline)
+                    watchdog = threading.Timer(
+                        max(0.0, limit - time.monotonic()), _kill_quietly, (proc,)
+                    )
+                    watchdog.daemon = True
+                    watchdog.start()
+                    try:
+                        reply = _recv(conn, self._max_message_bytes)
+                    finally:
+                        watchdog.cancel()
                     if hard_deadline is not None and time.monotonic() > hard_deadline:
                         raise WorkerCrashed("worker exceeded its deadline")
                     if not isinstance(reply, dict):
@@ -432,7 +449,7 @@ class WorkerHandle:
             except WorkerCrashed:
                 self._reset()
                 raise
-            except ValueError:  # malformed JSON / bad utf-8 from the worker
+            except (ValueError, RecursionError, MemoryError):  # hostile JSON / bad utf-8
                 self._reset()
                 raise WorkerCrashed("malformed worker reply") from None
             ok = reply.get("ok")
@@ -526,7 +543,11 @@ class WorkerHandle:
                 with self._lock:
                     self._graceful_reset()
             raise
-        result: list[Record] = reply["result"]
+        result = reply["result"]
+        if not isinstance(result, list) or not all(isinstance(r, dict) for r in result):
+            with self._lock:
+                self._reset()
+            raise WorkerCrashed("malformed worker reply")
         return result
 
     def stats(self) -> dict[str, int]:
@@ -576,6 +597,7 @@ class WorkerHandle:
                         UNLOAD_TIMEOUT_S,
                         hard_deadline=time.monotonic() + UNLOAD_TIMEOUT_S,
                     )
+                    self._ollama_ref = None  # the runner released it; skip the second request
         finally:
             self._reset()
 
@@ -621,7 +643,7 @@ class WorkerHandle:
         proc, conn = self._proc, self._conn
         self._proc = self._conn = None
         self._model_id = None
-        self._ollama_ref = None
+        ref, self._ollama_ref = self._ollama_ref, None
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():
@@ -633,6 +655,8 @@ class WorkerHandle:
         tmp, self._tmp_dir = self._tmp_dir, None
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
+        if proc is not None:  # hard kill: the daemon may still hold the weights (off-loop callers)
+            self._release_ollama(ref)
 
     def close(self) -> None:
         self._closed = True

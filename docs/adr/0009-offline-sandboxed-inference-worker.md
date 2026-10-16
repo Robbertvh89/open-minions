@@ -167,7 +167,7 @@ together with `MINION_EXECUTOR_DEV=1`.
     is KV cache for that whole window per request). Requests carry a bounded `keep_alive`. The
     worker unloads the model (`keep_alive: 0`) on idle unload and on a model switch, under a total
     wall-clock deadline that always ends in a kill (a hostile reply or tick flood cannot keep it
-    alive). After a hard kill (stop, cancel, 409) the control side sends a best-effort
+    alive). After a hard kill (stop, cancel, 409, a failed or timed-out step, a model switch) the control side sends a best-effort
     `keep_alive: 0` (short timeout, `trust_env=False`); if that fails the daemon drops the weights
     when `keep_alive` expires (at most 300 s). A budget downgrade (M4) will reuse the same path.
     Load-phase 5xx and transport errors are releases (the daemon is this Mac's problem); a run-phase
