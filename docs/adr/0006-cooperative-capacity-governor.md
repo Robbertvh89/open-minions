@@ -117,8 +117,10 @@ RSS misses). More than `memory_gb * 1.10` on 2 consecutive samples
 interrupts the worker and fails the subtask as **retryable `OOM`**: another Mac with a bigger budget
 may fit it, and `max_attempts` bounds the retries. *Implemented in TASK-5.5* in the per-subtask
 watcher (every `MINION_EXECUTOR_SIGNAL_POLL_S`; `None` = no live worker resets the count). The guard is
-suspended while a downgrade is pending (the worker legitimately exceeds the new, lower budget until its
-batch ends, which is bounded by D6). The Ollama daemon's memory is outside the worker
+never suspended. It measures against the budget the *running batch* started with (a drop that
+still fits the model, say full to light, only takes effect at the next batch boundary, so the worker
+legitimately sits between the two): `max(batch budget, live budget)`; during a downgrade window
+`max(model.memory_gb, batch budget)`. The window is bounded by D6. The Ollama daemon's memory is outside the worker
 and stays the documented caveat of ADR-0009.
 
 **D8 CPU priority.** `Budget.cpu_priority` (`background|low|normal`, optional on the wire so older
@@ -176,10 +178,14 @@ clear window applies to signal pauses only. `decide` takes `total_gb`, `local_no
 **Wired in TASK-5.5** (`capacity/runtime.py` `GovernorRuntime`, `capacity/status.py`): `run` first
 requires the state dir to be creatable/safe (exit 2 otherwise) and the signal source readable (exit 2),
 then the runtime polls every `MINION_EXECUTOR_SIGNAL_POLL_S` with one source object for the whole run
-(the one-read-in-flight bound is per source) through `read_with_timeout`, reads `control.json` in a
-thread under a timeout (a hang counts as unusable), and seeds `decide` from `initial_state` (a cold
+(the one-read-in-flight bound is per source) through `read_with_timeout`, reads `control.json` on one
+daemon thread under a timeout (at most one read in flight; while it hangs the file counts as unusable
+and no further thread starts), and seeds `decide` from `initial_state` (a cold
 `GovState()` has no applied budget and would skip the hold). Until its first poll finishes, and after
-an unexpected error in a poll, the decision is paused `signals_unavailable` (fail closed). The loop
+an unexpected error in a poll, the decision is paused `signals_unavailable` (fail closed); errors
+lasting `pause_release_after_s` set `pause_expired`, so an in-flight subtask is released. A published
+decision older than `max(10 s, 3 x poll)` (the polling task is stuck) reads as that same fail-closed
+decision, and if the governor task ends the loop stops acquiring and `run` exits 1. The loop
 takes the budget from `Decision.budget` only (a hold lowers it below `budget_for(profile)`). A signal
 read problem and an unusable control file are logged once per change, not per poll.
 `status.json` (atomic, 0600, same dir) is rewritten on every decision change, on subtask start/finish
@@ -187,8 +193,20 @@ and every 10 s, with a `stopped` marker on exit; `minion-executor status` prints
 the file is missing, `stopped`, older than 30 s or its pid is gone (2 on an unsafe dir). It holds ids
 and numbers only (profile and source, budget, "held below nominal" when the budget in force is under
 the profile's nominal one, candidate, paused reason, current subtask id/attempt/progress, GPU share,
-coarse signals, today's subtasks/records of this process); never a payload, URL, acquirement id or
-token.
+coarse signals, today's subtasks/records of this process; typed fields, control characters are
+stripped when printing); never a payload, URL, acquirement id or token. One executor per state dir:
+`run` takes an exclusive `flock` on `executor.lock` (0600) in it and a second one exits 2; only the
+lock holder writes the `stopped` marker.
+
+**After inference (TASK-5.5 fix round).** Once the batches are done the watcher can no longer end the
+subtask: a verdict (pause expired, memory critical, downgrade timeout, a crashed watcher) is moot, the
+result exists and upload / complete proceed. It then only unloads the idle worker for memory
+enforcement. A verdict that races the work finishing completes the result. A watcher that crashes
+while inferring is itself a verdict (`WATCHER_FAILED`: interrupt and release). The D8 grace window
+restarts when a batch starts with another CPU priority, not on a decision change. Presence and every
+acquire/heartbeat carry the profile, so the server can infer from adaptive profile changes that the
+owner is away from the keyboard; pin a profile (`run --profile`, `profile <name>`) to avoid that
+(SPEC S-11).
 
 **D12 Presence (FR-55).** `POST /api/v1/executor/presence {budget, paused_reason?}` returns 204 and
 updates the caller's own executor row (profile, budget, paused_reason, `last_seen_at`). It carries no

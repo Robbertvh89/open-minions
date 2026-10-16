@@ -282,7 +282,9 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   loaded model finishes the batch (bounded by 60 s), releases (`BUDGET_DOWNGRADE`, executor-side log
   code), unloads and unpins the cache; an idle warm worker above the budget is unloaded at once. A
   worker footprint above 1.1x the memory budget on two consecutive samples fails the subtask as a
-  retryable `OOM`.
+  retryable `OOM`. The guard measures against the budget the running batch started with, so a drop
+  that still fits the model (full to light) does not trip it before the next batch boundary. Once
+  inference is over, upload and complete are never cut short by the governor.
 - FR-55. **Reporting.** The executor sends its current profile, budget and pause reason with every
   `acquire` and `heartbeat`; the server uses `memory_gb` for admission filtering and records it for
   Grafana. A paused executor does not poll (it only sends a low-frequency presence ping).
@@ -447,6 +449,10 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   fake engine runs. `MINION_EXECUTOR_SANDBOX=0` requires `MINION_EXECUTOR_DEV=1`. Residual: the profile
   is allow-default outside the denied areas, so non-denied system paths (`/etc`, `/opt`, ...) stay
   readable (ADR-0009).
+- S-11. Presence leaks activity **[ours]**. Budgets and profile reach the server on every
+  acquire/heartbeat/presence; with adaptive switching (FR-52) a profile change from `light` to `full`
+  reveals that the owner went idle (away from the keyboard), and back. Owners who do not want that pin a
+  profile (`run --profile` or `minion-executor profile <name>`). Keyboard idle time itself is never sent.
 
 ## 9. Non-functional requirements
 

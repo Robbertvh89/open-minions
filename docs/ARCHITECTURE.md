@@ -410,7 +410,10 @@ object per run), `control.json` and runs the pure `decide`; the loop reads `deci
 only sends presence (on entering the pause, on a reason/budget change, every 60 s). A watcher task
 beside each subtask (next to the heartbeater) pushes duty/pause/trim to the worker, releases the
 subtask on `pause_expired` / `release_now`, bounds a downgrade to 60 s, and runs the memory and CPU
-priority guards (D7/D8). `status.json` mirrors the state for `minion-executor status`.
+priority guards (D7/D8). `status.json` mirrors the state for `minion-executor status`. After the
+batches are done the watcher never ends the subtask (it only frees an idle worker); a stale
+or errored governor reads as paused `signals_unavailable` and, lasting 60 s, releases the in-flight
+subtask; a dead governor task stops the executor (exit 1). One executor per state dir (`flock`).
 
 **Governor states:** `ACTIVE(profile)` ⇄ `IDLE(profile)` → `PAUSED(reason)` → back. Transitions:
 - user input within `idle_after_min` → `active_profile`; idle ≥ threshold and on AC → `idle_profile`;
