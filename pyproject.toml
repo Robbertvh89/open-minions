@@ -55,7 +55,7 @@ mypy_path = "$MYPY_CONFIG_FILE_DIR/migrations"
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*"]
+module = ["testcontainers.*", "mlx", "mlx.*"]  # mlx: optional extra, absent on Linux CI
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
