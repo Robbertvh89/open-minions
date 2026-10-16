@@ -499,3 +499,78 @@ def test_probe_cancelled_before_worker_exists_never_spawns(
             m.probe_available([Engine.MLX])
     finally:
         m._probe_cancelled.clear()
+
+
+# --- owner control commands (FR-56) -----------------------------------------------------------
+
+
+@pytest.fixture
+def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    d = tmp_path / "state"
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(d))
+    monkeypatch.delenv("MINION_EXECUTOR_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # default config path: absent
+    return d
+
+
+def test_help_lists_control_commands() -> None:
+    out = runner.invoke(app, ["--help"]).output
+    for cmd in ("pause", "resume", "profile"):
+        assert cmd in out
+
+
+def test_pause_resume_roundtrip(state_dir: Path) -> None:
+    from minion_executor.capacity.control import read_control
+
+    r = runner.invoke(app, ["pause"])
+    assert r.exit_code == 0, r.output
+    c = read_control(state_dir)
+    assert c is not None and c.paused and c.paused_until is None
+    r = runner.invoke(app, ["pause", "--for", "2h30m"])
+    assert r.exit_code == 0 and "until" in r.output
+    c = read_control(state_dir)
+    assert c is not None and c.paused_until is not None
+    r = runner.invoke(app, ["resume"])
+    assert r.exit_code == 0
+    c = read_control(state_dir)
+    assert c is not None and not c.paused and c.paused_until is None
+
+
+@pytest.mark.parametrize("bad", ["abc", "0m", "99d", "10"])
+def test_pause_rejects_bad_duration(state_dir: Path, bad: str) -> None:
+    r = runner.invoke(app, ["pause", "--for", bad])
+    assert r.exit_code == 2 and "duration" in r.output
+    assert not state_dir.exists()
+
+
+def test_profile_sets_and_auto_clears(state_dir: Path) -> None:
+    from minion_executor.capacity.control import read_control
+
+    assert runner.invoke(app, ["profile", "full"]).exit_code == 0
+    c = read_control(state_dir)
+    assert c is not None and c.profile is CapacityProfile.FULL
+    runner.invoke(app, ["pause"])
+    assert runner.invoke(app, ["profile", "auto"]).exit_code == 0
+    c = read_control(state_dir)
+    assert c is not None and c.profile is None and c.paused  # pause kept
+
+
+def test_profile_rejects_unknown_and_undefined_custom(state_dir: Path) -> None:
+    r = runner.invoke(app, ["profile", "turbo"])
+    assert r.exit_code == 2 and "unknown profile" in r.output
+    r = runner.invoke(app, ["profile", "custom"])
+    assert r.exit_code == 2 and "not defined" in r.output
+    assert not state_dir.exists()
+
+
+def test_control_refuses_unsafe_state_dir(state_dir: Path) -> None:
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o777)
+    r = runner.invoke(app, ["pause"])
+    assert r.exit_code == 2 and "writable" in r.output
+
+
+def test_control_rejects_relative_state_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", "rel/dir")
+    r = runner.invoke(app, ["pause"])
+    assert r.exit_code != 0
