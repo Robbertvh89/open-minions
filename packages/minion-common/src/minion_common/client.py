@@ -25,6 +25,7 @@ from minion_common.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
     PreferenceRequest,
+    PresenceRequest,
     RegisterRequest,
     RegisterResponse,
     TaskCreate,
@@ -143,6 +144,9 @@ class ExecutorClient(_BaseClient):
         if resp.status_code == 204:
             return None
         return Assignment.model_validate_json(resp.content)
+
+    async def presence(self, req: PresenceRequest) -> None:
+        await self._send("POST", "/executor/presence", req)
 
     async def complete(self, acquirement_id: uuid.UUID, req: CompleteRequest) -> None:
         await self._send("POST", f"/executor/subtasks/{acquirement_id}/complete", req)

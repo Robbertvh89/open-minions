@@ -57,3 +57,23 @@ class CapacityProfile(StrEnum):
     BALANCED = "balanced"
     FULL = "full"
     CUSTOM = "custom"
+
+
+class CpuPriority(StrEnum):
+    """Worker CPU priority (SPEC FR-50): background QoS, low (nice), or normal."""
+
+    BACKGROUND = "background"
+    LOW = "low"
+    NORMAL = "normal"
+
+
+class PausedReason(StrEnum):
+    """Why the governor paused the executor (SPEC FR-53). The wire field stays a pattern string."""
+
+    USER_PAUSED = "user_paused"
+    MEMORY_PRESSURE = "memory_pressure"
+    THERMAL = "thermal"
+    LOW_POWER_MODE = "low_power_mode"
+    LOW_BATTERY = "low_battery"
+    ON_BATTERY = "on_battery"
+    SIGNALS_UNAVAILABLE = "signals_unavailable"

@@ -28,11 +28,31 @@ class ExecutorSettings(BaseSettings):
     # Wall-clock limit for one model download (fetch subprocess); on expiry the subtask is released.
     download_timeout_s: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
 
+    # executor.toml (FR-51/52/53). Unset: ~/.config/minion/executor.toml, which may be absent.
+    # An explicit path must exist and be absolute (~ expanded). Env var:
+    # MINION_EXECUTOR_CONFIG; an empty value counts as unset.
+    config_path: Path | None = Field(default=None, validation_alias="MINION_EXECUTOR_CONFIG")
+
     # Run the inference worker inside the Seatbelt sandbox (ADR-0009). Turning it off is a dev
     # escape hatch only and requires MINION_EXECUTOR_DEV=1.
     sandbox: bool = True
     # Same for the model-fetch subprocess (network allowed, writes only to its staging dir).
     fetch_sandbox: bool = True
+
+    @field_validator("config_path", mode="before")
+    @classmethod
+    def _empty_config_path_is_unset(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("config_path")
+    @classmethod
+    def _config_path_absolute(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("MINION_EXECUTOR_CONFIG must be an absolute path")
+        return v
 
     @field_validator("model_cache_dir")
     @classmethod

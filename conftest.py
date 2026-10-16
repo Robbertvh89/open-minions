@@ -326,3 +326,20 @@ async def make_executors(
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_executor_config(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never read the developer's real ~/.config/minion/executor.toml (also in subprocesses).
+
+    Lives here, not in packages/minion-executor/tests/conftest.py: a second conftest.py breaks
+    `from conftest import ...` under --import-mode=importlib.
+    """
+    d = tmp_path_factory.mktemp("executor-config")
+    d.chmod(0o700)
+    f = d / "executor.toml"
+    f.write_text("")
+    f.chmod(0o600)
+    monkeypatch.setenv("MINION_EXECUTOR_CONFIG", str(f))

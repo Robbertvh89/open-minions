@@ -309,3 +309,22 @@ def test_ollama_ref_rejects_registry_host() -> None:
     ):
         with pytest.raises(ValidationError, match="ref"):
             _entry(engine="ollama", ref=ref, revision=SHA256)
+
+
+def test_budget_cpu_priority_optional_and_validated() -> None:
+    from minion_common.enums import CpuPriority
+    from minion_common.schemas import Budget, PresenceRequest
+
+    base = {"profile": "light", "memory_gb": 4, "gpu_duty_cycle": 0.3, "max_batch_size": 4}
+    assert Budget.model_validate(base).cpu_priority is None  # older clients
+    b = Budget.model_validate({**base, "cpu_priority": "background"})
+    assert b.cpu_priority is CpuPriority.BACKGROUND
+    assert Budget.model_validate_json(b.model_dump_json()) == b
+    with pytest.raises(ValidationError):
+        Budget.model_validate({**base, "cpu_priority": "turbo"})
+    assert PresenceRequest(budget=b, paused_reason="on_battery").paused_reason == "on_battery"
+    for bad in ("Bad", "x" * 65, "a b"):
+        with pytest.raises(ValidationError):
+            PresenceRequest(budget=b, paused_reason=bad)
+    with pytest.raises(ValidationError):
+        PresenceRequest.model_validate({"budget": base, "extra": 1})

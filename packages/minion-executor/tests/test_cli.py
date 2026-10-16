@@ -1,7 +1,8 @@
 from pathlib import Path
 
 import pytest
-from minion_common.enums import Engine
+from minion_common.enums import CapacityProfile, CpuPriority, Engine
+from minion_common.schemas import Budget
 from minion_executor.main import app
 from typer.testing import CliRunner
 
@@ -28,11 +29,101 @@ def test_run_rejects_insecure_server(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "tok" not in result.output
 
 
-def test_run_rejects_custom_profile_and_help_omits_it(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_rejects_undefined_custom_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
     result = runner.invoke(app, ["run", "--profile", "custom"])
     assert result.exit_code == 2
-    assert "custom" not in runner.invoke(app, ["run", "--help"]).output
+    assert "not defined" in result.output
+
+
+CUSTOM_TOML = """
+[profiles.custom]
+memory_gb = 6
+gpu_duty_cycle = 0.4
+max_batch_size = 2
+cpu_priority = "low"
+"""
+
+
+def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, mode: int = 0o600) -> None:
+    f = tmp_path / "executor.toml"
+    f.write_text(text)
+    f.chmod(mode)
+    monkeypatch.setenv("MINION_EXECUTOR_CONFIG", str(f))
+
+
+def test_run_custom_profile_from_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _cfg(tmp_path, monkeypatch, CUSTOM_TOML)
+    # host-independent: the 75 % RAM cap would clip 6 GB on a small CI runner
+    monkeypatch.setattr("minion_executor.capacity.profiles.total_memory_gb", lambda: 32.0)
+    seen: dict[str, object] = {}
+
+    async def fake_run(*args: object) -> None:
+        seen["profile"] = args[1]
+        seen["budget"] = args[4]
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    result = runner.invoke(app, ["run", "--runner", "fake", "--profile", "custom"])
+    assert result.exit_code == 0, result.output
+    assert seen["profile"] == "custom"
+    budget = seen["budget"]
+    assert isinstance(budget, Budget)
+    assert (budget.memory_gb, budget.cpu_priority) == (6, CpuPriority.LOW)
+
+
+def test_run_without_profile_is_adaptive_and_starts_on_active_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _cfg(tmp_path, monkeypatch, 'active_profile = "balanced"\n')
+    seen: list[object] = []
+
+    async def fake_run(*args: object) -> None:
+        seen.append(args[1])
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 0
+    assert seen == [CapacityProfile.BALANCED]
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")  # `run` removes it from the environment
+    assert runner.invoke(app, ["run", "--runner", "fake", "--profile", "full"]).exit_code == 0
+    assert seen[-1] == CapacityProfile.FULL  # explicit --profile pins
+
+
+@pytest.mark.parametrize(
+    "text, mode",
+    [
+        ("bogus_key = 1\n", 0o600),
+        ("idle_after_min = -3\n", 0o600),
+        (CUSTOM_TOML, 0o666),
+        (CUSTOM_TOML, 0o620),
+        ("not toml [", 0o600),
+    ],
+)
+def test_run_bad_config_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, mode: int
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    _cfg(tmp_path, monkeypatch, text, mode)
+    result = runner.invoke(app, ["run", "--runner", "fake"])
+    assert result.exit_code == 2
+    assert "tok" not in result.output
+
+
+def test_run_missing_explicit_config_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    monkeypatch.setenv("MINION_EXECUTOR_CONFIG", str(tmp_path / "nope.toml"))
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 2
 
 
 def test_run_rejects_unknown_runner(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,7 +301,12 @@ def test_token_removed_from_environment_before_start(monkeypatch: pytest.MonkeyP
     seen: dict[str, object] = {}
 
     async def fake_run(
-        server: str, profile: object, engines: list[Engine], token: object, hb: float
+        server: str,
+        profile: object,
+        engines: list[Engine],
+        token: object,
+        hb: float,
+        config: object = None,
     ) -> None:
         seen["env"] = os.environ.get("MINION_EXECUTOR_TOKEN")
         seen["token"] = token.get_secret_value()  # type: ignore[attr-defined]
