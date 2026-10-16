@@ -387,6 +387,11 @@ def _assignment(model: ModelEntry, body: bytes, count: int) -> Assignment:
     )
 
 
+def _budget_for(model: ModelEntry) -> Budget:
+    """The loop only takes models whose `memory_gb` fits the budget: size it to the model."""
+    return BUDGET.model_copy(update={"memory_gb": max(BUDGET.memory_gb, model.memory_gb)})
+
+
 async def _executor_e2e(
     model: ModelEntry, cache: ModelCache, lines: list[dict[str, Any]], tmp: Path
 ) -> list[dict[str, Any]]:
@@ -411,7 +416,7 @@ async def _executor_e2e(
     loop = ExecutorLoop(
         client,  # type: ignore[arg-type]
         worker,
-        BUDGET,
+        _budget_for(model),
         [model.engine],
         http=httpx.AsyncClient(transport=httpx.MockTransport(s3)),
         tmp_root=tmp,
