@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -25,10 +26,19 @@ from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
-from minion_executor.capacity.config import load_config, resolve_profiles
+from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
-from minion_executor.capacity.profiles import budget_for, nice_for, parse_profile, total_memory_gb
-from minion_executor.capacity.safefile import SafeFileError
+from minion_executor.capacity.governor import GovernorTiming
+from minion_executor.capacity.profiles import (
+    ProfileSpec,
+    budget_for,
+    nice_for,
+    parse_profile,
+    total_memory_gb,
+)
+from minion_executor.capacity.runtime import GovernorRuntime
+from minion_executor.capacity.safefile import SafeFileError, ensure_private_dir
+from minion_executor.capacity.signals import SignalSource, default_source
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
@@ -176,6 +186,37 @@ def _validate_heartbeat(interval_s: float) -> None:
             )
 
 
+@dataclass(frozen=True)
+class CapacityPlan:
+    """Everything `_run` needs to build the governor, resolved (and failed fast) by `run`."""
+
+    config: ExecutorConfig
+    specs: dict[CapacityProfile, ProfileSpec]
+    pinned: CapacityProfile | None  # `run --profile`: no adaptive switching, pause still applies
+    source: (
+        SignalSource  # one object for the whole run (the one-read-in-flight bound is per source)
+    )
+    settings: ExecutorSettings
+
+
+def build_governor(plan: CapacityPlan) -> GovernorRuntime:
+    s = plan.settings
+    return GovernorRuntime(
+        plan.source,
+        plan.config,
+        plan.specs,
+        state_dir=s.state_dir,
+        total_gb=total_memory_gb(),
+        pinned=plan.pinned,
+        timing=GovernorTiming(
+            escalate_after_s=s.escalate_after_s,
+            resume_after_s=s.resume_after_s,
+            pause_release_after_s=s.pause_release_after_s,
+        ),
+        poll_s=s.signal_poll_s,
+    )
+
+
 async def _run(
     server: str,
     profile: CapacityProfile,
@@ -183,9 +224,10 @@ async def _run(
     token: SecretStr,
     budget: Budget,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    plan: CapacityPlan | None = None,
 ) -> None:
     nice = nice_for(budget.cpu_priority)
-    settings = ExecutorSettings()
+    settings = plan.settings if plan is not None else ExecutorSettings()
     try:
         # Before restrict_environ(). FetchEnv keeps HF_TOKEN / proxy / CA values in this
         # process's memory (not in os.environ) and hands them to the fetch subprocess only.
@@ -254,6 +296,8 @@ async def _run(
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
             stop_grace_s=settings.stop_grace_s,
+            governor=build_governor(plan) if plan is not None else None,
+            presence_interval_s=settings.presence_interval_s,
             model_cache=ModelCache(
                 settings.model_cache_dir,
                 int(settings.model_cache_gb * 1024**3),
@@ -281,8 +325,8 @@ def run(
         typer.Option(
             help=(
                 "Pin a capacity profile: light, balanced, full or custom (SPEC §4.6). "
-                "Omitted: adaptive (FR-52); until the governor lands (M4.5) the executor "
-                "starts on active_profile from executor.toml (default light)"
+                "Omitted: adaptive (FR-52), starting on active_profile from executor.toml "
+                "(default light)"
             )
         ),
     ] = None,
@@ -316,15 +360,20 @@ def run(
         settings = ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
         config = load_config(settings.config_path)  # before restrict_environ(); exit 2 if unsafe
         specs = resolve_profiles(config)
-        prof = parse_profile(profile if profile is not None else config.active_profile, specs)
+        pinned = parse_profile(profile, specs) if profile is not None else None
+        prof = pinned or parse_profile(config.active_profile, specs)
         budget = budget_for(prof, specs=specs)
+        # An unsafe or uncreatable state dir (control.json, status.json) fails closed: exit 2.
+        ensure_private_dir(settings.state_dir)
+        source = default_source(settings.fake_signals)  # SignalError (a RuntimeError): exit 2
+        plan = CapacityPlan(config, specs, pinned, source, settings)
         token = load_token()  # fail fast, before starting anything
     except (ValueError, RuntimeError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
-        asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s))
+        asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s, plan))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None

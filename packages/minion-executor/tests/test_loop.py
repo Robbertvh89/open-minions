@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ from typing import Any
 import httpx
 import pytest
 from minion_common.client import ApiError, StaleAcquirementError
-from minion_common.enums import Engine
+from minion_common.enums import Engine, PausedReason
 from minion_common.schemas import (
     AcquireRequest,
     Assignment,
@@ -23,7 +24,10 @@ from minion_common.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
     ModelEntry,
+    PresenceRequest,
 )
+from minion_executor.capacity.governor import Decision, ProfileSource
+from minion_executor.capacity.runtime import FixedGovernor
 from minion_executor.loop import ExecutorLoop, cleanup_stale_tmp
 from minion_executor.runners.base import Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
@@ -94,6 +98,15 @@ class FakeClient:
         self.register_excs: list[Exception] = []
         self.on_empty: Any = None
         self.hb_script: list[HeartbeatResponse | Exception] = []
+        self.acquire_reqs: list[AcquireRequest] = []
+        self.presences: list[PresenceRequest] = []
+        self.on_presence: Any = None
+
+    async def presence(self, req: PresenceRequest) -> None:
+        self.calls.append(("presence", req))
+        self.presences.append(req)
+        if self.on_presence:
+            self.on_presence()
 
     async def register(self, req: Any) -> None:
         self.calls.append(("register", None))
@@ -102,6 +115,7 @@ class FakeClient:
 
     async def acquire(self, req: AcquireRequest) -> Assignment | None:
         self.calls.append(("acquire", None))
+        self.acquire_reqs.append(req)
         if not self.items:
             if self.on_empty:
                 self.on_empty()
@@ -149,6 +163,10 @@ class FakeWorker:
         self.unloads = 0
         self.controls: list[tuple[float, bool, bool]] = []
         self.started = threading.Event()  # set when run() begins
+        self.run_budgets: list[Budget | None] = []
+        self.footprints: list[int | None] = []  # scripted samples (last one repeats)
+        self.priority: bool | None = None
+        self.interrupts = 0
 
     def ensure_model(
         self, model: ModelEntry, budget: Budget, model_path: Path | None = None
@@ -170,6 +188,7 @@ class FakeWorker:
         budget: Budget | None = None,
     ) -> list[Record]:
         self.started.set()
+        self.run_budgets.append(budget)
         self.params.append(params)
         if self.block:
             import time
@@ -186,6 +205,18 @@ class FakeWorker:
 
     def interrupt(self) -> None:
         self.interrupted = True
+        self.interrupts += 1
+
+    def footprint_bytes(self) -> int | None:
+        if len(self.footprints) > 1:
+            return self.footprints.pop(0)
+        return self.footprints[0] if self.footprints else None
+
+    def priority_ok(self) -> bool | None:
+        return self.priority
+
+    def gpu_share(self) -> float | None:
+        return None
 
     def kill(self) -> None:
         self.killed = True
@@ -1808,3 +1839,202 @@ async def test_second_sigterm_during_blocking_probe_exits_cleanly(
     os.kill(os.getpid(), signal.SIGTERM)
     await asyncio.wait_for(task, 5)  # returns (exit 0) promptly
     m._probe_cancelled.clear()
+
+
+# --- governor in the loop (TASK-5.5) ---------------------------------------------------------
+
+
+def dec(
+    budget: Budget = BUDGET,
+    reason: PausedReason | None = None,
+    **kw: Any,
+) -> Decision:
+    fields: dict[str, Any] = {
+        "profile": budget.profile,
+        "budget": budget,
+        "paused_reason": reason,
+        "release_now": False,
+        "pause_expired": False,
+        "trim": False,
+        "profile_source": ProfileSource.PINNED,
+        "candidate": None,
+        "candidate_since": None,
+    }
+    fields.update(kw)
+    return Decision(**fields)
+
+
+async def until(pred: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not pred():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not reached")
+        await asyncio.sleep(0.01)
+
+
+def small(memory_gb: float, **kw: Any) -> Budget:
+    return BUDGET.model_copy(update={"memory_gb": memory_gb, **kw})
+
+
+async def test_paused_never_acquires_and_sends_presence(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    gov.update(dec(reason=PausedReason.THERMAL))
+    client = FakeClient([assignment()])
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov, presence_interval_s=0.05
+    )
+
+    def after_three() -> None:
+        if len(client.presences) == 3:
+            loop.stop()
+
+    client.on_presence = after_three
+    assert await asyncio.wait_for(loop.run(), 5) == 0
+    assert "acquire" not in client.kinds()  # paused: presence only
+    assert len(client.presences) == 3  # on entering the pause, then every interval
+    assert {p.paused_reason for p in client.presences} == {"thermal"}
+    assert client.presences[0].budget == BUDGET
+
+
+async def test_presence_on_pause_reason_change_not_only_on_interval(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    gov.update(dec(reason=PausedReason.THERMAL))
+    client = FakeClient([])
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov, presence_interval_s=100.0
+    )
+
+    def on_presence() -> None:
+        n = len(client.presences)
+        if n == 1:
+            gov.update(dec(reason=PausedReason.MEMORY_PRESSURE))
+        elif n == 2:
+            gov.update(dec(small(4.0, profile="light"), reason=PausedReason.MEMORY_PRESSURE))
+        else:
+            loop.stop()
+
+    client.on_presence = on_presence
+    await asyncio.wait_for(loop.run(), 5)
+    assert [p.paused_reason for p in client.presences] == [
+        "thermal",
+        "memory_pressure",
+        "memory_pressure",
+    ]
+    assert client.presences[2].budget.memory_gb == 4.0  # a profile/budget change is reported too
+
+
+async def test_resume_acquires_again_with_the_live_budget(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    gov.update(dec(reason=PausedReason.USER_PAUSED))
+    client = FakeClient([assignment()])
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov, presence_interval_s=100.0
+    )
+    held = small(3.0, gpu_duty_cycle=0.25)  # a hold: below the profile's nominal budget
+
+    def on_presence() -> None:
+        gov.update(dec(held))
+
+    client.on_presence = on_presence
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 5) == 1
+    # the governor's decision.budget, never budget_for(profile) or the constructor budget
+    assert client.acquire_reqs[0].budget == held
+    assert client.kinds().index("presence") < client.kinds().index("acquire")
+
+
+async def test_live_budget_reaches_admission_worker_and_heartbeat(tmp_path: Path) -> None:
+    held = small(0.5, max_batch_size=1, gpu_duty_cycle=0.25)
+    gov = FixedGovernor(held)
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, heartbeat_interval_s=1.0)
+    assert await loop.run(max_subtasks=1) == 1
+    assert worker.ensured[0][1] == held
+    assert worker.batches == [1, 1, 1]  # re-sliced with the live max_batch_size
+    assert worker.run_budgets == [held, held, held]
+
+
+async def test_model_over_live_budget_is_released_not_run(tmp_path: Path) -> None:
+    gov = FixedGovernor(small(0.05))  # the model needs 0.1
+    client = FakeClient([assignment()])
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert "release" in client.kinds() and "complete" not in client.kinds()
+
+
+async def test_heartbeat_carries_live_budget_and_paused_reason(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    delays: list[float] = []
+    loop = make_loop(
+        client,
+        worker,
+        FakeS3(),
+        tmp_path,
+        [],
+        governor=gov,
+        heartbeat_interval_s=1.0,
+        heartbeat_sleep=gated_sleep(2, delays),
+    )
+    changed = small(4.0, profile="light")
+
+    async def flip() -> None:
+        await until(lambda: "heartbeat" in client.kinds())
+        gov.update(dec(changed, reason=PausedReason.LOW_POWER_MODE))
+        await until(lambda: client.kinds().count("heartbeat") >= 2)
+        loop.stop()
+
+    task = asyncio.create_task(flip())
+    await asyncio.wait_for(loop.run(), 10)
+    await task
+    beats = [r for k, r in client.calls if k == "heartbeat"]
+    assert beats[0].budget == BUDGET and beats[0].paused_reason is None
+    assert beats[1].budget == changed and beats[1].paused_reason == "low_power_mode"
+
+
+async def test_idle_worker_above_new_budget_is_unloaded_at_once(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, idle_unload_s=0)
+
+    def shrink() -> None:
+        if worker.unloads == 0 and not hasattr(shrink, "done"):
+            shrink.done = True  # type: ignore[attr-defined]
+            gov.update(dec(small(0.05)))  # below the loaded model's 0.1
+        else:
+            loop.stop()
+
+    client.on_empty = shrink
+    assert await loop.run() == 1
+    assert worker.unloads == 1  # idle_unload_s=0 disables idle unload: the budget did it
+
+
+async def test_idle_sleep_wakes_on_pause_and_unloads_under_pressure(tmp_path: Path) -> None:
+    gov = FixedGovernor(BUDGET)
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    loop = make_loop(
+        client,
+        worker,
+        FakeS3(),
+        tmp_path,
+        [],
+        sleep=None,
+        backoff=(30.0, 30.0),
+        governor=gov,
+        idle_unload_s=0,
+        presence_interval_s=100.0,
+    )
+
+    async def pressure() -> None:
+        await until(lambda: "complete" in client.kinds())
+        await asyncio.sleep(0.1)  # now in the 15-30 s idle sleep
+        gov.update(dec(reason=PausedReason.MEMORY_PRESSURE, trim=True))
+
+    client.on_presence = loop.stop
+    task = asyncio.create_task(pressure())
+    t0 = asyncio.get_running_loop().time()
+    assert await asyncio.wait_for(loop.run(), 10) == 1
+    await task
+    assert asyncio.get_running_loop().time() - t0 < 5  # not the full back-off
+    assert client.presences[0].paused_reason == "memory_pressure"
+    assert worker.unloads == 1  # memory pressure frees a warm worker without a subtask

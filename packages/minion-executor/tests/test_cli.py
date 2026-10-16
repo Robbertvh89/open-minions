@@ -306,8 +306,9 @@ def test_token_removed_from_environment_before_start(monkeypatch: pytest.MonkeyP
         profile: object,
         engines: list[Engine],
         token: object,
+        budget: object,
         hb: float,
-        config: object = None,
+        plan: object = None,
     ) -> None:
         seen["env"] = os.environ.get("MINION_EXECUTOR_TOKEN")
         seen["token"] = token.get_secret_value()  # type: ignore[attr-defined]
@@ -600,3 +601,36 @@ def test_control_rejects_relative_state_dir(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", "rel/dir")
     r = runner.invoke(app, ["pause"])
     assert r.exit_code != 0
+
+
+def test_run_exits_2_on_unsafe_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    d = tmp_path / "state"
+    d.mkdir()
+    d.chmod(0o777)
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(d))
+    result = runner.invoke(app, ["run", "--runner", "fake"])
+    assert result.exit_code == 2
+    assert "writable" in result.output
+
+
+def test_run_hands_the_governor_plan_to_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    seen: list[object] = []
+
+    async def fake_run(*args: object) -> None:
+        seen.append(args[6])
+
+    monkeypatch.setattr(m, "_run", fake_run)
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 0
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    assert runner.invoke(app, ["run", "--runner", "fake", "--profile", "balanced"]).exit_code == 0
+    adaptive, pinned = seen
+    assert isinstance(adaptive, m.CapacityPlan) and isinstance(pinned, m.CapacityPlan)
+    assert adaptive.pinned is None and pinned.pinned is CapacityProfile.BALANCED
