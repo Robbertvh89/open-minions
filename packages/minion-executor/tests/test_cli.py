@@ -473,3 +473,29 @@ def test_kill_active_probe_kills_the_running_probe_worker(monkeypatch: pytest.Mo
     monkeypatch.setattr(m, "_active_probe", h)
     m.kill_active_probe()
     assert h.killed
+    m._probe_cancelled.clear()
+
+
+def test_probe_cancelled_before_worker_exists_never_spawns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minion_executor import main as m
+    from minion_executor.worker.process import WorkerCrashed
+
+    class H:
+        def __init__(self, *a: object, **k: object) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            raise WorkerCrashed("worker handle is stopped") if self.killed else AssertionError
+
+    monkeypatch.setattr(m, "WorkerHandle", H)
+    m.kill_active_probe()  # second signal arrives before the probe thread built its worker
+    try:
+        with pytest.raises(WorkerCrashed):
+            m.probe_available([Engine.MLX])
+    finally:
+        m._probe_cancelled.clear()

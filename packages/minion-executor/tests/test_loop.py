@@ -1504,7 +1504,7 @@ async def test_second_stop_signal_kills_and_releases_immediately(tmp_path: Path)
     task = asyncio.create_task(loop.run())
     await _until_running(worker)
     loop.stop()
-    assert await asyncio.to_thread(lambda: not task.done())  # still inside the grace period
+    assert not task.done()  # still inside the grace period
     loop.stop()
     assert await asyncio.wait_for(task, 5) == 0
     assert client.kinds() == ["acquire", "release"]
@@ -1604,7 +1604,7 @@ async def test_slow_server_after_hard_stop_is_bounded(
 ) -> None:
     import minion_executor.loop as lp
 
-    monkeypatch.setattr(lp, "SHUTDOWN_CALL_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(lp, "SHUTDOWN_BUDGET_S", 0.3)
     client = SlowServerClient([assignment()])
     worker = SlowWorker(0.05)
     loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=0.3)
@@ -1614,13 +1614,117 @@ async def test_slow_server_after_hard_stop_is_bounded(
     loop.stop()
     assert await asyncio.wait_for(task, 5) == 0  # never claims success
     elapsed = asyncio.get_running_loop().time() - t0
-    assert elapsed < 0.3 + 0.3 + 0.3 + 0.7  # grace + complete window + release timeout (+slack)
+    assert elapsed < 0.3 + 0.3 + 2 * lp.MIN_CALL_S + 0.7  # grace + shared budget + floors
     assert client.kinds()[-2:] == ["complete", "release"]
     assert worker.killed and worker.closed
 
 
 async def test_non_finite_grace_is_an_immediate_hard_stop(tmp_path: Path) -> None:
-    for grace in (float("nan"), float("inf") * -1):
+    for grace in (float("nan"), float("inf"), float("-inf")):
         loop = make_loop(FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], stop_grace_s=grace)
         loop.stop()
         assert loop._hard_stop.is_set()
+
+
+async def test_work_finishing_during_kill_is_completed_not_released(tmp_path: Path) -> None:
+    class KillSlowWorker(SlowWorker):
+        def kill(self) -> None:
+            import time
+
+            time.sleep(0.4)  # the batch ends while the kill is in progress
+            super().kill()
+
+    client, worker = FakeClient([assignment()]), KillSlowWorker(0.3)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=0.1)
+    task = asyncio.create_task(loop.run())
+    await _until_running(worker)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 1
+    kinds = client.kinds()
+    assert kinds[-1] == "complete" and "release" not in kinds
+
+
+async def test_shutdown_budget_is_shared_across_complete_release_and_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    import minion_executor.loop as lp
+
+    monkeypatch.setattr(lp, "SHUTDOWN_BUDGET_S", 1.0)
+    monkeypatch.setattr(lp, "MIN_CALL_S", 0.1)
+
+    class SlowCloseWorker(SlowWorker):
+        def close(self) -> None:
+            time.sleep(2.5)
+            super().close()
+
+    client, worker = SlowServerClient([assignment()]), SlowCloseWorker(0.05)
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=0.2)
+    task = asyncio.create_task(loop.run())
+    await _until_running(worker)
+    t0 = asyncio.get_running_loop().time()
+    loop.stop()
+    assert await asyncio.wait_for(task, 10) == 0
+    elapsed = asyncio.get_running_loop().time() - t0
+    # per-call timeouts would add up to ~0.2 + 3 x 1.0; one shared budget stays near 0.2 + 1.0
+    assert elapsed < 0.2 + 1.0 + 4 * 0.1 + 0.6
+    assert client.kinds()[-2:] == ["complete", "release"] and worker.killed
+
+
+async def test_acquire_in_flight_at_stop_is_abandoned_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.loop as lp
+
+    monkeypatch.setattr(lp, "SHUTDOWN_BUDGET_S", 0.3)
+    client, worker = FakeClient([]), FakeWorker()
+    entered = asyncio.Event()
+
+    async def hang(req: AcquireRequest) -> Assignment | None:
+        client.calls.append(("acquire", None))
+        entered.set()
+        await asyncio.sleep(60)
+        return None
+
+    client.acquire = hang  # type: ignore[method-assign]
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], stop_grace_s=0.0)
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(entered.wait(), 5)
+    t0 = asyncio.get_running_loop().time()
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+    assert asyncio.get_running_loop().time() - t0 < 1.5
+    assert client.kinds() == ["acquire"] and worker.closed
+
+
+async def test_second_sigterm_during_blocking_probe_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import signal
+
+    import minion_executor.main as m
+    from minion_common.enums import CapacityProfile
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(m, "restrict_environ", lambda: None)
+    started = threading.Event()
+
+    def blocking_probe(requested: list[Engine], sandbox: object = None) -> list[Engine]:
+        started.set()
+        if not m._probe_cancelled.wait(10):  # only a cancel (second signal) ends it
+            raise AssertionError("probe was never cancelled")
+        raise WorkerCrashed("probe killed")
+
+    monkeypatch.setattr(m, "probe_available", blocking_probe)
+    task = asyncio.create_task(
+        m._run("http://localhost:8080", CapacityProfile.LIGHT, [Engine.MLX], SecretStr("t"), BUDGET)
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.sleep(0.2)
+    assert not task.done()  # one signal only asks for a stop; the probe is still running
+    os.kill(os.getpid(), signal.SIGTERM)
+    await asyncio.wait_for(task, 5)  # returns (exit 0) promptly
+    m._probe_cancelled.clear()

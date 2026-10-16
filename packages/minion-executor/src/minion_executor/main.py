@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -125,10 +126,13 @@ def sandbox_policy(settings: ExecutorSettings, engines: list[Engine]) -> Sandbox
 
 
 _active_probe: WorkerHandle | None = None
+_probe_cancelled = threading.Event()
 
 
 def kill_active_probe() -> None:
-    """Kill the running engine probe worker (second stop signal during startup). Lock-free."""
+    """Abort the engine probe (second stop signal during startup). Lock-free. Sets a flag first,
+    so it also works when the probe thread has not created its worker yet."""
+    _probe_cancelled.set()
     handle = _active_probe
     if handle is not None:
         handle.kill()
@@ -144,6 +148,8 @@ def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = Non
     handle = WorkerHandle(requested, sandbox=sandbox)
     _active_probe = handle
     try:
+        if _probe_cancelled.is_set():  # cancelled before we got here: never spawn
+            handle.kill()
         found = handle.probe(PROBE_TIMEOUT_S)
     finally:
         _active_probe = None
@@ -203,6 +209,7 @@ async def _run(
                 kill_active_probe()
             stop_requested.set()
 
+        _probe_cancelled.clear()
         for sig in (signal.SIGTERM, signal.SIGINT):
             aloop.add_signal_handler(sig, on_early_signal)
         try:

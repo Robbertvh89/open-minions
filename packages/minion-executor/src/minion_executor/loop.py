@@ -58,9 +58,11 @@ MODEL_NOT_ADMISSIBLE = "MODEL_NOT_ADMISSIBLE"
 TMP_PREFIX = "minion-exec-"
 # Refresh the output URL with one synchronous heartbeat when it expires within this margin.
 UPLOAD_URL_MARGIN_S = 60.0
-# After a hard stop (grace over / second signal) every server call and thread hop is bounded by
-# this, so a slow server or wedged worker cannot hold the exit past grace + ~10 s.
-SHUTDOWN_CALL_TIMEOUT_S = 5.0
+# One absolute budget for everything after a hard stop (grace over / second signal): the complete
+# window, release, fail, worker kill and close all draw from it, so a slow server or wedged worker
+# cannot hold the exit past grace + SHUTDOWN_BUDGET_S (+ MIN_CALL_S per call as reaping slack).
+SHUTDOWN_BUDGET_S = 10.0
+MIN_CALL_S = 0.5
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
 # Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
 # (HTTP status errors, unexpected bodies) is a retryable `fail` so max_attempts bounds it.
@@ -188,6 +190,8 @@ class ExecutorLoop:
         self._hard_stop = asyncio.Event()  # grace over / second signal: kill + release now
         self._grace_s = stop_grace_s
         self._grace_timer: asyncio.TimerHandle | None = None
+        self._deadline: float | None = None  # monotonic; set once, when the hard stop is set
+        self._kill_timed_out = False
         self._idle = 0
         self._fails = 0
         self._idle_unload_s = idle_unload_s
@@ -200,18 +204,61 @@ class ExecutorLoop:
         (heartbeats keep running). A second call, or the grace expiring, hard-stops: the worker is
         killed and the subtask released. Grace 0 hard-stops at once. Call from the event loop."""
         if self._stop.is_set():
-            self._hard_stop.set()
+            self._set_hard_stop()
             return
         self._stop.set()
         if not math.isfinite(self._grace_s) or self._grace_s <= 0:
-            self._hard_stop.set()
+            self._set_hard_stop()
             return
         try:
             self._grace_timer = asyncio.get_running_loop().call_later(
-                self._grace_s, self._hard_stop.set
+                self._grace_s, self._set_hard_stop
             )
         except RuntimeError:  # no running loop: nothing can be in flight
-            self._hard_stop.set()
+            self._set_hard_stop()
+
+    def _set_hard_stop(self) -> None:
+        if self._deadline is None:
+            self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+        self._hard_stop.set()
+
+    def _left(self) -> float:
+        """Seconds left of the shared shutdown budget, floored at MIN_CALL_S so a call still gets
+        a real attempt. Without a hard stop (a plain stop, or a normal return from `run`) the
+        budget starts now."""
+        if self._deadline is None:
+            self._deadline = time.monotonic() + SHUTDOWN_BUDGET_S
+        return max(MIN_CALL_S, self._deadline - time.monotonic())
+
+    def _call_timeout(self) -> float | None:
+        """Bound for a server call: the shared budget once stopping, else unbounded."""
+        if self._stop.is_set() or self._hard_stop.is_set():
+            return self._left()
+        return None
+
+    async def _guarded(
+        self,
+        awaitable: Awaitable[Any],
+        trigger: asyncio.Event,
+        window: Callable[[], float],
+    ) -> Any:
+        """Await `awaitable`, but once `trigger` is set give it only `window()` more seconds; then
+        cancel it and raise `_HardStoppedError` (the outcome is unknown: the request may have
+        reached the server)."""
+        call = asyncio.ensure_future(awaitable)
+        stopper = asyncio.ensure_future(trigger.wait())
+        try:
+            await asyncio.wait({call, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if not call.done():
+                await asyncio.wait({call}, timeout=window())
+                if not call.done():
+                    raise _HardStoppedError
+            return call.result()
+        finally:
+            stopper.cancel()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, stopper, return_exceptions=True)
 
     @property
     def stopping(self) -> bool:
@@ -247,7 +294,13 @@ class ExecutorLoop:
         attempt = 0
         while not self.stopping:
             try:
-                await self._client.register(req)
+                await self._guarded(
+                    self._client.register(req), self._stop, lambda: SHUTDOWN_BUDGET_S
+                )
+                return
+            except _HardStoppedError:
+                # A register that landed is idempotent; the loop below exits on the stop.
+                log.warning("register_abandoned_at_stop")
                 return
             except (httpx.HTTPError, ApiError) as exc:
                 if isinstance(exc, ApiError) and exc.status_code < 500:
@@ -267,9 +320,18 @@ class ExecutorLoop:
                 await self._register_with_retry(self._register)
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
                 try:
-                    assignment = await self._client.acquire(
-                        AcquireRequest(engines=self._engines, budget=self._budget)
+                    assignment = await self._guarded(
+                        self._client.acquire(
+                            AcquireRequest(engines=self._engines, budget=self._budget)
+                        ),
+                        self._stop,
+                        lambda: SHUTDOWN_BUDGET_S,
                     )
+                except _HardStoppedError:
+                    # An acquirement that landed server-side is not ours to hold: just exit, the
+                    # watchdog reclaims it when its first heartbeat never arrives.
+                    log.warning("acquire_abandoned_at_stop")
+                    break
                 except (httpx.HTTPError, ApiError, ValueError) as exc:
                     if isinstance(exc, ApiError) and exc.status_code < 500:
                         raise
@@ -297,20 +359,27 @@ class ExecutorLoop:
             if self._grace_timer is not None:
                 self._grace_timer.cancel()
             shutil.rmtree(tmp, ignore_errors=True)
-            if not await self._bounded_thread(self._worker.close):
+            # a kill that already timed out means close/kill would wedge as well: skip them
+            if not self._kill_timed_out and not await self._bounded_thread(self._worker.close):
                 await self._bounded_thread(self._worker.kill)  # lock-free fallback
             if self._owns_http:
                 await self._http.aclose()
         return done
 
-    @staticmethod
-    async def _bounded_thread(fn: Callable[[], object]) -> bool:
-        """Run a blocking worker call off-loop, giving up after SHUTDOWN_CALL_TIMEOUT_S.
-        Returns whether it completed."""
+    async def _bounded_thread(self, fn: Callable[[], object]) -> bool:
+        """Run a blocking worker call off-loop, waiting at most the rest of the shared shutdown
+        budget. Returns whether it completed.
+
+        On a timeout the *thread keeps running* (Python cannot cancel it); only the wait is
+        abandoned. The exit bound therefore relies on every worker-lock holder aborting once the
+        handle is `_closed` (`kill()` sets it), so the leftover thread ends on its own and the
+        interpreter's executor shutdown does not wait on it."""
         try:
-            await asyncio.wait_for(asyncio.to_thread(fn), SHUTDOWN_CALL_TIMEOUT_S)
+            await asyncio.wait_for(asyncio.to_thread(fn), self._left())
         except TimeoutError:
             log.warning("worker_call_timed_out", call=getattr(fn, "__name__", "?"))
+            if getattr(fn, "__name__", "") == "kill":
+                self._kill_timed_out = True
             return False
         except Exception as exc:  # shutdown must continue
             log.warning("worker_call_failed", error=type(exc).__name__)
@@ -498,21 +567,10 @@ class ExecutorLoop:
 
     async def _call_complete(self, a: Assignment, result: CompleteRequest) -> None:
         """`client.complete`, but once a hard stop is set (or arrives mid-call) the call gets only
-        SHUTDOWN_CALL_TIMEOUT_S more; then `_HardStoppedError` (outcome unknown)."""
-        call = asyncio.ensure_future(self._client.complete(a.acquirement_id, result))
-        stopper = asyncio.ensure_future(self._hard_stop.wait())
-        try:
-            await asyncio.wait({call, stopper}, return_when=asyncio.FIRST_COMPLETED)
-            if not call.done():
-                await asyncio.wait({call}, timeout=SHUTDOWN_CALL_TIMEOUT_S)
-                if not call.done():
-                    raise _HardStoppedError
-            call.result()
-        finally:
-            stopper.cancel()
-            if not call.done():
-                call.cancel()
-            await asyncio.gather(call, stopper, return_exceptions=True)
+        the rest of the shared shutdown budget; then `_HardStoppedError` (outcome unknown)."""
+        await self._guarded(
+            self._client.complete(a.acquirement_id, result), self._hard_stop, self._left
+        )
 
     def _check_url(self, url: str) -> None:
         try:
@@ -654,19 +712,21 @@ class ExecutorLoop:
             await self._release(a, bound)
             return
         try:
-            await self._client.fail(
-                a.acquirement_id,
-                FailRequest(retryable=f.retryable, code=f.code, message=f.message[:1000]),
+            await asyncio.wait_for(
+                self._client.fail(
+                    a.acquirement_id,
+                    FailRequest(retryable=f.retryable, code=f.code, message=f.message[:1000]),
+                ),
+                self._call_timeout(),
             )
         except StaleAcquirementError:
             bound.info("stale_discarded")
-        except (httpx.HTTPError, ApiError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("fail_report_failed", error=type(exc).__name__)
 
     async def _release(self, a: Assignment, bound: Any) -> None:
-        timeout = SHUTDOWN_CALL_TIMEOUT_S if self._stop.is_set() else None
         try:
-            await asyncio.wait_for(self._client.release(a.acquirement_id), timeout)
+            await asyncio.wait_for(self._client.release(a.acquirement_id), self._call_timeout())
             bound.info("subtask_released")
         except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("release_failed", error=type(exc).__name__)

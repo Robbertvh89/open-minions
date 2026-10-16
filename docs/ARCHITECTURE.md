@@ -185,11 +185,17 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   upload cut off at the deadline publishes nothing final: only `complete` promotes an object, and
   the re-run is a new attempt with its own attempt-scoped key (invariant 5), so a cut attempt's
   leftover object, if any, is never promoted. An acquire that returns after the stop is released
-  untouched (no download, no model load). Once the hard stop is set, the in-flight `complete` gets
-  5 s more (then the subtask is released; a 409 there means `complete` had won) and `release`,
-  worker kill and close are bounded by 5 s each, so exit is within about grace + 10 s even with a
-  slow server. When the work finishes during the grace period the worker is killed before
-  `complete` so GPU memory is freed promptly. launchd `ExitTimeOut` must be at least grace + 15 s,
+  untouched (no download, no model load). Once the hard stop is set a single absolute deadline
+  (hard stop + 10 s, `SHUTDOWN_BUDGET_S`) covers the in-flight `complete` (then the subtask is
+  released; a 409 there means `complete` had won), `release`, `fail`, worker kill and close; each
+  call gets what is left, floored at 0.5 s so it still gets an attempt. Exit is therefore within
+  grace + 10 s plus at most a few 0.5 s floors, even with a slow server. A kill that times out
+  skips close and the fallback kill. The wait on a worker call is abandoned but its thread keeps
+  running: the bound relies on every worker-lock holder aborting once the handle is `_closed`.
+  An `acquire` or `register` still in flight when the first signal arrives is abandoned after
+  10 s and the executor exits; an acquirement that had landed server-side is left to the watchdog
+  (no heartbeat ever arrives, so it is reclaimed). When the work finishes during the grace period the worker is killed before
+  `complete` so GPU memory is freed promptly. launchd `ExitTimeOut` must be at least grace + 15 s (grace + 10 s budget + slack),
   and launchd's default is only 20 s (below the default 30 s grace), so the M5 plist must set it.
   A second signal during the startup engine probe kills the probe worker and exits 0.
 - **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
