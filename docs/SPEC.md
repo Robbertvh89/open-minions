@@ -344,7 +344,7 @@ changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_
 without finishing).
 
 **Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
-and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). The other rows are not yet implemented.
+and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). TASK-6.4 adds the task list, subtasks and fleet read endpoints; all §6.1 rows are implemented.
 
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
@@ -352,11 +352,11 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/tasks` | Create task. `input_uri` and `output_uri` are prefixes: a missing trailing `/` is added, and `output_uri` must be unique across tasks. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
-| `GET` | `/tasks?team=&project=&status=` | List tasks |
+| `GET` | `/tasks?team=&project=&status=&cursor=&limit=` | Tasks of the caller's teams, newest first (`TaskPage {items: [TaskOut], next_cursor}`). `team` outside the caller's teams → `403`; `limit` 1..100 (default 50). Keyset pagination on `(created_at, team, project, task_name)` DESC: stable under concurrent inserts. `cursor` is opaque and strictly validated (tampered/foreign → `422 INVALID_CURSOR`); it carries a sort position only, the team filter is always re-applied. Counts for the page come from one grouped query |
 | `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts (`TaskOut`, below) |
-| `GET` | `/tasks/{team}/{project}/{task_name}/subtasks` | Paginated subtasks |
+| `GET` | `/tasks/{team}/{project}/{task_name}/subtasks?status=&cursor=&limit=` | Subtasks by `subtask_id` (`SubtaskPage`; `limit` 1..100, default 100); same `403`/`404` rules as task detail. `SubtaskOut`: `subtask_id, status, attempt, max_attempts, record_count, error_code, updated_at` only: no input/output keys, presigned URLs or executor identity (S-11) |
 | `POST` | `/tasks/{team}/{project}/{task_name}/cancel` | Cancel (key's team must own the task: `403` otherwise, `404` unknown). Lazy two-phase: task → `CANCELLED`, then `PENDING` subtasks → `CANCELLED`; `RUNNING` ones keep their owner, who learns via `heartbeat.cancel=true` and releases (their `release`/`fail`/reclaim end `CANCELLED`; a `complete` is still accepted and the task stays `CANCELLED`). Idempotent: re-cancel → `200` + task; an already `SUCCEEDED/FAILED/PARTIAL` task → `409 TASK_FINISHED`. The watchdog sweeps stragglers (`PENDING` under a task cancelled within `MINION_CANCEL_SWEEP_WINDOW_S`, default 1 h; older stragglers are healed only by re-cancel). Acquire also refuses subtasks of a non-`PENDING/RUNNING` task |
-| `GET` | `/executors` | Fleet view: online, busy, last heartbeat |
+| `GET` | `/executors` | Fleet view, **operator keys only** (`403 OPERATOR_REQUIRED`; it reveals when owners are active, S-11). `ExecutorOut` (never the token hash): `executor_id, owner, pool, hostname, chip, total_memory_gb, os_version, engines, status, profile, paused_reason, registered_at, last_seen_at, last_heartbeat_at, online, busy`. `busy` = owns an acquirement with a heartbeat row; `online` = `ACTIVE` and heard from within `MINION_EXECUTOR_ONLINE_BUSY_S` (600) when busy, else `MINION_EXECUTOR_ONLINE_IDLE_S` (120) (ARCHITECTURE §7) |
 
 ### 6.2 Executor-facing **[paper: acquire, state update, heartbeat, publish]**
 | Method | Path | Purpose |

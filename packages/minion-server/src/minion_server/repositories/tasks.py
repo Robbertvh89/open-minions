@@ -373,3 +373,84 @@ async def sweep_cancelled(
         .values(status=SubtaskStatus.CANCELLED.value)
     )
     return int(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def list_tasks(
+    session: AsyncSession,
+    *,
+    teams: Sequence[str],
+    project: str | None,
+    status: TaskStatus | None,
+    after: tuple[datetime, str, str, str] | None,
+    limit: int,
+) -> tuple[list[tuple[Task, dict[SubtaskStatus, int]]], bool]:
+    """Keyset page of tasks in `teams`, newest first: `(created_at, team, project, task_name)` DESC.
+
+    Fetches `limit + 1` rows to learn whether another page exists, then one grouped counts
+    query for the whole page (no per-task queries). Returns `(items, has_more)`.
+    """
+    if not teams:
+        return [], False
+    stmt = select(Task).where(Task.team.in_(list(teams)))
+    if project is not None:
+        stmt = stmt.where(Task.project == project)
+    if status is not None:
+        stmt = stmt.where(Task.status == status.value)
+    if after is not None:
+        stmt = stmt.where(
+            tuple_(Task.created_at, Task.team, Task.project, Task.task_name) < tuple_(*after)
+        )
+    stmt = stmt.order_by(
+        Task.created_at.desc(), Task.team.desc(), Task.project.desc(), Task.task_name.desc()
+    ).limit(limit + 1)
+    rows = list((await session.execute(stmt)).scalars())
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    counts: dict[tuple[str, str, str], dict[SubtaskStatus, int]] = {}
+    if page:
+        grouped = await session.execute(
+            select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status, func.count())
+            .where(
+                tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
+                    [(t.team, t.project, t.task_name) for t in page]
+                )
+            )
+            .group_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status)
+        )
+        for team, proj, name, st, n in grouped.all():
+            counts.setdefault((team, proj, name), {})[SubtaskStatus(st)] = int(n)
+    return [(t, counts.get((t.team, t.project, t.task_name), {})) for t in page], has_more
+
+
+async def task_exists(session: AsyncSession, team: str, project: str, task_name: str) -> bool:
+    return (
+        await session.execute(
+            select(Task.task_name).where(
+                Task.team == team, Task.project == project, Task.task_name == task_name
+            )
+        )
+    ).first() is not None
+
+
+async def list_subtasks(
+    session: AsyncSession,
+    team: str,
+    project: str,
+    task_name: str,
+    *,
+    status: SubtaskStatus | None,
+    after_id: int | None,
+    limit: int,
+) -> tuple[list[Subtask], bool]:
+    """Keyset page of one task's subtasks ordered by `subtask_id` (primary key suffix)."""
+    stmt = select(Subtask).where(
+        Subtask.team == team, Subtask.project == project, Subtask.task_name == task_name
+    )
+    if status is not None:
+        stmt = stmt.where(Subtask.status == status.value)
+    if after_id is not None:
+        stmt = stmt.where(Subtask.subtask_id > after_id)
+    rows = list(
+        (await session.execute(stmt.order_by(Subtask.subtask_id).limit(limit + 1))).scalars()
+    )
+    return rows[:limit], len(rows) > limit

@@ -8,12 +8,13 @@ from __future__ import annotations
 import re
 import uuid
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, SecretStr
 
+from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     SLUG_PATTERN,
     AcquireRequest,
@@ -21,6 +22,7 @@ from minion_common.schemas import (
     Budget,
     CompleteRequest,
     ErrorBody,
+    ExecutorOut,
     FailRequest,
     HeartbeatRequest,
     HeartbeatResponse,
@@ -28,8 +30,10 @@ from minion_common.schemas import (
     PresenceRequest,
     RegisterRequest,
     RegisterResponse,
+    SubtaskPage,
     TaskCreate,
     TaskOut,
+    TaskPage,
 )
 
 API_PREFIX = "/api/v1"
@@ -185,6 +189,54 @@ class UserClient(_BaseClient):
     async def cancel_task(self, team: str, project: str, task_name: str) -> TaskOut:
         resp = await self._send("POST", self._task_path(team, project, task_name) + "/cancel")
         return TaskOut.model_validate_json(resp.content)
+
+    async def _get_page(self, path: str, params: dict[str, Any]) -> httpx.Response:
+        query = {k: v for k, v in params.items() if v is not None}
+        resp = await self._http.get(path, params=query)
+        if resp.status_code >= 400:
+            raise _error_from(resp)
+        return resp
+
+    async def list_tasks(
+        self,
+        *,
+        team: str | None = None,
+        project: str | None = None,
+        status: TaskStatus | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> TaskPage:
+        resp = await self._get_page(
+            "/tasks",
+            {
+                "team": team,
+                "project": project,
+                "status": status.value if status else None,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
+        return TaskPage.model_validate_json(resp.content)
+
+    async def list_subtasks(
+        self,
+        team: str,
+        project: str,
+        task_name: str,
+        *,
+        status: SubtaskStatus | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> SubtaskPage:
+        resp = await self._get_page(
+            self._task_path(team, project, task_name) + "/subtasks",
+            {"status": status.value if status else None, "cursor": cursor, "limit": limit},
+        )
+        return SubtaskPage.model_validate_json(resp.content)
+
+    async def list_executors(self) -> list[ExecutorOut]:
+        resp = await self._send("GET", "/executors")
+        return [ExecutorOut.model_validate(x) for x in resp.json()]
 
 
 __all__ = [

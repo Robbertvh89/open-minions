@@ -51,6 +51,9 @@ class ServerSettings(BaseSettings):
     # Minimum seconds between heartbeats of one acquirement; faster beats get 429 (guards write
     # amplification: a rogue executor cannot hammer the heartbeat row). 0 disables. Executors
     # beat every ~30 s, so 1 s leaves ample headroom.
+    # Fleet view (ARCHITECTURE §7): online = heard from within this window.
+    executor_online_idle_s: float = Field(default=120.0, gt=0)  # acquire poll / presence ping
+    executor_online_busy_s: float = Field(default=600.0, gt=0)  # running: heartbeat
     heartbeat_min_interval_s: float = Field(default=1.0, ge=0)
 
     # Splitter bounds (memory/DoS protection) and retry policy.

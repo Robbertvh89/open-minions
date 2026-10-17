@@ -1,0 +1,309 @@
+"""Read API: task list, subtasks, fleet (TASK-6.4, SPEC §6.1)."""
+
+import asyncio
+import hashlib
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from minion_common.client import ApiError, UserClient
+from minion_common.enums import SubtaskStatus
+from minion_common.schemas import ExecutorOut
+from minion_server.app import create_app
+from minion_server.cursor import (
+    InvalidCursorError,
+    SubtaskCursor,
+    TaskCursor,
+    decode_subtask_cursor,
+    decode_task_cursor,
+    encode_cursor,
+)
+from pydantic import SecretStr
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from conftest import _auth, _req, _settings, make_executors, seed_task
+
+AGE_ONE = (
+    "UPDATE minion_executor SET last_seen_at = now() - make_interval(mins => :m)"
+    " WHERE executor_id = :i"
+)
+ALICE, BOB, OP = "k-alice", "k-bob", "k-op"
+
+
+def _h(k: str) -> str:
+    return hashlib.sha256(k.encode()).hexdigest()
+
+
+# --- unit: cursor ------------------------------------------------------------------------------
+
+
+def test_cursor_roundtrip_and_rejects_garbage() -> None:
+    from datetime import UTC, datetime
+
+    c = TaskCursor(created_at=datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC),
+                   team="t", project="p", task_name="n")  # fmt: skip
+    assert decode_task_cursor(encode_cursor(c)) == c
+    s = SubtaskCursor(subtask_id=7)
+    assert decode_subtask_cursor(encode_cursor(s)) == s
+    for bad in ["", "!!!", "e30", "A" * 600, encode_cursor(s), "é"]:
+        with pytest.raises(InvalidCursorError):
+            decode_task_cursor(bad)
+    with pytest.raises(InvalidCursorError):
+        decode_subtask_cursor(encode_cursor(c))
+    import base64
+
+    forged = base64.urlsafe_b64encode(b'{"k":"subtask","subtask_id":-1}').decode()
+    with pytest.raises(InvalidCursorError):
+        decode_subtask_cursor(forged)
+    forged = base64.urlsafe_b64encode(b'{"k":"subtask","subtask_id":"1"}').decode()
+    with pytest.raises(InvalidCursorError):
+        decode_subtask_cursor(forged)
+
+
+# --- integration -------------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def http(migrated_url: str, tmp_path: Path) -> AsyncIterator[tuple[AsyncClient, Any]]:
+    keys = tmp_path / "keys.yaml"
+    keys.write_text(
+        "keys:\n"
+        f"  - {{name: alice, sha256: {_h(ALICE)}, teams: [ra, rb]}}\n"
+        f"  - {{name: bob, sha256: {_h(BOB)}, teams: [rc]}}\n"
+        f"  - {{name: op, sha256: {_h(OP)}, teams: [ra], operator: true}}\n"
+    )
+    cfg = _settings(migrated_url).model_copy(update={"api_keys_file": str(keys)})
+    app = create_app(cfg)
+    async with app.router.lifespan_context(app):
+        async with app.state.sessionmaker() as s, s.begin():  # DB is shared across tests
+            await s.execute(text("TRUNCATE minion_task, minion_executor CASCADE"))
+        app.state.splitter_task.cancel()
+        await asyncio.gather(app.state.splitter_task, return_exceptions=True)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            yield c, app
+
+
+def _a(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"}
+
+
+@pytest.mark.integration
+async def test_list_tasks_scoped_to_callers_teams(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "a1", 3, team="ra")
+    await seed_task(sm, "b1", 1, team="rb")
+    await seed_task(sm, "c1", 1, team="rc")
+    r = await c.get("/api/v1/tasks", headers=_a(ALICE))
+    assert r.status_code == 200
+    got = {(t["team"], t["task_name"]) for t in r.json()["items"]}
+    assert got == {("ra", "a1"), ("rb", "b1")}
+    assert r.json()["next_cursor"] is None
+    by_name = {t["task_name"]: t for t in r.json()["items"]}
+    assert by_name["a1"]["counts"]["pending"] == 3
+    # another team -> 403, own team filter works
+    assert (await c.get("/api/v1/tasks?team=rc", headers=_a(ALICE))).status_code == 403
+    r = await c.get("/api/v1/tasks?team=rb", headers=_a(ALICE))
+    assert [t["task_name"] for t in r.json()["items"]] == ["b1"]
+    r = await c.get("/api/v1/tasks?status=SUCCEEDED", headers=_a(ALICE))
+    assert r.json()["items"] == []
+    assert (await c.get("/api/v1/tasks?status=bogus", headers=_a(ALICE))).status_code == 422
+    assert (await c.get("/api/v1/tasks?limit=101", headers=_a(ALICE))).status_code == 422
+    assert (await c.get("/api/v1/tasks?limit=0", headers=_a(ALICE))).status_code == 422
+    assert (await c.get("/api/v1/tasks")).status_code == 401
+
+
+@pytest.mark.integration
+async def test_list_tasks_pagination_stable_under_inserts_and_ties(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+    for i in range(7):
+        await seed_task(sm, f"t{i}", 1, team="ra")
+    # force created_at ties across the page boundary: tie-breaker must keep the order total
+    async with sm() as s, s.begin():
+        await s.execute(
+            text("UPDATE minion_task SET created_at = '2026-01-01T00:00:00Z' "
+                 "WHERE task_name IN ('t2','t3','t4')")
+        )  # fmt: skip
+    r = await c.get("/api/v1/tasks?limit=3", headers=_a(ALICE))
+    p1 = r.json()
+    assert len(p1["items"]) == 3 and p1["next_cursor"]
+    # concurrent inserts between pages must not shift or duplicate the remaining pages
+    for i in range(3):
+        await seed_task(sm, f"new{i}", 1, team="ra")
+    seen = [t["task_name"] for t in p1["items"]]
+    cursor = p1["next_cursor"]
+    while cursor:
+        r = await c.get(f"/api/v1/tasks?limit=3&cursor={cursor}", headers=_a(ALICE))
+        assert r.status_code == 200, r.text
+        seen += [t["task_name"] for t in r.json()["items"]]
+        cursor = r.json()["next_cursor"]
+    assert len(seen) == len(set(seen)) == 7
+    assert set(seen) == {f"t{i}" for i in range(7)}
+    # exactly-full last page: no dangling cursor
+    r = await c.get("/api/v1/tasks?limit=100&team=ra", headers=_a(ALICE))
+    assert r.json()["next_cursor"] is None and len(r.json()["items"]) == 10
+
+
+@pytest.mark.integration
+async def test_tampered_cursor_is_422(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    await seed_task(app.state.sessionmaker, "x", 1, team="ra")
+    await seed_task(app.state.sessionmaker, "y", 1, team="ra")
+    cursor = (await c.get("/api/v1/tasks?limit=1", headers=_a(ALICE))).json()["next_cursor"]
+    for bad in [
+        cursor[:-3] + "AAA",
+        "garbage",
+        cursor + "x",
+        encode_cursor(SubtaskCursor(subtask_id=1)),
+    ]:
+        r = await c.get("/api/v1/tasks", params={"cursor": bad}, headers=_a(ALICE))
+        assert r.status_code == 422, bad
+        assert r.json()["detail"]["code"] == "INVALID_CURSOR"
+    r = await c.get("/api/v1/tasks/ra/p/x/subtasks?cursor=garbage", headers=_a(ALICE))
+    assert r.status_code == 422
+
+
+@pytest.mark.integration
+async def test_list_tasks_counts_is_one_grouped_query(http: tuple[AsyncClient, Any]) -> None:
+    from minion_server.repositories import tasks as repo
+    from sqlalchemy import event
+
+    _, app = http
+    sm = app.state.sessionmaker
+    for i in range(5):
+        await seed_task(sm, f"q{i}", 2, team="ra")
+    stmts: list[str] = []
+    engine = app.state.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", lambda *a: stmts.append(a[2]))
+    async with sm() as s, s.begin():
+        rows, _ = await repo.list_tasks(
+            s, teams=["ra"], project=None, status=None, after=None, limit=50
+        )
+    assert len(rows) == 5 and len(stmts) == 2  # tasks page + one grouped counts query
+
+
+@pytest.mark.integration
+async def test_list_subtasks_pagination_filter_and_rules(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "s", 5, team="ra")
+    async with sm() as s, s.begin():
+        await s.execute(
+            text(
+                "UPDATE minion_subtask SET status='FAILED', attempt=3, "
+                'error=\'{"code":"OOM","message":"secret"}\'::jsonb WHERE subtask_id IN (1,3)'
+            )
+        )
+    base = "/api/v1/tasks/ra/p/s/subtasks"
+    r = await c.get(f"{base}?limit=2", headers=_a(ALICE))
+    p = r.json()
+    assert [i["subtask_id"] for i in p["items"]] == [0, 1] and p["next_cursor"]
+    assert set(p["items"][0]) == {
+        *("subtask_id", "status", "attempt", "max_attempts"),
+        *("record_count", "error_code", "updated_at"),
+    }
+    assert p["items"][1]["error_code"] == "OOM" and "secret" not in r.text
+    ids = [0, 1]
+    cur = p["next_cursor"]
+    while cur:
+        p = (await c.get(f"{base}?limit=2&cursor={cur}", headers=_a(ALICE))).json()
+        ids += [i["subtask_id"] for i in p["items"]]
+        cur = p["next_cursor"]
+    assert ids == [0, 1, 2, 3, 4]
+    r = await c.get(f"{base}?status=FAILED", headers=_a(ALICE))
+    assert [i["subtask_id"] for i in r.json()["items"]] == [1, 3]
+    assert (await c.get(f"{base}?status=nope", headers=_a(ALICE))).status_code == 422
+    # same rules as get_task: other team 403, unknown task 404, bad slug 404
+    assert (await c.get(f"{base}", headers=_a(BOB))).status_code == 403
+    assert (await c.get("/api/v1/tasks/ra/p/zz/subtasks", headers=_a(ALICE))).status_code == 404
+    assert (await c.get("/api/v1/tasks/ra/P!/s/subtasks", headers=_a(ALICE))).status_code == 404
+    assert (await c.get(base)).status_code == 401
+
+
+@pytest.mark.integration
+async def test_executors_operator_only_no_token_hash_busy_online(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    assert (await c.get("/api/v1/executors", headers=_a(ALICE))).status_code == 403
+    assert (await c.get("/api/v1/executors")).status_code == 401
+    await seed_task(sm, "f", 1, team="ra")
+    (busy_p, busy_tok), (idle_p, _), (stale_p, _), (never_p, _), (rev_p, _) = await make_executors(
+        sm, 5
+    )
+    r = await c.post("/api/v1/executor/acquire", json=_req().model_dump(mode="json"),
+                     headers=_auth(busy_tok))  # fmt: skip
+    assert r.status_code == 200, r.text
+
+    async def sql(stmt: str, **kw: Any) -> None:
+        async with sm() as s, s.begin():
+            await s.execute(text(stmt), kw)
+
+    async def fleet() -> dict[str, dict[str, Any]]:
+        r = await c.get("/api/v1/executors", headers=_a(OP))
+        assert r.status_code == 200
+        assert "token_hash" not in r.text and "token_hash" not in r.text.lower()
+        return {e["executor_id"]: e for e in r.json()}
+
+    def flags(f: dict[str, dict[str, Any]], p: Any) -> tuple[bool, bool]:
+        e = f[str(p.executor_id)]
+        return e["online"], e["busy"]
+
+    await sql("UPDATE minion_executor SET last_seen_at = now() WHERE executor_id = :i",
+              i=idle_p.executor_id)  # fmt: skip
+    await sql(AGE_ONE, m=5,
+              i=stale_p.executor_id)  # fmt: skip
+    await sql("UPDATE minion_executor SET last_seen_at = NULL WHERE executor_id = :i",
+              i=never_p.executor_id)  # fmt: skip
+    await sql("UPDATE minion_executor SET status='REVOKED', last_seen_at = now() "
+              "WHERE executor_id = :i", i=rev_p.executor_id)  # fmt: skip
+    f = await fleet()
+    assert flags(f, busy_p) == (True, True)  # acquire touched last_seen_at + heartbeat row
+    assert flags(f, idle_p) == (True, False)
+    assert flags(f, stale_p) == (False, False)  # idle 5 min > 120 s window
+    assert flags(f, never_p) == (False, False)
+    assert flags(f, rev_p) == (False, False)
+    assert f[str(busy_p.executor_id)]["last_heartbeat_at"] is not None
+    # a busy executor stays online up to the heartbeat window (10 min), not the idle one
+    await sql(AGE_ONE, m=5,
+              i=busy_p.executor_id)  # fmt: skip
+    await sql(
+        "UPDATE minion_executor_heartbeat SET last_seen_at = now() - make_interval(mins => :m)", m=5
+    )
+    assert flags(await fleet(), busy_p) == (True, True)
+    await sql(AGE_ONE, m=11,
+              i=busy_p.executor_id)  # fmt: skip
+    await sql(
+        "UPDATE minion_executor_heartbeat SET last_seen_at = now() - make_interval(mins => :m)",
+        m=11,
+    )
+    assert flags(await fleet(), busy_p) == (False, True)
+    # finishing the subtask (release) drops the heartbeat row: no longer busy
+    acq = r.json()["acquirement_id"]
+    r = await c.post(f"/api/v1/executor/subtasks/{acq}/release", headers=_auth(busy_tok))
+    assert r.status_code == 204, r.text
+    assert flags(await fleet(), busy_p)[1] is False
+
+
+@pytest.mark.integration
+async def test_client_methods(http: tuple[AsyncClient, Any]) -> None:
+    _c, app = http
+    await seed_task(app.state.sessionmaker, "cl", 3, team="ra")
+    transport = ASGITransport(app=app)
+    async with UserClient("http://localhost", SecretStr(OP), transport=transport) as uc:
+        page = await uc.list_tasks(team="ra", limit=1)
+        assert [t.task_name for t in page.items] == ["cl"]
+        sp = await uc.list_subtasks("ra", "p", "cl", status=SubtaskStatus.PENDING, limit=2)
+        assert len(sp.items) == 2 and sp.next_cursor
+        fleet = await uc.list_executors()
+        assert isinstance(fleet, list) and all(isinstance(e, ExecutorOut) for e in fleet)
+        with pytest.raises(ApiError) as ei:
+            await uc.list_tasks(team="rc")
+        assert ei.value.status_code == 403

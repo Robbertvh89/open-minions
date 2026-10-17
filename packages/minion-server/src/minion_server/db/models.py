@@ -82,6 +82,14 @@ class Task(Base):
     __table_args__ = (
         PrimaryKeyConstraint("team", "project", "task_name"),
         Index("ix_minion_task_queue", "status", text("priority DESC"), "created_at"),
+        # Serves `GET /tasks` keyset pages (single-team listing, newest first).
+        Index(
+            "ix_minion_task_team_created",
+            "team",
+            text("created_at DESC"),
+            text("project DESC"),
+            text("task_name DESC"),
+        ),
         CheckConstraint("records_per_subtask > 0", name="records_per_subtask_positive"),
         CheckConstraint("max_attempts > 0", name="max_attempts_positive"),
         CheckConstraint("total_subtasks >= 0", name="total_subtasks_nonneg"),
