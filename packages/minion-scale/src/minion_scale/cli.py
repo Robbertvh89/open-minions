@@ -48,6 +48,8 @@ from minion_scale.sim import (
     ACQUIRE_PACE_S,
     DEFAULT_STALL_S,
     EXECUTOR_BACKOFF,
+    FAILURE_PAUSE_S,
+    MAX_CONSECUTIVE_FAILURES,
     FaultRates,
     SimConfig,
     run_fleet,
@@ -240,6 +242,12 @@ def run_cmd(
     backoff_lo: float = EXECUTOR_BACKOFF[0],
     backoff_hi: float = EXECUTOR_BACKOFF[1],
     acquire_pace_s: float = ACQUIRE_PACE_S,
+    max_consecutive_failures: Annotated[
+        int, typer.Option(min=1, help="Failed subtasks in a row before the long pause")
+    ] = MAX_CONSECUTIVE_FAILURES,
+    failure_pause_s: Annotated[
+        float, typer.Option(min=0, help="The long pause after that many failures in a row")
+    ] = FAILURE_PAUSE_S,
     vanish: Annotated[float, typer.Option(min=0, max=1, help="P(stop beating, walk away)")] = 0.0,
     release: Annotated[float, typer.Option(min=0, max=1)] = 0.0,
     fail: Annotated[float, typer.Option(min=0, max=1, help="P(retryable fail)")] = 0.0,
@@ -287,6 +295,8 @@ def run_cmd(
         heartbeat_interval_s=heartbeat_interval_s,
         backoff=(backoff_lo, backoff_hi),
         acquire_pace_s=acquire_pace_s,
+        max_consecutive_failures=max_consecutive_failures,
+        failure_pause_s=failure_pause_s,
         faults=faults,
         late_wait_s=late_wait_s,
         seed=seed,
@@ -328,6 +338,8 @@ def run_cmd(
                 "heartbeat_interval_s": heartbeat_interval_s,
                 "backoff_s": [backoff_lo, backoff_hi],
                 "acquire_pace_s": acquire_pace_s,
+                "max_consecutive_failures": max_consecutive_failures,
+                "failure_pause_s": failure_pause_s,
                 "fault_rates": {"vanish": vanish, "release": release, "fail": fail, "late": late},
                 "late_wait_s": late_wait_s,
                 "seed": seed,

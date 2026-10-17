@@ -63,7 +63,23 @@ async def test_smoke_20_sims_2k_subtasks_with_faults(
     async def cli(*args: str) -> str:
         rc, out = await _cli(env, work, *args)
         outputs.append(out)
-        assert rc == 0, out[-2000:]
+        diag = ""
+        if rc != 0 and (work / "run.json").exists():  # what the run saw, for a CI post-mortem
+            doc = json.loads((work / "run.json").read_text()).get("run", {})
+            diag = "\n" + json.dumps(
+                {
+                    k: doc.get(k)
+                    for k in ("assigned", "completed", "drained", "duration_s", "events", "faults")
+                }
+            )
+            diag += "\nacquire_assigned " + json.dumps(
+                {
+                    k: v
+                    for k, v in doc.get("calls", {}).get("acquire_assigned", {}).items()
+                    if k.startswith(("p", "count", "mean"))
+                }
+            )
+        assert rc == 0, out[-2000:] + diag
         return out
 
     await cli(
@@ -94,6 +110,8 @@ async def test_smoke_20_sims_2k_subtasks_with_faults(
             "--backoff-lo=0.05",
             "--backoff-hi=0.2",
             "--acquire-pace-s=0",
+            "--max-consecutive-failures=5",
+            "--failure-pause-s=2",
             "--vanish=0.01",
             "--release=0.02",
             "--fail=0.02",
