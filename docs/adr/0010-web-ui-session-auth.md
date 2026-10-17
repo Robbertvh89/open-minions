@@ -1,6 +1,6 @@
 # ADR-0010: Web UI authentication with API-key login and a stateless session cookie
 
-- Status: **Accepted** (TASK-6.6)
+- Status: **Accepted** (TASK-6.6; amended by TASK-6.7)
 - Deviates from paper: no (the paper only mentions a web UI). Answers SPEC Q4.
 
 ## Context
@@ -58,3 +58,14 @@ surface (flows, discovery, JWKS caching) for a tool that is deployed per team or
   Keys are 256-bit random, so online guessing is not feasible, but the hash scan costs CPU.
 - Login CSRF is mitigated by the Origin check and the nonce cookie, not by a server-side store.
 - The pages are English-only and need no JavaScript except htmx's auto-refresh.
+
+## Amendment (TASK-6.7): mutating pages
+
+- Create and cancel call `services/tasks.py`, the code behind `POST /tasks` and `.../cancel`; the UI
+  adds only form parsing (strings to `TaskCreate`; `params` is JSON parsed by the same
+  `parse_params`). Errors are shown as the API's `CODE: message` (server-authored text, never
+  request values), autoescaped. Params and prompts are never logged.
+- Cancel has a server-rendered confirm page (`GET`, no side effect) and a CSRF + Origin checked
+  `POST`; there is no JavaScript `confirm()` (CSP).
+- The fleet page is operator-only (S-11) and reuses `list_fleet` through `list_fleet_page`. Its
+  summary pages through the whole fleet (500 per query, at most 20 queries).

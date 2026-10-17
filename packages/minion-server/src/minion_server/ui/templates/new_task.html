@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}New task - open-minions{% endblock %}
+{% block content %}
+<h1>New task</h1>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/ui/tasks" class="stack" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <label>Team
+    <select name="team" required>
+      {% for t in teams %}<option value="{{ t }}"{% if t == v.team %} selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Project <input type="text" name="project" value="{{ v.project }}" maxlength="64" required></label>
+  <label>Task name <input type="text" name="task_name" value="{{ v.task_name }}" maxlength="64" required></label>
+  <label>Type
+    <select name="type" required>
+      {% for t in types %}<option value="{{ t }}"{% if t == v.type %} selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Model <input type="text" name="model" value="{{ v.model }}" list="model-list" maxlength="200" required></label>
+  <datalist id="model-list">
+    {% for id, kind in models %}<option value="{{ id }}">{{ kind }}</option>{% endfor %}
+  </datalist>
+  <label>Input URI <input type="text" name="input_uri" value="{{ v.input_uri }}" maxlength="2048" required></label>
+  <label>Output URI <input type="text" name="output_uri" value="{{ v.output_uri }}" maxlength="2048" required></label>
+  <label>Params (JSON object)
+    <textarea name="params" rows="6" spellcheck="false">{{ v.params }}</textarea>
+  </label>
+  <label>Records per subtask <input type="text" name="records_per_subtask" value="{{ v.records_per_subtask }}" inputmode="numeric"></label>
+  <label>Priority <input type="text" name="priority" value="{{ v.priority }}" inputmode="numeric"></label>
+  <label>Allowed pool (optional) <input type="text" name="allowed_pool" value="{{ v.allowed_pool }}" maxlength="64"></label>
+  <button type="submit">Create task</button>
+</form>
+{% endblock %}

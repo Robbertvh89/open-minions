@@ -1,27 +1,23 @@
-"""User-facing task endpoints (SPEC §6)."""
+"""User-facing task endpoints (SPEC §6). Create and cancel live in `services/tasks.py`."""
 
 import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
-from minion_common.enums import Engine, SubtaskStatus, TaskStatus
+from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     ERROR_CODE_PATTERN,
     SLUG_PATTERN,
-    EmbeddingParams,
     ModelEntry,
     SubtaskOut,
     SubtaskPage,
-    TaskCounts,
     TaskCreate,
     TaskOut,
     TaskPage,
-    parse_params,
 )
-from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from minion_server.auth import KeysConfig, User, current_user, request_keys_config, resolve_pool
+from minion_server.auth import KeysConfig, User, current_user, request_keys_config
 from minion_server.cursor import (
     InvalidCursorError,
     SubtaskCursor,
@@ -30,87 +26,20 @@ from minion_server.cursor import (
     encode_cursor,
     task_cursor_from,
 )
-from minion_server.db.models import Subtask, Task
+from minion_server.db.models import Subtask
 from minion_server.db.session import get_session
 from minion_server.errors import api_error
 from minion_server.repositories import tasks as tasks_repo
+from minion_server.services import tasks as tasks_service
+from minion_server.services.tasks import get_task as _get
+from minion_server.services.tasks import slug_ok as _slug_ok
+from minion_server.services.tasks import to_out, validate_uris
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
-from minion_server.uris import InvalidUriError, parse_s3_uri
+
+__all__ = ["router", "to_out", "validate_uris"]
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
-
-ATTEMPTS_SEGMENT = "_attempts"
-
-
-def _as_prefix(uri: str) -> str:
-    return uri if uri.endswith("/") else uri + "/"
-
-
-def validate_uris(body: TaskCreate, settings: ServerSettings) -> tuple[str, str, str]:
-    """Return `(canonical_input_uri, canonical_output_uri, input_key_prefix)`.
-
-    Stored URIs are rebuilt as `s3://{bucket}/{key}` from the parsed key, so every spelling of
-    the same prefix maps to one string (the output-prefix unique constraint relies on that).
-
-    Keys must live under `{configured prefix}{team}/`; both URIs are treated as prefixes. Output
-    may not touch the reserved `_attempts` namespace (attempt-scoped upload keys,
-    ARCHITECTURE §3.3).
-    """
-    in_uri, out_uri = _as_prefix(body.input_uri), _as_prefix(body.output_uri)
-    try:
-        inp = parse_s3_uri(
-            in_uri,
-            bucket=settings.s3_bucket,
-            prefixes=tuple(f"{p}{body.team}/" for p in settings.s3_input_prefixes),
-        )
-        out = parse_s3_uri(
-            out_uri,
-            bucket=settings.s3_bucket,
-            prefixes=tuple(f"{p}{body.team}/" for p in settings.s3_output_prefixes),
-        )
-    except InvalidUriError as exc:
-        raise api_error(422, "INVALID_URI", str(exc)) from exc
-    for key in (inp.key, out.key):
-        if ATTEMPTS_SEGMENT in key.split("/"):
-            raise api_error(422, "INVALID_URI", f"{ATTEMPTS_SEGMENT} is a reserved path segment")
-    bucket = settings.s3_bucket
-    return f"s3://{bucket}/{inp.key}", f"s3://{bucket}/{out.key}", inp.key
-
-
-def to_out(task: Task, counts: dict[SubtaskStatus, int]) -> TaskOut:
-    return TaskOut(
-        team=task.team,
-        project=task.project,
-        task_name=task.task_name,
-        type=task.type,
-        model=task.model_id,
-        input_uri=task.input_uri,
-        output_uri=task.output_uri,
-        params=task.params,
-        records_per_subtask=task.records_per_subtask,
-        priority=task.priority,
-        allowed_pool=task.allowed_pool,
-        status=task.status,
-        created_by=task.created_by,
-        created_at=task.created_at,
-        finished_at=task.finished_at,
-        error=task.error,
-        counts=TaskCounts(
-            total=task.total_subtasks,
-            pending=counts.get(SubtaskStatus.PENDING, 0),
-            running=counts.get(SubtaskStatus.RUNNING, 0),
-            succeeded=counts.get(SubtaskStatus.SUCCEEDED, 0),
-            failed=counts.get(SubtaskStatus.FAILED, 0),
-            cancelled=counts.get(SubtaskStatus.CANCELLED, 0),
-        ),
-    )
-
-
-def _params_message(exc: ValidationError) -> str:
-    """Field paths and reasons only; never echo submitted values."""
-    parts = [f"{'.'.join(str(p) for p in e['loc']) or 'params'}: {e['msg']}" for e in exc.errors()]
-    return "invalid params: " + "; ".join(parts)[:500]
 
 
 def _settings(request: Request) -> ServerSettings:
@@ -138,55 +67,21 @@ async def create_task(
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
     keys_config: Annotated[KeysConfig, Depends(request_keys_config)],
 ) -> TaskOut:
-    if body.team not in user.teams:
-        raise api_error(403, "FORBIDDEN", "not a member of this team")
-    pool = resolve_pool(keys_config.teams.get(body.team), body.allowed_pool)
-    if pool != body.allowed_pool:
-        body = body.model_copy(update={"allowed_pool": pool})
-    model = models.get(body.model)
-    if model is None:
-        raise api_error(422, "UNKNOWN_MODEL", "model is not in the allow-list")
-    if model.type != body.type:
-        raise api_error(422, "MODEL_TYPE_MISMATCH", "model type does not match task type")
-    try:
-        params = parse_params(body.type, body.params)
-    except ValidationError as exc:
-        raise api_error(422, "INVALID_PARAMS", _params_message(exc)) from exc
-    if (
-        model.engine == Engine.OLLAMA
-        and isinstance(params, EmbeddingParams)
-        and not params.normalize
-    ):
-        # Ollama only returns L2-normalised vectors: no executor could honour this (ADR-0009).
-        raise api_error(422, "INVALID_PARAMS", "model engine ollama requires normalize=true")
-    in_uri, out_uri, in_key = validate_uris(body, settings)
-    if not await storage.any_key(in_key):
-        raise api_error(422, "EMPTY_INPUT", "no objects under the input prefix")
-    try:
-        async with session.begin():
-            created = await tasks_repo.insert_task(
-                session,
-                body,
-                model=model,
-                input_uri=in_uri,
-                output_uri=out_uri,
-                created_by=user.name,
-            )
-            if not created:
-                raise api_error(409, "TASK_EXISTS", "a task with this name already exists")
-    except tasks_repo.OutputUriInUseError as exc:
-        raise api_error(
-            409, "OUTPUT_URI_IN_USE", "another task already writes to this output prefix"
-        ) from exc
-    return await _get(session, body.team, body.project, body.task_name)
+    return await tasks_service.create_task(
+        body, user, session, settings, storage, models, keys_config
+    )
 
 
-async def _get(session: AsyncSession, team: str, project: str, task_name: str) -> TaskOut:
-    async with session.begin():
-        result = await tasks_repo.get_task(session, team, project, task_name)
-    if result is None:
-        raise api_error(404, "NOT_FOUND", "task not found")
-    return to_out(*result)
+@router.post("/{team}/{project}/{task_name}/cancel")
+async def cancel_task(
+    team: str,
+    project: str,
+    task_name: str,
+    user: Annotated[User, Depends(current_user)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> TaskOut:
+    """Lazy two-phase cancel (plan D4). Idempotent: re-cancel returns 200; a finished task 409."""
+    return await tasks_service.cancel_task(session, user, team, project, task_name)
 
 
 MAX_PAGE = 100
@@ -324,36 +219,3 @@ def _subtask_out(row: Subtask) -> SubtaskOut:
         error_code=code if ok else None,
         updated_at=row.updated_at,
     )
-
-
-@router.post("/{team}/{project}/{task_name}/cancel")
-async def cancel_task(
-    team: str,
-    project: str,
-    task_name: str,
-    user: Annotated[User, Depends(current_user)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> TaskOut:
-    """Lazy two-phase cancel (plan D4). Idempotent: re-cancel returns 200; a finished task 409."""
-    for part in (team, project, task_name):
-        if not _slug_ok(part):
-            raise api_error(404, "NOT_FOUND", "task not found")
-    if team not in user.teams:
-        raise api_error(403, "FORBIDDEN", "not a member of this team")
-    async with session.begin():
-        status = await tasks_repo.cancel_task(session, team, project, task_name)
-    if status is None:
-        raise api_error(404, "NOT_FOUND", "task not found")
-    if status != TaskStatus.CANCELLED:
-        raise api_error(409, "TASK_FINISHED", "task already finished")
-    # Separate transaction (D4); also heals a cancel whose second phase never ran.
-    while True:  # batched: bounded row locks per transaction; also heals a re-cancel
-        async with session.begin():
-            n = await tasks_repo.cancel_pending_subtasks(session, team, project, task_name)
-        if n < tasks_repo.CANCEL_BATCH:
-            break
-    return await _get(session, team, project, task_name)
-
-
-def _slug_ok(value: str) -> bool:
-    return re.fullmatch(SLUG_PATTERN, value) is not None

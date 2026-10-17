@@ -48,7 +48,7 @@ minion_server/
     presign.py         # S3 presigned URL generation
   repositories/        # ALL SQL lives here
   auth.py              # user API keys (file), executor tokens (DB)
-  ui/                  # server-rendered web UI (ADR-0010)
+  ui/                  # server-rendered web UI (ADR-0010); create/cancel call services/tasks.py, the same code as the REST handlers
     routes.py          # /ui: login, logout, task list, task detail (+ ?partial=1 htmx fragment)
     session.py         # stateless HMAC session cookie, CSRF tokens, Origin check
     headers.py         # CSP / nosniff / same-origin / no-store middleware for /ui

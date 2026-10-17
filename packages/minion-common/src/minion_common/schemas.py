@@ -210,6 +210,7 @@ class ExecutorOut(_Model):
     engines: list[str] = Field(default_factory=list)
     status: ExecutorStatus
     profile: CapacityProfile | None = None
+    budget: Budget | None = None
     paused_reason: str | None = None
     registered_at: AwareDatetime
     last_seen_at: AwareDatetime | None = None

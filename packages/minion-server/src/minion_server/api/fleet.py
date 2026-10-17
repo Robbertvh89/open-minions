@@ -1,10 +1,11 @@
 """Operator-only fleet view (SPEC §6.1, S-11: it reveals when owners are active)."""
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from minion_common.enums import ExecutorStatus
-from minion_common.schemas import SLUG_PATTERN, ExecutorOut, ExecutorPage
+from minion_common.schemas import SLUG_PATTERN, Budget, ExecutorOut, ExecutorPage
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import User, require_operator
@@ -35,6 +36,28 @@ async def list_executors(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 200,
 ) -> ExecutorPage:
     settings: ServerSettings = request.app.state.settings
+    return await list_fleet_page(session, settings, status, pool, cursor, limit)
+
+
+def _budget(raw: dict[str, Any] | None) -> Budget | None:
+    """The stored budget is executor-supplied JSON: an unreadable one is shown as absent."""
+    if raw is None:
+        return None
+    try:
+        return Budget.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+async def list_fleet_page(
+    session: AsyncSession,
+    settings: ServerSettings,
+    status: ExecutorStatus | None,
+    pool: str | None,
+    cursor: str | None,
+    limit: int,
+) -> ExecutorPage:
+    """Shared by the REST endpoint and the web UI; the caller enforces operator-only access."""
     after = None
     if cursor is not None:
         try:
@@ -66,6 +89,7 @@ async def list_executors(
             engines=list(r.executor.engines),
             status=r.executor.status,
             profile=r.executor.profile,
+            budget=_budget(r.executor.budget),
             paused_reason=r.executor.paused_reason,
             registered_at=r.executor.registered_at,
             last_seen_at=r.executor.last_seen_at,
