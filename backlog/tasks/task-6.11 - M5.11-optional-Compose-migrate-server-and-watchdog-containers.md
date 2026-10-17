@@ -1,9 +1,10 @@
 ---
 id: TASK-6.11
 title: 'M5.11 (optional) Compose: migrate, server and watchdog containers'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 17:49'
 labels:
   - M5
 dependencies:
