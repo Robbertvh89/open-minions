@@ -324,7 +324,7 @@ Task status is derived from subtask counts and updated by the server on each sub
 
 ## 6. API (v1)
 
-Compatibility: response models the executor parses (assignment, register, heartbeat) ignore unknown fields for forward compatibility, while request models are strict (`extra="forbid"`); roll out the server before executors.
+Compatibility: response models the executor parses (assignment, register, heartbeat) ignore unknown top-level fields for forward compatibility (the nested `model` entry stays strict until TASK-12), while request models are strict (`extra="forbid"`); roll out the server before executors.
 
 All endpoints under `/api/v1`. JSON. Users authenticate with user API keys; executors with executor
 tokens (`Authorization: Bearer ...`). User keys come from a config file, executor tokens from the

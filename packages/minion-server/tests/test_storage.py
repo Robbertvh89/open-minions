@@ -103,12 +103,12 @@ async def test_signed_range_get_enforced_by_s3(s3: S3Env) -> None:
             return exc.code, b""
 
     assert get({"Range": "bytes=4-9"}) == (206, b"456789")
-    observed = (
-        get({"Range": "bytes=0-3"})[0],
-        get({})[0],
-        get({"Range": "bytes=4-9", "If-Range": '"bogus"'})[0],
-    )  # (other range, no range, extra If-Range header)
-    if observed != (403, 403, 403):
+    other, none = get({"Range": "bytes=0-3"})[0], get({})[0]
+    # If-Range is an unsigned header: SigV4 backends may accept it (403 or the same slice is
+    # fine); the risk is a backend that drops the Range on an ETag mismatch (200 / wider body)
+    if_range = get({"Range": "bytes=4-9", "If-Range": '"bogus"'})
+    observed = (other, none, if_range[0])  # (other range, no range, extra If-Range header)
+    if (other, none) != (403, 403) or if_range not in ((403, b""), (206, b"456789")):
         msg = (
             "backend does NOT enforce the signed Range / signed-header set "
             f"(other range, no range, extra If-Range) = {observed}; input GET URLs are not "

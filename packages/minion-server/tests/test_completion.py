@@ -181,23 +181,20 @@ async def test_oversize_attempt_never_promoted_then_failed(
     sm = app.state.sessionmaker
     app.state.settings = app.state.settings.model_copy(update={"max_output_bytes": len(DATA) - 1})
     await seed_task(sm, "big", 1, team="cmp8")
-    async with sm() as s, s.begin():
-        await s.execute(text("UPDATE minion_subtask SET max_attempts=2 WHERE task_name='big'"))
     ((p, tok),) = await make_executors(sm, 1)
-    for n in (1, 2):
-        a = await _own(c, sm, "cmp8", tok, p.executor_id)
-        assert a["attempt"] == n
-        src, dst = _put(s3, "cmp8", "big", a)
-        base = f"{BASE}/subtasks/{a['acquirement_id']}"
-        r = await c.post(f"{base}/complete", json=_complete_body(), headers=_auth(tok))
-        assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_TOO_LARGE")
-        assert not _exists(s3, dst)  # never promoted
-        assert not _exists(s3, src)  # the rejected attempt object is deleted
-        # the executor reports the rejected complete as a retryable fail
-        body = FAIL | {"code": "OUTPUT_TOO_LARGE"}
-        assert (await c.post(f"{base}/fail", json=body, headers=_auth(tok))).status_code == 204
+    a = await _own(c, sm, "cmp8", tok, p.executor_id)
+    assert a["max_output_bytes"] == len(DATA) - 1  # the assignment carries the server cap
+    src, dst = _put(s3, "cmp8", "big", a)
+    base = f"{BASE}/subtasks/{a['acquirement_id']}"
+    r = await c.post(f"{base}/complete", json=_complete_body(), headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_TOO_LARGE")
+    assert not _exists(s3, dst)  # never promoted
+    assert not _exists(s3, src)  # the rejected attempt object is deleted
+    # the executor reports a 422 OUTPUT_TOO_LARGE as a NON-retryable fail (deterministic)
+    body = FAIL | {"code": "OUTPUT_TOO_LARGE", "retryable": False}
+    assert (await c.post(f"{base}/fail", json=body, headers=_auth(tok))).status_code == 204
     row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name='big'")
-    assert row[0] == "FAILED"
+    assert row[0] == "FAILED"  # after one attempt, despite max_attempts > 1
 
 
 @pytest.mark.integration
