@@ -3,10 +3,10 @@ id: TASK-26
 title: >-
   Comprehensive README: what it is, quick start, operator, Mac owner and
   submitter guides
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 17:54'
-updated_date: '2026-10-17 19:44'
+updated_date: '2026-10-17 20:36'
 labels:
   - docs
 dependencies: []
@@ -21,7 +21,13 @@ Replace the 23-line README stub with a full usage guide after TASK-6.11 (compose
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 README quick start verified live from a clean checkout
-- [ ] #2 All commands in README match CLAUDE.md and actually run
-- [ ] #3 Known limitations section lists open items honestly
+- [x] #1 README quick start verified live from a clean checkout
+- [x] #2 All commands in README match CLAUDE.md and actually run
+- [x] #3 Known limitations section lists open items honestly
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #39: comprehensive README (quick start verified live from a clean worktree incl. Linux chown and battery troubleshooting; real-model MLX path verified; operator/Mac owner/submitter guides; honest known limitations), dev-only compose override with fake models. CI run 39066678857: 1725 passed.
+<!-- SECTION:FINAL_SUMMARY:END -->
