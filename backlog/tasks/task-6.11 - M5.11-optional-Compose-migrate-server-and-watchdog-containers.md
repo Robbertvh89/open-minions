@@ -95,5 +95,5 @@ Docs (step 4): CLAUDE.md Commands (--profile app up line, MINION_SERVER_HOST_POR
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Compose app profile (migrate, server, watchdog) documented in CLAUDE.md, ARCHITECTURE §2.3/§6, SPEC FR-41 and .env.example. Watchdog health file (MINION_WATCHDOG_HEALTH_FILE) documented. Known gap: the watchdog healthcheck interval is hardcoded to the 60 s default in the container.
+Compose app profile (migrate, server, watchdog) documented in CLAUDE.md, ARCHITECTURE §2.3/§6, SPEC FR-41 and .env.example. Watchdog health file (MINION_WATCHDOG_HEALTH_FILE) documented. The watchdog and its healthcheck share MINION_WATCHDOG_INTERVAL_S (compose passes it, default 60).
 <!-- SECTION:FINAL_SUMMARY:END -->
