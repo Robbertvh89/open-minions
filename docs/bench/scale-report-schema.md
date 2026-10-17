@@ -9,7 +9,7 @@ no API key, no presigned URL, no object or record content. The server is reduced
 ## Workflow
 
 ```bash
-export MINION_PG_PORT=55432 MINION_S3_PORT=59000 MINION_SERVER_HOST_PORT=58080   # never 8080
+export MINION_PG_PORT=55432 MINION_S3_PORT=59000 MINION_SERVER_HOST_PORT=58080 MINION_GRAFANA_PORT=53000   # never 8080
 docker compose -p open-minions-scale -f deploy/compose.yml -f deploy/compose.scale.yml \
   --profile app up -d --build --wait postgres s3 s3-init migrate server watchdog
 export MINION_DATABASE_URL=postgresql+asyncpg://minion:minion@localhost:55432/minion
@@ -25,7 +25,17 @@ docker compose -p open-minions-scale -f deploy/compose.yml -f deploy/compose.sca
 ```
 
 `seed` writes the tokens file with mode 0600 and refuses to overwrite it; `run` refuses a file
-that is group/world readable. `run` exits 1 if any 5xx was seen; `verify` exits 1 on a violation.
+that is group/world readable. `seed` issues the tokens into the executor pool `scale` and creates the
+tasks with `allowed_pool = 'scale'`; `minion-scale cleanup --tokens-file tokens.json` revokes them and
+deletes the file.
+
+Settings are read from the `MINION_*` environment only (no `.env` file); `MINION_S3_ENDPOINT_URL`
+has no default. `seed`, `run`, `explain` and `cleanup` refuse a database host that is not loopback,
+or a database holding tasks not created by `minion-scale`, unless `--yes-this-is-a-scale-db`.
+
+Exit codes: `run` exits 1 when `run.drained` is false (the time limit hit, every sim ended or
+aborted, or a sim process died) or any 5xx was seen, and 2 on bad input (insecure server URL,
+unreadable tokens file); `verify` exits 1 on a violation.
 
 ## Top level
 
@@ -51,11 +61,12 @@ default `[10, 30]`, the executor's), `acquire_pace_s` (default 0.4), `fault_rate
 | key | meaning |
 |---|---|
 | `duration_s`, `sims`, `procs` | wall clock until drained (or `--max-duration-s`) |
+| `drained` | bool: the queue emptied. False when `--max-duration-s` hit, every sim ended (`sim_aborted`), or a sim process crashed (`proc_crashed`); `run` then exits 1 |
 | `completed`, `throughput_per_s` | subtasks the sims completed (HTTP 200) and per second |
 | `assigned` | acquires that returned work |
 | `conflicts_409`, `rate_limited_429`, `server_errors_5xx`, `transport_errors` | status totals over all API calls (`transport_errors`: connect/timeout, no response) |
 | `faults` | injected faults by kind: `vanish`, `release`, `fail`, `late` |
-| `events` | named counters: `assigned`, `completed`, `released`, `failed_retryable`, `late_complete_409` (the 409 the server must answer), `late_complete_accepted` (reclaim had not happened yet), `complete_409`, `discarded_stale`, `complete_failed`, `sim_aborted`, `proc_crashed`, `fault_*` |
+| `events` | named counters: `assigned`, `completed`, `released`, `failed_retryable`, `late_complete_409` (the 409 the server must answer), `late_complete_accepted` (reclaim had not happened yet), `complete_409`, `discarded_stale`, `complete_failed`, `cancelled` (the heartbeat said cancel; released as `CANCELLED`), `failure_pause` (long pause after the consecutive-failure limit), `sim_aborted`, `proc_crashed` (+ `proc_crashed_<ExceptionType>`: type only), `fault_*` |
 | `calls` | per API operation, see below |
 | `event_loop_lag` | histogram of how late a 50 ms sleep woke up, summed over the sim processes (client-side saturation) |
 
@@ -73,7 +84,7 @@ Quantiles are the upper bound of the bucket holding them (the observed max in th
 bucket). `bucket_counts` has one more entry than finite bounds (`null` = overflow). `statuses`
 maps the HTTP status to a count, `"0"` meaning a transport error.
 
-The server side has a matching `minion_acquire_seconds{outcome=assigned|empty}` Prometheus
+The server side has a matching `minion_acquire_seconds{outcome=assigned|empty|error}` Prometheus
 histogram (`/metrics`, `MINION_METRICS_ENABLED=true`; outcome is the only label).
 
 ## `db`
@@ -82,6 +93,8 @@ histogram (`/metrics`, `MINION_METRICS_ENABLED=true`; outcome is the only label)
   `{"top_by_total_time": [...]}`, the statements that ran during the run (delta of two snapshots),
   each `{query, calls, total_exec_ms, mean_exec_ms, rows, shared_blks_hit, shared_blks_read}`.
   `query` is the normalized statement (parameters are `$n`), truncated to 160 characters.
+  Only the connecting role's SELECT/INSERT/UPDATE/DELETE/WITH statements are read (not other roles'
+  or utility statements).
   `deploy/compose.scale.yml` preloads it; `run` issues `CREATE EXTENSION IF NOT EXISTS` itself.
 * `tables_before`, `tables_after`: per `minion_*` table from `pg_stat_user_tables`:
   `table`, `live_tuples`, `dead_tuples`, `seq_scans`, `idx_scans`, `inserts`, `updates`,
@@ -102,7 +115,7 @@ One entry per hot query: `candidate`, `candidate_preference`, `stale_heartbeat`,
 built from the repository's own statements and run as `EXPLAIN (ANALYZE, BUFFERS)` in a read-only
 transaction after `ANALYZE`:
 
-`name`, `sql` (inline literals), `planning_ms`, `execution_ms`, `top_buffers` (first
+`name`, `plan_kind` (always `custom`: literals are inlined so the plan is for those values; the server's asyncpg prepared statements may switch to a generic plan after five executions), `sql` (inline literals), `planning_ms`, `execution_ms`, `top_buffers` (first
 `Buffers: shared ...` line), `seq_scan` (any `Seq Scan` node), `plan` (the plan text lines).
 
 ## `verify`
