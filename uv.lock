@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "minion-cli",
     "minion-common",
     "minion-executor",
     "minion-server",
@@ -1008,6 +1009,29 @@ wheels = [
 ]
 
 [[package]]
+name = "minion-cli"
+version = "0.1.0"
+source = { editable = "packages/minion-cli" }
+dependencies = [
+    { name = "boto3" },
+    { name = "httpx" },
+    { name = "minion-common" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.43.114" },
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "minion-common", editable = "packages/minion-common" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "pydantic-settings", specifier = ">=2.6" },
+    { name = "typer", specifier = ">=0.15" },
+]
+
+[[package]]
 name = "minion-common"
 version = "0.1.0"
 source = { editable = "packages/minion-common" }
@@ -1292,6 +1316,7 @@ name = "open-minions"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "minion-cli" },
     { name = "minion-common" },
     { name = "minion-executor" },
     { name = "minion-server" },
@@ -1312,6 +1337,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "minion-cli", editable = "packages/minion-cli" },
     { name = "minion-common", editable = "packages/minion-common" },
     { name = "minion-executor", editable = "packages/minion-executor" },
     { name = "minion-server", editable = "packages/minion-server" },

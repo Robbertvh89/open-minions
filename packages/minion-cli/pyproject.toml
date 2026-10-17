@@ -1,0 +1,23 @@
+[project]
+name = "minion-cli"
+version = "0.1.0"
+description = "open-minions submitter CLI: upload JSONL, submit a task, follow progress, fetch results"
+requires-python = ">=3.12"
+dependencies = [
+    "minion-common",
+    "boto3>=1.43.114",
+    "httpx>=0.28",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "typer>=0.15",
+]
+
+[project.scripts]
+minion = "minion_cli.main:app"
+
+[tool.uv.sources]
+minion-common = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
