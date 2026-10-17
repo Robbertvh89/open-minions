@@ -38,6 +38,12 @@ class ServerSettings(BaseSettings):
     s3_output_prefixes: list[str] = ["outputs/"]
     presign_ttl_s: int = Field(default=900, gt=0, le=3600)
 
+    # Prometheus /metrics (FR-41): off by default. The same port serves it, so with a token set
+    # only `Authorization: Bearer <token>` scrapes it (>= 32 chars; empty = unset); without one,
+    # restrict it at the proxy (a warning is logged at startup when the host is not loopback).
+    metrics_enabled: bool = False
+    metrics_token: SecretStr | None = None
+
     # Config files and background work.
     models_file: str = "deploy/models.yaml"
     api_keys_file: str | None = None
@@ -66,6 +72,19 @@ class ServerSettings(BaseSettings):
     split_backoff_max_s: float = Field(default=300.0, ge=0)
     split_lease_s: float = Field(default=900.0, gt=0)  # claim lease; crashed splits retry after
     split_max_seconds: float = Field(default=3600.0, gt=0)  # wall-clock budget per split attempt
+
+    @field_validator("metrics_token", mode="before")
+    @classmethod
+    def _metrics_token(cls, v: object) -> object:
+        """Empty means unset (a blank `MINION_METRICS_TOKEN=` line); a set token must be strong."""
+        raw = v.get_secret_value() if isinstance(v, SecretStr) else v
+        if isinstance(raw, str):
+            raw = raw.strip()  # a trailing newline/space must neither count nor break the match
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, str) and len(raw) < 32:
+            raise ValueError("metrics_token must be at least 32 characters (or unset)")
+        return raw
 
     @field_validator("s3_input_prefixes", "s3_output_prefixes")
     @classmethod

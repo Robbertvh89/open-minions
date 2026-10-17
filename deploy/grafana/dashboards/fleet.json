@@ -1,0 +1,389 @@
+{
+  "uid": "minion-fleet",
+  "title": "open-minions: fleet",
+  "description": "Executor fleet and donated capacity. Operator-only (SPEC S-11). Reads the minion_ro views only.",
+  "tags": [
+    "open-minions"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "utc",
+  "panels": [
+    {
+      "id": 10,
+      "title": "Active executors",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT count(*) AS active FROM minion_ro.executor WHERE online"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value"
+      },
+      "description": "ACTIVE and heard from: heartbeat < 10 min or acquire/presence poll < 2 min (ARCHITECTURE section 7)."
+    },
+    {
+      "id": 11,
+      "title": "Busy executors",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT count(*) AS busy FROM minion_ro.executor e WHERE e.online AND EXISTS (SELECT 1 FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value"
+      },
+      "description": "Executors that currently own a running subtask."
+    },
+    {
+      "id": 12,
+      "title": "Paused executors",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT count(*) AS paused FROM minion_ro.executor\nWHERE online AND paused_reason IS NOT NULL"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 13,
+      "title": "Registered executors",
+      "type": "stat",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT count(*) AS registered FROM minion_ro.executor WHERE status = 'ACTIVE'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 14,
+      "title": "Paused by reason",
+      "type": "piechart",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT paused_reason, count(*) AS executors FROM minion_ro.executor\nWHERE online AND paused_reason IS NOT NULL\nGROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": true
+        }
+      },
+      "description": "Why the owners' Macs are not donating right now (SPEC FR-53)."
+    },
+    {
+      "id": 15,
+      "title": "Donated memory by profile (GB)",
+      "type": "piechart",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 5,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT profile, sum(coalesce(budget_memory_gb, 0)) AS memory_gb\nFROM minion_ro.executor WHERE online AND profile IS NOT NULL\nGROUP BY 1 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": true
+        }
+      },
+      "description": "Sum of the memory budgets the owners granted, per capacity profile."
+    },
+    {
+      "id": 16,
+      "title": "Releases by reason",
+      "type": "timeseries",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 5,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT $__timeGroupAlias(finished_at, '1h'), coalesce(error_code, 'UNSPECIFIED') AS metric, count(*) AS releases\nFROM minion_ro.attempt\nWHERE outcome = 'RELEASED' AND $__timeFilter(finished_at)\nGROUP BY 1, 2 ORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Voluntary hand-backs: BUDGET_DOWNGRADE, PAUSE_RELEASE, MEMORY_CRITICAL_RELEASE, STOP, ... (old executors: UNSPECIFIED)."
+    },
+    {
+      "id": 17,
+      "title": "Top contributors",
+      "type": "table",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT e.owner, count(*) AS subtasks, sum(a.record_count) AS records\nFROM minion_ro.attempt a JOIN minion_ro.executor e USING (executor_id)\nWHERE a.outcome = 'SUCCEEDED' AND $__timeFilter(a.finished_at)\nGROUP BY e.owner ORDER BY records DESC NULLS LAST LIMIT 20"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Per owner. Operator-only: it shows who donated, and Grafana access must be limited to operators (SPEC S-11)."
+    },
+    {
+      "id": 18,
+      "title": "Executors",
+      "type": "table",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "minion-postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "minion-postgres"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "editorMode": "code",
+          "rawSql": "SELECT e.owner, e.hostname, e.chip, e.pool, e.profile, e.paused_reason, e.last_seen_at, e.online,\n  (SELECT count(*) FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id) AS running,\n  (SELECT count(*) FROM minion_ro.attempt a WHERE a.executor_id = e.executor_id AND a.outcome = 'SUCCEEDED' AND $__timeFilter(a.finished_at)) AS completed\nFROM minion_ro.executor e WHERE e.status = 'ACTIVE'\nORDER BY e.last_seen_at DESC NULLS LAST LIMIT 100"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Per-executor view. Operator-only (SPEC S-11): presence reveals when an owner is active."
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  }
+}

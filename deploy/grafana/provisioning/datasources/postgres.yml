@@ -4,11 +4,15 @@ datasources:
     uid: minion-postgres
     type: grafana-postgresql-datasource
     url: postgres:5432
-    user: minion
+    # Read-only login: sees only the minion_ro views (migration 0007, deploy/postgres/initdb).
+    user: minion_grafana
     secureJsonData:
-      password: minion
+      password: $MINION_GRAFANA_DB_PASSWORD
     jsonData:
       database: minion
       sslmode: disable
       postgresVersion: 1600
+      maxOpenConns: 4  # below the role's CONNECTION LIMIT 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
     isDefault: true

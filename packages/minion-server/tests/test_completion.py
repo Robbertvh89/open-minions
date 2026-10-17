@@ -95,6 +95,11 @@ async def _one(sm: async_sessionmaker[AsyncSession], sql: str, **p: Any) -> Any:
         return (await s.execute(text(sql), p)).one()
 
 
+async def _all(sm: async_sessionmaker[AsyncSession], sql: str, **p: Any) -> list[Any]:
+    async with sm() as s:
+        return list((await s.execute(text(sql), p)).all())
+
+
 FAIL = {"retryable": True, "code": "OOM", "message": "boom"}
 
 
@@ -218,6 +223,161 @@ async def test_release_does_not_consume_retry_budget(http: tuple[AsyncClient, An
 
 
 @pytest.mark.integration
+async def test_release_code_is_stored_in_attempt_history(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "relcode", 1, team="cmp4c")
+    ((p, tok), (_q, other)) = await make_executors(sm, 2)
+    a = await _own(c, sm, "cmp4c", tok, p.executor_id)
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/release"
+    # a malformed code is rejected before anything changes; so is a foreign executor (409)
+    for bad in ({"code": "lower"}, {"code": "X" * 65}, {"code": ""}, {"code": "A", "x": 1}):
+        assert (await c.post(url, json=bad, headers=_auth(tok))).status_code == 422
+    r = await c.post(url, json={"code": "BUDGET_DOWNGRADE"}, headers=_auth(other))
+    assert (r.status_code, r.json()["detail"]["code"]) == (409, "STALE_ACQUIREMENT")
+    row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name='relcode'")
+    assert row[0] == "RUNNING"
+    r = await c.post(url, json={"code": "BUDGET_DOWNGRADE"}, headers=_auth(tok))
+    assert r.status_code == 204
+    row = await _one(
+        sm,
+        "SELECT outcome, error_code FROM minion_ro.attempt WHERE task_name='relcode'",
+    )
+    assert tuple(row) == ("RELEASED", "BUDGET_DOWNGRADE")
+    sub = await _one(sm, "SELECT status, error FROM minion_subtask WHERE task_name='relcode'")
+    assert tuple(sub) == ("PENDING", None)  # the reason is history, not the subtask's error
+    # a release without a body (old executors) still works and has no code
+    b = await _own(c, sm, "cmp4c", tok, p.executor_id)
+    r = await c.post(f"{BASE}/subtasks/{b['acquirement_id']}/release", headers=_auth(tok))
+    assert r.status_code == 204
+    rows = await _one(
+        sm,
+        "SELECT count(*) FILTER (WHERE error_code IS NULL), count(*)"
+        " FROM minion_ro.attempt WHERE task_name='relcode'",
+    )
+    assert tuple(rows) == (1, 2)
+
+
+@pytest.mark.integration
+async def test_release_on_cancelled_task_records_cancelled_with_code(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "relcan", 1, team="cmp4d")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp4d", tok, p.executor_id)
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_task SET status='CANCELLED' WHERE task_name='relcan'"))
+    r = await c.post(
+        f"{BASE}/subtasks/{a['acquirement_id']}/release",
+        json={"code": "STOP"},
+        headers=_auth(tok),
+    )
+    assert r.status_code == 204
+    row = await _one(
+        sm, "SELECT outcome, error_code FROM minion_ro.attempt WHERE task_name='relcan'"
+    )
+    assert tuple(row) == ("CANCELLED", "STOP")
+
+
+@pytest.mark.integration
+async def test_views_expose_only_code_shaped_error_codes(http: tuple[AsyncClient, Any]) -> None:
+    _c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "badcode", 2, team="cmp4e")
+    async with sm() as s, s.begin():
+        await s.execute(
+            text(
+                "UPDATE minion_subtask SET error = CAST(:e AS jsonb)"
+                " WHERE task_name='badcode' AND subtask_id=0"
+            ),
+            {"e": '{"code": "secret free text", "message": "m"}'},
+        )
+        await s.execute(
+            text(
+                "UPDATE minion_subtask SET error = CAST(:e AS jsonb)"
+                " WHERE task_name='badcode' AND subtask_id=1"
+            ),
+            {"e": '{"code": "OOM"}'},
+        )
+    rows = await _all(
+        sm,
+        "SELECT subtask_id, error_code FROM minion_ro.subtask WHERE task_name='badcode'"
+        " ORDER BY subtask_id",
+    )
+    assert [tuple(r) for r in rows] == [(0, None), (1, "OOM")]
+
+
+@pytest.mark.integration
+async def test_ro_executor_online_matches_the_fleet_api(http: tuple[AsyncClient, Any]) -> None:
+    """minion_ro.executor.online must equal GET /executors online (same thresholds, 120/600 s)."""
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "onl", 2, team="cmp4g")
+    execs = await make_executors(sm, 6)
+    ages = [
+        (None, 10),  # idle, fresh
+        (None, 200),  # idle, past 120 s
+        (None, 130),  # idle, past 120 s
+        ("hb", 300),  # busy: last_seen old, heartbeat 300 s ago -> within 600 s
+        ("hb", 700),  # busy, past 600 s
+        (None, 10),  # REVOKED below
+    ]
+    owned = {}
+    for idx in (3, 4):
+        (p, tok) = execs[idx]
+        owned[idx] = await _own(c, sm, "cmp4g", tok, p.executor_id)
+    async with sm() as s, s.begin():
+        for idx, ((p, _), (kind, age)) in enumerate(zip(execs, ages, strict=True)):
+            if kind == "hb":
+                await s.execute(
+                    text(
+                        "UPDATE minion_executor_heartbeat SET last_seen_at = now() - :a * interval"
+                        " '1 second' WHERE acquirement_id = :q"
+                    ),
+                    {"a": age, "q": uuid.UUID(owned[idx]["acquirement_id"])},
+                )
+                age = 5000
+            await s.execute(
+                text(
+                    "UPDATE minion_executor SET last_seen_at = now() - :a * interval '1 second',"
+                    " status = CASE WHEN :i = 5 THEN 'REVOKED' ELSE status END"
+                    " WHERE executor_id = :e"
+                ),
+                {"a": age, "e": p.executor_id, "i": idx},
+            )
+    async with sm() as s, s.begin():
+        api = {
+            r.executor.executor_id: r.online
+            for r in (
+                await executors_repo.list_fleet(
+                    s, idle_online_s=120.0, busy_online_s=600.0, limit=50
+                )
+            )[0]
+        }
+    rows = await _all(sm, "SELECT executor_id, online FROM minion_ro.executor")
+    view = {r[0]: r[1] for r in rows}
+    assert view == api
+    assert [view[p.executor_id] for p, _ in execs] == [True, False, False, True, False, False]
+
+
+@pytest.mark.integration
+async def test_attempt_error_is_sql_null_without_a_code(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "nullerr", 1, team="cmp4f")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp4f", tok, p.executor_id)
+    r = await c.post(f"{BASE}/subtasks/{a['acquirement_id']}/release", headers=_auth(tok))
+    assert r.status_code == 204
+    row = await _one(
+        sm, "SELECT error IS NULL FROM minion_subtask_attempt WHERE task_name='nullerr'"
+    )
+    assert row[0] is True
+
+
+@pytest.mark.integration
 async def test_fail_consumes_budget_then_terminal(http: tuple[AsyncClient, Any]) -> None:
     c, app = http
     sm = app.state.sessionmaker
@@ -292,3 +452,33 @@ async def test_task_partial_when_mixed(http: tuple[AsyncClient, Any], s3: S3Env)
         " FROM minion_task WHERE task_name='mix'",
     )
     assert tuple(end) == ("PARTIAL", True, 1, 1)
+
+
+@pytest.mark.integration
+async def test_fail_code_is_normalized_server_side(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "normcode", 1, team="cmp6")
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET max_attempts=5 WHERE task_name='normcode'"))
+    ((p, tok),) = await make_executors(sm, 1)
+    for sent, stored in (("oom_killed", "OOM_KILLED"), ("not a code!", "RUNNER_ERROR")):
+        a = await _own(c, sm, "cmp6", tok, p.executor_id)
+        r = await c.post(
+            f"{BASE}/subtasks/{a['acquirement_id']}/fail",
+            json=FAIL | {"code": sent},
+            headers=_auth(tok),
+        )
+        assert r.status_code == 204, sent
+        row = await _one(
+            sm,
+            "SELECT error ->> 'code' FROM minion_subtask WHERE task_name='normcode'",
+        )
+        assert row[0] == stored
+        row = await _one(
+            sm,
+            "SELECT error ->> 'code' FROM minion_subtask_attempt WHERE task_name='normcode'"
+            " AND attempt = :n",
+            n=a["attempt"],
+        )
+        assert row[0] == stored

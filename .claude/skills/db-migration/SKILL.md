@@ -33,3 +33,9 @@ description: How to change the open-minions PostgreSQL schema safely — edit OR
   (use `CREATE INDEX CONCURRENTLY` via `op.create_index(..., postgresql_concurrently=True)` inside
   `with op.get_context().autocommit_block():`).
 - Exceed 7 core tables without updating SPEC §7 and an ADR.
+- Alter or drop a column used by a `minion_ro` view (migration 0007) without dropping and recreating
+  the view in the same migration: views block `ALTER COLUMN TYPE` and `DROP COLUMN` on the columns
+  they use. Keep the views free of secrets (token hash, params, object keys) when you add columns.
+- Recreate or add a `minion_ro` view without re-running the guarded `GRANT SELECT ON ALL TABLES IN
+  SCHEMA minion_ro TO minion_readonly` (see the role block in 0007) afterwards: a dropped view loses
+  its grant. `test_0007_minion_readonly_can_select_every_view` asserts the privilege per view.

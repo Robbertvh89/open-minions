@@ -1,3 +1,4 @@
+# DEV ONLY - DO NOT DEPLOY. Default passwords, no TLS, ports on loopback; see docs/ARCHITECTURE.md §7.
 # Local development stack. The executor runs natively on macOS (needs Metal), not in Docker.
 # Server and watchdog services are added in a later milestone (ARCHITECTURE §6).
 name: open-minions
@@ -9,10 +10,13 @@ services:
       POSTGRES_USER: minion
       POSTGRES_PASSWORD: minion
       POSTGRES_DB: minion
+      # Dev-only default. Used by deploy/postgres/initdb to create the read-only Grafana login.
+      MINION_GRAFANA_DB_PASSWORD: ${MINION_GRAFANA_DB_PASSWORD:-minion-grafana-dev}
     ports:
       - "127.0.0.1:${MINION_PG_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U minion -d minion"]
       interval: 2s
@@ -53,11 +57,17 @@ services:
     image: grafana/grafana:11.3.0
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Dev ergonomics: override with GF_SECURITY_ADMIN_PASSWORD in .env; the 'admin' default is dev only.
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Read by the datasource provisioning ($MINION_GRAFANA_DB_PASSWORD); dev-only default.
+      MINION_GRAFANA_DB_PASSWORD: ${MINION_GRAFANA_DB_PASSWORD:-minion-grafana-dev}
     ports:
       - "127.0.0.1:${MINION_GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       postgres:
         condition: service_healthy

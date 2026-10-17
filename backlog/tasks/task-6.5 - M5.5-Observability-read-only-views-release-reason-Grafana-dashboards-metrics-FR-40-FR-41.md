@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 08:03'
+updated_date: '2026-10-17 08:42'
 labels:
   - M5
 dependencies:
@@ -23,9 +23,15 @@ Migration 0007: schema minion_ro with views (executor w/o token_hash, task w/o p
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Every panel's SQL (macros substituted) runs as minion_readonly on the migrated DB (integration)
-- [ ] #2 As minion_readonly, selecting token_hash gives permission denied; static test: every panel queries minion_ro only
-- [ ] #3 A release with a code shows in the attempt view; a release without body still works; ownership/409 unchanged
-- [ ] #4 /metrics exposes counters with no ids, team names or payload
-- [ ] #5 Migration upgrade/downgrade test passes; live: compose shows both dashboards with data from an e2e run
+- [x] #1 Every panel's SQL (macros substituted) runs as minion_readonly on the migrated DB (integration)
+- [x] #2 As minion_readonly, selecting token_hash gives permission denied; static test: every panel queries minion_ro only
+- [x] #3 A release with a code shows in the attempt view; a release without body still works; ownership/409 unchanged
+- [x] #4 /metrics exposes counters with no ids, team names or payload
+- [x] #5 Migration upgrade/downgrade test passes; live: compose shows both dashboards with data from an e2e run
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Deviation from plan: metrics shipped counters-only (HTTP requests by route template, acquire outcomes) and off by default (MINION_METRICS_ENABLED=false); no gauges/histograms. Fix round: online column in minion_ro.executor, role hardening (connection limit, temp_file_limit, TEMPORARY revoked), code-shaped error_code, release/fail code normalization in the executor.
+<!-- SECTION:NOTES:END -->

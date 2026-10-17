@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy import func, select, update
+from sqlalchemy import func, null, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -157,8 +157,12 @@ async def finish_attempt(
     subtask_status: SubtaskStatus,
     output_uri: str | None = None,
     error: dict[str, Any] | None = None,
+    attempt_error: dict[str, Any] | None = None,
 ) -> None:
-    """Record the attempt, drop the acquirement (cascades heartbeat), move the subtask."""
+    """Record the attempt, drop the acquirement (cascades heartbeat), move the subtask.
+
+    `error` goes on both rows; `attempt_error` (a release reason) only on the attempt history.
+    """
     await session.execute(
         pg_insert(SubtaskAttempt).values(
             team=o.team,
@@ -170,7 +174,8 @@ async def finish_attempt(
             executor_id=o.executor_id,
             outcome=outcome.value,
             started_at=o.acquired_at,
-            error=error,
+            # SQL NULL (not JSON null) when there is no error / release reason
+            error=(error if error is not None else attempt_error) or null(),
         )
     )
     await session.execute(
@@ -178,7 +183,10 @@ async def finish_attempt(
             SubtaskAcquirement.acquirement_id == o.acquirement_id
         )
     )
-    values: dict[str, Any] = {"status": subtask_status.value, "error": error}
+    values: dict[str, Any] = {
+        "status": subtask_status.value,
+        "error": error if error is not None else null(),
+    }
     if output_uri is not None:
         values["output_uri"] = output_uri
     await session.execute(

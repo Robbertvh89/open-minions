@@ -1,0 +1,56 @@
+-- Read-only login for Grafana (TASK-6.5, FR-40). Run by 01-grafana-role.sh with `-v pw=<password>`
+-- (also replayed by packages/minion-server/tests/test_dashboards.py). Not a *.sql file on purpose:
+-- the postgres image would run it again without the pw variable.
+--
+-- ENFORCED limits: privileges (SELECT on minion_ro only), CONNECTION LIMIT, temp_file_limit
+-- (superuser-only setting, caps temp-file DISK per session), no TEMP tables, no large-object
+-- creation. NOT enforced: statement_timeout and default_transaction_read_only are session
+-- defaults the role can SET away, and so are work_mem and friends: a hostile Grafana user can
+-- exhaust server memory/CPU. Privileges also cannot stop LISTEN/NOTIFY queue growth, long-open
+-- transactions (AccessShare locks that stall ACCESS EXCLUSIVE migrations and hold back vacuum;
+-- idle_in_transaction_session_timeout is user-settable) or XID burn via txid_current(). Point
+-- production Grafana at a read replica or put a query-timeout proxy in front
+-- (docs/ARCHITECTURE.md section 7).
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'minion_readonly') THEN
+        CREATE ROLE minion_readonly NOLOGIN;
+    END IF;
+END
+$$;
+CREATE ROLE minion_grafana LOGIN PASSWORD :'pw' IN ROLE minion_readonly;
+ALTER ROLE minion_grafana SET statement_timeout = '10s';
+ALTER ROLE minion_grafana SET default_transaction_read_only = on;
+ALTER ROLE minion_grafana CONNECTION LIMIT 5;
+ALTER ROLE minion_grafana SET temp_file_limit = '1GB';
+-- No TEMP tables for PUBLIC (a temp table is a writable scratch area); only the app owner keeps it.
+SELECT format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()) \gexec
+SELECT format('GRANT TEMPORARY ON DATABASE %I TO %I', current_database(), current_user) \gexec
+-- No large-object creation (a writable scratch area even in a read-only transaction). The
+-- app owner keeps them. (lo_import/lo_export are superuser-only by default; revoked anyway.)
+REVOKE EXECUTE ON FUNCTION lo_creat(integer), lo_create(oid), lo_from_bytea(oid, bytea),
+    lo_import(text), lo_import(text, oid) FROM PUBLIC;
+SELECT format(
+    'GRANT EXECUTE ON FUNCTION lo_creat(integer), lo_create(oid), lo_from_bytea(oid, bytea),'
+    ' lo_import(text), lo_import(text, oid) TO %I', current_user) \gexec
+-- No advisory locks: session-level locks outlive the statement (statement_timeout does not help)
+-- and exhausting the shared lock table blocks every new connection cluster-wide. The app does
+-- not use advisory locks.
+REVOKE EXECUTE ON FUNCTION
+    pg_advisory_lock(bigint), pg_advisory_lock(integer, integer),
+    pg_advisory_lock_shared(bigint), pg_advisory_lock_shared(integer, integer),
+    pg_try_advisory_lock(bigint), pg_try_advisory_lock(integer, integer),
+    pg_try_advisory_lock_shared(bigint), pg_try_advisory_lock_shared(integer, integer),
+    pg_advisory_xact_lock(bigint), pg_advisory_xact_lock(integer, integer),
+    pg_advisory_xact_lock_shared(bigint), pg_advisory_xact_lock_shared(integer, integer),
+    pg_try_advisory_xact_lock(bigint), pg_try_advisory_xact_lock(integer, integer),
+    pg_try_advisory_xact_lock_shared(bigint), pg_try_advisory_xact_lock_shared(integer, integer)
+    FROM PUBLIC;
+-- No WAL messages (they write pg_wal/archive, bypassing temp_file_limit).
+REVOKE EXECUTE ON FUNCTION pg_logical_emit_message(boolean, text, text),
+    pg_logical_emit_message(boolean, text, bytea) FROM PUBLIC;
+-- minion_grafana may only connect to the application database: never revoke on the database
+-- this script runs in (POSTGRES_DB may be `postgres`).
+SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', datname)
+FROM pg_database
+WHERE datname IN ('postgres', 'template1') AND datname <> current_database() \gexec

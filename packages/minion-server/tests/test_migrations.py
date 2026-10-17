@@ -121,3 +121,51 @@ def test_0004_splitter_backoff_and_unique_output_round_trip(fresh_url: str) -> N
     assert not asyncio.run(_has_column(fresh_url, "minion_task", "next_split_at"))
     assert not asyncio.run(_has_constraint(fresh_url, "uq_minion_task_output_uri"))
     command.upgrade(cfg, "head")
+
+
+async def _scalar(url: str, sql: str) -> int:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            return int((await conn.execute(text(sql))).scalar_one())
+    finally:
+        await eng.dispose()
+
+
+def test_0007_readonly_views_round_trip(fresh_url: str) -> None:
+    views = "SELECT count(*) FROM pg_views WHERE schemaname = 'minion_ro'"
+    schema = "SELECT count(*) FROM pg_namespace WHERE nspname = 'minion_ro'"
+    role = "SELECT count(*) FROM pg_roles WHERE rolname = 'minion_readonly'"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_scalar(fresh_url, views)) == 5
+    assert asyncio.run(_scalar(fresh_url, role)) == 1
+    command.downgrade(cfg, "0006")
+    assert asyncio.run(_scalar(fresh_url, schema)) == 0
+    assert asyncio.run(_table_count(fresh_url)) == 7  # tables untouched
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_scalar(fresh_url, views)) == 5
+
+
+async def _view_privileges(url: str) -> list[tuple[str, bool]]:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT viewname, has_table_privilege('minion_readonly',"
+                    " format('%I.%I', schemaname, viewname), 'SELECT')"
+                    " FROM pg_views WHERE schemaname = 'minion_ro' ORDER BY 1"
+                )
+            )
+            return [(r[0], bool(r[1])) for r in res]
+    finally:
+        await eng.dispose()
+
+
+def test_0007_minion_readonly_can_select_every_view(fresh_url: str) -> None:
+    """A view added or recreated later must be granted again (db-migration skill)."""
+    command.upgrade(alembic_config(fresh_url), "head")
+    privs = asyncio.run(_view_privileges(fresh_url))
+    assert len(privs) == 5
+    assert all(ok for _, ok in privs), privs

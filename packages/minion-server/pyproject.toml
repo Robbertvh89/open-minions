@@ -12,6 +12,7 @@ dependencies = [
     "structlog>=24.4",
     "uvicorn[standard]>=0.32",
     "boto3>=1.43.114",
+    "prometheus-client>=0.21",
     "pyyaml>=6.0",
     "typer>=0.12",
 ]

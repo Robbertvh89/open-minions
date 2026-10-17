@@ -29,7 +29,7 @@ from minion_common.schemas import (
 )
 from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.runtime import FixedGovernor
-from minion_executor.loop import ExecutorLoop, cleanup_stale_tmp
+from minion_executor.loop import ExecutorLoop, _release_code, cleanup_stale_tmp
 from minion_executor.runners.base import Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
@@ -94,6 +94,7 @@ class FakeClient:
     def __init__(self, items: list[Assignment | Exception | None]) -> None:
         self.items = items
         self.calls: list[tuple[str, Any]] = []
+        self.release_codes: list[str | None] = []
         self.complete_exc: Exception | None = None
         self.complete_excs: list[Exception] = []
         self.register_excs: list[Exception] = []
@@ -138,8 +139,9 @@ class FakeClient:
     async def fail(self, aid: uuid.UUID, req: FailRequest) -> None:
         self.calls.append(("fail", req))
 
-    async def release(self, aid: uuid.UUID) -> None:
+    async def release(self, aid: uuid.UUID, req: Any = None) -> None:
         self.calls.append(("release", aid))
+        self.release_codes.append(req.code if req is not None else None)
 
     async def heartbeat(self, aid: uuid.UUID, req: HeartbeatRequest) -> HeartbeatResponse:
         self.calls.append(("heartbeat", req))
@@ -378,7 +380,7 @@ async def test_runner_error_is_retryable_fail(tmp_path: Path) -> None:
     client.on_empty = loop.stop
     await loop.run()
     req = next(r for k, r in client.calls if k == "fail")
-    assert (req.retryable, req.code) == (True, "oom")
+    assert (req.retryable, req.code) == (True, "OOM")  # normalized to upper case
     assert "secret" not in req.message
 
 
@@ -394,6 +396,7 @@ async def test_stop_releases_current_subtask(tmp_path: Path) -> None:
     loop.stop()
     assert await asyncio.wait_for(task, 5) == 0
     assert client.kinds() == ["acquire", "release"]
+    assert client.release_codes == ["STOP"]
     assert worker.killed and worker.closed
     assert not leftover(tmp_path)
 
@@ -470,6 +473,43 @@ async def test_runner_release_error_releases_without_failing(tmp_path: Path) -> 
     client.on_empty = loop.stop
     await loop.run()
     assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert client.release_codes == ["MODEL_INTEGRITY"]
+
+
+async def test_runner_release_with_invalid_code_uses_fallback_and_loop_survives(
+    tmp_path: Path,
+) -> None:
+    from minion_executor.runners.base import RunnerError
+
+    class RelWorker(FakeWorker):
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
+            raise RunnerError("runner-error!", "x", release=True)
+
+    client = FakeClient([assignment(), assignment()])
+    loop = make_loop(client, RelWorker(), FakeS3(), tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.release_codes == ["EXECUTOR_RELEASE", "EXECUTOR_RELEASE"]  # both handled
+
+
+@pytest.mark.parametrize(
+    ("raw", "sent"),
+    [("runner_error", "RUNNER_ERROR"), ("oom-killed", "RUNNER_ERROR"), ("", "RUNNER_ERROR")],
+)
+async def test_runner_fail_code_is_normalized_not_a_validation_error(
+    tmp_path: Path, raw: str, sent: str
+) -> None:
+    from minion_executor.runners.base import RunnerError
+
+    class FailWorker(FakeWorker):
+        def run(self, batch: list[Record], *_: Any) -> list[Record]:
+            raise RunnerError(raw, "x")
+
+    client = FakeClient([assignment(), assignment()])
+    loop = make_loop(client, FailWorker(), FakeS3(), tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert [c.code for k, c in client.calls if k == "fail"] == [sent, sent]
 
 
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
@@ -765,6 +805,7 @@ async def test_cancel_interrupts_worker_releases_and_continues(tmp_path: Path) -
     assert worker.interrupted and not worker.killed
     assert cache.released >= 1  # the interrupted worker no longer holds the pinned model
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire", "complete", "acquire"]
+    assert client.release_codes == ["CANCELLED"]
     assert len(s3.puts) == 1  # only the second subtask uploads
     assert len(sleeps) == 1  # only the final empty-queue sleep: no failure backoff for CANCELLED
 
@@ -1025,6 +1066,7 @@ async def test_pre_upload_refresh_cancel_releases_without_upload(tmp_path: Path)
     client.on_empty = loop.stop
     assert await loop.run() == 0
     assert client.kinds() == ["acquire", "heartbeat", "release", "acquire"]
+    assert client.release_codes == ["CANCELLED"]
     assert s3.puts == []
     assert not worker.interrupted  # work had finished: the warm worker is kept
 
@@ -1101,6 +1143,7 @@ async def test_cancel_during_output_write_leaves_no_files(
     await loop.run()
     assert seen == [[]]
     assert "release" in client.kinds() and s3.puts == []
+    assert client.release_codes == ["CANCELLED"]
 
 
 def _asn(**over: Any) -> Assignment:
@@ -1657,6 +1700,7 @@ async def test_hard_stop_during_complete_backoff_releases_at_grace(tmp_path: Pat
     elapsed = asyncio.get_running_loop().time() - t0
     assert 0.2 <= elapsed < 1.5
     assert client.kinds()[-1] == "release" and "complete" in client.kinds()
+    assert client.release_codes == ["STOP"]
 
 
 class SlowServerClient(FakeClient):
@@ -1666,8 +1710,9 @@ class SlowServerClient(FakeClient):
         self.calls.append(("complete", req))
         await asyncio.sleep(60)
 
-    async def release(self, aid: uuid.UUID) -> None:
+    async def release(self, aid: uuid.UUID, req: Any = None) -> None:
         self.calls.append(("release", aid))
+        self.release_codes.append(req.code if req is not None else None)
         await asyncio.sleep(60)
 
 
@@ -2096,7 +2141,10 @@ async def test_pause_and_duty_reach_the_worker_at_once_and_resume_continues(
 
 @pytest.mark.parametrize(
     ("flags", "label"),
-    [({"pause_expired": True}, "pause"), ({"release_now": True, "trim": True}, "critical")],
+    [
+        ({"pause_expired": True}, "PAUSE_RELEASE"),
+        ({"release_now": True, "trim": True}, "MEMORY_CRITICAL_RELEASE"),
+    ],
 )
 async def test_pause_expired_or_critical_interrupts_and_releases(
     tmp_path: Path, flags: dict[str, Any], label: str
@@ -2121,6 +2169,7 @@ async def test_pause_expired_or_critical_interrupts_and_releases(
     await asyncio.wait_for(task, 10)
     kinds = client.kinds()
     assert worker.interrupts == 1 and "complete" not in kinds and "fail" not in kinds
+    assert client.release_codes == [label]
     assert cache.unpins >= 2  # the killed worker no longer pins the model
     assert sleeps == []  # released, not failed: no failure back-off
 
@@ -2162,6 +2211,7 @@ async def test_downgrade_finishes_the_batch_then_releases_and_unloads(tmp_path: 
     loop.stop()
     await asyncio.wait_for(task, 10)
     assert worker.batches == [2]  # ... and no further batch starts
+    assert client.release_codes == ["BUDGET_DOWNGRADE"]
     assert worker.unloads >= 1 and worker.interrupts == 0  # graceful unload, not a kill
     assert "complete" not in client.kinds() and "fail" not in client.kinds()
     assert cache.unpins >= 2
@@ -2178,6 +2228,7 @@ async def test_downgrade_overrunning_the_bound_interrupts(tmp_path: Path) -> Non
     loop.stop()
     await asyncio.wait_for(task, 10)
     assert worker.interrupts == 1 and "fail" not in client.kinds()
+    assert client.release_codes == ["BUDGET_DOWNGRADE"]
 
 
 async def test_budget_drop_during_model_fetch_never_loads(tmp_path: Path) -> None:
@@ -2254,6 +2305,7 @@ async def test_priority_violation_after_grace_interrupts_and_releases(tmp_path: 
     client.on_empty = loop.stop
     await asyncio.wait_for(loop.run(), 10)
     assert worker.interrupts == 1 and "release" in client.kinds()
+    assert client.release_codes == ["PRIORITY_VIOLATION"]
 
 
 async def test_priority_false_inside_the_grace_window_is_ignored(tmp_path: Path) -> None:
@@ -2496,6 +2548,7 @@ async def test_crashed_watcher_before_inference_ends_releases(tmp_path: Path) ->
     await asyncio.wait_for(task, 10)
     assert worker.interrupts == 1 and "complete" not in client.kinds()
     assert "fail" not in client.kinds()  # released, not failed
+    assert client.release_codes == ["WATCHER_FAILED"]
 
 
 async def test_crashed_watcher_after_inference_lets_the_upload_complete(tmp_path: Path) -> None:
@@ -3073,3 +3126,9 @@ async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_pat
     await until(lambda: worker.unloads >= 1)
     loop.stop()
     await asyncio.wait_for(task, 10)
+
+
+def test_release_code_is_upper_cased_before_falling_back() -> None:
+    assert _release_code("budget_downgrade") == "BUDGET_DOWNGRADE"
+    assert _release_code("STOP") == "STOP"
+    assert _release_code("free text!") == "EXECUTOR_RELEASE"

@@ -358,7 +358,7 @@ class _Client:
     async def fail(self, aid: uuid.UUID, req: Any) -> None:
         self.failed.append(req)
 
-    async def release(self, aid: uuid.UUID) -> None: ...
+    async def release(self, aid: uuid.UUID, req: Any = None) -> None: ...
 
     async def heartbeat(self, aid: uuid.UUID, req: Any) -> HeartbeatResponse:
         return HeartbeatResponse(

@@ -1,5 +1,6 @@
 """Complete / fail / release (plan D6). Ownership is checked on every call (invariant 3)."""
 
+import re
 import uuid
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
@@ -119,6 +120,16 @@ async def finish_failed(
     return status
 
 
+_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
+_FAIL_FALLBACK = "RUNNER_ERROR"
+
+
+def normalize_fail_code(code: str) -> str:
+    """Upper-case a failure code; anything still not a stable code becomes RUNNER_ERROR."""
+    up = code.upper()
+    return up if _CODE_RE.fullmatch(up) else _FAIL_FALLBACK
+
+
 async def fail(
     session: AsyncSession,
     principal: ExecutorPrincipal,
@@ -133,7 +144,11 @@ async def fail(
             session,
             o,
             outcome=AttemptOutcome.FAILED,
-            error={"code": req.code, "message": req.message, "retryable": req.retryable},
+            error={
+                "code": normalize_fail_code(req.code),
+                "message": req.message,
+                "retryable": req.retryable,
+            },
             retryable=req.retryable,
         )
 
@@ -144,17 +159,21 @@ async def release(
     acquirement_id: uuid.UUID,
     *,
     settings: ServerSettings,
+    code: str | None = None,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
+        # Why the executor handed it back (dashboards); history only, not the subtask's error.
+        reason = {"code": code} if code is not None else None
         if o.task_status == TaskStatus.CANCELLED:
             await repo.finish_attempt(
                 session,
                 o,
                 outcome=AttemptOutcome.CANCELLED,
                 subtask_status=SubtaskStatus.CANCELLED,
+                attempt_error=reason,
             )
         elif await repo.released_attempt_count(session, o) >= settings.release_limit:
             # Repeated releases must not livelock a subtask: past the cap they cost budget.
@@ -175,4 +194,5 @@ async def release(
                 o,
                 outcome=AttemptOutcome.RELEASED,
                 subtask_status=SubtaskStatus.PENDING,
+                attempt_error=reason,
             )

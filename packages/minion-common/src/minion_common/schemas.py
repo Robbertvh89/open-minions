@@ -284,8 +284,19 @@ class CompleteRequest(_Model):
 
 class FailRequest(_Model):
     retryable: bool
+    # Lenient on the wire (old executors); the server normalizes it before storing.
     code: str = Field(min_length=1, max_length=64)
     message: str = Field(max_length=1000, description="Diagnostic only; never payload content")
+
+
+class ReleaseRequest(_Model):
+    """Optional body of a voluntary release: why the executor handed the subtask back.
+
+    A stable upper-case code (e.g. `BUDGET_DOWNGRADE`), stored in the attempt history for
+    dashboards. Never free text or payload content. Old executors send no body at all.
+    """
+
+    code: str = Field(pattern=r"^[A-Z0-9_]{1,64}$")
 
 
 class Progress(_Model):
