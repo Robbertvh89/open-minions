@@ -1,0 +1,26 @@
+# ADR-0012: In-memory per-replica rate limits on executor endpoints
+
+- Status: **Accepted** (TASK-6.2, plan decision D4)
+- Deviates from paper: no (the paper does not cover abuse protection)
+
+## Context
+
+A buggy or hostile executor can hammer `register`, `acquire` and `presence`, each a DB write or a
+candidate scan. Heartbeats already have a DB-backed minimum interval. NF-5 wants a stateless server.
+
+## Decision
+
+- `minion_server/ratelimit.py`: a minimum interval per `(executor_id, op)`, monotonic clock, bounded
+  LRU (10 000 keys), kept in process memory. Intervals: `MINION_REGISTER_MIN_INTERVAL_S` 5,
+  `MINION_ACQUIRE_MIN_INTERVAL_S` 0.5, `MINION_PRESENCE_MIN_INTERVAL_S` 5; `0` disables.
+- Applied as a route dependency after authentication and before any DB work: `429
+  TOO_MANY_REQUESTS` + `Retry-After`. Only admitted calls are recorded.
+- The counters are soft state, not coordination state: N replicas admit up to N calls per interval,
+  and a restart forgets them. Nothing depends on them for correctness; ownership is still decided
+  only by the `INSERT ... ON CONFLICT DO NOTHING` (invariant 2). Per-IP limits stay at the proxy.
+- Executors treat 429 as a back-off of at least `Retry-After` (cap 300 s), also across a pause.
+
+## Alternatives
+
+A DB or Redis counter: shared and exact, but adds a write on the hot path or a new dependency to
+guard against a problem that approximate limits solve.

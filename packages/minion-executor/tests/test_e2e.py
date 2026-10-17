@@ -17,8 +17,9 @@ import pytest
 import uvicorn
 from minion_common.client import ExecutorClient, UserClient
 from minion_common.enums import Engine
-from minion_common.schemas import Budget, TaskCreate
+from minion_common.schemas import AcquireRequest, Budget, PreferenceRequest, TaskCreate
 from minion_executor.loop import ExecutorLoop
+from minion_executor.main import _send_preference
 from minion_executor.worker.process import WorkerHandle
 from minion_server.admin import issue_executor_token
 from minion_server.app import create_app
@@ -26,7 +27,7 @@ from minion_server.services.reclaim import reclaim_stale
 from pydantic import SecretStr
 from sqlalchemy import text
 
-from conftest import S3Env, _settings
+from conftest import S3Env, _settings, seed_task
 
 pytestmark = pytest.mark.integration
 
@@ -519,3 +520,20 @@ async def test_stale_acquirement_409_stops_work_sends_nothing_and_continues(
     assert _final_keys(live, "stale") == []
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live) -> None:
+    """TASK-6.2 AC #4: `prefer` (the CLI's request) sets the preference over real HTTP; clearing
+    restores plain FIFO."""
+    await seed_task(live.sm, "older", 3, team="aaa")  # older: FIFO would serve this first
+    await seed_task(live.sm, "newer", 3, team="bbb")
+    token = SecretStr(await live.token("pref"))
+    req = AcquireRequest(engines=[Engine.MLX], budget=BUDGET)
+    async with ExecutorClient(live.url, token) as c:
+        await _send_preference(live.url, token, PreferenceRequest(team="bbb"))
+        for _ in range(2):
+            got = await c.acquire(req)
+            assert got is not None and got.team == "bbb"
+        await _send_preference(live.url, token, PreferenceRequest())  # --clear
+        got = await c.acquire(req)
+        assert got is not None and got.team == "aaa"

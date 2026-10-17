@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,7 @@ class FakeClient:
         self.acquire_reqs: list[AcquireRequest] = []
         self.presences: list[PresenceRequest] = []
         self.on_presence: Any = None
+        self.presence_excs: list[Exception] = []
         self.registers: list[Any] = []
 
     async def presence(self, req: PresenceRequest) -> None:
@@ -110,6 +112,8 @@ class FakeClient:
         self.presences.append(req)
         if self.on_presence:
             self.on_presence()
+        if self.presence_excs:
+            raise self.presence_excs.pop(0)
 
     async def register(self, req: Any) -> None:
         self.calls.append(("register", None))
@@ -3109,9 +3113,28 @@ async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None
     assert sleeps[0] == 300.0  # Retry-After is capped
 
 
+def _grew(items: list[float], seen: int) -> bool:
+    return len(items) > seen
+
+
+class WaitSpyGovernor(FixedGovernor):
+    """Records every `wait_change` timeout and signals it: an observable 'the loop is now
+    sleeping in a back-off of that length', instead of guessing with asyncio.sleep."""
+
+    def __init__(self, budget: Budget) -> None:
+        super().__init__(budget)
+        self.timeouts: list[float] = []
+        self.waiting = asyncio.Event()
+
+    async def wait_change(self, version: int, timeout_s: float) -> int:
+        self.timeouts.append(timeout_s)
+        self.waiting.set()
+        return await super().wait_change(version, timeout_s)
+
+
 async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_path: Path) -> None:
     gib = 1024**3
-    gov = FixedGovernor(BUDGET)  # 8 GB
+    gov = WaitSpyGovernor(BUDGET)  # 8 GB
     first = assignment()
     first = first.model_copy(update={"model": first.model.model_copy(update={"memory_gb": 8})})
     client = FakeClient([first, ApiError(429, "RATE_LIMITED", "slow", retry_after=250.0)])
@@ -3120,10 +3143,67 @@ async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_pat
     loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, sleep=None)
     task = asyncio.create_task(loop.run())
     await until(lambda: client.kinds().count("acquire") >= 2)
-    await asyncio.sleep(0.05)  # now inside the 429 back-off (>= 250 s)
+    await until(lambda: any(t >= 200 for t in gov.timeouts))  # inside the 429 back-off
     assert worker.unloads == 0
     gov.update(dec(small(4.0)))
     await until(lambda: worker.unloads >= 1)
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_429_backoff_cut_short_by_a_pause_is_waited_out_after_resume(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    gov = WaitSpyGovernor(BUDGET)
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "slow", retry_after=250.0), assignment()])
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov, sleep=None, clock=lambda: now[0]
+    )
+    task = asyncio.create_task(loop.run())
+    await until(lambda: any(t >= 200 for t in gov.timeouts))  # in the 429 back-off
+    gov.update(dec(reason=PausedReason.THERMAL))
+    await until(lambda: len(client.presences) >= 1)  # the pause ended the back-off
+    now[0] += 100.0  # 100 s of the 250 s passed while paused
+    gov.timeouts.clear()
+    gov.update(dec())  # resume
+    await until(lambda: any(100 <= t <= 160 for t in gov.timeouts))  # ~150 s still to wait
+    assert client.kinds().count("acquire") == 1  # not retried before Retry-After elapsed
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_presence_429_honours_retry_after_and_keeps_the_pending_state(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    gov = WaitSpyGovernor(BUDGET)
+    gov.update(dec(reason=PausedReason.THERMAL))
+    client = FakeClient([])
+    client.presence_excs = [ApiError(429, "TOO_MANY_REQUESTS", "slow", retry_after=30.0)]
+    loop = make_loop(
+        client,
+        FakeWorker(),
+        FakeS3(),
+        tmp_path,
+        [],
+        governor=gov,
+        presence_interval_s=100.0,
+        clock=lambda: now[0],
+    )
+    task = asyncio.create_task(loop.run())
+    await until(lambda: len(client.presences) == 1)  # rejected
+    await until(lambda: gov.waiting.is_set())
+    for state in (dec(reason=PausedReason.MEMORY_PRESSURE), dec(small(4.0, profile="light"))):
+        seen = len(gov.timeouts)
+        now[0] += 5.0
+        gov.update(dec(state.budget, reason=PausedReason.MEMORY_PRESSURE))  # changed, limited
+        await until(partial(_grew, gov.timeouts, seen))  # the loop looked and waited again
+    assert len(client.presences) == 1  # nothing sent inside Retry-After
+    now[0] += 25.0  # past the 30 s deadline
+    gov.update(dec(reason=PausedReason.THERMAL))
+    await until(lambda: len(client.presences) == 2)
+    assert client.presences[1].paused_reason == "thermal"
     loop.stop()
     await asyncio.wait_for(task, 10)
 

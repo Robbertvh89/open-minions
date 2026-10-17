@@ -15,6 +15,7 @@ from minion_server.metrics import Metrics, MetricsMiddleware
 from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
 from minion_server.netutil import is_loopback
+from minion_server.ratelimit import MinIntervalLimiter
 from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
@@ -43,6 +44,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 busy_s=cfg.executor_online_busy_s,
                 note="minion_ro.executor.online (migration 0007) hardcodes 120/600",
             )
+        app.state.limiter = MinIntervalLimiter(
+            {
+                "register": cfg.register_min_interval_s,
+                "acquire": cfg.acquire_min_interval_s,
+                "presence": cfg.presence_min_interval_s,
+            }
+        )
         app.state.api_keys = api_keys
         app.state.ui_secret = (
             cfg.ui_session_secret.get_secret_value().encode("utf-8")

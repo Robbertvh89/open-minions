@@ -279,6 +279,10 @@ class ExecutorLoop:
         self._trim_pushed = False
         self._presence_key: tuple[object, object] | None = None
         self._presence_due = 0.0
+        self._presence_blocked_until = 0.0  # presence 429: no ping, even a changed one, before this
+        # Monotonic (self._clock) deadline of a 429 on acquire: a back-off cut short by a pause
+        # must still be waited out after the resume, or the first acquire would 429 again.
+        self._rate_limited_until: float | None = None
         self._loaded: ModelEntry | None = None  # model the warm worker holds (None: nothing)
         self._loaded_path: Path | None = None  # cache path pinned for `_loaded` (None: unpinned)
         self._unload_fut: asyncio.Future[None] | None = None  # in-flight watcher/idle unload
@@ -450,6 +454,8 @@ class ExecutorLoop:
         reason or budget changes, and every `presence_interval_s`."""
         key = (d.paused_reason, d.budget)
         now = self._clock()
+        if now < self._presence_blocked_until:
+            return
         if key == self._presence_key and now < self._presence_due:
             return
         req = PresenceRequest(
@@ -465,6 +471,12 @@ class ExecutorLoop:
             if isinstance(exc, ApiError) and exc.status_code in (401, 403):
                 raise  # the credential is gone: same as a refused acquire
             log.warning("presence_failed", error=type(exc).__name__)
+            if isinstance(exc, ApiError) and exc.status_code == 429:
+                # keep the key: the (changed) state is sent once the limit allows it
+                wait = self._rate_limit_delay(exc, 0) if exc.retry_after is not None else 10.0
+                self._presence_blocked_until = now + wait
+                self._presence_due = self._presence_blocked_until
+                return
         self._presence_key = key
         self._presence_due = now + (self._presence_s if ok else min(self._presence_s, 10.0))
 
@@ -530,6 +542,14 @@ class ExecutorLoop:
                     continue
                 self._presence_key = None
                 version = self._gov.version
+                if (until := self._rate_limited_until) is not None:
+                    if (left := until - self._clock()) > 0:
+                        await self._sleep(version, delay=left)  # rest of a 429 back-off
+                        if not self._gov.decision.paused:  # a pause cut it short: keep the rest
+                            self._rate_limited_until = None
+                        continue
+                    self._rate_limited_until = None
+                version = self._gov.version
                 try:
                     assignment = await self._guarded(
                         self._client.acquire(
@@ -550,9 +570,13 @@ class ExecutorLoop:
                     log.warning("acquire_failed", error=type(exc).__name__)
                     await self._maybe_unload()  # a warm model must not outlive a server outage
                     await self._enforce_idle_budget()
-                    if limited:  # 429: back off at least Retry-After (TASK-6.2 extends this)
+                    if limited:  # 429: back off at least Retry-After, also across a pause
                         limited_n += 1
-                        await self._sleep(version, delay=self._rate_limit_delay(exc, limited_n - 1))
+                        delay = self._rate_limit_delay(exc, limited_n - 1)
+                        self._rate_limited_until = self._clock() + delay
+                        await self._sleep(version, delay=delay)
+                        if not self._gov.decision.paused:  # waited it out (a pause keeps the rest)
+                            self._rate_limited_until = None
                     else:
                         await self._sleep(version)
                     continue

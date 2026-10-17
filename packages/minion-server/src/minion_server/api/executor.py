@@ -1,9 +1,10 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
 import uuid
+from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from minion_common.schemas import (
     AcquireRequest,
     Assignment,
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from minion_server.auth import ExecutorPrincipal, current_executor
 from minion_server.db.session import get_session
 from minion_server.errors import api_error
+from minion_server.ratelimit import retry_after_header
 from minion_server.repositories import executors as executors_repo
 from minion_server.services import acquisition, completion
 from minion_server.services import heartbeat as heartbeat_service
@@ -48,7 +50,27 @@ def _models(request: Request) -> dict[str, ModelEntry]:
     return m
 
 
-@router.post("/register")
+def _limited(op: str) -> Callable[[Request, ExecutorPrincipal], None]:
+    """Dependency: 429 + Retry-After when this executor called `op` too soon. Declared after
+    `current_executor` (unauthenticated callers never touch the counters) and before any DB
+    work. It only sheds load: ownership is still decided by the acquirement INSERT (invariant 2)."""
+
+    def check(
+        request: Request, principal: Annotated[ExecutorPrincipal, Depends(current_executor)]
+    ) -> None:
+        limiter = getattr(request.app.state, "limiter", None)
+        wait = limiter.check(principal.executor_id, op) if limiter is not None else None
+        if wait is not None:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "TOO_MANY_REQUESTS", "message": f"{op} called too fast"},
+                headers={"Retry-After": retry_after_header(wait)},
+            )
+
+    return check
+
+
+@router.post("/register", dependencies=[Depends(_limited("register"))])
 async def register(
     body: RegisterRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
@@ -88,7 +110,7 @@ async def set_preference(
     return Response(status_code=204)
 
 
-@router.post("/presence", status_code=204)
+@router.post("/presence", status_code=204, dependencies=[Depends(_limited("presence"))])
 async def presence(
     body: PresenceRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
@@ -98,7 +120,12 @@ async def presence(
     return Response(status_code=204)
 
 
-@router.post("/acquire", response_model=Assignment, responses={204: {"description": "No work"}})
+@router.post(
+    "/acquire",
+    response_model=Assignment,
+    responses={204: {"description": "No work"}},
+    dependencies=[Depends(_limited("acquire"))],
+)
 async def acquire(
     request: Request,
     body: AcquireRequest,

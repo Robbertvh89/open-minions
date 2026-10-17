@@ -539,4 +539,5 @@ token in macOS Keychain.
 - [ADR-0008](adr/0008-fault-tolerance-reclaim-and-cancel.md): Fault-tolerance deviations: SKIP LOCKED reclaim, budget, lazy cancel, max lease, executor interrupt — **Accepted**
 - [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
 - [ADR-0010](adr/0010-web-ui-session-auth.md): Web UI login with an API key and a stateless session cookie; OIDC via reverse proxy — **Accepted**
+- [ADR-0012](adr/0012-in-memory-executor-rate-limits.md): In-memory per-replica rate limits on register/acquire/presence (soft state, not coordination) — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*
