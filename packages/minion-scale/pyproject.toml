@@ -1,0 +1,26 @@
+[project]
+name = "minion-scale"
+version = "0.1.0"
+description = "open-minions scale harness (DEV ONLY): bulk seed, simulated executors, invariant verifier"
+requires-python = ">=3.12"
+dependencies = [
+    "minion-common",
+    "minion-server",
+    "boto3>=1.43.114",
+    "httpx>=0.28",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "typer>=0.15",
+]
+
+[project.scripts]
+minion-scale = "minion_scale.cli:app"
+
+[tool.uv.sources]
+minion-common = { workspace = true }
+minion-server = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"

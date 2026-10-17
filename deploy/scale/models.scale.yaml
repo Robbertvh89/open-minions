@@ -1,0 +1,10 @@
+# DEV ONLY - DO NOT DEPLOY. Allow-list for the scale harness (packages/minion-scale): one model
+# served by the executor's `fake` engine. The simulated executors never run inference, they
+# only exercise the REST protocol. Use with deploy/compose.scale.yml.
+models:
+  - model_id: scale-fake
+    type: embedding
+    engine: fake
+    ref: fake
+    revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    memory_gb: 0.1
