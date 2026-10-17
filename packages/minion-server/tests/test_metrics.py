@@ -110,6 +110,33 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
     assert str(p.executor_id) not in text and "metrics-pool" not in text
 
 
+@pytest.mark.integration
+async def test_acquire_error_outcome_is_timed(
+    fresh_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.api import executor as executor_api
+
+    async def boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(executor_api.acquisition, "acquire", boom)
+    cfg = _settings(fresh_url).model_copy(update={"metrics_enabled": True})
+    app = create_app(cfg)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://t"
+        ) as c,
+    ):
+        ((_p, tok),) = await make_executors(app.state.sessionmaker, 1, pool="metrics-pool")
+        body = _req().model_dump(mode="json")
+        r = await c.post("/api/v1/executor/acquire", json=body, headers=_auth(tok))
+        assert r.status_code == 500
+        text: Any = (await c.get("/metrics")).text
+    assert 'minion_acquire_seconds_count{outcome="error"} 1.0' in text
+    assert 'minion_acquire_total{outcome="error"}' not in text
+
+
 def _cfg(**kw: Any) -> ServerSettings:
     return ServerSettings(
         database_url=SecretStr("x"),

@@ -139,14 +139,18 @@ async def acquire(
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
 ) -> Response:
     started = time.perf_counter()
-    assignment = await acquisition.acquire(
-        session, principal, body, settings=settings, storage=storage, models=models
-    )
     metrics = getattr(request.app.state, "metrics", None)
-    if metrics is not None:
+    outcome = "error"  # one of three fixed values; a raised acquire is timed too
+    try:
+        assignment = await acquisition.acquire(
+            session, principal, body, settings=settings, storage=storage, models=models
+        )
         outcome = "empty" if assignment is None else "assigned"
+    finally:
+        if metrics is not None:
+            metrics.observe_acquire(outcome, time.perf_counter() - started)
+    if metrics is not None:
         metrics.acquires.labels(outcome=outcome).inc()
-        metrics.observe_acquire(outcome, time.perf_counter() - started)
     if assignment is None:
         return Response(status_code=204)
     return Response(content=assignment.model_dump_json(), media_type="application/json")
