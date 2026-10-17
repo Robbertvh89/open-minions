@@ -160,9 +160,15 @@ def test_sampler_collects_and_surfaces_a_failed_read() -> None:
 
     bad = GpuSampler(read=flaky, interval_s=0.01)
     bad.start()
-    time.sleep(0.1)
+    _wait_dead(bad)
     with pytest.raises(GpuMeterError, match="gone"):
         bad.stop()  # a broken meter never passes as a quiet GPU
+
+
+def _wait_dead(sampler: GpuSampler) -> None:
+    deadline = time.monotonic() + 5
+    while sampler._thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 def test_sampler_turns_any_exception_into_a_meter_error() -> None:
@@ -171,9 +177,7 @@ def test_sampler_turns_any_exception_into_a_meter_error() -> None:
 
     bad = GpuSampler(read=boom, interval_s=0.01)
     bad.start()
-    import time
-
-    time.sleep(0.1)
+    _wait_dead(bad)
     with pytest.raises(GpuMeterError, match="ValueError") as e:
         bad.stop()
     assert "secret" not in str(e.value)
@@ -229,6 +233,37 @@ def test_process_gpu_share_needs_readings_and_ignores_counter_resets() -> None:
         process_gpu_share([sm(0, None), sm(1, None)], 0, 1)  # pid unknown the whole time
     assert process_gpu_share([sm(0, {"a": 900}), sm(1, {"a": 5})], 0, 1) == 0.0
     assert process_gpu_share([sm(0, {}), sm(1, {})], 0, 1) == 0.0  # no client: not on the GPU
+
+
+def test_process_gpu_share_a_mid_window_drop_loses_one_interval_only() -> None:
+    # 0.5 s/s, counter resets to 0 between t=4 and t=5, then keeps going at 0.5 s/s
+    vals = [0.0, 0.5, 1.0, 1.5, 2.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    samples = [sm(t, {"a": int(v * 1e9)}) for t, v in enumerate(vals)]
+    assert process_gpu_share(samples, 0, 10) == pytest.approx(0.45)  # 9 of 10 intervals count
+
+
+def test_read_gpu_clients_rejects_output_without_creator_and_gpu_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    no_time = '+-o AGXDeviceUserClient id 0x1\n"IOUserClientCreator" = "pid 5, x"\n'
+    no_pid = '+-o AGXDeviceUserClient id 0x1\n"accumulatedGPUTime"=5\n"IOUserClientCreator"="x"\n'
+    for text in (no_time, no_pid):
+        monkeypatch.setattr(IOREG, lambda *a, _t=text, **k: _t)
+        with pytest.raises(GpuMeterError, match="creator pid and accumulatedGPUTime"):
+            read_gpu_clients()
+
+
+def test_budget_check_zero_attribution_is_an_error_not_a_pass(tmp_path: Path) -> None:
+    report = check(tmp_path, fake_entry(), rate=0.0)
+    for row in report.results:
+        assert row.status == "error" and "no GPU time attributed" in (row.detail or "")
+        assert not row.passed
+
+
+def test_budget_check_unpaced_share_above_wall_time_is_an_anomaly(tmp_path: Path) -> None:
+    report = check(tmp_path, fake_entry(), rate=2.0)
+    light = report.results[0]
+    assert light.status == "error" and "meter anomaly" in (light.detail or "")
 
 
 def v(**kw: Any) -> bb.Nf8Verdict:

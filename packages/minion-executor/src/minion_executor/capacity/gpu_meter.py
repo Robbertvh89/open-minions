@@ -19,6 +19,7 @@ loop. Absent off macOS: `GpuMeterError`.
 
 from __future__ import annotations
 
+import itertools
 import re
 import statistics
 import subprocess
@@ -126,6 +127,9 @@ def read_gpu_clients(timeout_s: float = 5.0) -> dict[int, dict[str, int]]:
     text = _ioreg(IOREG_CLIENTS_ARGV, timeout_s)
     if "AGXDeviceUserClient" not in text:
         raise GpuMeterError("ioreg lists no AGXDeviceUserClient (no Apple GPU?)")
+    if not any(_CREATOR.search(b) and _GPU_TIME.search(b) for b in _BLOCK.split(text)[1:]):
+        # a changed ioreg format must fail loudly, not read as a process that used no GPU
+        raise GpuMeterError("no AGXDeviceUserClient has a creator pid and accumulatedGPUTime")
     return parse_gpu_clients(text)
 
 
@@ -213,20 +217,22 @@ def process_gpu_share(samples: list[GpuSample], start: float, end: float) -> flo
     Uses the last sample at or before each bound, so the divisor is the true span between the two
     readings. Per client: the start value is 0 when the client is not yet listed (it appeared
     inside the window), the end value is the last one seen (a client that closed inside the window
-    keeps what it accumulated). Counters that go backwards count 0. Clients of the process are
-    summed. Raises GpuMeterError without a usable pair of readings."""
+    keeps what it accumulated). Positive deltas are summed per consecutive sample pair, so a
+    counter that goes backwards costs at most one interval. Clients of the process are summed.
+    Raises GpuMeterError without a usable pair of readings."""
     usable = [s for s in samples if s.clients is not None]
     before = [s for s in usable if s.at <= start]
     after = [s for s in usable if s.at <= end]
     if not before or not after or after[-1].at <= before[-1].at:
         raise GpuMeterError("not enough per-process GPU readings in the window")
     first, last = before[-1], after[-1]
-    base = first.clients or {}
-    latest: dict[str, int] = {}
-    for s in usable:
-        if first.at <= s.at <= last.at:
-            latest.update(s.clients or {})
-    delta_ns = sum(max(0, v - base.get(cid, 0)) for cid, v in latest.items())
+    window = [s for s in usable if first.at <= s.at <= last.at]
+    delta_ns = 0
+    for prev, cur in itertools.pairwise(window):
+        before_ns = prev.clients or {}
+        # a client new in this interval started at 0; a counter that dropped (reset) loses at
+        # most this one interval, never the rest of the window
+        delta_ns += sum(max(0, v - before_ns.get(cid, 0)) for cid, v in (cur.clients or {}).items())
     return delta_ns / 1e9 / (last.at - first.at)
 
 

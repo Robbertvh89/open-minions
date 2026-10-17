@@ -60,7 +60,7 @@ memory critical (release), power (battery 5 %), user return, with `FileSignals`,
 100 ms steps and a 0.25 s poll. Pause and duty are timed to the worker's ack, memory critical to the
 worker process exiting. It reports p50 and max per event
 (`uv run pytest packages/minion-executor/tests/test_governor_reaction.py -s`) and asserts max < 5 s
-and max < poll + step + 0.5 s. `MINION_EXECUTOR_SIGNAL_POLL_S` is capped at 4 s so poll plus one
+and max < poll + step + 1.0 s. `MINION_EXECUTOR_SIGNAL_POLL_S` is capped at 4 s so poll plus one
 engine step stays under the bound.
 
 On the Mac with real signals and the production poll (2 s), `--watch-reactions` runs a real

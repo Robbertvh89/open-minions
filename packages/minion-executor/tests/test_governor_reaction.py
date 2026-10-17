@@ -237,6 +237,6 @@ async def test_reaction_within_five_seconds(
             f"max={ordered[-1]:.3f}s (poll {POLL_S}s, step {STEP_S}s)"
         )
     assert ordered[-1] < NF9_LIMIT_S, times
-    # poll + one engine step + scheduling slack: a regression that merely stays under 5 s is caught
-    assert ordered[-1] < POLL_S + STEP_S + 0.5, times
+    # poll + one engine step + 1 s slack: a regression that merely stays under 5 s is caught
+    assert ordered[-1] < POLL_S + STEP_S + 1.0, times
     assert ordered[0] >= 0

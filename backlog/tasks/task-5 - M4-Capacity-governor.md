@@ -133,7 +133,7 @@ Out of scope (do not absorb):
 
 **D1 Governor placement.**
 - It is an asyncio task in the control process.
-- Signals are polled every `MINION_EXECUTOR_SIGNAL_POLL_S` (2.0, range 0.5..5) in `asyncio.to_thread`.
+- Signals are polled every `MINION_EXECUTOR_SIGNAL_POLL_S` (2.0, range 0.5..4) in `asyncio.to_thread`.
 - No NSWorkspace or dispatch notifications: polling bounds detection at 2 s, which leaves NF-9 headroom. This deviates from ARCH §3.6 "+ notifications".
 - `governor.py` is pure: `decide(snapshot, config, owner_ctl, now, prev_state) -> Decision`.
 

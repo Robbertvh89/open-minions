@@ -335,6 +335,24 @@ def _fill_shares(
     res.records_done = ph.paced.records
 
 
+UNPACED_SHARE_MAX = 1.05  # a process cannot keep one GPU busy more than its wall time
+
+
+def _attribution_anomaly(res: BudgetCheckResult, ph: _Phases) -> str | None:
+    """A meter that attributes nothing (or too much) must never pass as a quiet or exact GPU."""
+    if ph.paced.records > 0 and not (res.measured_share and res.measured_share > 0):
+        return "no GPU time attributed to the worker"
+    if (
+        ph.unpaced is not None
+        and ph.unpaced.records > 0
+        and not (res.unpaced_share and res.unpaced_share > 0)
+    ):
+        return "no GPU time attributed to the worker in the unpaced phase"
+    if res.unpaced_share is not None and res.unpaced_share > UNPACED_SHARE_MAX:
+        return f"unpaced share {res.unpaced_share:.2f} > {UNPACED_SHARE_MAX}: meter anomaly"
+    return None
+
+
 def _judge(res: BudgetCheckResult, budget: Budget) -> None:
     if res.measured_share is None or res.footprint_peak_gb is None:
         raise RuntimeError("_judge needs the measurements first")
@@ -385,6 +403,9 @@ def _check_one(
     finally:
         samples = sampler.stop()
     _fill_shares(res, samples, phases, cfg)
+    if (anomaly := _attribution_anomaly(res, phases)) is not None:
+        res.status, res.detail = "error", anomaly
+        return res
     stats = worker.stats()
     res.footprint_peak_gb = fp.peak / GIB
     res.worker_rss_peak_gb = stats.get("max_rss_bytes", 0) / GIB
