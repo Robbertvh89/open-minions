@@ -1,4 +1,7 @@
-"""CI smoke (TASK-7.2 c): 20 sims, 2000 subtasks, faults on, through the CLI; verify must pass."""
+"""CI smoke (TASK-7.2 c): 20 sims, 1000 subtasks, faults on, through the CLI; verify must pass.
+
+Sized for slow CI runners (TASK-28): acquire there can be ~5x slower than on a dev Mac.
+"""
 
 import asyncio
 import json
@@ -44,7 +47,7 @@ async def _cli(env: dict[str, str], cwd: Path, *args: str) -> tuple[int, str]:
     return proc.returncode or 0, out.decode()
 
 
-async def test_smoke_20_sims_2k_subtasks_with_faults(
+async def test_smoke_20_sims_1k_subtasks_with_faults(
     lv: Live, fresh_url: str, s3: S3Env, tmp_path: Path
 ) -> None:
     work = tmp_path / "cwd"  # no .env here: settings come from the env below only
@@ -84,7 +87,7 @@ async def test_smoke_20_sims_2k_subtasks_with_faults(
 
     await cli(
         "seed",
-        "--tasks=20",
+        "--tasks=10",
         "--subtasks=100",
         "--executors=20",
         f"--tokens-file={tokens_path}",
@@ -136,10 +139,10 @@ async def test_smoke_20_sims_2k_subtasks_with_faults(
     run = report["run"]
     assert run["server_errors_5xx"] == 0 and run["transport_errors"] == 0
     assert run["sims"] == 20 and run["procs"] == 2
-    assert run["completed"] >= 1900  # the rest ended FAILED after exhausting retries or 409s
+    assert run["completed"] >= 950  # the rest ended FAILED after exhausting retries or 409s
     assert sum(run["faults"].values()) > 0 and run["conflicts_409"] >= 0
     assert report["verify"]["ok"], report["verify"]
-    assert report["verify"]["counts"]["subtasks"] == 2000
+    assert report["verify"]["counts"]["subtasks"] == 1000
     assert {e["name"] for e in report["explain"]} == {
         "candidate",
         "candidate_preference",
@@ -147,7 +150,7 @@ async def test_smoke_20_sims_2k_subtasks_with_faults(
         "over_lease",
     }
     assert all(e["execution_ms"] is not None for e in report["explain"])
-    assert run["calls"]["acquire_assigned"]["count"] >= 2000
+    assert run["calls"]["acquire_assigned"]["count"] >= 1000
 
     # no credentials or payload anywhere in what the harness printed or wrote
     blob = "\n".join(outputs) + (work / "report.json").read_text()
