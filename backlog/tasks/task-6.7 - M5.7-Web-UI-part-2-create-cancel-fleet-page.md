@@ -1,9 +1,10 @@
 ---
 id: TASK-6.7
 title: 'M5.7 Web UI part 2: create, cancel, fleet page'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 10:45'
 labels:
   - M5
 dependencies:

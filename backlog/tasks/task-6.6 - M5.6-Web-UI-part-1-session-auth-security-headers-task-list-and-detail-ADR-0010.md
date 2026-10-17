@@ -3,10 +3,10 @@ id: TASK-6.6
 title: >-
   M5.6 Web UI part 1: session auth, security headers, task list and detail
   (ADR-0010)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 09:57'
+updated_date: '2026-10-17 10:45'
 labels:
   - M5
 dependencies:
