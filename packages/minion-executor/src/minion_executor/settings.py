@@ -57,7 +57,7 @@ class ExecutorSettings(BaseSettings):
 
     # Minimum seconds between two acquire calls (NF-5): instant subtasks must not trip the server's
     # MINION_ACQUIRE_MIN_INTERVAL_S (0.2). Only the remainder is slept. 0 disables.
-    acquire_pace_s: float = Field(default=0.25, ge=0, le=60, allow_inf_nan=False)
+    acquire_pace_s: float = Field(default=0.4, ge=0, le=60, allow_inf_nan=False)
 
     @field_validator("acquire_pace_s")
     @classmethod

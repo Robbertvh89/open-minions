@@ -605,7 +605,7 @@ async def test_default_rate_limits_never_trip_a_healthy_loop(
 ) -> None:
     """TASK-6.2: several subtasks and a pause/resume at the production intervals: no 429.
 
-    The fake subtasks are instant, so only the executor's acquire pacing (>= 0.25 s between
+    The fake subtasks are instant, so only the executor's acquire pacing (>= 0.4 s between
     acquires, above the server's 0.2 s interval) keeps the back-to-back acquires from tripping the
     limit; the loop below uses the production pace and asserts zero 429s."""
     live = live_default_limits
@@ -624,7 +624,7 @@ async def test_default_rate_limits_never_trip_a_healthy_loop(
         allow_http_loopback=True,
         governor=gov,
         backoff=(1.0, 2.0),
-        acquire_pace_s=0.25,  # the production default
+        acquire_pace_s=0.4,  # the production default
     )
     paused = dataclasses.replace(gov.decision, paused_reason=PausedReason.THERMAL)
     resumed = gov.decision

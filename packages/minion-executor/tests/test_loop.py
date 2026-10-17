@@ -3293,7 +3293,7 @@ async def test_acquire_pacing_sleeps_only_the_remaining_fraction(tmp_path: Path)
 def test_acquire_pace_setting_rejects_values_below_server_interval() -> None:
     from minion_executor.settings import ExecutorSettings
 
-    assert ExecutorSettings.model_fields["acquire_pace_s"].default == 0.25
+    assert ExecutorSettings.model_fields["acquire_pace_s"].default == 0.4
     for bad in (0.1, -1.0):
         with pytest.raises(ValueError):
             ExecutorSettings(acquire_pace_s=bad)

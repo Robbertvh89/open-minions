@@ -16,7 +16,7 @@ candidate scan. Heartbeats already have a DB-backed minimum interval. NF-5 wants
   `MINION_PREFERENCE_MIN_INTERVAL_S` 1; `0` disables. LRU bound `MINION_RATE_LIMIT_MAX_ENTRIES`
   (default 40 000). `check` is guarded by a lock and the dependency is `async` (runs on the event
   loop, not the threadpool), so admission is atomic.
-- Executor-side pacing: the loop keeps `MINION_EXECUTOR_ACQUIRE_PACE_S` (0.25, 0 or >= 0.2) between
+- Executor-side pacing: the loop keeps `MINION_EXECUTOR_ACQUIRE_PACE_S` (0.4, 0 or >= 0.2; margin over the 0.2 s server interval absorbs network jitter) between
   acquire calls, sleeping only the remainder, so back-to-back instant subtasks never earn a 429.
 - Applied as a route dependency after authentication and before any DB work: `429
   TOO_MANY_REQUESTS` + `Retry-After`. Only admitted calls are recorded.
