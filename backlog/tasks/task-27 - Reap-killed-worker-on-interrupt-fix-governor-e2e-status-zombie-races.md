@@ -1,10 +1,10 @@
 ---
 id: TASK-27
 title: Reap killed worker on interrupt; fix governor e2e status/zombie races
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 22:57'
-updated_date: '2026-10-17 22:57'
+updated_date: '2026-10-17 23:31'
 labels:
   - bug
 dependencies: []
@@ -19,8 +19,14 @@ WorkerHandle.interrupt()/kill() SIGKILL the worker but don't reap it; when the p
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 interrupt() and kill() reap the worker (unit test: no zombie child left after interrupt with no in-flight call)
-- [ ] #2 test_memory_critical_releases_immediately polls status.json instead of asserting once
-- [ ] #3 descendants() ignores zombie processes
-- [ ] #4 Governor e2e tests green on CI
+- [x] #1 interrupt() and kill() reap the worker (unit test: no zombie child left after interrupt with no in-flight call)
+- [x] #2 test_memory_critical_releases_immediately polls status.json instead of asserting once
+- [x] #3 descendants() ignores zombie processes
+- [x] #4 Governor e2e tests green on CI
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #43: interrupt()/kill() reap the worker (KILL_REAP_TIMEOUT_S 2 s; signal-handler path reap=False); governor e2e polls status and ignores zombies. CI run 39078695078: 1818 passed.
+<!-- SECTION:FINAL_SUMMARY:END -->

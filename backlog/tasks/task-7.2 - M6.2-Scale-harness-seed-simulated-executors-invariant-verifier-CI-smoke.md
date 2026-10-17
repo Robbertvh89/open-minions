@@ -1,10 +1,10 @@
 ---
 id: TASK-7.2
 title: 'M6.2 Scale harness: seed, simulated executors, invariant verifier, CI smoke'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 20:36'
-updated_date: '2026-10-17 21:10'
+updated_date: '2026-10-17 23:31'
 labels:
   - scale
 dependencies: []
@@ -20,9 +20,15 @@ Dev-only workspace package packages/minion-scale (console script minion-scale; n
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Sims use only the REST API and presigned URLs (invariants 1, 4); test: minion_scale.sim imports no sqlalchemy/asyncpg
-- [ ] #2 Back-off/429 handling matches the executor (unit test against executor constants)
-- [ ] #3 verify detects a seeded double-success and an orphan acquirement
-- [ ] #4 Integration smoke (CI): 20 sims, 2k subtasks, faults on, < 90 s, verify passes, zero 5xx
-- [ ] #5 JSON report schema documented; no tokens or payload in output
+- [x] #1 Sims use only the REST API and presigned URLs (invariants 1, 4); test: minion_scale.sim imports no sqlalchemy/asyncpg
+- [x] #2 Back-off/429 handling matches the executor (unit test against executor constants)
+- [x] #3 verify detects a seeded double-success and an orphan acquirement
+- [x] #4 Integration smoke (CI): 20 sims, 2k subtasks, faults on, < 90 s, verify passes, zero 5xx
+- [x] #5 JSON report schema documented; no tokens or payload in output
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #42: dev-only minion-scale harness (seed/run/verify/explain/report/cleanup), REST-only sims with executor-parity back-off and faults, fail-fast drained flag + stall detector, NF-2/NF-3 snapshot verifier, isolated compose.scale overlay, minion_acquire_seconds histogram, non-dev DB guard. CI run 39077098028: 1816 passed. Smoke sizing for slow runners: TASK-28.
+<!-- SECTION:FINAL_SUMMARY:END -->
