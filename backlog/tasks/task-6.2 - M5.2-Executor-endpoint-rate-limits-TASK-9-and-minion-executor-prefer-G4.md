@@ -1,10 +1,10 @@
 ---
 id: TASK-6.2
 title: M5.2 Executor endpoint rate limits (TASK-9) and minion-executor prefer (G4)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 05:14'
+updated_date: '2026-10-17 11:46'
 labels:
   - M5
 dependencies: []
