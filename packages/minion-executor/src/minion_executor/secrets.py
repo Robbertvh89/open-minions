@@ -13,10 +13,8 @@ ENV_VAR = "MINION_EXECUTOR_TOKEN"
 KEYCHAIN_SERVICE = "open-minions-executor"
 
 
-def load_token() -> SecretStr:
-    env = os.environ.get(ENV_VAR)
-    if env:
-        return SecretStr(env.strip())
+def keychain_token() -> SecretStr | None:
+    """The Keychain item only (never the environment); None if absent or unreadable."""
     try:
         out = subprocess.run(  # noqa: S603 - fixed argv, no shell
             ["/usr/bin/security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
@@ -27,9 +25,19 @@ def load_token() -> SecretStr:
             env=scrub_env(os.environ),
         )
     except (OSError, subprocess.SubprocessError):
-        out = None
-    if out is not None and out.returncode == 0 and out.stdout.strip():
+        return None
+    if out.returncode == 0 and out.stdout.strip():
         return SecretStr(out.stdout.strip())
+    return None
+
+
+def load_token() -> SecretStr:
+    env = os.environ.get(ENV_VAR)
+    if env:
+        return SecretStr(env.strip())
+    found = keychain_token()
+    if found is not None:
+        return found
     raise RuntimeError(
         f"no executor token: set ${ENV_VAR} or add Keychain item {KEYCHAIN_SERVICE!r}"
     )

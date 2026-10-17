@@ -123,7 +123,7 @@ minion_executor/
   bench.py             # engine × model throughput / memory benchmark
   io.py                # streaming download/upload via presigned URLs
 ```
-- Installed via `uv tool install minion-executor`; optional `launchd` LaunchAgent in `deploy/`.
+- Installed via `uv tool install minion-executor`; `minion-executor service install|uninstall|status` manages a per-user launchd LaunchAgent (ADR-0011; example plist in `deploy/launchd/`; guide in `docs/ops/executor-install.md`).
 - **Two processes**: the async *control process* (polling, heartbeats, governor, I/O) and a *worker
   subprocess* (spawned with `multiprocessing` `spawn`) that owns Metal/MLX and the loaded model. The
   worker is reused across subtasks of the same model and killed to reclaim memory on budget downgrade,
@@ -199,7 +199,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   deadline is fixed only at the hard stop (or at the final cleanup). When the work finishes
   during the grace period the worker is killed before `complete` so GPU memory is freed
   promptly. launchd `ExitTimeOut` must be at least grace + 15 s (grace + 10 s budget + slack),
-  and launchd's default is only 20 s (below the default 30 s grace), so the M5 plist must set it.
+  and launchd's default is only 20 s (below the default 30 s grace), so `service install` sets `ExitTimeOut = ceil(grace) + 15` and exports it as `MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S`; `run` exits 2 when that is below grace + 15.
   A second signal during the startup engine probe kills the probe worker and exits 0.
 - **Backoff**: `min(30 s, 10 s × 2^min(idle, 16)) × U(0.5, 1.0)`, so the actual delay is 5–30 s,
   not a fixed 10–30 s band. Resets on the first assignment.
@@ -493,7 +493,7 @@ Local dev uses SeaweedFS instead of MinIO (MinIO community images are no longer 
 | Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana, server, watchdog; executor runs natively on the Mac (needs Metal — not in Docker) |
 | Prod | Managed Postgres (separate dev/prod DBs **[paper]**), S3, ≥2 server replicas, 1–2 watchdogs, Grafana. One deployment per team/org for isolation **[paper]** |
 
-Executor distribution: `uv tool install`, signed `launchd` plist, config in `~/.config/minion/executor.toml`,
+Executor distribution: `uv tool install`, a generated per-user `launchd` plist (`minion-executor service install`, ADR-0011; no code signing), config in `~/.config/minion/executor.toml`,
 token in macOS Keychain.
 
 ## 7. Observability

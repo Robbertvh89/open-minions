@@ -51,11 +51,13 @@ from minion_executor.loop import ExecutorLoop, GovernorStoppedError
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
+from minion_executor.service import check_launchd_timeout, service_app
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
 from minion_executor.worker.sandbox import SandboxPolicy
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
+app.add_typer(service_app, name="service")
 
 
 def _chip() -> str:
@@ -372,6 +374,7 @@ def run(
         requested = _requested_engines(engines, runner)
         _validate_heartbeat(heartbeat_interval_s)
         settings = ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
+        check_launchd_timeout(settings)
         config = load_config(settings.config_path)  # before restrict_environ(); exit 2 if unsafe
         specs = resolve_profiles(config)
         pinned = parse_profile(profile, specs) if profile is not None else None
