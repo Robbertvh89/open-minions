@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: 'M4: Capacity governor'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-16 18:23'
+updated_date: '2026-10-17 03:20'
 labels:
   - milestone
   - M4
@@ -20,8 +20,8 @@ Profiles, macOS signals, duty-cycle throttle, auto-pause, budget reporting, down
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 NF-8 budget adherence measured
-- [ ] #2 NF-9 reaction <5s measured
+- [x] #1 NF-8 budget adherence measured
+- [x] #2 NF-9 reaction <5s measured
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -514,4 +514,6 @@ Carry-over from M1 (TASK-2.3): (1) FR-17 grace period — SIGTERM currently kill
 Decisions (orchestrator, autonomous delivery; record in ADR-0006): D10 omitting --profile = adaptive (FR-52), pinned profiles via --profile; Gap 1 NF-8 hard bound share <= duty+10pp, ±10pp checked vs duty x unpaced share; D5 resume after 10 s clear; D7 memory guard fails as retryable OOM.
 
 The plan remark that the pipe buffer cannot fill is superseded by the bounded ctl send in TASK-5.3 (kill watchdog; ctl is not written while a non-run op is in flight).
+
+M4 done (TASK-5.1..5.6, PRs #16-#18, #20-#22). NF-8 measured on M3 Pro (all rows pass after quantum pacing), NF-9 CI max 0.433 s (real-signal Mac run opt-in, not run), NF-4 control process <0.2 %. Follow-ups: TASK-15 controller-side duty enforcement, TASK-12 Ollama pacing warning + warm-worker revision check, TASK-9 presence rate limit + ACL checks.
 <!-- SECTION:NOTES:END -->
