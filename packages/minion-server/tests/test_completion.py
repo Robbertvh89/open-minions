@@ -218,6 +218,42 @@ async def test_release_does_not_consume_retry_budget(http: tuple[AsyncClient, An
 
 
 @pytest.mark.integration
+async def test_release_code_is_stored_in_attempt_history(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "relcode", 1, team="cmp4c")
+    ((p, tok), (_q, other)) = await make_executors(sm, 2)
+    a = await _own(c, sm, "cmp4c", tok, p.executor_id)
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/release"
+    # a malformed code is rejected before anything changes; so is a foreign executor (409)
+    for bad in ({"code": "lower"}, {"code": "X" * 65}, {"code": ""}, {"code": "A", "x": 1}):
+        assert (await c.post(url, json=bad, headers=_auth(tok))).status_code == 422
+    r = await c.post(url, json={"code": "BUDGET_DOWNGRADE"}, headers=_auth(other))
+    assert (r.status_code, r.json()["detail"]["code"]) == (409, "STALE_ACQUIREMENT")
+    row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name='relcode'")
+    assert row[0] == "RUNNING"
+    r = await c.post(url, json={"code": "BUDGET_DOWNGRADE"}, headers=_auth(tok))
+    assert r.status_code == 204
+    row = await _one(
+        sm,
+        "SELECT outcome, error_code FROM minion_ro.attempt WHERE task_name='relcode'",
+    )
+    assert tuple(row) == ("RELEASED", "BUDGET_DOWNGRADE")
+    sub = await _one(sm, "SELECT status, error FROM minion_subtask WHERE task_name='relcode'")
+    assert tuple(sub) == ("PENDING", None)  # the reason is history, not the subtask's error
+    # a release without a body (old executors) still works and has no code
+    b = await _own(c, sm, "cmp4c", tok, p.executor_id)
+    r = await c.post(f"{BASE}/subtasks/{b['acquirement_id']}/release", headers=_auth(tok))
+    assert r.status_code == 204
+    rows = await _one(
+        sm,
+        "SELECT count(*) FILTER (WHERE error_code IS NULL), count(*)"
+        " FROM minion_ro.attempt WHERE task_name='relcode'",
+    )
+    assert tuple(rows) == (1, 2)
+
+
+@pytest.mark.integration
 async def test_fail_consumes_budget_then_terminal(http: tuple[AsyncClient, Any]) -> None:
     c, app = http
     sm = app.state.sessionmaker

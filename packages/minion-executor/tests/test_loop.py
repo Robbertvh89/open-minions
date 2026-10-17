@@ -94,6 +94,7 @@ class FakeClient:
     def __init__(self, items: list[Assignment | Exception | None]) -> None:
         self.items = items
         self.calls: list[tuple[str, Any]] = []
+        self.release_codes: list[str | None] = []
         self.complete_exc: Exception | None = None
         self.complete_excs: list[Exception] = []
         self.register_excs: list[Exception] = []
@@ -138,8 +139,9 @@ class FakeClient:
     async def fail(self, aid: uuid.UUID, req: FailRequest) -> None:
         self.calls.append(("fail", req))
 
-    async def release(self, aid: uuid.UUID) -> None:
+    async def release(self, aid: uuid.UUID, req: Any = None) -> None:
         self.calls.append(("release", aid))
+        self.release_codes.append(req.code if req is not None else None)
 
     async def heartbeat(self, aid: uuid.UUID, req: HeartbeatRequest) -> HeartbeatResponse:
         self.calls.append(("heartbeat", req))
@@ -394,6 +396,7 @@ async def test_stop_releases_current_subtask(tmp_path: Path) -> None:
     loop.stop()
     assert await asyncio.wait_for(task, 5) == 0
     assert client.kinds() == ["acquire", "release"]
+    assert client.release_codes == ["STOP"]
     assert worker.killed and worker.closed
     assert not leftover(tmp_path)
 
@@ -470,6 +473,7 @@ async def test_runner_release_error_releases_without_failing(tmp_path: Path) -> 
     client.on_empty = loop.stop
     await loop.run()
     assert client.kinds().count("release") == 1 and "fail" not in client.kinds()
+    assert client.release_codes == ["MODEL_INTEGRITY"]
 
 
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
@@ -1666,8 +1670,9 @@ class SlowServerClient(FakeClient):
         self.calls.append(("complete", req))
         await asyncio.sleep(60)
 
-    async def release(self, aid: uuid.UUID) -> None:
+    async def release(self, aid: uuid.UUID, req: Any = None) -> None:
         self.calls.append(("release", aid))
+        self.release_codes.append(req.code if req is not None else None)
         await asyncio.sleep(60)
 
 

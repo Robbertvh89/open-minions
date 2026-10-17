@@ -38,6 +38,11 @@ class ServerSettings(BaseSettings):
     s3_output_prefixes: list[str] = ["outputs/"]
     presign_ttl_s: int = Field(default=900, gt=0, le=3600)
 
+    # Prometheus /metrics (FR-41): off by default. The same port serves it, so with a token set
+    # only `Authorization: Bearer <token>` scrapes it; without one, restrict it at the proxy.
+    metrics_enabled: bool = False
+    metrics_token: SecretStr | None = None
+
     # Config files and background work.
     models_file: str = "deploy/models.yaml"
     api_keys_file: str | None = None

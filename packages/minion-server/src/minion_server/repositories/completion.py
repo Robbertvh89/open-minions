@@ -157,8 +157,12 @@ async def finish_attempt(
     subtask_status: SubtaskStatus,
     output_uri: str | None = None,
     error: dict[str, Any] | None = None,
+    attempt_error: dict[str, Any] | None = None,
 ) -> None:
-    """Record the attempt, drop the acquirement (cascades heartbeat), move the subtask."""
+    """Record the attempt, drop the acquirement (cascades heartbeat), move the subtask.
+
+    `error` goes on both rows; `attempt_error` (a release reason) only on the attempt history.
+    """
     await session.execute(
         pg_insert(SubtaskAttempt).values(
             team=o.team,
@@ -170,7 +174,7 @@ async def finish_attempt(
             executor_id=o.executor_id,
             outcome=outcome.value,
             started_at=o.acquired_at,
-            error=error,
+            error=error if error is not None else attempt_error,
         )
     )
     await session.execute(

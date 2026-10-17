@@ -16,6 +16,7 @@ from minion_common.schemas import (
     PresenceRequest,
     RegisterRequest,
     RegisterResponse,
+    ReleaseRequest,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,6 +100,7 @@ async def presence(
 
 @router.post("/acquire", response_model=Assignment, responses={204: {"description": "No work"}})
 async def acquire(
+    request: Request,
     body: AcquireRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -109,6 +111,9 @@ async def acquire(
     assignment = await acquisition.acquire(
         session, principal, body, settings=settings, storage=storage, models=models
     )
+    metrics = getattr(request.app.state, "metrics", None)
+    if metrics is not None:
+        metrics.acquires.labels(outcome="empty" if assignment is None else "assigned").inc()
     if assignment is None:
         return Response(status_code=204)
     return Response(content=assignment.model_dump_json(), media_type="application/json")
@@ -160,6 +165,13 @@ async def release(
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[ServerSettings, Depends(_settings)],
+    body: ReleaseRequest | None = None,  # optional: executors before TASK-6.5 send no body
 ) -> Response:
-    await completion.release(session, principal, acquirement_id, settings=settings)
+    await completion.release(
+        session,
+        principal,
+        acquirement_id,
+        settings=settings,
+        code=body.code if body is not None else None,
+    )
     return Response(status_code=204)

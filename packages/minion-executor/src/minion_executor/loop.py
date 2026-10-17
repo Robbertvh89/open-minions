@@ -40,6 +40,7 @@ from minion_common.schemas import (
     ModelEntry,
     PresenceRequest,
     RegisterRequest,
+    ReleaseRequest,
     TaskParams,
     parse_params,
 )
@@ -544,7 +545,9 @@ class ExecutorLoop:
                     await self._sleep(version)
                     continue
                 if self.stopping:  # acquired while a stop arrived: hand it back untouched
-                    await self._release(assignment, log.bind(subtask_id=assignment.subtask_id))
+                    await self._release(
+                        assignment, log.bind(subtask_id=assignment.subtask_id), "STOP"
+                    )
                     break
                 self._idle = 0
                 self._unloaded = False
@@ -717,7 +720,7 @@ class ExecutorLoop:
                     await asyncio.gather(work, return_exceptions=True)
                     if finished and not work.cancelled() and work.exception() is None:
                         return await self._complete(a, work.result(), bound)
-                    await self._release(a, bound)
+                    await self._release(a, bound, "STOP")
                     return _Outcome.STOPPED
                 if watch.done():
                     if watch.cancelled() or watch.exception() is not None:
@@ -760,7 +763,7 @@ class ExecutorLoop:
                 await self._bounded_thread(self._worker.unload)  # Ollama keep_alive 0, then kill
                 if self._cache is not None:
                     self._cache.release_in_use()
-                await self._release(a, bound)
+                await self._release(a, bound, "BUDGET_DOWNGRADE")
                 return _Outcome.RELEASED
             except Exception as exc:  # poison pill: never let one subtask kill the loop
                 bound.warning("unexpected_error", error=type(exc).__name__)
@@ -946,7 +949,7 @@ class ExecutorLoop:
             err = _FailureError(True, "OOM", "worker memory exceeded the budget")
             await self._report_failure(a, err, bound)
             return _Outcome.FAILED
-        await self._release(a, bound)
+        await self._release(a, bound, v.value)
         # a priority violation / crashed watcher is a local fault: back off so it cannot churn;
         # the rest is policy
         local = v in (_Verdict.PRIORITY, _Verdict.WATCHER_FAILED)
@@ -1080,7 +1083,7 @@ class ExecutorLoop:
         work.cancel()
         await asyncio.gather(work, return_exceptions=True)
         if sig is HeartbeatSignal.CANCEL:
-            await self._release(a, bound)
+            await self._release(a, bound, "CANCELLED")
             return _Outcome.CANCELLED
         bound.info("stale_discarded")
         return _Outcome.DISCARDED
@@ -1099,7 +1102,7 @@ class ExecutorLoop:
                 # The call may have reached the server: never claim success. If it did, the
                 # release below gets a 409 (handled); if not, the subtask requeues at once.
                 bound.warning("complete_abandoned_at_hard_stop")
-                await self._release(a, bound)
+                await self._release(a, bound, "STOP")
                 return _Outcome.STOPPED
             except StaleAcquirementError:
                 bound.info("stale_discarded")
@@ -1119,7 +1122,7 @@ class ExecutorLoop:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             attempt += 1
             if self._hard_stop.is_set():
-                await self._release(a, bound)
+                await self._release(a, bound, "STOP")
                 return _Outcome.STOPPED
             if attempt >= self._complete_retries:
                 bound.error("complete_gave_up", server_error=saw_5xx)
@@ -1310,7 +1313,7 @@ class ExecutorLoop:
     async def _report_failure(self, a: Assignment, f: _FailureError, bound: Any) -> None:
         bound.warning("subtask_failed", code=f.code, retryable=f.retryable, released=f.release)
         if f.release:  # executor-local trouble: don't burn the subtask's retry budget
-            await self._release(a, bound)
+            await self._release(a, bound, f.code)
             return
         try:
             await asyncio.wait_for(
@@ -1325,9 +1328,13 @@ class ExecutorLoop:
         except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("fail_report_failed", error=type(exc).__name__)
 
-    async def _release(self, a: Assignment, bound: Any) -> None:
+    async def _release(self, a: Assignment, bound: Any, code: str) -> None:
+        """Hand the subtask back; `code` (stable reason) goes to the attempt history."""
         try:
-            await asyncio.wait_for(self._client.release(a.acquirement_id), self._call_timeout())
+            await asyncio.wait_for(
+                self._client.release(a.acquirement_id, ReleaseRequest(code=code)),
+                self._call_timeout(),
+            )
             bound.info("subtask_released")
         except (httpx.HTTPError, ApiError, TimeoutError) as exc:
             bound.warning("release_failed", error=type(exc).__name__)

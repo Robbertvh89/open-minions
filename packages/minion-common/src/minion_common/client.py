@@ -30,6 +30,7 @@ from minion_common.schemas import (
     PresenceRequest,
     RegisterRequest,
     RegisterResponse,
+    ReleaseRequest,
     SubtaskPage,
     TaskCreate,
     TaskOut,
@@ -172,8 +173,8 @@ class ExecutorClient(_BaseClient):
         resp = await self._send("POST", f"/executor/subtasks/{acquirement_id}/heartbeat", req)
         return HeartbeatResponse.model_validate_json(resp.content)
 
-    async def release(self, acquirement_id: uuid.UUID) -> None:
-        await self._send("POST", f"/executor/subtasks/{acquirement_id}/release")
+    async def release(self, acquirement_id: uuid.UUID, req: ReleaseRequest | None = None) -> None:
+        await self._send("POST", f"/executor/subtasks/{acquirement_id}/release", req)
 
 
 class UserClient(_BaseClient):

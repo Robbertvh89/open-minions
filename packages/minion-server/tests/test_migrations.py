@@ -121,3 +121,27 @@ def test_0004_splitter_backoff_and_unique_output_round_trip(fresh_url: str) -> N
     assert not asyncio.run(_has_column(fresh_url, "minion_task", "next_split_at"))
     assert not asyncio.run(_has_constraint(fresh_url, "uq_minion_task_output_uri"))
     command.upgrade(cfg, "head")
+
+
+async def _scalar(url: str, sql: str) -> int:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            return int((await conn.execute(text(sql))).scalar_one())
+    finally:
+        await eng.dispose()
+
+
+def test_0007_readonly_views_round_trip(fresh_url: str) -> None:
+    views = "SELECT count(*) FROM pg_views WHERE schemaname = 'minion_ro'"
+    schema = "SELECT count(*) FROM pg_namespace WHERE nspname = 'minion_ro'"
+    role = "SELECT count(*) FROM pg_roles WHERE rolname = 'minion_readonly'"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_scalar(fresh_url, views)) == 5
+    assert asyncio.run(_scalar(fresh_url, role)) == 1
+    command.downgrade(cfg, "0006")
+    assert asyncio.run(_scalar(fresh_url, schema)) == 0
+    assert asyncio.run(_table_count(fresh_url)) == 7  # tables untouched
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_scalar(fresh_url, views)) == 5

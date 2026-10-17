@@ -498,7 +498,10 @@ Executor distribution: `uv tool install`, a generated per-user `launchd` plist (
 token in macOS Keychain.
 
 ## 7. Observability
-- Grafana with Postgres datasource; dashboards provisioned from `deploy/grafana/`.
+- Grafana with Postgres datasource; dashboards provisioned from `deploy/grafana/` (`dashboards/tasks.json`, `dashboards/fleet.json`).
+- Grafana reads through the `minion_ro` schema (migration 0007): views `executor` (no `token_hash`), `task` (no `params`, no S3 URIs), `subtask` (no input/output keys, `error_code` only), `attempt` (plus model and record count; `error_code` is the failure code or release reason) and `heartbeat` (running subtasks). The views run with their owner's rights, so the role `minion_readonly` has no privilege on the `public` tables. `deploy/postgres/initdb` creates the login `minion_grafana` (member of `minion_readonly`, read-only, `statement_timeout` 10 s; password `MINION_GRAFANA_DB_PASSWORD`, a dev-only default). initdb runs only on an empty data volume; on an existing one run the same statements by hand (`docker compose exec postgres sh /docker-entrypoint-initdb.d/01-grafana-role.sh` works if `MINION_GRAFANA_DB_PASSWORD` is set in the container) and `alembic upgrade head`. Managed Postgres without CREATEROLE: migration 0007 skips the role with a NOTICE; create it and grant `USAGE` on the schema and `SELECT` on its tables.
+- Grafana is an operator tool: the fleet dashboard exposes per-owner activity (S-11); never expose it to ordinary users. Changing a column the views use needs the views dropped and recreated in the same migration.
+- `/metrics` (prometheus-client, off unless `MINION_METRICS_ENABLED`, optional `MINION_METRICS_TOKEN`): HTTP counters by route template, method and status, and acquire outcomes. No identifiers.
 - Panels: tasks by status, subtasks/min (from `minion_subtask_attempt`), active executors
   (heartbeat < 10 min or polled < 2 min), reclaim rate, per-model throughput, top contributors,
   **fleet capacity** (Σ donated memory by profile, paused executors by reason, releases due to downgrade).

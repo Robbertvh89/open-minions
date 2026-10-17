@@ -144,17 +144,21 @@ async def release(
     acquirement_id: uuid.UUID,
     *,
     settings: ServerSettings,
+    code: str | None = None,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
+        # Why the executor handed it back (dashboards); history only, not the subtask's error.
+        reason = {"code": code} if code is not None else None
         if o.task_status == TaskStatus.CANCELLED:
             await repo.finish_attempt(
                 session,
                 o,
                 outcome=AttemptOutcome.CANCELLED,
                 subtask_status=SubtaskStatus.CANCELLED,
+                attempt_error=reason,
             )
         elif await repo.released_attempt_count(session, o) >= settings.release_limit:
             # Repeated releases must not livelock a subtask: past the cap they cost budget.
@@ -175,4 +179,5 @@ async def release(
                 o,
                 outcome=AttemptOutcome.RELEASED,
                 subtask_status=SubtaskStatus.PENDING,
+                attempt_error=reason,
             )
