@@ -20,6 +20,6 @@ After --clear the test assumed strict FIFO, but acquisition shuffles the candida
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The clear is asserted deterministically (preference row gone) without relying on FIFO order
-- [ ] #2 Preferred-team acquires still asserted
+- [x] #1 The clear is asserted deterministically (preference row gone) without relying on FIFO order
+- [x] #2 Preferred-team acquires still asserted
 <!-- AC:END -->
