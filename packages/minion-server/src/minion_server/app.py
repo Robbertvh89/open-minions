@@ -18,6 +18,8 @@ from minion_server.models_registry import load_models
 from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
+from minion_server.ui.headers import UiHeadersMiddleware
+from minion_server.ui.routes import router as ui_router
 
 
 def is_loopback(host: str) -> bool:
@@ -49,6 +51,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 note="minion_ro.executor.online (migration 0007) hardcodes 120/600",
             )
         app.state.api_keys = api_keys
+        app.state.ui_secret = (
+            cfg.ui_session_secret.get_secret_value().encode("utf-8")
+            if cfg.ui_session_secret is not None
+            else None
+        )
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         app.state.storage = S3Storage(cfg)
@@ -72,11 +79,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app = FastAPI(title="open-minions server", version="0.1.0", lifespan=lifespan)
 
     app.add_middleware(BodyLimitMiddleware)
+    app.add_middleware(UiHeadersMiddleware)
     app.add_middleware(MetricsMiddleware)  # outermost: counts 413s too
     app.include_router(tasks_api.router)
     app.include_router(executor_api.router)
     app.include_router(fleet_api.router)
     app.include_router(metrics_router)
+    app.include_router(ui_router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}{{ task.task_name }} - open-minions{% endblock %}
+{% block content %}
+<p><a href="/ui/tasks">&larr; Tasks</a></p>
+<h1>{{ task.team }} / {{ task.project }} / {{ task.task_name }}</h1>
+<dl class="meta">
+  <dt>Type</dt><dd>{{ task.type.value }}</dd>
+  <dt>Model</dt><dd>{{ task.model }}</dd>
+  <dt>Priority</dt><dd>{{ task.priority }}</dd>
+  <dt>Pool</dt><dd>{{ task.allowed_pool or "any" }}</dd>
+  <dt>Records per subtask</dt><dd>{{ task.records_per_subtask }}</dd>
+  <dt>Input</dt><dd>{{ task.input_uri }}</dd>
+  <dt>Output</dt><dd>{{ task.output_uri }}</dd>
+  <dt>Created by</dt><dd>{{ task.created_by }} at {{ task.created_at|ts }}</dd>
+  <dt>Finished</dt><dd>{{ task.finished_at|ts }}</dd>
+</dl>
+{% include "_task_live.html" %}
+{% endblock %}
