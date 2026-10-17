@@ -169,3 +169,26 @@ def test_0007_minion_readonly_can_select_every_view(fresh_url: str) -> None:
     privs = asyncio.run(_view_privileges(fresh_url))
     assert len(privs) == 5
     assert all(ok for _, ok in privs), privs
+
+
+async def _index_exists(url: str, name: str) -> bool:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text("SELECT count(*) FROM pg_indexes WHERE indexname = :n"), {"n": name}
+            )
+            return int(res.scalar_one()) == 1
+    finally:
+        await eng.dispose()
+
+
+def test_0008_acquired_at_index_round_trip(fresh_url: str) -> None:
+    name = "ix_minion_subtask_acquirement_acquired_at"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))
+    command.downgrade(cfg, "0007")
+    assert not asyncio.run(_index_exists(fresh_url, name))
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))

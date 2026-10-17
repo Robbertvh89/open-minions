@@ -521,6 +521,7 @@ race, stale-acquirement rejection, splitter restart.
 ### 5.1 Key indexes
 - `minion_subtask`: partial index on `status='PENDING'`; index on `(team, project, task_name, status)` for progress.
 - `minion_executor_heartbeat`: index on `last_seen_at`.
+- `minion_subtask_acquirement`: `ix_minion_subtask_acquirement_acquired_at` on `acquired_at` serves the watchdog max-lease scan (migration 0008).
 - `minion_task`: index on `(status, priority DESC, created_at)`.
 - `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
 

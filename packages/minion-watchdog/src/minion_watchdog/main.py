@@ -9,6 +9,7 @@ import contextlib
 import logging
 import os
 import signal
+import time
 
 import structlog
 from minion_server.db.session import create_engine, create_sessionmaker
@@ -38,6 +39,7 @@ async def tick(
     sm: async_sessionmaker[AsyncSession], cfg: WatchdogSettings, stop: asyncio.Event
 ) -> None:
     """One pass: reclaim (repeated while batches come back full), then sweep cancelled tasks."""
+    started = time.monotonic()
     for _ in range(MAX_ROUNDS_PER_TICK):
         results = await reclaim_stale(
             sm,
@@ -46,7 +48,11 @@ async def tick(
             max_lease_s=cfg.max_lease_s,
         )
         if results:
-            log.info("watchdog_reclaim", **{k.value: v for k, v in results.items()})
+            log.info(
+                "watchdog_reclaim",
+                **{k.value: v for k, v in results.items()},
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
         expired = sum(n for r, n in results.items() if r in _EXPIRED)
         if expired < cfg.watchdog_batch_size or stop.is_set():
             break
