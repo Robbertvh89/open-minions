@@ -12,9 +12,12 @@ False (file in place, durability unconfirmed) and the caller decides how to tell
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import secrets
 import stat
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -156,3 +159,45 @@ def atomic_write_private(path: Path, data: bytes) -> bool:
     finally:
         os.close(dfd)
     return durable
+
+
+@contextlib.contextmanager
+def private_lock(directory: Path, name: str) -> Iterator[None]:
+    """Hold an exclusive `flock` on `directory/name` (0600, O_NOFOLLOW, created when missing).
+
+    Serialises read-modify-write cycles across threads and processes. The directory is vetted
+    first and the lock file is opened relative to that fd. Raises SafeFileError when the
+    directory or lock file is unsafe. The lock file is never removed (that would race).
+    """
+    dfd = open_private_dir(directory)
+    try:
+        fd = -1
+        for attempt in range(5):
+            try:
+                fd = os.open(
+                    name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd
+                )
+                break
+            except FileNotFoundError:
+                # concurrent first-time O_CREAT can report ENOENT on APFS: the file is there now
+                time.sleep(0.01 * (attempt + 1))
+            except OSError as exc:
+                raise SafeFileError(
+                    f"cannot open lock {directory / name}: {exc.strerror}"
+                ) from None
+        if fd < 0:
+            raise SafeFileError(f"cannot open lock {directory / name}: No such file or directory")
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SafeFileError(f"lock {directory / name} is not a regular file")
+        _check_owner_mode(st, "lock file", directory / name)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)

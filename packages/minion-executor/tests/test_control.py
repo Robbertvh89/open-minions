@@ -257,3 +257,60 @@ def test_update_control_warns_when_not_durably_synced(
     msgs: list[str] = []
     update_control(state, paused=True, warn=msgs.append)
     assert msgs == [f"written but not durably synced: {state / 'control.json'}"]
+
+
+def test_update_control_concurrent_threads_lose_no_field(sd: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def pause() -> None:
+        update_control(sd, paused=True, warn=lambda _m: None)
+
+    def pin() -> None:
+        update_control(sd, profile=CapacityProfile.FULL, warn=lambda _m: None)
+
+    with ThreadPoolExecutor(8) as pool:
+        futs = [pool.submit(pause if i % 2 else pin) for i in range(200)]
+        for f in futs:
+            f.result()
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl)
+    assert ctl.paused and ctl.profile is CapacityProfile.FULL
+
+
+_CHILD = """
+import sys
+from pathlib import Path
+from minion_common.enums import CapacityProfile
+from minion_executor.capacity.control import update_control
+sd, i = Path(sys.argv[1]), int(sys.argv[2])
+for k in range(10):
+    if (i + k) % 2:
+        update_control(sd, paused=True, warn=lambda m: None)
+    else:
+        update_control(sd, profile=CapacityProfile.LIGHT, warn=lambda m: None)
+"""
+
+
+def test_update_control_concurrent_processes_lose_no_field(sd: Path) -> None:
+    import subprocess
+    import sys
+
+    procs = [
+        subprocess.Popen([sys.executable, "-c", _CHILD, str(sd), str(i)])  # noqa: S603
+        for i in range(6)
+    ]
+    assert [p.wait(timeout=120) for p in procs] == [0] * 6
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl)
+    assert ctl.paused and ctl.profile is CapacityProfile.LIGHT
+
+
+def test_control_lock_is_private_and_symlink_refused(sd: Path) -> None:
+    update_control(sd, paused=True, warn=lambda _m: None)
+    lock = sd / "control.lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    lock.unlink()
+    (sd / "elsewhere").write_text("")
+    lock.symlink_to(sd / "elsewhere")
+    with pytest.raises(SafeFileError):
+        update_control(sd, paused=False, warn=lambda _m: None)

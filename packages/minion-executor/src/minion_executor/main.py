@@ -646,6 +646,31 @@ def status() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command()
+def menubar() -> None:
+    """Show a menu-bar item to pause/resume and pick the profile (macOS, as your own user).
+
+    Talks only to the local status.json / control.json: no server, no token.
+    """
+    if sys.platform != "darwin":
+        typer.echo("error: the menu-bar app needs macOS", err=True)
+        raise typer.Exit(code=2)
+    if os.geteuid() == 0:
+        typer.echo("error: refusing to run the menu-bar app as root", err=True)
+        raise typer.Exit(code=2)
+    from minion_executor.menubar.model import resolve_state_dir  # no AppKit import off macOS
+
+    try:
+        state_dir = resolve_state_dir()
+        ensure_private_dir(state_dir)
+    except (ValueError, SafeFileError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    from minion_executor.menubar.app import run as run_menubar
+
+    run_menubar(state_dir)
+
+
 def _check_out_path(out: Path) -> None:
     """Fail before the (long) run if the report cannot be written. Symlinks are refused."""
     parent = out.parent

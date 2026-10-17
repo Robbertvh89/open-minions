@@ -10,6 +10,7 @@ every poll. A missing file or state directory is simply "absent". No payloads ar
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,10 +26,12 @@ from minion_executor.capacity.safefile import (
     UnsafeDirError,
     atomic_write_private,
     ensure_private_dir,
+    private_lock,
     read_private_file,
 )
 
 CONTROL_FILE = "control.json"
+CONTROL_LOCK_FILE = "control.lock"
 MAX_CONTROL_BYTES = 4096
 MAX_PAUSE = timedelta(days=30)
 _DURATION = re.compile(r"^(?:(\d{1,3})d)?(?:(\d{1,4})h)?(?:(\d{1,5})m)?(?:(\d{1,7})s)?$")
@@ -119,6 +122,34 @@ def update_control(
     explicitly, the result is paused (no end time) and `warn` is told why. `resume` is the
     explicit way out.
     """
+    # one writer at a time (CLI and menu bar): an unsafe directory is reported below as before
+    try:
+        ensure_private_dir(state_dir)
+        lock: contextlib.AbstractContextManager[None] = private_lock(state_dir, CONTROL_LOCK_FILE)
+    except UnsafeDirError:
+        lock = contextlib.nullcontext()
+    with lock:
+        return _update_locked(
+            state_dir,
+            paused=paused,
+            pause_for=pause_for,
+            profile=profile,
+            clear_profile=clear_profile,
+            now=now,
+            warn=warn,
+        )
+
+
+def _update_locked(
+    state_dir: Path,
+    *,
+    paused: bool | None,
+    pause_for: timedelta | None,
+    profile: CapacityProfile | None,
+    clear_profile: bool,
+    now: datetime | None,
+    warn: Callable[[str], None],
+) -> OwnerControl:
     current = read_control(state_dir)
     if isinstance(current, ControlUnusable):
         if paused is None:
