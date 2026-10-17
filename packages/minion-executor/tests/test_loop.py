@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,7 @@ class FakeClient:
         self.acquire_reqs: list[AcquireRequest] = []
         self.presences: list[PresenceRequest] = []
         self.on_presence: Any = None
+        self.presence_excs: list[Exception] = []
         self.registers: list[Any] = []
 
     async def presence(self, req: PresenceRequest) -> None:
@@ -110,6 +112,8 @@ class FakeClient:
         self.presences.append(req)
         if self.on_presence:
             self.on_presence()
+        if self.presence_excs:
+            raise self.presence_excs.pop(0)
 
     async def register(self, req: Any) -> None:
         self.calls.append(("register", None))
@@ -3097,7 +3101,7 @@ async def test_register_429_backs_off_honouring_retry_after(tmp_path: Path) -> N
     client.on_empty = loop.stop
     await loop.run()
     assert client.kinds().count("register") == 2
-    assert sleeps[0] == 120.0
+    assert 120.0 <= sleeps[0] <= 144.0  # Retry-After + 0-20 % jitter
 
 
 async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None:
@@ -3106,12 +3110,31 @@ async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None
     loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
     client.on_empty = loop.stop
     await loop.run()
-    assert sleeps[0] == 300.0  # Retry-After is capped
+    assert 300.0 <= sleeps[0] <= 360.0  # Retry-After is capped, then jittered
+
+
+def _grew(items: list[float], seen: int) -> bool:
+    return len(items) > seen
+
+
+class WaitSpyGovernor(FixedGovernor):
+    """Records every `wait_change` timeout and signals it: an observable 'the loop is now
+    sleeping in a back-off of that length', instead of guessing with asyncio.sleep."""
+
+    def __init__(self, budget: Budget) -> None:
+        super().__init__(budget)
+        self.timeouts: list[float] = []
+        self.waiting = asyncio.Event()
+
+    async def wait_change(self, version: int, timeout_s: float) -> int:
+        self.timeouts.append(timeout_s)
+        self.waiting.set()
+        return await super().wait_change(version, timeout_s)
 
 
 async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_path: Path) -> None:
     gib = 1024**3
-    gov = FixedGovernor(BUDGET)  # 8 GB
+    gov = WaitSpyGovernor(BUDGET)  # 8 GB
     first = assignment()
     first = first.model_copy(update={"model": first.model.model_copy(update={"memory_gb": 8})})
     client = FakeClient([first, ApiError(429, "RATE_LIMITED", "slow", retry_after=250.0)])
@@ -3120,10 +3143,67 @@ async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_pat
     loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, sleep=None)
     task = asyncio.create_task(loop.run())
     await until(lambda: client.kinds().count("acquire") >= 2)
-    await asyncio.sleep(0.05)  # now inside the 429 back-off (>= 250 s)
+    await until(lambda: any(t >= 200 for t in gov.timeouts))  # inside the 429 back-off
     assert worker.unloads == 0
     gov.update(dec(small(4.0)))
     await until(lambda: worker.unloads >= 1)
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_429_backoff_cut_short_by_a_pause_is_waited_out_after_resume(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    gov = WaitSpyGovernor(BUDGET)
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "slow", retry_after=250.0), assignment()])
+    loop = make_loop(
+        client, FakeWorker(), FakeS3(), tmp_path, [], governor=gov, sleep=None, clock=lambda: now[0]
+    )
+    task = asyncio.create_task(loop.run())
+    await until(lambda: any(t >= 200 for t in gov.timeouts))  # in the 429 back-off
+    gov.update(dec(reason=PausedReason.THERMAL))
+    await until(lambda: len(client.presences) >= 1)  # the pause ended the back-off
+    now[0] += 100.0  # 100 s of the 250 s passed while paused
+    gov.timeouts.clear()
+    gov.update(dec())  # resume
+    await until(lambda: any(100 <= t <= 210 for t in gov.timeouts))  # 150-200 s still to wait
+    assert client.kinds().count("acquire") == 1  # not retried before Retry-After elapsed
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_presence_429_honours_retry_after_and_keeps_the_pending_state(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    gov = WaitSpyGovernor(BUDGET)
+    gov.update(dec(reason=PausedReason.THERMAL))
+    client = FakeClient([])
+    client.presence_excs = [ApiError(429, "TOO_MANY_REQUESTS", "slow", retry_after=30.0)]
+    loop = make_loop(
+        client,
+        FakeWorker(),
+        FakeS3(),
+        tmp_path,
+        [],
+        governor=gov,
+        presence_interval_s=100.0,
+        clock=lambda: now[0],
+    )
+    task = asyncio.create_task(loop.run())
+    await until(lambda: len(client.presences) == 1)  # rejected
+    await until(lambda: gov.waiting.is_set())
+    for state in (dec(reason=PausedReason.MEMORY_PRESSURE), dec(small(4.0, profile="light"))):
+        seen = len(gov.timeouts)
+        now[0] += 5.0
+        gov.update(dec(state.budget, reason=PausedReason.MEMORY_PRESSURE))  # changed, limited
+        await until(partial(_grew, gov.timeouts, seen))  # the loop looked and waited again
+    assert len(client.presences) == 1  # nothing sent inside Retry-After
+    now[0] += 25.0  # past the 30 s deadline
+    gov.update(dec(reason=PausedReason.THERMAL))
+    await until(lambda: len(client.presences) == 2)
+    assert client.presences[1].paused_reason == "thermal"
     loop.stop()
     await asyncio.wait_for(task, 10)
 
@@ -3132,3 +3212,89 @@ def test_release_code_is_upper_cased_before_falling_back() -> None:
     assert _release_code("budget_downgrade") == "BUDGET_DOWNGRADE"
     assert _release_code("STOP") == "STOP"
     assert _release_code("free text!") == "EXECUTOR_RELEASE"
+
+
+async def test_repeated_429_escalates_to_max_of_backoff_and_retry_after(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "x", retry_after=3.0)] * 2)
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert 3.0 <= sleeps[0] <= 3.6 + 1e-9  # first: Retry-After + jitter, no escalation
+    assert sleeps[1] >= 10.0 * 0.5  # repeated: escalated to the backoff base (10 s x 0.5..1)
+
+
+def test_rate_limit_delay_first_vs_repeated(tmp_path: Path) -> None:
+    loop = make_loop(FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [])
+    exc = ApiError(429, "RATE_LIMITED", "x", retry_after=2.0)
+    for _ in range(50):
+        assert 2.0 <= loop._rate_limit_delay(exc, 0) <= 2.4 + 1e-9
+        assert loop._rate_limit_delay(exc, 0, repeated=True) >= 10.0 * 0.5  # backoff[0] wins
+    other = ApiError(503, "X", "x")
+    assert loop._rate_limit_delay(other, 0) <= loop._delay(0) * 2
+
+
+class _PacedClient(FakeClient):
+    """Stamps each acquire with a fake clock that advances `work_s` per subtask."""
+
+    def __init__(self, items: list[Assignment | Exception | None], now: list[float], work_s: float):
+        super().__init__(items)
+        self.now, self.work_s = now, work_s
+        self.at: list[float] = []
+
+    async def acquire(self, req: AcquireRequest) -> Assignment | None:
+        self.at.append(self.now[0])
+        got = await super().acquire(req)
+        self.now[0] += self.work_s  # the subtask that follows takes this long
+        return got
+
+
+async def _run_paced(tmp_path: Path, work_s: float) -> tuple[_PacedClient, list[float]]:
+    now = [100.0]
+    sleeps: list[float] = []
+
+    async def sleep(d: float) -> None:
+        sleeps.append(d)
+        now[0] += d
+
+    client = _PacedClient([assignment(), assignment(), assignment()], now, work_s)
+    loop = make_loop(
+        client,
+        FakeWorker(),
+        FakeS3(),
+        tmp_path,
+        sleeps,
+        sleep=sleep,
+        clock=lambda: now[0],
+        acquire_pace_s=0.25,
+    )
+    await loop.run(max_subtasks=3)
+    return client, sleeps
+
+
+async def test_acquire_pacing_keeps_min_gap_for_instant_subtasks(tmp_path: Path) -> None:
+    client, sleeps = await _run_paced(tmp_path, work_s=0.0)
+    gaps = [b - a for a, b in zip(client.at, client.at[1:], strict=False)]
+    assert len(gaps) == 2 and all(g >= 0.25 - 1e-9 for g in gaps)
+    assert sleeps == [0.25, 0.25]  # exactly the remainder
+
+
+async def test_acquire_pacing_adds_no_delay_when_subtasks_are_slower(tmp_path: Path) -> None:
+    client, sleeps = await _run_paced(tmp_path, work_s=1.0)
+    assert sleeps == []
+    assert client.at == [100.0, 101.0, 102.0]
+
+
+async def test_acquire_pacing_sleeps_only_the_remaining_fraction(tmp_path: Path) -> None:
+    _, sleeps = await _run_paced(tmp_path, work_s=0.1)
+    assert sleeps == [pytest.approx(0.15)] * 2
+
+
+def test_acquire_pace_setting_rejects_values_below_server_interval() -> None:
+    from minion_executor.settings import ExecutorSettings
+
+    assert ExecutorSettings.model_fields["acquire_pace_s"].default == 0.4
+    for bad in (0.1, -1.0):
+        with pytest.raises(ValueError):
+            ExecutorSettings(acquire_pace_s=bad)
+    assert ExecutorSettings(acquire_pace_s=0).acquire_pace_s == 0

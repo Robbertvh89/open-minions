@@ -708,3 +708,106 @@ def test_run_exits_1_when_the_governor_stops(
     monkeypatch.setattr(m, "_run", fake_run)
     result = runner.invoke(app, ["run", "--runner", "fake"])
     assert result.exit_code == 1 and "governor stopped" in result.output
+
+
+# --- prefer (TASK-6.2, G4) --------------------------------------------------------------------
+
+
+def _capture_prefer(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, object]]:
+    import minion_executor.main as main_mod
+
+    sent: list[tuple[str, str, object]] = []
+
+    async def fake(server: str, token: object, pref: object, transport: object = None) -> None:
+        sent.append((server, token.get_secret_value(), pref))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(main_mod, "_send_preference", fake)
+    return sent
+
+
+def test_prefer_sets_team_project_and_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    sent = _capture_prefer(monkeypatch)
+    result = runner.invoke(
+        app, ["prefer", "--team", "nlp", "--project", "emb", "--task-name", "nightly"]
+    )
+    assert result.exit_code == 0, result.output
+    [(server, token, pref)] = sent
+    assert server == "http://localhost:8080" and token == "tok"
+    assert pref.model_dump() == {"team": "nlp", "project": "emb", "task_name": "nightly"}  # type: ignore[attr-defined]
+    assert "tok" not in result.output
+
+
+def test_prefer_clear_sends_all_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    sent = _capture_prefer(monkeypatch)
+    result = runner.invoke(app, ["prefer", "--clear"])
+    assert result.exit_code == 0, result.output
+    assert sent[0][2].model_dump() == {  # type: ignore[attr-defined]
+        "team": None,
+        "project": None,
+        "task_name": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],  # neither a team nor --clear
+        ["--clear", "--team", "a"],
+        ["--team", "a", "--task-name", "t"],  # task without project
+        ["--team", "Bad Slug"],
+        ["--team", "a", "--server", "http://example.com"],  # insecure
+        ["--team", "a", "--server", "https://u:p@example.com"],  # credentials in the URL
+    ],
+)
+def test_prefer_rejects_bad_input_with_exit_2(
+    args: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    sent = _capture_prefer(monkeypatch)
+    result = runner.invoke(app, ["prefer", *args])
+    assert result.exit_code == 2, result.output
+    assert sent == []
+
+
+def test_prefer_without_token_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as main_mod
+    from minion_executor.secrets import TokenUnavailableError
+
+    monkeypatch.delenv("MINION_EXECUTOR_TOKEN", raising=False)
+
+    def no_token() -> object:
+        raise TokenUnavailableError("no executor token", transient=False)
+
+    monkeypatch.setattr(main_mod, "load_token", no_token)
+    result = runner.invoke(app, ["prefer", "--team", "a"])
+    assert result.exit_code == 2
+
+
+def test_prefer_sends_put_to_the_preference_endpoint() -> None:
+    import asyncio
+
+    import httpx
+    from minion_common.schemas import PreferenceRequest
+    from minion_executor.main import _send_preference
+    from pydantic import SecretStr
+
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(204)
+
+    asyncio.run(
+        _send_preference(
+            "http://localhost:8080",
+            SecretStr("tok"),
+            PreferenceRequest(team="nlp"),
+            httpx.MockTransport(handler),
+        )
+    )
+    [req] = seen
+    assert (req.method, req.url.path) == ("PUT", "/api/v1/executor/preference")
+    assert req.headers["authorization"] == "Bearer tok"
+    assert req.read() == b'{"team":"nlp","project":null,"task_name":null}'

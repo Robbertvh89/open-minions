@@ -56,6 +56,9 @@ def _cfg(url: str, s3: S3Env, keys: Path | None = None) -> ServerSettings:
         models_file=TEST_MODELS_FILE,
         splitter_poll_s=3600,  # tests drive split_one themselves
         db_pool_size=60,
+        register_min_interval_s=0,  # tests acquire back-to-back (TASK-6.2 has its own tests)
+        acquire_min_interval_s=0,
+        presence_min_interval_s=0,
     )
 
 

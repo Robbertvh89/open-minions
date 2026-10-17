@@ -248,8 +248,11 @@ class ExecutorLoop:
         priority_grace_s: float = 60.0,
         status_dir: Path | None = None,
         status_interval_s: float = STATUS_INTERVAL_S,
+        acquire_pace_s: float = 0.0,
     ) -> None:
         self._cache = model_cache
+        self._acquire_pace_s = acquire_pace_s  # min gap between acquire calls; 0 disables
+        self._last_acquire: float | None = None
         self._client = client
         self._worker = worker
         # `budget` seeds a FixedGovernor when no governor is given; with one, the governor's live
@@ -279,6 +282,10 @@ class ExecutorLoop:
         self._trim_pushed = False
         self._presence_key: tuple[object, object] | None = None
         self._presence_due = 0.0
+        self._presence_blocked_until = 0.0  # presence 429: no ping, even a changed one, before this
+        # Monotonic (self._clock) deadline of a 429 on acquire: a back-off cut short by a pause
+        # must still be waited out after the resume, or the first acquire would 429 again.
+        self._rate_limited_until: float | None = None
         self._loaded: ModelEntry | None = None  # model the warm worker holds (None: nothing)
         self._loaded_path: Path | None = None  # cache path pinned for `_loaded` (None: unpinned)
         self._unload_fut: asyncio.Future[None] | None = None  # in-flight watcher/idle unload
@@ -379,12 +386,15 @@ class ExecutorLoop:
         lo, hi = self._backoff
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
-    def _rate_limit_delay(self, exc: Exception, n: int) -> float:
-        """Backoff for attempt `n`; a 429 waits at least its numeric `Retry-After` (cap 300 s)."""
-        delay = self._delay(n)
+    def _rate_limit_delay(self, exc: Exception, n: int, *, repeated: bool = False) -> float:
+        """Backoff for attempt `n`. A first 429 waits its numeric `Retry-After` (cap 300 s) plus
+        0-20 % jitter; when 429s repeat (`repeated`) it escalates to max(backoff, Retry-After)."""
         if isinstance(exc, ApiError) and exc.status_code == 429 and exc.retry_after is not None:
-            delay = max(delay, min(exc.retry_after, MAX_RETRY_AFTER_S))
-        return delay
+            ra = min(exc.retry_after, MAX_RETRY_AFTER_S)
+            if repeated:
+                return max(self._delay(n), ra * random.uniform(1.0, 1.2))  # noqa: S311
+            return float(ra * random.uniform(1.0, 1.2))  # noqa: S311
+        return self._delay(n)
 
     async def _pause(self, delay: float, *, until: asyncio.Event | None = None) -> None:
         if self._sleep_fn is not None:
@@ -450,6 +460,8 @@ class ExecutorLoop:
         reason or budget changes, and every `presence_interval_s`."""
         key = (d.paused_reason, d.budget)
         now = self._clock()
+        if now < self._presence_blocked_until:
+            return
         if key == self._presence_key and now < self._presence_due:
             return
         req = PresenceRequest(
@@ -465,6 +477,12 @@ class ExecutorLoop:
             if isinstance(exc, ApiError) and exc.status_code in (401, 403):
                 raise  # the credential is gone: same as a refused acquire
             log.warning("presence_failed", error=type(exc).__name__)
+            if isinstance(exc, ApiError) and exc.status_code == 429:
+                # keep the key: the (changed) state is sent once the limit allows it
+                wait = self._rate_limit_delay(exc, 0) if exc.retry_after is not None else 10.0
+                self._presence_blocked_until = now + wait
+                self._presence_due = self._presence_blocked_until
+                return
         self._presence_key = key
         self._presence_due = now + (self._presence_s if ok else min(self._presence_s, 10.0))
 
@@ -480,6 +498,7 @@ class ExecutorLoop:
 
     async def _register_with_retry(self, req: RegisterRequest) -> None:
         attempt = 0
+        limited_n = 0
         while not self.stopping:
             try:
                 await self._guarded(
@@ -495,7 +514,11 @@ class ExecutorLoop:
                 if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     raise
                 log.warning("register_failed", error=type(exc).__name__)
-                await self._pause(self._rate_limit_delay(exc, attempt))
+                if limited:  # 429s are counted separately, like the acquire loop's limited_n
+                    limited_n += 1
+                await self._pause(
+                    self._rate_limit_delay(exc, attempt, repeated=limited and limited_n > 1)
+                )
                 attempt += 1
 
     async def run(self, max_subtasks: int | None = None) -> int:
@@ -530,6 +553,23 @@ class ExecutorLoop:
                     continue
                 self._presence_key = None
                 version = self._gov.version
+                if (until := self._rate_limited_until) is not None:
+                    if (left := until - self._clock()) > 0:
+                        await self._sleep(version, delay=left)  # rest of a 429 back-off
+                        if not self._gov.decision.paused:  # a pause cut it short: keep the rest
+                            self._rate_limited_until = None
+                        continue
+                    self._rate_limited_until = None
+                if self._acquire_pace_s > 0 and self._last_acquire is not None:
+                    # Keep >= pace between acquires (instant subtasks would trip the server's
+                    # limit): sleep only the remainder, none after a subtask that took longer.
+                    gap = self._last_acquire + self._acquire_pace_s - self._clock()
+                    if gap > 0:
+                        await self._pause(gap)
+                        if self.stopping:
+                            break
+                version = self._gov.version
+                self._last_acquire = self._clock()
                 try:
                     assignment = await self._guarded(
                         self._client.acquire(
@@ -550,9 +590,13 @@ class ExecutorLoop:
                     log.warning("acquire_failed", error=type(exc).__name__)
                     await self._maybe_unload()  # a warm model must not outlive a server outage
                     await self._enforce_idle_budget()
-                    if limited:  # 429: back off at least Retry-After (TASK-6.2 extends this)
+                    if limited:  # 429: back off at least Retry-After, also across a pause
                         limited_n += 1
-                        await self._sleep(version, delay=self._rate_limit_delay(exc, limited_n - 1))
+                        delay = self._rate_limit_delay(exc, limited_n - 1, repeated=limited_n > 1)
+                        self._rate_limited_until = self._clock() + delay
+                        await self._sleep(version, delay=delay)
+                        if not self._gov.decision.paused:  # waited it out (a pause keeps the rest)
+                            self._rate_limited_until = None
                     else:
                         await self._sleep(version)
                     continue

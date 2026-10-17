@@ -55,6 +55,17 @@ class ExecutorSettings(BaseSettings):
     signal_poll_s: float = Field(default=2.0, ge=0.5, le=4.0, allow_inf_nan=False)
     presence_interval_s: float = Field(default=60.0, ge=1.0, le=110.0, allow_inf_nan=False)
 
+    # Minimum seconds between two acquire calls (NF-5): instant subtasks must not trip the server's
+    # MINION_ACQUIRE_MIN_INTERVAL_S (0.2). Only the remainder is slept. 0 disables.
+    acquire_pace_s: float = Field(default=0.4, ge=0, le=60, allow_inf_nan=False)
+
+    @field_validator("acquire_pace_s")
+    @classmethod
+    def _pace_not_below_server_default(cls, v: float) -> float:
+        if 0 < v < 0.2:
+            raise ValueError("acquire_pace_s must be 0 (off) or >= 0.2 (server default interval)")
+        return v
+
     # Governor timers (ADR-0006 D5/D6). The defaults are the spec; any other value is a test knob
     # and needs MINION_EXECUTOR_DEV=1.
     pause_release_after_s: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)

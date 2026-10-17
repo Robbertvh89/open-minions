@@ -42,7 +42,12 @@ def _cfg(url: str, s3: S3Env, **extra: Any) -> ServerSettings:
         models_file=TEST_MODELS_FILE,
         splitter_poll_s=3600,
         db_pool_size=60,
-        **extra,
+        **{
+            "register_min_interval_s": 0.0,
+            "acquire_min_interval_s": 0.0,
+            "presence_min_interval_s": 0.0,
+            **extra,
+        },
     )
 
 

@@ -25,7 +25,7 @@ import structlog
 import typer
 from minion_common.client import LOCAL_HOSTS, ApiError, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
-from minion_common.schemas import Budget, RegisterRequest
+from minion_common.schemas import Budget, PreferenceRequest, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
@@ -329,6 +329,7 @@ async def _run(
             stop_grace_s=settings.stop_grace_s,
             governor=governor,
             presence_interval_s=settings.presence_interval_s,
+            acquire_pace_s=settings.acquire_pace_s,
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,
             status_dir=settings.state_dir,
@@ -495,6 +496,68 @@ def _failure(
 
 def _warn(message: str) -> None:
     typer.echo(f"warning: {message}", err=True)
+
+
+async def _send_preference(
+    server: str,
+    token: SecretStr,
+    pref: PreferenceRequest,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> None:
+    async with ExecutorClient(server, token, transport=transport) as client:
+        await client.set_preference(pref)
+
+
+@app.command()
+def prefer(
+    server: Annotated[str, typer.Option(help="Minion server base URL (https, or localhost)")] = (
+        "http://localhost:8080"
+    ),
+    team: Annotated[str | None, typer.Option(help="Prefer subtasks of this team")] = None,
+    project: Annotated[str | None, typer.Option(help="...and this project (needs --team)")] = None,
+    task_name: Annotated[str | None, typer.Option(help="...and this task (needs --project)")] = (
+        None
+    ),
+    clear: Annotated[bool, typer.Option("--clear", help="Remove the preference")] = False,
+) -> None:
+    """Set or clear this executor's work preference (G4/FR-22): a hint, not a filter.
+
+    Matching subtasks are acquired first; otherwise plain FIFO. Token: $MINION_EXECUTOR_TOKEN
+    or Keychain."""
+    try:
+        require_secure_url(server)
+        check_server_url(server)
+        if clear:
+            if team or project or task_name:
+                raise ValueError("--clear cannot be combined with --team/--project/--task-name")
+            pref = PreferenceRequest()
+        else:
+            if not team:
+                raise ValueError("give --team (optionally with --project, --task-name) or --clear")
+            if task_name and not project:
+                raise ValueError("--task-name needs --project")
+            pref = PreferenceRequest(team=team, project=project, task_name=task_name)
+        token = load_token()
+    except TokenUnavailableError as exc:
+        typer.echo(f"error: {sanitize(str(exc), 500)}", err=True)
+        raise typer.Exit(code=2 if not exc.transient else 1) from None
+    except ValueError as exc:  # includes pydantic ValidationError (bad slug)
+        typer.echo(f"error: {sanitize(str(exc), 500)}", err=True)
+        raise typer.Exit(code=2) from None
+    try:
+        asyncio.run(_send_preference(server, token, pref))
+    except ApiError as exc:
+        typer.echo(f"error: server answered {exc.status_code} {sanitize(exc.code, 64)}", err=True)
+        raise typer.Exit(code=1) from None
+    except httpx.HTTPError as exc:
+        typer.echo(f"error: cannot reach the server ({type(exc).__name__})", err=True)
+        raise typer.Exit(code=1) from None
+    if clear:
+        typer.echo("preference cleared")
+    else:
+        fields = (("team", team), ("project", project), ("task", task_name))
+        parts = [f"{k}={v}" for k, v in fields if v]
+        typer.echo("preference set: " + " ".join(parts))
 
 
 @app.command()
