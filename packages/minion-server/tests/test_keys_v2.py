@@ -212,17 +212,18 @@ def test_resolve_pool() -> None:
         assert ei.value.detail["code"] == code  # type: ignore[index]
 
 
-def test_store_team_policy_follows_reload(tmp_path: Path) -> None:
+def test_store_config_teams_follow_reload(tmp_path: Path) -> None:
     f = tmp_path / "k.yaml"
     f.write_text("keys:\n" + _entry("a", K1) + "teams:\n  t1: {default_pool: p1}\n")
     clock = Clock()
     store = KeyStore(f, reload_s=1, clock=clock)
-    pol = store.team_policy("t1")
+    assert store.config is not None
+    pol = store.config.teams.get("t1")
     assert pol is not None and pol.default_pool == "p1"
-    assert store.team_policy("other") is None
+    assert "other" not in store.config.teams
     _write(f, "keys:\n" + _entry("a", K1), bump=5)
     clock.t = 2
-    assert store.team_policy("t1") is None
+    assert store.config is not None and "t1" not in store.config.teams
 
 
 async def test_transient_read_error_retries(
@@ -430,8 +431,145 @@ async def test_concurrent_requests_during_rewrites(tmp_path: Path) -> None:
     results = await asyncio.gather(*[_status(app, K1) for _ in range(150)])
     stop = True
     await w
-    assert set(results) <= {200, 401}
-    assert results.count(200) > 0
+    # atomic rewrites always keep K1 valid; refresh is single-threaded by design
+    assert set(results) == {200}
     f.write_text("keys:\n" + _entry("a", K2))
     assert await _status(app, K1) == 401
     assert await _status(app, K2) == 200
+
+
+def test_fifo_fails_closed_without_hanging(tmp_path: Path) -> None:
+    import os
+
+    fifo = tmp_path / "k.yaml"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular"):
+        KeyStore(fifo)
+
+
+def test_duplicate_yaml_keys_rejected() -> None:
+    from minion_server.auth import DuplicateKeyError
+
+    with pytest.raises(DuplicateKeyError):
+        parse_keys_config("keys: []\nkeys: []\n")
+    with pytest.raises(DuplicateKeyError):
+        parse_keys_config("teams:\n  t1: {default_pool: a}\n  t1: {default_pool: b}\n")
+    with pytest.raises(DuplicateKeyError):
+        parse_keys_config(f"keys:\n  - {{name: a, name: b, sha256: {_h(K1)}, teams: [t1]}}\n")
+
+
+def test_content_failure_logged_again_when_hash_changes(tmp_path: Path) -> None:
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    clock = Clock()
+    store = KeyStore(f, reload_s=1, clock=clock)
+    with capture_logs() as logs:
+        for i, body in enumerate(["keys: nope\n", "keys: nope\n\n", "keys: nope\n\n"]):
+            _write(f, body, bump=i + 1)
+            clock.t += 2
+            assert store.config is None
+    assert [e["event"] for e in logs].count("api_keys_reload_failed") == 2
+
+
+def _good(tmp_path: Path) -> Path:
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    return f
+
+
+def test_world_writable_directory_rejected(tmp_path: Path) -> None:
+    from minion_server.auth import KeysFileUnsafeError
+
+    d = tmp_path / "d"
+    d.mkdir()
+    f = _good(d)
+    KeyStore(f)
+    d.chmod(0o777)
+    try:
+        with pytest.raises(KeysFileUnsafeError):
+            KeyStore(f)
+    finally:
+        d.chmod(0o755)
+
+
+def test_symlink_in_writable_dir_rejected(tmp_path: Path) -> None:
+    from minion_server.auth import KeysFileUnsafeError
+
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    real = _good(safe)
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "link.yaml").symlink_to(real)
+    KeyStore(bad / "link.yaml")
+    bad.chmod(0o777)
+    try:
+        with pytest.raises(KeysFileUnsafeError):
+            KeyStore(bad / "link.yaml")
+    finally:
+        bad.chmod(0o755)
+
+
+def test_symlinked_intermediate_directory_checked(tmp_path: Path) -> None:
+    from minion_server.auth import KeysFileUnsafeError
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    _good(bad)
+    bad.chmod(0o777)
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    (holder / "dirlink").symlink_to(bad)
+    try:
+        with pytest.raises(KeysFileUnsafeError):
+            KeyStore(holder / "dirlink" / "k.yaml")
+    finally:
+        bad.chmod(0o755)
+
+
+def test_symlink_loop_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    with pytest.raises(OSError):
+        KeyStore(tmp_path / "a")
+
+
+def test_k8s_secret_layout_passes(tmp_path: Path) -> None:
+    ts = tmp_path / "..2024_01_01"
+    ts.mkdir()
+    _good(ts)
+    (tmp_path / "..data").symlink_to("..2024_01_01")
+    (tmp_path / "keys.yaml").symlink_to("..data/k.yaml")
+    assert KeyStore(tmp_path / "keys.yaml").config is not None
+
+
+def test_dir_ownership_and_sticky_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import stat
+
+    from minion_server.auth import KeysFileUnsafeError, _check_dir
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    def st(uid: int, mode: int) -> os.stat_result:
+        return os.stat_result((stat.S_IFDIR | mode, 1, 1, 1, uid, 0, 0, 0, 0, 0))
+
+    _check_dir("/", st(0, 0o755))  # Docker /run/secrets
+    _check_dir("/", st(1000, 0o700))
+    _check_dir("/", st(0, 0o1777))  # K8s sticky root-owned mount
+    for bad in (st(1001, 0o755), st(1000, 0o775), st(1000, 0o1777), st(0, 0o770)):
+        with pytest.raises(KeysFileUnsafeError):
+            _check_dir("/", bad)
+
+
+def test_foreign_owned_directory_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from minion_server.auth import KeysFileUnsafeError
+
+    if os.getuid() == 0:
+        pytest.skip("root owns everything")
+    f = _good(tmp_path)
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(KeysFileUnsafeError):
+        KeyStore(f)

@@ -1,8 +1,10 @@
+# ruff: noqa: PTH100, PTH115, PTH116, PTH118, PTH120
 """Authentication dependencies: user API keys (file, plan D1) and executor tokens (DB, plan D2).
 
 Secrets are never logged. Lookups hash with SHA-256 and compare with `hmac.compare_digest`.
 """
 
+import errno
 import hashlib
 import hmac
 import os
@@ -118,33 +120,97 @@ MAX_KEYS_FILE_BYTES = 1 << 20
 _FIELD_NAMES = frozenset(
     {"keys", "teams", "name", "sha256", "operator", "expires_at", "default_pool", "allowed_pools"}
 )
-_YamlLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+class DuplicateKeyError(ValueError):
+    """A YAML mapping in the keys file repeats a key (the last one would silently win)."""
+
+
+_BaseLoader: type[yaml.SafeLoader] = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+class _StrictLoader(_BaseLoader):  # type: ignore[valid-type,misc]
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[object, object]:
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                raise DuplicateKeyError("duplicate mapping key in api keys file")
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)  # type: ignore[no-any-return]
 
 
 class KeysFileUnsafeError(Exception):
     """The keys file (or its directory chain) is writable by someone other than root/this user."""
 
 
-def _check_parents(path: Path) -> None:
-    """Refuse a target whose directory chain is group/world-writable (unless sticky and root-owned).
+_MAX_SYMLINK_HOPS = 40
 
-    Docker/K8s secret mounts are root-owned and not writable by others, so they pass.
+
+def _check_dir(directory: str, st: os.stat_result) -> None:
+    """A directory where the keys path is looked up: root/server-owned, not group/world-writable.
+
+    Sticky + root-owned directories (e.g. a K8s 1777 mount) are exempt from the writable rule.
     """
-    for directory in Path(os.path.realpath(path)).parents:
-        st = directory.stat()
-        if st.st_mode & 0o022 and not (st.st_mode & stat.S_ISVTX and st.st_uid == 0):
-            raise KeysFileUnsafeError("api keys file directory is group/world-writable")
+    if not stat.S_ISDIR(st.st_mode):
+        raise NotADirectoryError(f"api keys path component is not a directory: {directory}")
+    if st.st_uid not in (0, os.geteuid()):
+        raise KeysFileUnsafeError("api keys file directory is not owned by root or the server user")
+    sticky_root = bool(st.st_mode & stat.S_ISVTX) and st.st_uid == 0
+    if st.st_mode & 0o022 and not sticky_root:
+        raise KeysFileUnsafeError("api keys file directory is group/world-writable")
+
+
+def _resolve_checked(path: str | Path) -> str:
+    """Resolve `path` component by component (OpenSSH safe_path style), following symlinks by hand.
+
+    Every directory in which a name is looked up is checked, including the directory holding a
+    symlink and every symlinked intermediate directory. Returns the resolved path.
+    """
+    queue = os.path.abspath(os.fspath(path)).split("/")[::-1]
+    current = "/"
+    checked: set[str] = set()
+    hops = 0
+    while queue:
+        name = queue.pop()
+        if name in ("", "."):
+            continue
+        if current not in checked:
+            _check_dir(current, os.stat(current))
+            checked.add(current)
+        if name == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, name)
+        if stat.S_ISLNK(os.lstat(candidate).st_mode):
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise OSError(errno.ELOOP, "too many symlinks in api keys path")
+            target = os.readlink(candidate)
+            if target.startswith("/"):
+                current = "/"
+            queue.extend(target.split("/")[::-1])
+        else:
+            current = candidate
+    return current
 
 
 def _read_file(path: str | Path) -> bytes:
     """Read through one file descriptor after checking ownership and permissions.
 
-    Symlinked files are allowed (secret mounts use them); only regular files are read.
+    Symlinks are allowed (secret mounts use them) but every directory on the way is checked; only
+    regular files are read. Opened non-blocking so a FIFO cannot hang the server.
     """
-    _check_parents(Path(path))
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    real = _resolve_checked(path)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(real, flags)
     try:
         st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) and not stat.S_ISDIR(st.st_mode):
+            raise ValueError("api keys file is not a regular file")
+        after = os.stat(real)
+        if (st.st_dev, st.st_ino) != (after.st_dev, after.st_ino):
+            raise KeysFileUnsafeError("api keys file changed while it was being opened")
         if not stat.S_ISREG(st.st_mode):
             raise ValueError("api keys file is not a regular file")
         if st.st_uid not in (0, os.geteuid()):
@@ -163,7 +229,7 @@ def _read_file(path: str | Path) -> bytes:
 
 
 def parse_keys_config(text: str) -> KeysConfig:
-    raw = yaml.load(text, Loader=_YamlLoader) or {}  # noqa: S506  (safe loader)
+    raw = yaml.load(text, Loader=_StrictLoader) or {}  # noqa: S506  (safe loader)
     parsed = _KeysFile.model_validate(raw)
     keys: dict[str, User] = {}
     names: set[str] = set()
@@ -247,7 +313,7 @@ class KeyStore:
 
     def _fail(self, exc: Exception, digest: str | None) -> None:
         detail = _safe_detail(exc)
-        if self._config is not None or self._last_error != detail:
+        if self._config is not None or self._last_error != detail or self._digest != digest:
             log.error("api_keys_reload_failed", path=str(self._path), error=detail)
         self._last_error = detail
         self._config = None
@@ -287,10 +353,6 @@ class KeyStore:
     def config(self) -> KeysConfig | None:
         self._refresh()
         return self._config
-
-    def team_policy(self, team: str) -> TeamPolicy | None:
-        cfg = self.config
-        return cfg.teams.get(team) if cfg else None
 
 
 def lookup_user(keys: dict[str, User], presented: str) -> User | None:

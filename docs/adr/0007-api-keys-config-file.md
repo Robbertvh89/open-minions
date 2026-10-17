@@ -64,3 +64,18 @@ authorized by team.
   and not group/world-writable, and its resolved directory chain must not be group/world-writable
   (sticky + root-owned excepted); otherwise startup fails and a reload fails closed. Docker/K8s secret
   mounts (root-owned 0444/0644) pass. Each request uses one config snapshot for auth and pool policy.
+- Hardening round 2: the file is opened `O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW` (a FIFO fails
+  closed instead of hanging), after the configured path is resolved component by component (OpenSSH
+  `safe_path` style, symlinks followed by hand, at most 40 hops). **Every directory in which a name is
+  looked up** (including the directory holding the configured symlink and any symlinked intermediate
+  directory) must be owned by root or the server's euid and not group/world-writable; sticky +
+  root-owned directories (K8s 1777 mount) are exempt from the writable rule. After the open,
+  `fstat(fd)` (device, inode) must equal `stat` of the checked path (TOCTOU guard). Docker
+  `/run/secrets` (root 0755, file root 0444) and K8s `..data` layouts pass.
+- YAML mappings with duplicate keys (duplicate team slug, repeated top-level key) are rejected
+  (`DuplicateKeyError`, fail closed) instead of letting the last one win.
+- The reload runs synchronously on the request that crosses the interval. This is accepted: the file is
+  capped at 1 MiB, parsed by `CSafeLoader`, on local storage, and checked at most once per interval.
+- A non-atomic in-place rewrite can be observed half-written; a truncated file that still parses may
+  briefly drop team pool policies (fail open for one interval). This is why atomic replace
+  (temp + rename) is required, not just recommended.
