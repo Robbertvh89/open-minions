@@ -1,10 +1,10 @@
 ---
 id: TASK-23
 title: Fix flaky test_complete_vs_reclaim_randomized coverage assertion
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 14:14'
-updated_date: '2026-10-17 14:15'
+updated_date: '2026-10-17 14:24'
 labels:
   - server
   - test
