@@ -27,7 +27,7 @@ from minion_executor.runners.base import (
     Record,
     RunnerError,
     StepControl,
-    is_paced,
+    sync_due,
 )
 from minion_executor.runners.mlx_common import (
     MODEL_UNSUPPORTED,
@@ -167,7 +167,7 @@ class HfEmbeddingRunner:
                     for rec, vec, n in zip(batch[start : start + CHUNK], vecs, counts, strict=True):
                         out.append({"id": rec.get("id"), "embedding": vec, "tokens": n})
                     self._mem.sample()
-                    if is_paced(ctl):
+                    if sync_due(ctl):
                         torch.mps.synchronize()
                     ctl.checkpoint(len(out))
         except RuntimeError as exc:
@@ -384,7 +384,7 @@ class HfCompletionRunner:
         class Checkpoint(LogitsProcessor):  # type: ignore[misc]
             def __call__(self, input_ids: Any, scores: Any) -> Any:
                 mem.sample()
-                if is_paced(ctl):  # MPS is async: drain it so the pacer sees the GPU time
+                if sync_due(ctl):  # MPS is async: drain it so the pacer sees the GPU time
                     torch.mps.synchronize()
                 ctl.checkpoint(done)
                 return scores

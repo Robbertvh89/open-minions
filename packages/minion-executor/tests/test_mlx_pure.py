@@ -15,6 +15,9 @@ from minion_executor.runners.mlx_embedding import MlxEmbeddingRunner
 
 
 class _Ctl:
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         pass
 
@@ -125,14 +128,17 @@ def test_context_window_from_config() -> None:
     assert _context_window({}) == 0
 
 
-def test_is_paced_follows_the_control_and_defaults_to_the_safe_side() -> None:
-    from minion_executor.runners.base import is_paced
+def test_sync_due_follows_the_control_and_defaults_to_the_safe_side() -> None:
+    from typing import cast
 
-    class Paced(_Ctl):
-        paced = False
+    from minion_executor.runners.base import StepControl, sync_due
 
-    assert is_paced(_Ctl())  # unknown control: drain GPU work
-    assert not is_paced(Paced())
+    class Quiet(_Ctl):
+        def will_sleep(self) -> bool:
+            return False
+
+    assert sync_due(cast(StepControl, object()))  # no will_sleep: drain GPU work
+    assert not sync_due(Quiet())
 
 
 def test_sync_gpu_synchronizes_default_and_given_stream(monkeypatch: pytest.MonkeyPatch) -> None:

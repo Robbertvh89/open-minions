@@ -19,7 +19,6 @@ loop. Absent off macOS: `GpuMeterError`.
 
 from __future__ import annotations
 
-import itertools
 import re
 import statistics
 import subprocess
@@ -228,11 +227,14 @@ def process_gpu_share(samples: list[GpuSample], start: float, end: float) -> flo
     first, last = before[-1], after[-1]
     window = [s for s in usable if first.at <= s.at <= last.at]
     delta_ns = 0
-    for prev, cur in itertools.pairwise(window):
-        before_ns = prev.clients or {}
-        # a client new in this interval started at 0; a counter that dropped (reset) loses at
-        # most this one interval, never the rest of the window
-        delta_ns += sum(max(0, v - before_ns.get(cid, 0)) for cid, v in (cur.clients or {}).items())
+    seen = dict(first.clients or {})  # last value per client across the window
+    for cur in window[1:]:
+        for cid, v in (cur.clients or {}).items():
+            # a client new in this interval started at 0; one missing from a sample and back later
+            # continues from its last seen value; a counter that dropped (reset) loses at most
+            # this one interval, never the rest of the window
+            delta_ns += max(0, v - seen.get(cid, 0))
+            seen[cid] = v
     return delta_ns / 1e9 / (last.at - first.at)
 
 

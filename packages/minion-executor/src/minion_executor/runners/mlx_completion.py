@@ -15,7 +15,7 @@ from minion_executor.runners.base import (
     Record,
     RunnerError,
     StepControl,
-    is_paced,
+    sync_due,
 )
 from minion_executor.runners.pooling import read_json
 from minion_executor.runners.prompts import build_messages
@@ -153,7 +153,7 @@ class MlxCompletionRunner:
                         tokens[r.uid].append(int(r.token))
                     if r.finish_reason is not None:
                         reasons[r.uid] = str(r.finish_reason)
-                if is_paced(ctl):  # drain mx.async_eval'd work so busy time includes the GPU
+                if sync_due(ctl):  # quantum ends: drain async_eval work
                     common.sync_gpu(generation_stream)
                 ctl.checkpoint(done + len(reasons))
         finally:

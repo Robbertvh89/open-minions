@@ -69,6 +69,9 @@ class Ctl:
         self.last_done: int | None = None
         self.probe = probe
 
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         self.calls += 1
         self.last_done = records_done
@@ -532,8 +535,10 @@ class _PacedCtl:
     def __init__(self, duty: float) -> None:
         from minion_executor.worker.throttle import DutyCyclePacer
 
-        self.paced = duty < 1.0
         self._pacer = DutyCyclePacer(duty, time.monotonic, lambda s: time.sleep(s))
+
+    def will_sleep(self) -> bool:
+        return self._pacer.quantum_due()
 
     def checkpoint(self, records_done: int | None = None) -> None:
         self._pacer.step_done()
@@ -549,16 +554,26 @@ def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionR
     recs = _recs([f"Count upward from {i}, one number per line, never stop." for i in range(16)])
     params = CompletionParams(max_tokens=300, temperature=0.0)
     completion.run(recs[:2], CompletionParams(max_tokens=4), Ctl())  # warm up kernels
-    sampler = make_sampler(os.getpid)
-    sampler.start()
-    time.sleep(1.0)
-    start = time.monotonic()
-    out = completion.run(recs, params, _PacedCtl(duty))
-    end = time.monotonic()
-    time.sleep(1.0)
-    samples = sampler.stop()
-    assert len(out) == 16
-    assert end - start > 5, "run too short to measure"
-    share = process_gpu_share(samples, start, end)
-    print(f"gpu share {share:.3f} over {end - start:.1f}s")
+
+    def measure(d: float) -> tuple[float, float, int]:
+        sampler = make_sampler(os.getpid)
+        sampler.start()
+        time.sleep(1.0)
+        t0 = time.monotonic()
+        out = []
+        for _ in range(2):  # long enough for the paced run to span several meter samples
+            out = completion.run(recs, params, _PacedCtl(d))
+        t1 = time.monotonic()
+        time.sleep(1.0)
+        samples = sampler.stop()
+        return process_gpu_share(samples, t0, t1), t1 - t0, len(out)
+
+    unpaced, _, n0 = measure(1.0)
+    share, secs, n = measure(duty)
+    print(f"gpu share unpaced {unpaced:.3f}, paced {share:.3f} over {secs:.1f}s")
+    assert n0 == n == 16
+    assert secs > 5, "run too short to measure"
     assert share <= duty + 0.10, f"worker GPU share {share:.2f} exceeds duty {duty}"
+    assert share >= duty * unpaced - 0.10, (
+        f"worker GPU share {share:.2f} under-uses the duty (expected ~{duty * unpaced:.2f})"
+    )

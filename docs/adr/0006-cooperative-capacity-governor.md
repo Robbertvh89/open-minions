@@ -61,10 +61,24 @@ outstanding, with a checkpoint before each) and the requests already sent finish
 wall time between checkpoints. mlx-lm pipelines the next token with `mx.async_eval`, so at a
 checkpoint the GPU still holds queued work that runs through the pacer's sleep (measured: balanced
 duty 0.5 gave 74-76 % GPU share on qwen2.5-0.5b, larger batches worse). Runners therefore drain the
-GPU before each checkpoint when duty < 1 (`mx.synchronize` incl. mlx-lm's generation stream; HF:
-`torch.mps.synchronize()`), signalled by `StepControl.paced`. At duty 1.0 nothing is synced and async
-pipelining stays on. Ollama is not controllable: the daemon owns the GPU queue, so its duty is
-best-effort (request-level pacing only).
+GPU before the checkpoint that ends a pacing quantum (`mx.synchronize` incl. mlx-lm's generation
+stream; HF: `torch.mps.synchronize()`). At duty 1.0 nothing is synced and async pipelining stays on.
+
+*Quantum pacing (TASK-5.6 round 3).* Syncing at every step at duty < 1 serialises CPU graph build and
+GPU compute (no pipelining), so the paced share fell to about duty x G/(G+C): measured light 14-15 %
+(expected 23 %), balanced 27-31 % (expected 40 %), i.e. the owner's granted duty was wasted. The pacer
+therefore accumulates busy time across steps and only ends a *quantum* when it reaches `QUANTUM_S`
+(50 ms): that step syncs the GPU first (so the sync counts as busy), then sleeps
+`busy x (1 - d) / d` (oversleep credit capped at 0.5 s) and resets the accumulator. Between quanta
+there is neither a sync nor a sleep, so pipelining works inside a quantum and the GPU holds at most one
+quantum of queued work (<= the quantum plus one step) when the sleep starts: invariant 6 and NF-8(b)
+(share <= duty + 10 pp) hold with a bounded overshoot. Runners ask `StepControl.will_sleep()` before
+the checkpoint and sync only when it is True (controls without it sync every step, the safe side).
+Pause and control-message reading still happen at every checkpoint (NF-9 reaction is unchanged). A
+live duty drop (1.0 -> 0.5) makes the next step a quantum end regardless of accumulated time:
+`will_sleep()` applies pending control messages first. A message arriving between `will_sleep()` and
+`checkpoint()` is applied at the checkpoint and takes effect one step later. Ollama is not
+controllable: the daemon owns the GPU queue, so its duty is best-effort (request-level pacing only).
 
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
 memory/wired limits and batch caps; `Runner.trim` frees allocator caches. The loop re-slices records

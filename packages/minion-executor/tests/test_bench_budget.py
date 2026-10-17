@@ -224,6 +224,16 @@ def test_process_gpu_share_a_client_closing_keeps_its_last_value() -> None:
     assert process_gpu_share(samples, 0, 2) == pytest.approx(0.75)
 
 
+def test_process_gpu_share_a_client_missing_from_one_sample_continues_from_its_last_value() -> None:
+    samples = [
+        sm(0, {"a": 0}),
+        sm(1, {"a": 500_000_000}),
+        sm(2, {}),  # a absent from this reading only
+        sm(3, {"a": 1_500_000_000}),
+    ]
+    assert process_gpu_share(samples, 0, 3) == pytest.approx(0.5)  # not 1.5 s counted from 0
+
+
 def test_process_gpu_share_needs_readings_and_ignores_counter_resets() -> None:
     with pytest.raises(GpuMeterError):
         process_gpu_share([], 0, 1)

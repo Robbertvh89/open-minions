@@ -174,6 +174,17 @@ class _Ctl:
         """The pacer will sleep at checkpoints: runners must drain async GPU work first."""
         return self._pacer.duty < 1.0
 
+    def will_sleep(self) -> bool:
+        """The coming checkpoint ends a pacing quantum: runners must drain async GPU work first.
+        Pending control messages are applied first, so a duty that just dropped (say 1.0 -> 0.5)
+        makes this step drain too instead of leaving the queued work to run through the sleep."""
+        try:
+            while self._read_ctl(0):
+                pass
+        except _ParentGone:
+            return True  # the checkpoint right after raises it; draining first is harmless
+        return self._pacer.quantum_due()
+
     def start(self) -> None:
         """Ack the starting state; a run that begins paused does no work until resumed."""
         self._pacer.reset()
@@ -183,7 +194,9 @@ class _Ctl:
         self._pacer.reset()
 
     def finish(self) -> None:
-        """Final usage totals, so the control side can read the run's GPU share."""
+        """Pay the partial quantum's sleep, then send the final usage totals (the run's GPU
+        share)."""
+        self._pacer.flush()
         self._send_tick()
 
     def _send_tick(self, *, ack: bool = False) -> None:

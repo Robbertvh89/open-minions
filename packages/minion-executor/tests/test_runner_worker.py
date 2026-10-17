@@ -39,6 +39,9 @@ class _NoopCtl:
     def __init__(self) -> None:
         self.calls: list[int | None] = []
 
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         self.calls.append(records_done)
 
