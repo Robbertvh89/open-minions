@@ -100,6 +100,12 @@ def test_session_ttl_is_age_based_without_revival() -> None:
     # issued in the future beyond skew is rejected
     assert sess.verify_session(secret, value, t0 - timedelta(minutes=5), 8 * 3600) is None
     assert sess.verify_session(secret, value, t0 - timedelta(seconds=30), 8 * 3600) is not None
+    # exact boundary now == issued + ttl is rejected; one second earlier is still valid
+    assert not ok(timedelta(seconds=3600), 3600)
+    assert ok(timedelta(seconds=3599), 3600)
+    assert not ok(timedelta(seconds=8 * 3600), 24 * 3600)  # signed expiry boundary too
+    # an old-format cookie (v1) is rejected even with a plausible shape
+    assert sess.verify_session(secret, "v1." + value.split(".", 1)[1], t0, 8 * 3600) is None
 
 
 def test_referrer_policy_header_and_meta_are_same_origin() -> None:
@@ -147,6 +153,20 @@ def test_settings_ttl_cap_and_allowed_hosts_and_secret_charset() -> None:
         ServerSettings.model_validate({**base, "ui_session_secret": "a" * 40})
     cfg = ServerSettings.model_validate({**base, "ui_allowed_hosts": " A.example:8443, b.example "})
     assert cfg.ui_allowed_host_set == {"a.example:8443", "b.example"}
+    empty = ServerSettings.model_validate({**base, "ui_allowed_hosts": ""})
+    assert empty.ui_allowed_host_set == set()
+    for bad in [
+        "https://a.example",
+        "a.example/path",
+        "u@a.example",
+        "a .example",
+        "a.example,,b.example",
+        "a.example,",
+        ",a.example",
+        "a.example, ,b.example",
+    ]:
+        with pytest.raises(ValidationError, match="ui_allowed_hosts"):
+            ServerSettings.model_validate({**base, "ui_allowed_hosts": bad})
 
 
 def test_generate_ui_secret_command() -> None:
@@ -283,6 +303,12 @@ async def test_tampered_expired_cookie_redirects_and_removed_key_ends_session(
     )
     c.cookies.set("minion_session", old, path="/ui")
     assert (await c.get("/ui/tasks")).status_code == 303
+    # an old-format v1 cookie is rejected and cleared on the redirect
+    c.cookies.set("minion_session", "v1." + value.split(".", 1)[1], path="/ui")
+    r = await c.get("/ui/tasks")
+    assert r.status_code == 303 and r.headers["location"] == "/ui/login"
+    cleared = [v for v in r.headers.get_list("set-cookie") if v.startswith("minion_session=")]
+    assert cleared and "Max-Age=0" in cleared[0]
     # htmx fragment request gets HX-Redirect instead of a followed redirect
     r = await c.get("/ui/tasks", headers={"HX-Request": "true"})
     assert r.status_code == 401 and r.headers["hx-redirect"] == "/ui/login"

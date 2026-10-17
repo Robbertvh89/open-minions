@@ -108,6 +108,23 @@ class ServerSettings(BaseSettings):
             raise ValueError("ui_session_secret must not be a single repeated character")
         return raw
 
+    @field_validator("ui_allowed_hosts")
+    @classmethod
+    def _ui_allowed_hosts(cls, v: str) -> str:
+        """Bare `host[:port]` items only: no scheme, path, userinfo, whitespace, empty items."""
+        if not v.strip():
+            return ""
+        for item in v.split(","):
+            entry = item.strip()
+            if not entry:
+                raise ValueError("ui_allowed_hosts has an empty item (stray comma)")
+            if "://" in entry or any(c in entry for c in "/@") or any(c.isspace() for c in entry):
+                raise ValueError(
+                    f"ui_allowed_hosts entry {entry!r} must be a bare host[:port] "
+                    "(no scheme, '/', '@' or whitespace)"
+                )
+        return v
+
     @property
     def ui_allowed_host_set(self) -> frozenset[str]:
         return frozenset(h.strip().lower() for h in self.ui_allowed_hosts.split(",") if h.strip())

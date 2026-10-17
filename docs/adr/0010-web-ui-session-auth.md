@@ -31,7 +31,7 @@ surface (flows, discovery, JWKS caching) for a tool that is deployed per team or
    (per session). The login form, which has no session yet, uses an HMAC of a random nonce held in
    a short-lived `HttpOnly` `minion_login` cookie. Both checks fail with `403`. The reverse proxy
    must forward `Host` including the port (nginx `$http_host`, not `$host`). A non-loopback UI
-   requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` restricts `Host` (else `400`).
+   requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` restricts `Host` (else `400`); bare `host[:port]` entries, validated at startup. Production should set it (DNS rebinding) and generate the secret with `minion-server-admin generate-ui-secret` (hand-picked phrases are weak).
 5. **Headers** on every `/ui` response: `Content-Security-Policy: default-src 'self'; script-src
    'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'`, `X-Content-Type-Options:
    nosniff`, `Referrer-Policy: same-origin`, `Cache-Control: no-store`, plus `Strict-Transport-Security:

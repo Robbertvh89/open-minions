@@ -485,7 +485,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'`,
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (with `no-referrer` browsers send `Origin: null` on same-origin form POSTs, which are rejected), `Strict-Transport-Security` when the server sees https, `Cache-Control: no-store`. Templates are
   autoescaped: executor-supplied strings (owner, hostname, task `error`) are rendered inert. Rate-limit
-  `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`. `minion-server-admin generate-ui-secret` prints a secret; single-character secrets are rejected. OIDC/SSO: put a proxy in front.
+  `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`; entries are bare `host[:port]` (a scheme, `/`, `@`, whitespace or an empty item fails at startup). Production should set it (DNS rebinding). Generate the secret with `minion-server-admin generate-ui-secret` (hand-picked phrases are weak; only single-character secrets are rejected). OIDC/SSO: put a proxy in front.
 
 ## 9. Non-functional requirements
 
