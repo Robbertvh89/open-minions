@@ -57,6 +57,13 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
+class _ResponseModel(_Model):
+    """Parsed by the executor from server responses: unknown fields are ignored so a newer
+    server can add fields without breaking older executors (requests stay strict)."""
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
 class Budget(_Model):
     """Capacity budget the Mac's owner granted (SPEC §4.6)."""
 
@@ -236,7 +243,7 @@ class RegisterRequest(_Model):
     budget: Budget
 
 
-class RegisterResponse(_Model):
+class RegisterResponse(_ResponseModel):
     executor_id: uuid.UUID
 
 
@@ -253,7 +260,7 @@ class AcquireRequest(_Model):
     budget: Budget
 
 
-class Assignment(_Model):
+class Assignment(_ResponseModel):
     acquirement_id: uuid.UUID
     attempt: int = Field(ge=1)
     team: str
@@ -328,7 +335,7 @@ class PresenceRequest(_Model):
     paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
 
 
-class HeartbeatResponse(_Model):
+class HeartbeatResponse(_ResponseModel):
     cancel: bool
     output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
     expires_at: AwareDatetime
