@@ -14,6 +14,7 @@ import math
 import os
 import plistlib
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -156,12 +157,35 @@ def tcc_roots(home: Path) -> list[Path]:
     return list(dict.fromkeys(roots))
 
 
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except (OSError, RuntimeError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def is_tcc_protected(path: Path | str, roots: list[Path]) -> bool:
+    """True when `path` is, or lies under, a protected root. Compared as written, symlink-resolved,
+    case-folded (APFS is case-insensitive) and by (st_dev, st_ino) of every existing ancestor
+    (firmlinks such as /System/Volumes/Data/Users/<u>)."""
     raw = Path(os.path.abspath(path))  # noqa: PTH100 - normalise ".." without symlinks
     cands = [raw]
     with contextlib.suppress(OSError, RuntimeError):
         cands.append(raw.resolve())
-    return any(c == r or r in c.parents for c in cands for r in roots)
+    if any(c == r or r in c.parents for c in cands for r in roots):
+        return True
+    folded = [Path(str(r).casefold()) for r in roots]
+    for c in cands:
+        fc = Path(str(c).casefold())
+        if any(fc == r or r in fc.parents for r in folded):
+            return True
+    root_ids = {i for r in roots if (i := _identity(r)) is not None}
+    if not root_ids:
+        return False
+    return any(
+        (i := _identity(a)) is not None and i in root_ids for c in cands for a in (c, *c.parents)
+    )
 
 
 def pth_targets(directory: Path) -> list[Path]:
@@ -595,7 +619,8 @@ def _wait_unloaded(label: str, timeout_s: float) -> bool:
 
 
 def _manual_removal(label: str, plist_path: Path) -> str:
-    return f"remove it by hand: `launchctl bootout gui/$(id -u)/{label}` then `rm {plist_path}`"
+    rm = shlex.quote(str(plist_path))
+    return f"remove it by hand: `launchctl bootout gui/$(id -u)/{label}` then `rm {rm}`"
 
 
 @service_app.command()
@@ -615,7 +640,13 @@ def uninstall(label: LabelOpt = DEFAULT_LABEL, agents_dir: AgentsDirOpt = None) 
         rc, _ = run_launchctl(["print", f"gui/{_uid()}/{label}"])
         present = plist_path.is_symlink() or plist_path.exists()
         if rc != SERVICE_NOT_FOUND or present:
-            state = "loaded" if rc == 0 else "not confirmed unloaded" if rc != 113 else "not loaded"
+            state = (
+                "loaded"
+                if rc == 0
+                else "not loaded"
+                if rc == SERVICE_NOT_FOUND
+                else "not confirmed unloaded"
+            )
             file_state = "unreadable or malformed" if present else "missing"
             raise _fail(
                 f"{plist_path} is {file_state} and the service is {state}; "

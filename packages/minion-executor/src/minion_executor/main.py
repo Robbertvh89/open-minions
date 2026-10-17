@@ -419,10 +419,19 @@ def run(
     if service_mode():
         clear_failure(settings.state_dir)
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
+    # restrict_environ() (inside _run) scrubs the service env vars: decide once, before it.
+    in_service = service_mode()
+    state_dir = settings.state_dir
     try:
         asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s, plan))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
-        _failure("startup_failed", str(exc), permanent=exc.permanent)
+        _failure(
+            "startup_failed",
+            str(exc),
+            permanent=exc.permanent,
+            in_service=in_service,
+            state_dir=state_dir,
+        )
     except ApiError as exc:
         # Permanent only when the server itself refused us: 401/403 carrying its own error code
         # (a proxy/WAF 403 has none) or 400/422. 429/5xx and the rest are retried.
@@ -430,11 +439,16 @@ def run(
             raise
         auth = exc.status_code in (401, 403) and exc.code in SERVER_AUTH_CODES
         detail = f"server answered {exc.status_code} {sanitize(exc.code, 64)}"
-        if auth:
-            _failure("credential_rejected", detail, permanent=True, code=1)
-        elif exc.status_code in (400, 422):
-            _failure("request_rejected", detail, permanent=True, code=1)
-        _failure("request_refused", detail, permanent=False, code=1)
+        rejected = exc.status_code == 422 or (exc.status_code == 400 and exc.code != "HTTP_ERROR")
+        reason = "credential_rejected" if auth else "request_rejected" if rejected else None
+        _failure(
+            reason or "request_refused",
+            detail,
+            permanent=reason is not None,
+            code=1,
+            in_service=in_service,
+            state_dir=state_dir,
+        )
     except GovernorStoppedError as exc:  # nothing steers the budget: exit non-zero, never run on
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
@@ -442,7 +456,15 @@ def run(
         os.close(lock_fd)
 
 
-def _failure(reason: str, detail: str, *, permanent: bool, code: int = 2) -> NoReturn:
+def _failure(
+    reason: str,
+    detail: str,
+    *,
+    permanent: bool,
+    code: int = 2,
+    in_service: bool | None = None,
+    state_dir: Path | None = None,
+) -> NoReturn:
     """End `run` after a failure.
 
     Under launchd (KeepAlive SuccessfulExit=false) a *permanent* one (a restart cannot fix it) exits
@@ -452,7 +474,7 @@ def _failure(reason: str, detail: str, *, permanent: bool, code: int = 2) -> NoR
     """
     detail = sanitize(detail, 500)
     typer.echo(f"error: {detail}", err=True)
-    if service_mode():
+    if service_mode() if in_service is None else in_service:
         ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not permanent:
             typer.echo(
@@ -460,7 +482,7 @@ def _failure(reason: str, detail: str, *, permanent: bool, code: int = 2) -> NoR
             )
             raise typer.Exit(code=1)
         with contextlib.suppress(Exception):
-            record_failure(ExecutorSettings().state_dir, reason, detail, ts)
+            record_failure(state_dir or ExecutorSettings().state_dir, reason, detail, ts)
         typer.echo(
             f"permanent_failure ts={ts} reason={reason}: exiting 0 so launchd does not relaunch; "
             "fix the cause, then `launchctl kickstart` (or reinstall) the service",

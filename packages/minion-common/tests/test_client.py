@@ -330,3 +330,32 @@ def test_heartbeat_response_requires_aware_expires_at() -> None:
         HeartbeatResponse.model_validate(
             {"cancel": False, "output_url": "http://s3/out", "expires_at": "2026-01-01T00:00:00"}
         )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"detail": {"code": "lowercase", "message": "m"}},
+        {"detail": {"code": "A" * 65, "message": "m"}},
+        {"detail": {"code": "BAD\x1b[31m", "message": "m"}},
+        {"detail": {"code": "BAD\n", "message": "m"}},
+        {"detail": "Not Found"},
+        {"detail": [{"loc": ["body"], "msg": "field required", "type": "missing"}]},
+        {"detail": {"message": "no code"}},
+        ["not", "a", "dict"],
+    ],
+)
+def test_malformed_error_bodies_fall_back_to_http_error(body: object) -> None:
+    from minion_common.client import _error_from
+
+    err = _error_from(httpx.Response(422, json=body))
+    assert err.status_code == 422 and err.code == "HTTP_ERROR"
+
+
+def test_error_body_ignores_unknown_fields() -> None:
+    from minion_common.client import _error_from
+
+    err = _error_from(
+        httpx.Response(403, json={"detail": {"code": "FORBIDDEN", "message": "m", "x": 1}})
+    )
+    assert err.code == "FORBIDDEN"

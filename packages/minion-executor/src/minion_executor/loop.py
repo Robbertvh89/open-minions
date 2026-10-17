@@ -374,11 +374,12 @@ class ExecutorLoop:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for((until or self._stop).wait(), timeout=delay)
 
-    async def _sleep(self, version: int | None = None) -> None:
+    async def _sleep(self, version: int | None = None, *, delay: float | None = None) -> None:
         """Idle back-off. `version` is the governor version read *before* the acquire call, so a
-        change that arrived during it is not missed."""
-        delay = self._delay(self._idle)
-        self._idle += 1
+        change that arrived during it is not missed. `delay` overrides the idle back-off (429)."""
+        if delay is None:
+            delay = self._delay(self._idle)
+            self._idle += 1
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
@@ -532,7 +533,7 @@ class ExecutorLoop:
                     await self._enforce_idle_budget()
                     if limited:  # 429: back off at least Retry-After (TASK-6.2 extends this)
                         limited_n += 1
-                        await self._pause(self._rate_limit_delay(exc, limited_n - 1))
+                        await self._sleep(version, delay=self._rate_limit_delay(exc, limited_n - 1))
                     else:
                         await self._sleep(version)
                     continue

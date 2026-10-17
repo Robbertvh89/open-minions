@@ -380,6 +380,8 @@ def _service_run_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mo
     monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok-secret")
     monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    # no test may reach the real Keychain (/usr/bin/security)
+    monkeypatch.setattr("minion_executor.secrets.keychain_lookup", lambda: (None, False))
     if service_mode:
         monkeypatch.setenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S", "45")
         monkeypatch.setenv("MINION_EXECUTOR_SERVICE_LABEL", "com.x")
@@ -933,11 +935,7 @@ def test_token_unavailable_transient_vs_missing(
 ) -> None:
     _service_run_env(tmp_path, monkeypatch, True)
     monkeypatch.delenv("MINION_EXECUTOR_TOKEN")
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "", ""),
-    )
+    monkeypatch.setattr("minion_executor.secrets.keychain_lookup", lambda: (None, transient))
     res = runner.invoke(app, ["run", "--runner", "fake"])
     assert res.exit_code == (1 if transient else 0), res.output
 
@@ -980,6 +978,7 @@ def test_failure_file_cleared_on_next_service_start(
     runner.invoke(app, ["run", "--runner", "fake"])
     f = tmp_path / "state" / service.FAILURE_FILE
     assert f.exists()
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok-secret")
     _patch_run(monkeypatch, ApiError(503, "DOWN", "x"))
     runner.invoke(app, ["run", "--runner", "fake"])
     assert not f.exists()
@@ -998,3 +997,56 @@ def test_sanitize_and_read_failure_untrusted(tmp_path: Path) -> None:
     service.record_failure(state, "r\x1b", "d" * 1000, "2026-01-01T00:00:00Z")
     got = service.read_failure(state)
     assert got is not None and got["reason"] == "r?" and len(got["detail"]) <= 300
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ApiError(401, "UNAUTHORIZED", "bad token"), StartupError(NO_ENGINE_MSG)],
+)
+def test_permanent_failure_after_restrict_environ_still_exits_0(
+    exc: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_executor.main as m
+    from minion_executor.worker.process import restrict_environ
+
+    _service_run_env(tmp_path, monkeypatch, True)
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok-secret")
+    saved = dict(os.environ)
+
+    async def scrub_then_raise(*args: object) -> None:
+        restrict_environ()  # the real one: deletes the service env vars
+        assert not os.environ.get("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S")
+        raise exc
+
+    monkeypatch.setattr(m, "_run", scrub_then_raise)
+    try:
+        res = runner.invoke(app, ["run", "--runner", "fake"])
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert res.exit_code == 0, res.output
+    assert "permanent_failure" in res.output
+    assert (tmp_path / "state" / service.FAILURE_FILE).exists()
+
+
+def test_http_error_400_is_transient_in_service_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, True)
+    _patch_run(monkeypatch, ApiError(400, "HTTP_ERROR", "Bad Request"))
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 1
+
+
+def test_tcc_case_insensitive_and_firmlink_paths(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    roots = service.tcc_roots(home)
+    assert service.is_tcc_protected(str(home).lower() + "/documents/x", roots)
+    assert service.is_tcc_protected(home / "DOWNLOADS" / "x" / "y", roots)
+    assert not service.is_tcc_protected(home / "Library" / "Logs", roots)
+    # a non-existing path under an alias of the same directory (same inode, other spelling)
+    alias = tmp_path / "alias"
+    alias.symlink_to(home)
+    assert service.is_tcc_protected(alias / "Documents" / "missing" / "x", roots)
+    data = Path("/System/Volumes/Data" + str(home.resolve()))
+    if data.exists():  # real firmlink on macOS
+        assert service.is_tcc_protected(data / "Documents" / "x", roots)

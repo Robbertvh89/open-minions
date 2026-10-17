@@ -264,6 +264,8 @@ ERROR_CODE_PATTERN = r"^[A-Z0-9_]{1,64}$"
 
 
 class ErrorBody(_Model):
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
     code: str = Field(pattern=ERROR_CODE_PATTERN)
     message: str
 
