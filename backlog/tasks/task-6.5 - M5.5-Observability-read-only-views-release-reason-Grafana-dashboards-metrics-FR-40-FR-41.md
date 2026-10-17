@@ -3,10 +3,10 @@ id: TASK-6.5
 title: >-
   M5.5 Observability: read-only views, release reason, Grafana dashboards,
   /metrics (FR-40, FR-41)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 08:42'
+updated_date: '2026-10-17 09:34'
 labels:
   - M5
 dependencies:
