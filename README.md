@@ -75,8 +75,9 @@ printf '%s\n' "$out" | sed -n '/^keys:/,$p' > deploy/secrets/api-keys.yaml
 chmod 600 deploy/secrets/api-keys.yaml
 ```
 
-On **Linux** the server runs as uid 10001 and refuses a keys file owned by anyone else (every request
-is then `401` while the stack looks healthy). Give it the files:
+On **Linux** the server runs as uid 10001 and refuses a keys file owned by anyone else: it fails to
+start (restart loop, `up --wait` fails, and `docker compose logs server` shows the ownership error).
+Give it the files:
 `sudo chown -R 10001:10001 deploy/secrets`. (Alternative: keep them `root:root`, directory 0755 and
 file 0644.) On macOS Docker Desktop this is not needed.
 
@@ -106,7 +107,7 @@ docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app exe
 ```
 
 The command prints `executor_id: ...` and `token (shown once): ...`. Export the token without
-putting it in your shell history, then paste it when asked:
+putting it in your shell history: run this, paste the token (nothing is echoed), press Enter:
 
 ```bash
 read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN
@@ -199,20 +200,23 @@ rm -rf deploy/secrets      # on Linux after the chown: sudo rm -rf deploy/secret
 
 `down` keeps the data volumes, so old tasks survive and an executor (FIFO) would process these
 leftovers first next time. For a clean slate use `down -v` instead (this **deletes** all dev
-data: database, S3 objects, Grafana). Alternatively point the executor at your own tasks with
-`minion-executor prefer --server URL --team T`.
+data: database, S3 objects, Grafana).
 
-**Troubleshooting.** `submit` waits and nothing happens: run `uv run minion-executor status` and read
-`paused_reason`. On battery the executor is paused by default (`low_battery`): plug in, or set
-`allow_on_battery = true` in `~/.config/minion/executor.toml` ([Mac owners](#mac-owners)). It also
-pauses at a memory-pressure warning.
+**Troubleshooting.** `submit` waits and nothing happens: run `uv run minion-executor status`; it
+prints `state: paused (<reason>)`. On battery the executor is paused by default (`on_battery`; with
+`allow_on_battery = true` it pauses as `low_battery` once the charge is under the minimum): plug in,
+or set `allow_on_battery = true` in `~/.config/minion/executor.toml` ([Mac owners](#mac-owners)) and
+restart the executor, which reads that file only at start. It also pauses at a memory-pressure
+warning.
 
 ## Using real models on a Mac
 
 On an Apple Silicon Mac, reuse Quick start steps 2, 5 and 8, but start the stack **without**
-`compose.dev.yml` (the stock model allow-list, no fake models). Issue the token with:
+`compose.dev.yml` (the stock model allow-list, no fake models), and in step 8 submit with
+`--model bge-small-en` or `--model qwen2.5-0.5b-instruct`. Start the stack and issue the token with:
 
 ```bash
+docker compose -f deploy/compose.yml --profile app up -d --build --wait
 docker compose -f deploy/compose.yml --profile app exec -T server \
   minion-server-admin issue-executor-token --owner <name>
 ```
@@ -222,11 +226,13 @@ Then install the engines and run without the dev flags (if you changed a host po
 
 ```bash
 uv sync --package minion-executor --extra mlx --extra hf     # mlx: default engine; hf: fallback
-read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN   # or the Keychain (recommended, see Mac owners)
+read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN   # paste the token, Enter (no echo)
+# or use the Keychain (recommended, see Mac owners)
 uv run minion-executor run --server http://localhost:8080 --profile light
 ```
 
-The first subtask loads the model (about 30 s on an M3 Pro, longer when it must be downloaded first).
+The first subtask loads the model: a few seconds with the weights cached (see
+[`docs/bench/m3-apple-m3-pro.md`](docs/bench/m3-apple-m3-pro.md)), longer when it must download first.
 
 - `--engines auto` (the default) probes `mlx` and `hf` in a sandboxed worker subprocess and
   advertises what works (exit 2 if none). Ollama is opt-in (`--engines ollama`, see
@@ -236,8 +242,6 @@ The first subtask loads the model (about 30 s on an M3 Pro, longer when it must 
   Each entry pins a revision. Models are downloaded on first use into the model cache by a pinned,
   sha256-verified subprocess, so the first subtask on a Mac is slow and needs network access to the
   Hugging Face hub.
-- Use the stock stack (`docker compose -f deploy/compose.yml --profile app up -d --build --wait`,
-  without the dev override) and submit with `--model bge-small-en` or `--model qwen2.5-0.5b-instruct`.
 - Profiles `light` (25 % of RAM, 30 % GPU duty, batch 4), `balanced` (40 %, 50 %, 8), `full`
   (70 %, 100 %, 32) and `custom`. Omit `--profile` for adaptive mode ([Mac owners](#mac-owners)).
 - Measure your own Mac: `uv run minion-executor bench --models deploy/bench-models.yaml --model <id>`
@@ -301,9 +305,13 @@ user from exhausting CPU or memory). `/healthz` is always on; Prometheus `/metri
 `MINION_METRICS_ENABLED=true`, and with `MINION_METRICS_TOKEN` (32+ chars) it requires
 `Authorization: Bearer <token>`. Logs never contain payload content.
 
-**Rate limits.** Executor endpoints are rate-limited in memory per replica (`429` with `Retry-After`); the intervals and defaults are in [`.env.example`](.env.example) and [ADR-0012](docs/adr/0012-in-memory-executor-rate-limits.md). Put per-IP limits at the proxy.
+**Rate limits.** Executor endpoints are rate-limited in memory per replica (`429` with
+`Retry-After`); the intervals and defaults are in [`.env.example`](.env.example) and
+[ADR-0012](docs/adr/0012-in-memory-executor-rate-limits.md). Put per-IP limits at the proxy.
 
-**Storage and S3 policy.** Executors only get presigned URLs (default TTL 900 s); give each team's submitters their **own** scoped credentials, never the server's, and add lifecycle rules and a bucket quota. The exact policy is in [SPEC S-14](docs/SPEC.md) and S-2.
+**Storage and S3 policy.** Executors only get presigned URLs (default TTL 900 s); give each team's
+submitters their **own** scoped credentials, never the server's, and add lifecycle rules and a
+bucket quota. The exact policy is in [SPEC S-14](docs/SPEC.md) and S-2.
 
 **Watchdog.** `uv run minion-watchdog` (DB access only, no S3) reclaims subtasks whose heartbeat is
 older than `MINION_HEARTBEAT_TIMEOUT_S` (900 s) or whose lease exceeds `MINION_MAX_LEASE_S` (6 h),
@@ -366,7 +374,11 @@ permissions, unknown keys are an error (exit 2). Keys: `active_profile`, `idle_p
 `idle_after_min`, `allow_on_battery`, `min_battery_percent`, `on_call`, `[profiles.<name>]`
 overrides, `[profiles.custom]`, `[[schedule]]` (profile, `HH:MM` start/end, days).
 
-**`on_call` and privacy.** The governor can notice that a microphone or camera is in use and cap or pause the executor (`on_call = auto|light|pause|ignore`); no device is opened. The server learns your profile, memory budget and pause reason, which can reveal when you are idle or on a call; keyboard idle time and mic/camera state are never sent. Details and how to opt out: [SPEC S-11](docs/SPEC.md). Prefer a task or team with
+**`on_call` and privacy.** The governor can notice that a microphone or camera is in use and cap or
+pause the executor (`on_call = auto|light|pause|ignore`); no device is opened. The server learns
+your profile, memory budget and pause reason, which can reveal when you are idle or on a call;
+keyboard idle time and mic/camera state are never sent. Details and how to opt out: [SPEC
+S-11](docs/SPEC.md). Prefer a task or team with
 `minion-executor prefer --server URL (--team T [--project P] [--task-name N] | --clear)`; it is a
 hint, not a filter.
 
@@ -511,7 +523,8 @@ CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the
   needs at least 8 people on their own Macs. Until then, do not claim calls are unaffected.
 - **Real microphone/camera call detection is not verified on hardware** (`on_call`); it is covered by
   tests with injected signals only. Screen sharing is not detected.
-- **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15): a misbehaving or compromised worker can exceed it.
+- **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15):
+a misbehaving or compromised worker can exceed it.
   Measured on one Mac (Apple M3 Pro, [`docs/bench/`](docs/bench/)); other chips are untested.
 - **Presigned PUT cannot cap upload size.** An executor can write a large object under its own
   attempt key until `complete` rejects it; use a bucket quota and lifecycle rules (TASK-19, S-2).
@@ -521,7 +534,8 @@ CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the
   aggregate subtask counts per request (TASK-16); rate-limit the read endpoints at the proxy.
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
   capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)).
-- **Not built yet:** scale test and menu-bar app (TASK-7), timer-based split-lease renewal for very large single-object inputs (TASK-11).
+- **Not built yet:** scale test and menu-bar app (TASK-7), timer-based split-lease renewal for very
+large single-object inputs (TASK-11).
 - **Hardening gaps (TASK-9):** no absolute per-batch wall-clock cap, no server cap on
   `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state dir or
   `executor.toml` (mode bits only).
