@@ -39,6 +39,7 @@ from minion_executor.capacity.governor import (
 from minion_executor.capacity.profiles import ProfileSpec, budget_for
 from minion_executor.capacity.signals import (
     DEFAULT_READ_TIMEOUT_S,
+    CallAwareSource,
     SignalError,
     SignalSnapshot,
     SignalSource,
@@ -351,9 +352,8 @@ class GovernorRuntime:
 
     async def poll_once(self) -> Decision:
         """One governor step: read, decide, publish. Never raises on a bad read or file."""
-        want = getattr(self._source, "set_want_call_state", None)
-        if want is not None:  # the source skips the call probe unless the config wants it
-            want(self._cfg.on_call is not OnCall.IGNORE)
+        if isinstance(self._source, CallAwareSource):  # skip the probe unless the config wants it
+            self._source.set_want_call_state(self._cfg.on_call is not OnCall.IGNORE)
         snap = await self._read_signals()
         owner = await self._read_owner()
         decision, self._state = decide(

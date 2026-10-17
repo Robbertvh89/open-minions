@@ -263,10 +263,10 @@ CoreMediaIO `IsRunningSomewhere` per device. These are public property reads; th
 there is no TCC prompt and no indicator. Device names/UIDs are never read. Residual risk: loading
 CoreMediaIO may load admin-installed third-party DAL plug-ins into the control process.
 The probe runs on its own daemon thread (`AsyncCallProbe`), apart from the safety read: one read in
-flight, a 0.5 s hang limit, the latest finished value cached (15 s max age). `MacSignals.read` takes
-the cached value without blocking; pending, hung, failed or stale gives `None` (unknown), treated as
-not in a call, and can never cause `signals_unavailable`. `value()` starts a read and waits up to the 0.5 s limit for its
-completion event, so a new call state is seen on the very next poll (NF-9); a read already hung is not
+flight, a 0.5 s hang limit; the 15 s max age only caps a hung read's old value. A hung, failed or
+stale read gives `None` (unknown), treated as not in a call, and can never cause
+`signals_unavailable`. `MacSignals.read` starts the probe read, takes the safety reads, then waits
+for the rest of the 0.5 s limit for the completion event, so a new call state is seen on the very next poll (NF-9); a read already hung is not
 waited for. The probe is built lazily and skipped (no thread, no CoreMediaIO load, `call_active`
 `None`) when `on_call = "ignore"`: `GovernorRuntime` tells the source each poll
 (`set_want_call_state`). `call_probe_unavailable` is logged once when the probe yields `None`,

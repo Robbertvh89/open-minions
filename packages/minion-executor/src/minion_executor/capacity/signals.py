@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,6 +75,13 @@ class SignalSnapshot:
 
 class SignalSource(Protocol):
     def read(self) -> SignalSnapshot: ...
+
+
+@runtime_checkable
+class CallAwareSource(Protocol):
+    """A source that can skip its call probe (`on_call = "ignore"`)."""
+
+    def set_want_call_state(self, want: bool) -> None: ...
 
 
 # --- pure mapping helpers (unit-tested on every platform) -------------------------------------
@@ -341,7 +348,6 @@ class AsyncCallProbe:
         self._clock = clock
         self._lock = threading.Lock()
         self._started: float | None = None  # start of the read in flight
-        self._done: threading.Event | None = None  # completion of the read in flight
         self._value: bool | None = None
         self._finished: float | None = None
 
@@ -359,33 +365,39 @@ class AsyncCallProbe:
         with self._lock:
             return self._finished is not None
 
-    def read(self) -> tuple[bool | None, bool]:
-        """(value, settled), taken under one lock after the wait."""
+    def begin(self) -> tuple[threading.Event | None, float]:
+        """Start a read if none is in flight; returns (event to wait on or None, start time)."""
         now = self._clock()
-        wait_for: threading.Event | None = None
         with self._lock:
             if self._started is None:
                 done = threading.Event()
-                self._started, self._done = now, done
+                self._started = now
                 try:
                     threading.Thread(
                         target=self._run, args=(done,), name="call-probe", daemon=True
                     ).start()
-                    wait_for = done
+                    return done, now
                 except RuntimeError:  # cannot start a thread: unknown
                     self._started = None
-            elif now - self._started > self._timeout_s:
-                return None, self._finished is not None  # hung: nothing new is started
+            return None, now
+
+    def finish(self, wait_for: threading.Event | None, began: float) -> tuple[bool | None, bool]:
+        """(value, settled): wait for the read begun at `began` until its timeout, then take both
+        under one lock. A read already hung when `begin` ran is not waited for."""
         if wait_for is not None:
-            wait_for.wait(self._timeout_s)
+            wait_for.wait(max(0.0, self._timeout_s - (self._clock() - began)))
         now = self._clock()
         with self._lock:
             settled = self._finished is not None
             if self._started is not None and now - self._started > self._timeout_s:
-                return None, settled  # the read we started hung
+                return None, settled  # hung (or the read we started hung)
             if self._finished is None or now - self._finished > self._max_age_s:
                 return None, settled
             return self._value, settled
+
+    def read(self) -> tuple[bool | None, bool]:
+        """(value, settled) after starting a read and waiting for it."""
+        return self.finish(*self.begin())
 
     def value(self) -> bool | None:
         return self.read()[0]
@@ -406,7 +418,7 @@ class MacSignals:
     _call_warned: bool
     _want_call: bool
 
-    def __init__(self) -> None:
+    def __init__(self, want_call: bool = True) -> None:
         if sys.platform != "darwin":
             raise SignalError("MacSignals needs macOS")
         try:
@@ -442,7 +454,7 @@ class MacSignals:
         self._iokit = iokit
         self._call = None  # built lazily: no CoreMediaIO load or thread unless call state is wanted
         self._call_warned = False
-        self._want_call = True
+        self._want_call = want_call
 
     def set_want_call_state(self, want: bool) -> None:
         """Whether the governor uses call state (`on_call` != ignore); set from config each poll."""
@@ -492,12 +504,17 @@ class MacSignals:
             raise SignalError("memory pressure unreadable")
         return pressure_from_sysctl(val.value)
 
-    def _call_state(self) -> bool | None:
+    def _call_begin(self) -> tuple[threading.Event | None, float] | None:
         if not self._want_call:
             return None
         if self._call is None:
             self._call = AsyncCallProbe(_CallProbe())
-        call, _settled = self._call.read()
+        return self._call.begin()
+
+    def _call_finish(self, began: tuple[threading.Event | None, float] | None) -> bool | None:
+        if began is None or self._call is None:
+            return None
+        call, _settled = self._call.finish(*began)
         # the read waits for a fresh value, so None is unreadable: failed, or hung (never settled)
         if call is None and not self._call_warned:
             self._call_warned = True
@@ -508,18 +525,22 @@ class MacSignals:
         try:
             # reads run on a bare worker thread with no ambient pool: drain autoreleased objects
             with self._objc.autorelease_pool():
-                call = self._call_state()
+                began = self._call_begin()  # the probe runs while the safety reads are taken
                 info = self._foundation.NSProcessInfo.processInfo()
                 on_ac, percent = self._power()
+                hid_idle_s = self._hid_idle_s()
+                low_power = bool(info.isLowPowerModeEnabled())
+                thermal = thermal_from_ns(int(info.thermalState()))
+                pressure = self._memory_pressure()
                 return SignalSnapshot(
-                    hid_idle_s=self._hid_idle_s(),
+                    hid_idle_s=hid_idle_s,
                     on_ac=on_ac,
                     battery_percent=percent,
-                    low_power_mode=bool(info.isLowPowerModeEnabled()),
-                    thermal=thermal_from_ns(int(info.thermalState())),
-                    memory_pressure=self._memory_pressure(),
+                    low_power_mode=low_power,
+                    thermal=thermal,
+                    memory_pressure=pressure,
                     taken_at=_now(),
-                    call_active=call,
+                    call_active=self._call_finish(began),
                 )
         except SignalError:
             raise
@@ -574,7 +595,7 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def default_source(fake_signals: Path | None) -> SignalSource:
+def default_source(fake_signals: Path | None, *, want_call: bool) -> SignalSource:
     """File source (dev), real macOS source, or the null source elsewhere.
 
     On macOS the real source is probed once: a source that cannot be read at startup raises
@@ -583,7 +604,7 @@ def default_source(fake_signals: Path | None) -> SignalSource:
     if fake_signals is not None:
         src: SignalSource = FileSignals(fake_signals)
     elif sys.platform == "darwin":
-        src = MacSignals()
+        src = MacSignals(want_call=want_call)
     else:
         return NullSignals()
     _startup_read(src)

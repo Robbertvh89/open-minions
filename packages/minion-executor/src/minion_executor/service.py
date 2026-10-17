@@ -475,7 +475,7 @@ def install(
     """
     from minion_common.client import require_secure_url
 
-    from minion_executor.capacity.config import load_config, resolve_profiles
+    from minion_executor.capacity.config import OnCall, load_config, resolve_profiles
     from minion_executor.capacity.profiles import parse_profile
     from minion_executor.capacity.safefile import ensure_private_dir
     from minion_executor.capacity.signals import default_source
@@ -506,7 +506,9 @@ def install(
         specs = resolve_profiles(config)
         if profile is not None:
             parse_profile(profile, specs)
-        default_source(None)  # the real signal source must be readable
+        default_source(
+            None, want_call=config.on_call is not OnCall.IGNORE
+        )  # the real signal source must be readable
         executable = _executable()
         check_not_protected(home, install_locations(executable, settings))
         if not keychain_present():

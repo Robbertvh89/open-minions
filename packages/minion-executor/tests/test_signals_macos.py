@@ -30,7 +30,7 @@ def test_mac_signals_read_plausible_values() -> None:
 
 
 def test_mac_signals_repeat_reads_and_default_source() -> None:
-    src = default_source(None)
+    src = default_source(None, want_call=True)
     assert isinstance(src, MacSignals)
     for _ in range(20):
         src.read()
@@ -93,6 +93,19 @@ def test_mac_signals_hung_call_probe_does_not_block_safety_read() -> None:
 
     m = MacSignals()
     m._call = AsyncCallProbe(Hang(), timeout_s=0.05)
-    for _ in range(3):
+    import time
+
+    for i in range(3):
+        t0 = time.monotonic()
         snap = m.read()
+        took = time.monotonic() - t0
         assert snap.call_active is None and snap.thermal is not None
+        if i > 0:  # a probe already hung is not waited for
+            assert took < 0.04, took
+
+
+def test_default_source_with_want_call_false_builds_no_probe() -> None:
+    src = default_source(None, want_call=False)
+    assert isinstance(src, MacSignals)
+    assert src._call is None and src.read().call_active is None
+    assert src._call is None

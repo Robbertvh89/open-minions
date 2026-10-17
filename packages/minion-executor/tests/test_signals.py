@@ -100,7 +100,7 @@ def test_file_signals_need_dev(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(SignalError, match="DEV"):
         FileSignals(_file(tmp_path, {}))
     with pytest.raises(SignalError, match="DEV"):
-        default_source(_file(tmp_path, {}))
+        default_source(_file(tmp_path, {}), want_call=True)
 
 
 def test_file_signals_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,7 +109,7 @@ def test_file_signals_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         tmp_path,
         {"hid_idle_s": 700, "on_ac": False, "battery_percent": 20, "thermal": "serious"},
     )
-    s = default_source(p).read()
+    s = default_source(p, want_call=True).read()
     assert (s.hid_idle_s, s.on_ac, s.battery_percent, s.thermal) == (
         700.0,
         False,
@@ -190,7 +190,7 @@ def test_default_source_off_mac_is_null(monkeypatch: pytest.MonkeyPatch) -> None
     import minion_executor.capacity.signals as sg
 
     monkeypatch.setattr(sg, "sys", types.SimpleNamespace(platform="linux"))
-    assert isinstance(default_source(None), NullSignals)
+    assert isinstance(default_source(None, want_call=True), NullSignals)
 
 
 async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_works() -> None:
@@ -397,3 +397,18 @@ def test_startup_read_times_out_on_a_hung_source() -> None:
             _startup_read(Hung(), 0.05)
     finally:
         gate.set()
+
+
+def test_async_call_probe_recovers_after_a_hung_read_finishes() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    gate = threading.Event()
+    r = _Reader(gate, value=True)
+    p = AsyncCallProbe(r, timeout_s=0.1)
+    assert p.value() is None  # hung
+    gate.set()  # the hung read finishes
+    deadline = time.monotonic() + 5
+    while not p.settled() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert p.value() is True  # a new read started and returned its value
+    assert r.calls == 2

@@ -30,7 +30,7 @@ from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
 from minion_executor import bench_budget as budget_mod
-from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
+from minion_executor.capacity.config import ExecutorConfig, OnCall, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
 from minion_executor.capacity.gpu_meter import GpuMeterError
@@ -404,7 +404,9 @@ def run(
         budget = budget_for(prof, specs=specs)
         # An unsafe or uncreatable state dir (control.json, status.json) fails closed: exit 2.
         ensure_private_dir(settings.state_dir)
-        source = default_source(settings.fake_signals)  # SignalError (a RuntimeError): exit 2
+        source = default_source(
+            settings.fake_signals, want_call=config.on_call is not OnCall.IGNORE
+        )  # SignalError (a RuntimeError): exit 2
         plan = CapacityPlan(config, specs, pinned, source, settings)
         token = load_token()  # fail fast, before starting anything
     except TokenUnavailableError as exc:
@@ -682,7 +684,9 @@ def _watch_reactions(duration: float, out: Path | None) -> None:
             raise ValueError("duration must be in 1..3600 seconds")
         settings = ExecutorSettings()
         config = load_config(settings.config_path)
-        source = default_source(settings.fake_signals)
+        source = default_source(
+            settings.fake_signals, want_call=config.on_call is not OnCall.IGNORE
+        )
     except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
@@ -708,7 +712,9 @@ def _cpu_check(duration: float, out: Path | None) -> None:
             _check_out_path(out)
         settings = ExecutorSettings()
         config = load_config(settings.config_path)
-        source = default_source(settings.fake_signals)
+        source = default_source(
+            settings.fake_signals, want_call=config.on_call is not OnCall.IGNORE
+        )
     except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
