@@ -12,6 +12,8 @@ from pydantic import SecretStr
 
 from conftest import _auth, _req, _settings, make_executors, seed_task
 
+ALL_IF = "0.0.0.0"  # noqa: S104 - a config value under test, nothing binds to it
+TOKEN = "scrape-me-" + "x" * 32
 DEAD_DB = "postgresql+asyncpg://u:p@127.0.0.1:1/none"  # engines connect lazily: never reached
 
 
@@ -64,15 +66,15 @@ async def test_counts_route_templates_not_urls(on: AsyncClient) -> None:
 
 async def test_token_protects_metrics() -> None:
     cfg = _settings(DEAD_DB).model_copy(
-        update={"metrics_enabled": True, "metrics_token": SecretStr("scrape-me")}
+        update={"metrics_enabled": True, "metrics_token": SecretStr(TOKEN)}
     )
     async for c in _client(cfg):
         assert (await c.get("/metrics")).status_code == 401
         bad = await c.get("/metrics", headers={"Authorization": "Bearer nope"})
         assert bad.status_code == 401
-        ok = await c.get("/metrics", headers=_auth("scrape-me"))
+        ok = await c.get("/metrics", headers=_auth(TOKEN))
         assert ok.status_code == 200
-        assert "scrape-me" not in ok.text
+        assert TOKEN not in ok.text
 
 
 @pytest.mark.integration
@@ -96,3 +98,35 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
     assert 'minion_acquire_total{outcome="empty"} 1.0' in text
     assert 'minion_acquire_total{outcome="assigned"} 1.0' in text
     assert str(p.executor_id) not in text and "metrics-pool" not in text
+
+
+def _cfg(**kw: Any) -> ServerSettings:
+    return ServerSettings(
+        database_url=SecretStr("x"),
+        s3_access_key=SecretStr("a"),
+        s3_secret_key=SecretStr("b"),
+        **kw,
+    )
+
+
+def test_metrics_token_empty_is_unset_and_short_is_rejected() -> None:
+    assert _cfg(metrics_token="").metrics_token is None
+    assert _cfg(metrics_token=TOKEN).metrics_token is not None
+    with pytest.raises(ValueError, match="at least 32"):
+        _cfg(metrics_token="short")
+
+
+async def test_warns_when_metrics_are_open_on_a_non_loopback_host(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for host, expect in ((ALL_IF, True), ("127.0.0.1", False), ("localhost", False)):
+        cfg = _settings(DEAD_DB).model_copy(update={"metrics_enabled": True, "host": host})
+        async for _ in _client(cfg):
+            pass
+        assert ("metrics_unauthenticated" in capsys.readouterr().out) is expect, host
+    cfg = _settings(DEAD_DB).model_copy(
+        update={"metrics_enabled": True, "host": ALL_IF, "metrics_token": SecretStr(TOKEN)}
+    )
+    async for _ in _client(cfg):
+        pass
+    assert "metrics_unauthenticated" not in capsys.readouterr().out

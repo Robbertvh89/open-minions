@@ -1,7 +1,9 @@
 import asyncio
+import ipaddress
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import structlog
 from fastapi import FastAPI
 
 from minion_server.api import executor as executor_api
@@ -18,6 +20,13 @@ from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 
 
+def is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     """Build the app. With no settings, they are read from the environment at startup."""
 
@@ -30,6 +39,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
         app.state.settings = cfg
         app.state.metrics = Metrics() if cfg.metrics_enabled else None
+        if cfg.metrics_enabled and cfg.metrics_token is None and not is_loopback(cfg.host):
+            structlog.get_logger().warning("metrics_unauthenticated", host=cfg.host)
         app.state.api_keys = api_keys
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)

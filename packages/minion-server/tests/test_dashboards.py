@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DASHBOARDS = sorted((REPO_ROOT / "deploy" / "grafana" / "dashboards").glob("*.json"))
 RELATION = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.\"]*)", re.IGNORECASE)
+# non-updatable views (executor) fail before the privilege check; either way nothing is written
+DENIED = r"permission denied|cannot (insert into|update|delete from) view"
 _STEP = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
@@ -70,6 +72,15 @@ def test_panel_queries_only_the_minion_ro_schema(name: str, sql: str) -> None:
     # no way around the views: no public.* / catalog / raw table names
     assert not re.search(r"\bminion_(task|subtask|executor|subtask_attempt)\b", sql), name
     assert not re.search(r"token_hash|public\.|pg_", sql, re.IGNORECASE), name
+
+
+@pytest.mark.parametrize(
+    "title", ["Active executors", "Paused executors", "Paused by reason", "Donated memory"]
+)
+def test_fleet_panels_count_only_online_executors(title: str) -> None:
+    sqls = [sql for name, sql in panels() if name.startswith("fleet/") and title in name]
+    assert len(sqls) == 1
+    assert re.search(r"\bWHERE online\b", sqls[0]), sqls[0]
 
 
 def test_static_check_catches_a_raw_table() -> None:
@@ -141,7 +152,7 @@ async def test_minion_readonly_cannot_read_secrets_or_write(ro_engine: AsyncEngi
     ]
     for sql in denied:
         async with ro_engine.connect() as conn:
-            with pytest.raises(DBAPIError, match="permission denied"):
+            with pytest.raises(DBAPIError, match=DENIED):
                 await conn.execute(text(sql))
     # the views expose no secret column at all
     async with ro_engine.connect() as conn:
@@ -161,3 +172,14 @@ async def test_minion_readonly_cannot_read_secrets_or_write(ro_engine: AsyncEngi
         res = await conn.execute(text("SELECT owner, paused_reason FROM minion_ro.executor"))
         row = res.one()
     assert tuple(row) == ("alice", "thermal")
+    async with ro_engine.connect() as conn:
+        online = [
+            tuple(r)
+            for r in await conn.execute(
+                text(
+                    "SELECT count(*) FILTER (WHERE online), count(*) FROM minion_ro.executor"
+                    " WHERE paused_reason IS NOT NULL"
+                )
+            )
+        ]
+    assert online == [(1, 1)]  # ACTIVE and seen just now

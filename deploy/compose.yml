@@ -1,3 +1,4 @@
+# DEV ONLY - DO NOT DEPLOY. Default passwords, no TLS, ports on loopback; see docs/ARCHITECTURE.md §7.
 # Local development stack. The executor runs natively on macOS (needs Metal), not in Docker.
 # Server and watchdog services are added in a later milestone (ARCHITECTURE §6).
 name: open-minions
@@ -56,7 +57,10 @@ services:
     image: grafana/grafana:11.3.0
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Dev ergonomics: override with GF_SECURITY_ADMIN_PASSWORD in .env; the 'admin' default is dev only.
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
       # Read by the datasource provisioning ($MINION_GRAFANA_DB_PASSWORD); dev-only default.
       MINION_GRAFANA_DB_PASSWORD: ${MINION_GRAFANA_DB_PASSWORD:-minion-grafana-dev}
     ports:

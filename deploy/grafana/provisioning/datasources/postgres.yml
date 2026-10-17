@@ -12,4 +12,8 @@ datasources:
       database: minion
       sslmode: disable
       postgresVersion: 1600
+      maxOpenConns: 4  # below the role's CONNECTION LIMIT 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      timeout: 15  # seconds per query (Grafana-side; the DB-side limit is temp_file_limit)
     isDefault: true

@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy import func, select, update
+from sqlalchemy import func, null, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -174,7 +174,8 @@ async def finish_attempt(
             executor_id=o.executor_id,
             outcome=outcome.value,
             started_at=o.acquired_at,
-            error=error if error is not None else attempt_error,
+            # SQL NULL (not JSON null) when there is no error / release reason
+            error=(error if error is not None else attempt_error) or null(),
         )
     )
     await session.execute(

@@ -30,13 +30,37 @@ VIEWS = ("executor", "task", "subtask", "attempt", "heartbeat")
 
 # Operator-only data (S-11): hostname/owner/profile/paused_reason reveal when an owner is active.
 # Grafana is an operator tool; do not hand `minion_grafana` to ordinary users.
+#
+# `online` mirrors GET /executors (repositories/executors.py list_fleet): ACTIVE and heard from
+# within 600 s (the newest of last_seen_at and the heartbeat) while it holds a running subtask,
+# else within 120 s of last_seen_at. 600/120 are the defaults of the settings
+# `executor_online_busy_s` / `executor_online_idle_s`; a deployment that changes those must
+# recreate this view (the coupling is deliberate: a view cannot read server settings).
 _EXECUTOR = """
 CREATE VIEW minion_ro.executor AS
-SELECT executor_id, owner, pool, hostname, chip, total_memory_gb, os_version, engines, status,
-       profile, paused_reason, (budget ->> 'memory_gb')::numeric AS budget_memory_gb,
-       registered_at, last_seen_at, token_expires_at
-FROM public.minion_executor
+WITH hb AS (
+    SELECT q.executor_id, max(h.last_seen_at) AS last_hb
+    FROM public.minion_executor_heartbeat h
+    JOIN public.minion_subtask_acquirement q USING (acquirement_id)
+    GROUP BY q.executor_id
+)
+SELECT e.executor_id, e.owner, e.pool, e.hostname, e.chip, e.total_memory_gb, e.os_version,
+       e.engines, e.status, e.profile, e.paused_reason,
+       (e.budget ->> 'memory_gb')::numeric AS budget_memory_gb,
+       e.registered_at, e.last_seen_at, e.token_expires_at,
+       coalesce(
+           e.status = 'ACTIVE'
+           AND greatest(e.last_seen_at, hb.last_hb) >= now()
+               - CASE WHEN hb.last_hb IS NOT NULL THEN interval '600 seconds'
+                      ELSE interval '120 seconds' END,
+           false
+       ) AS online
+FROM public.minion_executor e
+LEFT JOIN hb USING (executor_id)
 """
+
+# The error code is exposed only when it has the shape of a stable code (never free text).
+_CODE = "CASE WHEN {col} ->> 'code' ~ '^[A-Z0-9_]{{1,64}}$' THEN {col} ->> 'code' END"
 
 _TASK = """
 CREATE VIEW minion_ro.task AS
@@ -49,21 +73,21 @@ FROM public.minion_task
 _SUBTASK = """
 CREATE VIEW minion_ro.subtask AS
 SELECT team, project, task_name, subtask_id, status, attempt, max_attempts, record_count,
-       error ->> 'code' AS error_code, created_at, updated_at
+       {code} AS error_code, created_at, updated_at
 FROM public.minion_subtask
-"""
+""".format(code=_CODE.format(col="error"))
 
 # One row per finished attempt, with the task's model and the subtask's record count so panels
 # need no joins. `error_code` is the failure code or, for RELEASED, the release reason.
 _ATTEMPT = """
 CREATE VIEW minion_ro.attempt AS
 SELECT a.id, a.team, a.project, a.task_name, a.subtask_id, a.attempt, a.executor_id, a.outcome,
-       a.started_at, a.finished_at, a.error ->> 'code' AS error_code,
+       a.started_at, a.finished_at, {code} AS error_code,
        t.model_id, s.record_count
 FROM public.minion_subtask_attempt a
 LEFT JOIN public.minion_task t USING (team, project, task_name)
 LEFT JOIN public.minion_subtask s USING (team, project, task_name, subtask_id)
-"""
+""".format(code=_CODE.format(col="a.error"))
 
 # One row per running subtask (its heartbeat): who is busy and how far along.
 _HEARTBEAT = """

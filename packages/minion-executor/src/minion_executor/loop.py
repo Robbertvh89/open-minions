@@ -188,6 +188,23 @@ class _SignalledError(Exception):
         self.signal = signal
 
 
+_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
+RELEASE_FALLBACK = "EXECUTOR_RELEASE"
+FAIL_FALLBACK = "RUNNER_ERROR"
+
+
+def _release_code(code: str) -> str:
+    """A release reason the server accepts; anything else (e.g. a runner's free-form code)
+    becomes the fixed fallback so a bad code can never break the release."""
+    return code if _CODE_RE.fullmatch(code) else RELEASE_FALLBACK
+
+
+def _fail_code(code: str) -> str:
+    """A failure code the server accepts: upper-cased, or the fallback when still invalid."""
+    up = code.upper()
+    return up if _CODE_RE.fullmatch(up) else FAIL_FALLBACK
+
+
 class _HardStoppedError(Exception):
     """A server call was abandoned because the hard stop fired and its time ran out."""
 
@@ -1316,25 +1333,22 @@ class ExecutorLoop:
             await self._release(a, bound, f.code)
             return
         try:
-            await asyncio.wait_for(
-                self._client.fail(
-                    a.acquirement_id,
-                    FailRequest(retryable=f.retryable, code=f.code, message=f.message[:1000]),
-                ),
-                self._call_timeout(),
+            req = FailRequest(
+                retryable=f.retryable, code=_fail_code(f.code), message=f.message[:1000]
             )
+            await asyncio.wait_for(self._client.fail(a.acquirement_id, req), self._call_timeout())
         except StaleAcquirementError:
             bound.info("stale_discarded")
-        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError, ValidationError) as exc:
             bound.warning("fail_report_failed", error=type(exc).__name__)
 
     async def _release(self, a: Assignment, bound: Any, code: str) -> None:
         """Hand the subtask back; `code` (stable reason) goes to the attempt history."""
         try:
             await asyncio.wait_for(
-                self._client.release(a.acquirement_id, ReleaseRequest(code=code)),
+                self._client.release(a.acquirement_id, ReleaseRequest(code=_release_code(code))),
                 self._call_timeout(),
             )
             bound.info("subtask_released")
-        except (httpx.HTTPError, ApiError, TimeoutError) as exc:
+        except (httpx.HTTPError, ApiError, TimeoutError, ValidationError) as exc:
             bound.warning("release_failed", error=type(exc).__name__)

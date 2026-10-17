@@ -87,6 +87,9 @@ def test_preference_all_none_and_slug() -> None:
 
 def test_fail_message_limit() -> None:
     FailRequest(retryable=True, code="OOM", message="x" * 1000)
+    for bad in ("", "oom", "A-B", "X" * 65):
+        with pytest.raises(ValidationError):
+            FailRequest(retryable=True, code=bad, message="m")
     with pytest.raises(ValidationError):
         FailRequest(retryable=True, code="OOM", message="x" * 1001)
 

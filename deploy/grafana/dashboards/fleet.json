@@ -39,7 +39,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT count(*) AS active\nFROM minion_ro.executor e\nWHERE e.status = 'ACTIVE' AND (\n  e.last_seen_at > now() - interval '2 minutes'\n  OR EXISTS (SELECT 1 FROM minion_ro.heartbeat h\n             WHERE h.executor_id = e.executor_id AND h.last_seen_at > now() - interval '10 minutes'))"
+          "rawSql": "SELECT count(*) AS active FROM minion_ro.executor WHERE online"
         }
       ],
       "fieldConfig": {
@@ -123,7 +123,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT count(*) AS paused FROM minion_ro.executor\nWHERE status = 'ACTIVE' AND paused_reason IS NOT NULL"
+          "rawSql": "SELECT count(*) AS paused FROM minion_ro.executor\nWHERE online AND paused_reason IS NOT NULL"
         }
       ],
       "fieldConfig": {
@@ -205,7 +205,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT paused_reason, count(*) AS executors FROM minion_ro.executor\nWHERE status = 'ACTIVE' AND paused_reason IS NOT NULL\nGROUP BY 1 ORDER BY 1"
+          "rawSql": "SELECT paused_reason, count(*) AS executors FROM minion_ro.executor\nWHERE online AND paused_reason IS NOT NULL\nGROUP BY 1 ORDER BY 1"
         }
       ],
       "fieldConfig": {
@@ -253,7 +253,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT profile, sum(coalesce(budget_memory_gb, 0)) AS memory_gb\nFROM minion_ro.executor WHERE status = 'ACTIVE' AND profile IS NOT NULL\nGROUP BY 1 ORDER BY 1"
+          "rawSql": "SELECT profile, sum(coalesce(budget_memory_gb, 0)) AS memory_gb\nFROM minion_ro.executor WHERE online AND profile IS NOT NULL\nGROUP BY 1 ORDER BY 1"
         }
       ],
       "fieldConfig": {
@@ -369,7 +369,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT e.owner, e.hostname, e.chip, e.pool, e.profile, e.paused_reason, e.last_seen_at,\n  (SELECT count(*) FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id) AS running,\n  (SELECT count(*) FROM minion_ro.attempt a WHERE a.executor_id = e.executor_id AND a.outcome = 'SUCCEEDED' AND $__timeFilter(a.finished_at)) AS completed\nFROM minion_ro.executor e WHERE e.status = 'ACTIVE'\nORDER BY e.last_seen_at DESC NULLS LAST LIMIT 100"
+          "rawSql": "SELECT e.owner, e.hostname, e.chip, e.pool, e.profile, e.paused_reason, e.last_seen_at, e.online,\n  (SELECT count(*) FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id) AS running,\n  (SELECT count(*) FROM minion_ro.attempt a WHERE a.executor_id = e.executor_id AND a.outcome = 'SUCCEEDED' AND $__timeFilter(a.finished_at)) AS completed\nFROM minion_ro.executor e WHERE e.status = 'ACTIVE'\nORDER BY e.last_seen_at DESC NULLS LAST LIMIT 100"
         }
       ],
       "fieldConfig": {

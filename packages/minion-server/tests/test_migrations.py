@@ -145,3 +145,27 @@ def test_0007_readonly_views_round_trip(fresh_url: str) -> None:
     assert asyncio.run(_table_count(fresh_url)) == 7  # tables untouched
     command.upgrade(cfg, "head")
     assert asyncio.run(_scalar(fresh_url, views)) == 5
+
+
+async def _view_privileges(url: str) -> list[tuple[str, bool]]:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT viewname, has_table_privilege('minion_readonly',"
+                    " format('%I.%I', schemaname, viewname), 'SELECT')"
+                    " FROM pg_views WHERE schemaname = 'minion_ro' ORDER BY 1"
+                )
+            )
+            return [(r[0], bool(r[1])) for r in res]
+    finally:
+        await eng.dispose()
+
+
+def test_0007_minion_readonly_can_select_every_view(fresh_url: str) -> None:
+    """A view added or recreated later must be granted again (db-migration skill)."""
+    command.upgrade(alembic_config(fresh_url), "head")
+    privs = asyncio.run(_view_privileges(fresh_url))
+    assert len(privs) == 5
+    assert all(ok for _, ok in privs), privs
