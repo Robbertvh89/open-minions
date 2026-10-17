@@ -1,9 +1,10 @@
 ---
 id: TASK-7.1
 title: M6.1 Index acquired_at for the max-lease reclaim scan + watchdog tick timing
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-17 20:36'
 labels:
   - server
 dependencies: []

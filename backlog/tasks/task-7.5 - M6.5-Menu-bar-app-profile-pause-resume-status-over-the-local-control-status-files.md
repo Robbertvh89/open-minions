@@ -3,9 +3,10 @@ id: TASK-7.5
 title: >-
   M6.5 Menu-bar app: profile/pause/resume/status over the local control/status
   files
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-17 20:36'
 labels:
   - executor
 dependencies: []
