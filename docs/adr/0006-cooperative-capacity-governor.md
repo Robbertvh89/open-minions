@@ -281,17 +281,17 @@ engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac 
 
 ## Measurements
 
-> Filled in by TASK-5.6 from the M3 Pro run (docs/bench/m4-governor-apple-m3-pro.{json,md}; the table is tee'd to the .md).
+> M3 Pro (36 GB, macOS 27.0.1), TASK-5.6: docs/bench/m4-governor-apple-m3-pro.{json,md} (NF-8, NF-9 CI) and docs/bench/m4-governor-cpu-apple-m3-pro.json (NF-4). The first per-process run found a pacing bug (mlx-lm async_eval work running during the pacer sleep: qwen balanced 74–76 % at duty 50 %), fixed by quantum pacing; see the .md for the history.
 
 | Check | Result | Verdict |
 |---|---|---|
-| NF-8 hard bound (share <= duty + 10 pp), light / balanced / full | _TBD_ | _TBD_ |
-| NF-8 accuracy (+-10 pp of duty x unpaced share) | _TBD_ | _TBD_ |
-| NF-8 memory (footprint <= 1.1 x memory_gb) | _TBD_ | _TBD_ |
-| NF-9 CI, 20 trials, poll 0.25 s: max | _TBD_ | < 5 s |
-| NF-9 Mac, production poll 2 s: memory pressure / user return / thermal+power (FileSignals) | _TBD_ | < 5 s |
-| NF-4 control-process CPU, idle / paused (60 s) | _TBD_ | < 1 % |
-| Q5 (adaptive duty from total GPU utilization): answered by the data above? | _TBD_ | |
+| NF-8 hard bound (share <= duty + 10 pp), light / balanced / full | qwen2.5-0.5b-mlx 21–22 % / 31–35 % / 77–78 %; minilm-mlx 12–13 % / 20–22 % / 54–55 % (per-process GPU time, 3 repeats) | pass (18/18 rows) |
+| NF-8 accuracy (+-10 pp of duty x unpaced share) | qwen light 21–22 vs 22–23 %, balanced 31–35 vs 39–41 %; minilm light 12–13 vs 10 %, balanced 20–22 vs 28–29 %; errs low | pass (12/12 paced rows) |
+| NF-8 memory (footprint <= 1.1 x memory_gb) | peak 0.45–2.09 GB vs 9.0 / 14.4 / 25.2 GB | pass |
+| NF-9 CI, 20 trials, poll 0.25 s: max | 0.433 s (on battery 5 %); p50 0.10–0.25 s per event | pass (< 5 s) |
+| NF-9 Mac, production poll 2 s: memory pressure / user return / thermal+power (FileSignals) | not run on this Mac (needs a person at the keyboard and induced swap); opt-in procedure in docs/bench/governor-measurements.md; bound by poll (≤ 4 s cap) + one step + ack | open (opt-in) |
+| NF-4 control-process CPU, idle / paused (60 s) | 0.134 % / 0.162 % | pass (< 1 %) |
+| Q5 (adaptive duty from total GPU utilization): answered by the data above? | Partly: device-wide utilization is 31–39 % on an idle desktop and moves with DVFS, so a policy keyed on total GPU utilization would need a per-process signal (AGX accumulatedGPUTime works) and its own experiment; Q5 stays open | |
 
 ## Consequences
 

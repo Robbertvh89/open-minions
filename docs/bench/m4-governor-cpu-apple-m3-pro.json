@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "kind": "cpu-check",
+  "results": [
+    {
+      "state": "idle",
+      "poll_s": 2.0,
+      "duration_s": 60.00046416699479,
+      "cpu_s": 0.0802480000000001,
+      "cpu_pct": 0.13374563199486567,
+      "passed": true
+    },
+    {
+      "state": "paused",
+      "poll_s": 2.0,
+      "duration_s": 60.00109325000085,
+      "cpu_s": 0.0971280000000001,
+      "cpu_pct": 0.16187705046524087,
+      "passed": true
+    }
+  ]
+}
