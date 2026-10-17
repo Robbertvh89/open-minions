@@ -40,7 +40,7 @@ is built) | [Decision records](docs/adr/).
 ## Status and limitations
 
 Milestones M0 to M5 (protocol, fault tolerance, real engines, capacity governor, ops usability and
-the `minion` submitter CLI) are implemented and tested. The scale test and a menu-bar app (M6) are
+the `minion` submitter CLI) are implemented and tested, except the human NF-7 study (see below). The scale test and a menu-bar app (M6) are
 not. Some things are measured only on one Mac, or not at all; read [Known limitations](#known-limitations)
 before you rely on it, in particular if you plan to run it on people's work laptops.
 
@@ -52,13 +52,15 @@ GPU). You can follow it on Linux or macOS; real engines need an Apple Silicon Ma
 ([next section](#using-real-models-on-a-mac)).
 
 **Prerequisites:** Docker with Compose v2, [`uv`](https://docs.astral.sh/uv/), Python 3.12+ (uv
-installs it), git. Free host ports 8080 (server), 5432, 9000 and 3000. If 8080 is taken, run
-`export MINION_SERVER_HOST_PORT=18080` first and use that port instead of 8080 below.
+installs it), git. Free host ports 8080 (server), 5432, 9000 and 3000. If one is taken, set
+`MINION_SERVER_HOST_PORT`, `MINION_PG_PORT`, `MINION_S3_PORT` or `MINION_GRAFANA_PORT` (for example
+`export MINION_SERVER_HOST_PORT=18080`) and use that port below. If you change the S3 port, set
+`MINION_CLI_S3_ENDPOINT_URL` (step 8) to match.
 
 **1. Clone and install**
 
 ```bash
-git clone git@github.com:Robbertvh89/open-minions.git && cd open-minions
+git clone https://github.com/Robbertvh89/open-minions.git && cd open-minions
 uv sync
 ```
 
@@ -72,6 +74,11 @@ export MINION_API_KEY=$(printf '%s\n' "$out" | sed -n 's/^api key (shown once): 
 printf '%s\n' "$out" | sed -n '/^keys:/,$p' > deploy/secrets/api-keys.yaml
 chmod 600 deploy/secrets/api-keys.yaml
 ```
+
+On **Linux** the server runs as uid 10001 and refuses a keys file owned by anyone else (every request
+is then `401` while the stack looks healthy). Give it the files:
+`sudo chown -R 10001:10001 deploy/secrets`. (Alternative: keep them `root:root`, directory 0755 and
+file 0644.) On macOS Docker Desktop this is not needed.
 
 **3. Optional: enable the web UI.** The UI is off (404) unless a session secret is set before the
 server starts.
@@ -96,21 +103,30 @@ watchdog are healthy.
 ```bash
 docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app exec -T server \
   minion-server-admin issue-executor-token --owner demo
-export MINION_EXECUTOR_TOKEN=<paste the token>
 ```
 
-The command prints `executor_id: ...` and `token (shown once): ...`; export the part after the colon.
+The command prints `executor_id: ...` and `token (shown once): ...`. Export the token without
+putting it in your shell history, then paste it when asked:
+
+```bash
+read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN
+```
 
 **6. Run a dev executor with the fake engine** (in a second terminal, in the repo, with
 `MINION_EXECUTOR_TOKEN` exported there too). `MINION_EXECUTOR_DEV=1` is what allows the `fake`
-engine. On a Mac the fake engine runs in the normal Seatbelt sandbox (checked).
+engine. On a Mac the fake engine runs in the normal Seatbelt sandbox (checked). The executor
+pauses on battery power and under memory pressure by default, so on a laptop plug in the charger or
+submit will wait forever (see Troubleshooting below).
 
 ```bash
 MINION_EXECUTOR_DEV=1 uv run minion-executor run --server http://localhost:8080 --engines fake
 ```
 
-On Linux the Seatbelt sandbox does not exist; add `MINION_EXECUTOR_SANDBOX=0` (accepted only together
-with `MINION_EXECUTOR_DEV=1`). The Linux path is untested.
+On Linux there is no Seatbelt sandbox; the worker skips it for the fake engine only (any other engine
+fails closed), so no extra flag is needed. The Linux path is untested.
+
+`MINION_EXECUTOR_DEV=1` and `MINION_EXECUTOR_SANDBOX=0` are for local development only. Never set
+them on a machine that runs real tasks.
 
 **7. Create sample input.** One JSON object per line. Embedding input needs `id` and `text`:
 
@@ -165,27 +181,52 @@ uv run minion submit --type embedding --model fake-embed embed.jsonl --no-wait -
 uv run minion cancel demo-two         # the only way to cancel
 ```
 
+The instant fake engine may finish `demo-two` before you cancel; `cancel` then says `TASK_FINISHED`
+(`409`, exit 2). To see a cancel, stop the executor first (Ctrl-C), submit, cancel, then restart it.
+
 **10. Look around.** Web UI: <http://localhost:8080/ui> (log in with the API key from step 2; you
 see the task list, details, the create form and cancel). Grafana: <http://localhost:3000>, login
-`admin` / `admin` (dev default), dashboards `open-minions: tasks` and `open-minions: fleet`..
+`admin` / `admin` (dev default), dashboards `open-minions: tasks` and `open-minions: fleet`.
 
 **11. Tear down.** Stop the executor with Ctrl-C in its terminal (it finishes or releases the
-current subtask first). `down` keeps your data volumes; add `-v` to wipe them.
+current subtask first).
 
 ```bash
 docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app down
-rm -rf deploy/secrets embed.jsonl complete.jsonl out-embed out-complete
+rm -rf embed.jsonl complete.jsonl out-embed out-complete
+rm -rf deploy/secrets      # on Linux after the chown: sudo rm -rf deploy/secrets
 ```
+
+`down` keeps the data volumes, so old tasks survive and an executor (FIFO) would process these
+leftovers first next time. For a clean slate use `down -v` instead (this **deletes** all dev
+data: database, S3 objects, Grafana). Alternatively point the executor at your own tasks with
+`minion-executor prefer --server URL --team T`.
+
+**Troubleshooting.** `submit` waits and nothing happens: run `uv run minion-executor status` and read
+`paused_reason`. On battery the executor is paused by default (`low_battery`): plug in, or set
+`allow_on_battery = true` in `~/.config/minion/executor.toml` ([Mac owners](#mac-owners)). It also
+pauses at a memory-pressure warning.
 
 ## Using real models on a Mac
 
-On an Apple Silicon Mac, install the engines and drop the dev flags:
+On an Apple Silicon Mac, reuse Quick start steps 2, 5 and 8, but start the stack **without**
+`compose.dev.yml` (the stock model allow-list, no fake models). Issue the token with:
+
+```bash
+docker compose -f deploy/compose.yml --profile app exec -T server \
+  minion-server-admin issue-executor-token --owner <name>
+```
+
+Then install the engines and run without the dev flags (if you changed a host port, use it in
+`--server` and the `MINION_CLI_*` values):
 
 ```bash
 uv sync --package minion-executor --extra mlx --extra hf     # mlx: default engine; hf: fallback
-export MINION_EXECUTOR_TOKEN=<token>                          # or Keychain, see Mac owners
+read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN   # or the Keychain (recommended, see Mac owners)
 uv run minion-executor run --server http://localhost:8080 --profile light
 ```
+
+The first subtask loads the model (about 30 s on an M3 Pro, longer when it must be downloaded first).
 
 - `--engines auto` (the default) probes `mlx` and `hf` in a sandboxed worker subprocess and
   advertises what works (exit 2 if none). Ollama is opt-in (`--engines ollama`, see
@@ -200,7 +241,7 @@ uv run minion-executor run --server http://localhost:8080 --profile light
 - Profiles `light` (25 % of RAM, 30 % GPU duty, batch 4), `balanced` (40 %, 50 %, 8), `full`
   (70 %, 100 %, 32) and `custom`. Omit `--profile` for adaptive mode ([Mac owners](#mac-owners)).
 - Measure your own Mac: `uv run minion-executor bench --models deploy/bench-models.yaml --model <id>`
-  (see CLAUDE.md for all bench modes). Results from an M3 Pro: [`docs/bench/`](docs/bench/m3-apple-m3-pro.md).
+  (`uv run minion-executor bench --help` lists all modes). Results from an M3 Pro: [`docs/bench/`](docs/bench/m3-apple-m3-pro.md).
   Measurement procedures: [`docs/bench/governor-measurements.md`](docs/bench/governor-measurements.md).
 
 ## Guides
@@ -260,20 +301,9 @@ user from exhausting CPU or memory). `/healthz` is always on; Prometheus `/metri
 `MINION_METRICS_ENABLED=true`, and with `MINION_METRICS_TOKEN` (32+ chars) it requires
 `Authorization: Bearer <token>`. Logs never contain payload content.
 
-**Rate limits.** Executors calling `register`, `acquire`, `presence` or `PUT /executor/preference`
-faster than `MINION_REGISTER_MIN_INTERVAL_S` (5), `MINION_ACQUIRE_MIN_INTERVAL_S` (0.2),
-`MINION_PRESENCE_MIN_INTERVAL_S` (5) or `MINION_PREFERENCE_MIN_INTERVAL_S` (1) get `429` with
-`Retry-After`; heartbeats are limited by `MINION_HEARTBEAT_MIN_INTERVAL_S` (1). These are in-memory per
-replica; per-IP limits belong at the proxy ([ADR-0012](docs/adr/0012-in-memory-executor-rate-limits.md)).
+**Rate limits.** Executor endpoints are rate-limited in memory per replica (`429` with `Retry-After`); the intervals and defaults are in [`.env.example`](.env.example) and [ADR-0012](docs/adr/0012-in-memory-executor-rate-limits.md). Put per-IP limits at the proxy.
 
-**Storage and S3 policy.** Server S3 credentials never reach executors, which only get presigned
-URLs (default TTL 900 s, max 3600). Give each team's submitters their **own** credentials (never the
-server's): `PutObject`, `AbortMultipartUpload` and `GetObject` on `inputs/{team}/*`, `GetObject` on
-`outputs/{team}/*`, `ListBucket` limited to those two prefixes, and no `DeleteObject` and no `PutObject`
-on `outputs/` (SPEC S-14). Add a lifecycle rule that aborts incomplete multipart uploads and expires
-`_attempts/` objects, enable versioning or Object Lock on `inputs/`, and set a bucket quota: an
-executor can write an oversized attempt object until `complete` rejects it
-(`MINION_MAX_OUTPUT_BYTES`, 4 GiB). Executor output goes through presigned PUT only.
+**Storage and S3 policy.** Executors only get presigned URLs (default TTL 900 s); give each team's submitters their **own** scoped credentials, never the server's, and add lifecycle rules and a bucket quota. The exact policy is in [SPEC S-14](docs/SPEC.md) and S-2.
 
 **Watchdog.** `uv run minion-watchdog` (DB access only, no S3) reclaims subtasks whose heartbeat is
 older than `MINION_HEARTBEAT_TIMEOUT_S` (900 s) or whose lease exceeds `MINION_MAX_LEASE_S` (6 h),
@@ -300,11 +330,12 @@ security add-generic-password -s open-minions-executor -a "$USER" -w     # paste
 minion-executor service install --server https://minions.example.com --dry-run   # print the plist
 minion-executor service install --server https://minions.example.com
 minion-executor service status
-minion-executor service uninstall
 ```
 
-Options: `--profile`, `--engines`, `--label`, `--no-load`. `$MINION_EXECUTOR_TOKEN` also works for
-foreground runs, but launchd cannot see it, so the service needs the Keychain item. The log is
+To remove it again: `minion-executor service uninstall`.
+
+Options: `--profile`, `--engines`, `--label`, `--no-load`. For real use keep the token in the Keychain
+(launchd cannot see `$MINION_EXECUTOR_TOKEN`, so the service needs the Keychain item anyway). The log is
 `~/Library/Logs/open-minions/executor.log`.
 
 **Profiles.** `--profile light|balanced|full|custom` pins a profile. Without `--profile` the
@@ -325,7 +356,8 @@ variable as at install. `status` exits 1 if no executor is running.
 
 **Automatic pauses.** No new work, and the running subtask is released after 60 s (at once under
 critical memory pressure), on: memory pressure, serious/critical thermal state, battery power (unless
-`allow_on_battery = true`, then below 30 %), Low Power Mode, or an unusable `control.json`. Stop it
+`allow_on_battery = true`, then below 30 %), Low Power Mode, an unusable `control.json`, or signals
+that cannot be read (`signals_unavailable`). Stop it
 any time with SIGTERM or `launchctl bootout`; the in-flight subtask finishes within
 `MINION_EXECUTOR_STOP_GRACE_S` (30) or is released.
 
@@ -334,13 +366,7 @@ permissions, unknown keys are an error (exit 2). Keys: `active_profile`, `idle_p
 `idle_after_min`, `allow_on_battery`, `min_battery_percent`, `on_call`, `[profiles.<name>]`
 overrides, `[profiles.custom]`, `[[schedule]]` (profile, `HH:MM` start/end, days).
 
-**`on_call` and privacy.** The governor can notice that a microphone or camera is in use (no device
-is opened, no permission prompt). `on_call = "auto"` (default) caps an adaptive executor at `light`
-during calls; `"light"` caps pinned profiles too; `"pause"` pauses; `"ignore"` turns it off. What the
-server learns: your profile, memory budget and pause reason on every call, so a switch from `light` to
-`full` shows that you went idle, and a drop to `light` can hint at a call (`on_call = "pause"` says so
-outright). Keyboard idle time and the microphone/camera state are never sent. If that matters to you,
-pin a profile or set `on_call = "ignore"` ([SPEC S-11](docs/SPEC.md)). Prefer a task or team with
+**`on_call` and privacy.** The governor can notice that a microphone or camera is in use and cap or pause the executor (`on_call = auto|light|pause|ignore`); no device is opened. The server learns your profile, memory budget and pause reason, which can reveal when you are idle or on a call; keyboard idle time and mic/camera state are never sent. Details and how to opt out: [SPEC S-11](docs/SPEC.md). Prefer a task or team with
 `minion-executor prefer --server URL (--team T [--project P] [--task-name N] | --clear)`; it is a
 hint, not a filter.
 
@@ -383,10 +409,10 @@ Configuration is the environment (there is no config file):
 
 | Variable | Meaning |
 |---|---|
-| `MINION_API_KEY` | your API key; or the Keychain item `open-minions-api-key` |
-| `MINION_CLI_SERVER` | server URL (`https` only; plain `http` only for loopback) |
+| `MINION_API_KEY` | your API key; or the Keychain item `open-minions-api-key` (`security add-generic-password -s open-minions-api-key -a "$USER" -w`) |
+| `MINION_CLI_SERVER` | server URL (`https`, or `http` to loopback) |
 | `MINION_CLI_TEAM`, `MINION_CLI_PROJECT` | team (required, must be in your key's teams) and project (default `default`) |
-| `MINION_CLI_S3_ENDPOINT_URL` | `https` S3 endpoint; unset = AWS default |
+| `MINION_CLI_S3_ENDPOINT_URL` | S3 endpoint (`https`, or `http` to loopback); unset = AWS default |
 | `MINION_CLI_S3_BUCKET`, `MINION_CLI_S3_REGION` | bucket (`minion`), region (`us-east-1`) |
 | `MINION_CLI_S3_ACCESS_KEY`, `MINION_CLI_S3_SECRET_KEY` | your team-scoped credentials; unset = boto3 default chain |
 | `MINION_CLI_INPUT_PREFIX`, `MINION_CLI_OUTPUT_PREFIX` | `inputs/`, `outputs/` |
@@ -399,7 +425,7 @@ Configuration is the environment (there is no config file):
 | 1 | task `FAILED` or `CANCELLED` |
 | 2 | usage, config, auth or other 4xx error |
 | 3 | task `PARTIAL` (some subtasks failed; fetch what succeeded) |
-| 4 | timeout, or server or S3 unreachable |
+| 4 | timeout, or server (also 5xx) or S3 unreachable |
 | 130 | Ctrl-C (the task keeps running; `minion cancel` is the only way to cancel) |
 
 **Input and output.** Embedding input: `{"id", "text"}`. Completion input: `{"id", "prompt"}` or
@@ -478,13 +504,14 @@ CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the
 - **NF-7 (no visible harm during video calls) is not met everywhere.** The synthetic foreground
   proxy ([`docs/bench/m5-foreground-apple-m3-pro.md`](docs/bench/m5-foreground-apple-m3-pro.md)) fails for the
   `minilm` embedding model at `light` (+1.11 percentage points of missed frames) and `balanced`
-  (+1.56 pp); the completion model passes. The proxy is confounded by GPU clock scaling (DVFS: a
+  (+1.56 pp); the completion model passes. `minilm` is a bench-only model; the served embedding
+  model `bge-small-en` was not measured. The proxy is confounded by GPU clock scaling (DVFS: a
   probe frame takes about 22 ms on an idle GPU and 9.5 ms under full load). Tracked in TASK-24.
 - **The human NF-7 study has not been run.** [`docs/usability/nf7-video-call-protocol.md`](docs/usability/nf7-video-call-protocol.md)
   needs at least 8 people on their own Macs. Until then, do not claim calls are unaffected.
 - **Real microphone/camera call detection is not verified on hardware** (`on_call`); it is covered by
   tests with injected signals only. Screen sharing is not detected.
-- **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15).
+- **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15): a misbehaving or compromised worker can exceed it.
   Measured on one Mac (Apple M3 Pro, [`docs/bench/`](docs/bench/)); other chips are untested.
 - **Presigned PUT cannot cap upload size.** An executor can write a large object under its own
   attempt key until `complete` rejects it; use a bucket quota and lifecycle rules (TASK-19, S-2).
@@ -495,6 +522,10 @@ CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
   capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)).
 - **Not built yet:** scale test and menu-bar app (TASK-7), timer-based split-lease renewal for very large single-object inputs (TASK-11).
+- **Hardening gaps (TASK-9):** no absolute per-batch wall-clock cap, no server cap on
+  `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state dir or
+  `executor.toml` (mode bits only).
+- **Ollama completions** silently truncate long prompts instead of returning `PROMPT_TOO_LONG` (TASK-12).
 - **Operations gaps:** no backup guidance, no code-signed executor build, the compose stack is
   dev only. The web UI has no SSO (put an OIDC proxy in front).
 
