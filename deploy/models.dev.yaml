@@ -1,0 +1,41 @@
+# DEV ONLY - DO NOT DEPLOY. Allow-list for the README quick start (deploy/compose.dev.yml):
+# the stock models plus two entries served by the executor's `fake` engine (no GPU, deterministic;
+# fake-complete echoes the prompt). The fake engine only runs with MINION_EXECUTOR_DEV=1.
+# Keep the real entries in sync with deploy/models.yaml (a test checks this).
+models:
+  - model_id: fake-embed
+    type: embedding
+    engine: fake
+    ref: fake
+    revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    memory_gb: 0.1
+  - model_id: fake-complete
+    type: completion
+    engine: fake
+    ref: fake
+    revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    memory_gb: 0.1
+  - model_id: qwen2.5-0.5b-instruct
+    type: completion
+    engine: mlx
+    ref: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+    revision: a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3
+    memory_gb: 1.0
+  - model_id: bge-small-en
+    type: embedding
+    engine: mlx
+    ref: mlx-community/bge-small-en-v1.5-bf16
+    revision: 0e415031434cdf5f1b89d584e11be33b82abfc8d
+    memory_gb: 0.5
+  - model_id: qwen2.5-0.5b-instruct-hf
+    type: completion
+    engine: hf
+    ref: Qwen/Qwen2.5-0.5B-Instruct
+    revision: 7ae557604adf67be50417f59c2c2f167def9a775
+    memory_gb: 2.5  # measured worker RSS peak 2.26 GB at batch 32 (docs/bench/m3-apple-m3-pro.md)
+  - model_id: bge-small-en-hf
+    type: embedding
+    engine: hf
+    ref: BAAI/bge-small-en-v1.5
+    revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+    memory_gb: 0.5

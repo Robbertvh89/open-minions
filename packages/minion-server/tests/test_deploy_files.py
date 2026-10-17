@@ -167,3 +167,33 @@ def test_every_workspace_member_pyproject_is_copied_before_the_locked_sync() -> 
     for pyproject in sorted((ROOT / "packages").glob("*/pyproject.toml")):
         rel = pyproject.relative_to(ROOT).as_posix()
         assert rel in copied, f"deploy/Dockerfile has no COPY line for {rel}"
+
+
+# --- dev override (README quick start) ----------------------------------------------------------
+
+COMPOSE_DEV = ROOT / "deploy" / "compose.dev.yml"
+MODELS_DEV = ROOT / "deploy" / "models.dev.yaml"
+
+
+def test_models_dev_file_loads_and_extends_the_stock_list() -> None:
+    from minion_server.models_registry import load_models
+
+    dev = load_models(MODELS_DEV)
+    stock = load_models(ROOT / "deploy" / "models.yaml")
+    assert dev["fake-embed"].engine.value == "fake"
+    assert dev["fake-complete"].type.value == "completion"
+    assert dev["fake-complete"].engine.value == "fake"
+    assert {k: v for k, v in dev.items() if v.engine.value != "fake"} == stock
+
+
+def test_compose_dev_override_mounts_the_dev_models_file_read_only() -> None:
+    doc = yaml.safe_load(COMPOSE_DEV.read_text())
+    assert set(doc["services"]) == {"server"}
+    server = doc["services"]["server"]
+    target = server["environment"]["MINION_MODELS_FILE"]
+    [mount] = server["volumes"]
+    src, dst, mode = mount.split(":")
+    assert (ROOT / "deploy" / src).resolve() == MODELS_DEV
+    assert dst == target
+    assert mode == "ro"
+    assert COMPOSE_DEV.read_text().startswith("# DEV ONLY")

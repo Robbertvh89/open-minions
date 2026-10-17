@@ -82,3 +82,11 @@ def test_imports_and_contents(image: str) -> None:
 def test_compose_config_with_app_profile_is_valid() -> None:
     out = _docker("compose", "-f", "deploy/compose.yml", "--profile", "app", "config", "-q")
     assert out.returncode == 0, out.stderr
+
+
+def test_compose_config_with_dev_override_is_valid() -> None:
+    out = _docker(
+        "compose", "-f", "deploy/compose.yml", "-f", "deploy/compose.dev.yml",
+        "--profile", "app", "config", "-q",
+    )  # fmt: skip
+    assert out.returncode == 0, out.stderr

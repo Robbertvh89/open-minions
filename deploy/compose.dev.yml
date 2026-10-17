@@ -1,0 +1,11 @@
+# DEV ONLY - DO NOT DEPLOY. Overlay for the README quick start: swaps the server's model allow-list
+# for deploy/models.dev.yaml, which adds the fake-embed / fake-complete models (executor `fake`
+# engine, needs MINION_EXECUTOR_DEV=1). Never use it in production: it lets a task name a model
+# that does no real inference.
+#   docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app up -d --build --wait
+services:
+  server:
+    environment:
+      MINION_MODELS_FILE: /run/minion-models/models.dev.yaml
+    volumes:
+      - ./models.dev.yaml:/run/minion-models/models.dev.yaml:ro
