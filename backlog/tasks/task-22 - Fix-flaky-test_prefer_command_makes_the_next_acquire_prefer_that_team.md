@@ -1,10 +1,10 @@
 ---
 id: TASK-22
 title: Fix flaky test_prefer_command_makes_the_next_acquire_prefer_that_team
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 13:45'
-updated_date: '2026-10-17 13:45'
+updated_date: '2026-10-17 14:03'
 labels:
   - executor
   - test
