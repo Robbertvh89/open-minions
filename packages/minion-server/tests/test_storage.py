@@ -54,6 +54,64 @@ def test_presigned_host_uses_public_endpoint() -> None:
     assert urlsplit(url).scheme == "https"
 
 
+def _unit_storage() -> S3Storage:
+    return S3Storage(
+        ServerSettings(
+            database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+            s3_access_key=SecretStr("ak"),
+            s3_secret_key=SecretStr("sk"),
+        )
+    )
+
+
+async def test_presign_get_signs_the_range_header() -> None:
+    from urllib.parse import parse_qs
+
+    st = _unit_storage()
+    ranged = parse_qs(urlsplit(await st.presign_get("inputs/a", 60, (10, 20))).query)
+    assert "range" in ranged["X-Amz-SignedHeaders"][0].split(";")
+    plain = parse_qs(urlsplit(await st.presign_get("inputs/a", 60)).query)
+    assert "range" not in plain["X-Amz-SignedHeaders"][0].split(";")
+    # a different slice yields a different signature
+    other = parse_qs(urlsplit(await st.presign_get("inputs/a", 60, (10, 21))).query)
+    assert other["X-Amz-Signature"] != ranged["X-Amz-Signature"]
+
+
+@pytest.mark.integration
+async def test_signed_range_get_enforced_by_s3(s3: S3Env) -> None:
+    """206 for the signed range; another or no Range is refused (403), or SeaweedFS ignores it.
+
+    SeaweedFS may not enforce signed headers; the unit test above proves `range` is in
+    SignedHeaders, which real S3 enforces. This test records which behavior the dev store has.
+    """
+    cfg = ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+    st = S3Storage(cfg)
+    s3.client.put_object(Bucket=s3.bucket, Key="rng/in", Body=b"0123456789abcdef")
+    url = await st.presign_get("rng/in", None, (4, 10))
+
+    def get(rng: str | None) -> tuple[int, bytes]:
+        req = urllib.request.Request(url, headers={"Range": rng} if rng else {})  # noqa: S310
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310
+                return r.status, bytes(r.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, b""
+
+    assert get("bytes=4-9") == (206, b"456789")
+    other, none = get("bytes=0-3")[0], get(None)[0]
+    if other == 403:
+        assert none == 403  # enforced as on AWS S3
+    else:  # SeaweedFS does not verify signed Range; record it rather than hide it
+        assert (other, none) in {(206, 200), (206, 206), (200, 200)}
+
+
 @pytest.mark.integration
 async def test_any_key_stat_and_conditional_copy(s3: S3Env) -> None:
     from minion_server.storage import PreconditionFailedError

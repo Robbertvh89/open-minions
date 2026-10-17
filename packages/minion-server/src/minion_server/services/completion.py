@@ -65,6 +65,8 @@ async def complete(
         stat = await storage.stat(src)
         if stat is None:
             raise api_error(422, "OUTPUT_MISSING", "attempt output object not found")
+        if stat.size > settings.max_output_bytes:  # HEAD only; never promoted or downloaded
+            raise api_error(422, "OUTPUT_TOO_LARGE", "attempt output exceeds the size cap")
         if stat.size != req.byte_size:
             raise api_error(422, "OUTPUT_SIZE_MISMATCH", "attempt output size differs")
         try:

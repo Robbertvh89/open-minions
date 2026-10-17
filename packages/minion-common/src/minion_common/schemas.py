@@ -332,6 +332,8 @@ class HeartbeatResponse(_Model):
     expires_at: AwareDatetime
 
 
+# Cap on one subtask output object (server promotion check and executor pre-upload check).
+MAX_OUTPUT_BYTES_DEFAULT = 4 << 30
 ERROR_CODE_PATTERN = r"^[A-Z0-9_]{1,64}$"
 
 

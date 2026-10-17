@@ -353,6 +353,19 @@ Server:   verify acquirement is current (else 409)
                UPDATE subtask SUCCEEDED, INSERT minion_subtask_attempt,
                UPDATE task counters / status
 ```
+Input GET URLs sign the subtask's exact `Range` header (`bytes=byte_start-(byte_end-1)`), so a URL
+reads only its slice. Before promotion the server HEADs the attempt object: above
+`MINION_MAX_OUTPUT_BYTES` (4 GiB) → `422 OUTPUT_TOO_LARGE`, no copy, no download; the executor
+reports the rejected complete as a retryable fail, so the subtask is retried and `FAILED` after
+`max_attempts`. The executor checks the same cap on its local file before uploading
+(`MINION_EXECUTOR_MAX_OUTPUT_BYTES`, `OUTPUT_TOO_LARGE`, not retryable). A presigned PUT cannot cap
+upload size (`content-length-range` needs presigned POST; deferred).
+
+**Lifecycle rule (operators).** Attempt objects are kept after promotion and unpromoted ones are
+never read again, so expire them (e.g. 7 days). S3 lifecycle filters match key prefixes only and
+`_attempts/` sits below the per-task prefix, so add one rule per task output prefix
+(`outputs/<team>/<project>/<task>/_attempts/`), or run a periodic cleanup job over `*/_attempts/*`.
+Never expire the promoted `NNNNNN.jsonl` outputs. Not automated in v1.
 
 ### 3.4 Heartbeat & reclaim
 ```

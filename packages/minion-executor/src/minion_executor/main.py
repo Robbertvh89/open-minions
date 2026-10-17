@@ -327,6 +327,7 @@ async def _run(
             heartbeat_interval_s=heartbeat_interval_s,
             idle_unload_s=settings.idle_unload_s,
             stop_grace_s=settings.stop_grace_s,
+            max_output_bytes=settings.max_output_bytes,
             governor=governor,
             presence_interval_s=settings.presence_interval_s,
             acquire_pace_s=settings.acquire_pace_s,

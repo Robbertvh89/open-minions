@@ -1057,6 +1057,17 @@ async def test_upload_refreshes_url_synchronously_when_expiring(tmp_path: Path) 
     assert urls == ["https://s3.test/out?sig=2"]
 
 
+async def test_oversize_output_fails_non_retryable_without_upload(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [], max_output_bytes=10)
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    assert client.kinds() == ["acquire", "fail", "acquire"]
+    req = client.calls[1][1]
+    assert (req.code, req.retryable) == ("OUTPUT_TOO_LARGE", False)
+    assert s3.puts == []
+
+
 async def test_pre_upload_refresh_cancel_releases_without_upload(tmp_path: Path) -> None:
     a = assignment()
     a.expires_at = datetime.now(UTC)

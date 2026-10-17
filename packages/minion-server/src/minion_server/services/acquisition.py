@@ -87,7 +87,7 @@ async def _assignment(
 ) -> Assignment:
     out = parse_s3_uri(c.output_uri, bucket=settings.s3_bucket, prefixes=("",))
     ttl = min(settings.presign_ttl_s, MAX_PRESIGN_TTL_S)
-    input_url = await storage.presign_get(c.input_object_key, ttl)
+    input_url = await storage.presign_get(c.input_object_key, ttl, (c.byte_start, c.byte_end))
     output_url = await storage.presign_put(attempt_key(out.key, c.subtask_id, won.attempt), ttl)
     return Assignment(
         acquirement_id=won.acquirement_id,

@@ -338,7 +338,7 @@ output prefix, belongs to another task), `PAYLOAD_TOO_LARGE` (413: request body 
 `MINION_MAX_REQUEST_BODY_BYTES`, default 1 MiB, enforced before authentication), and
 `OUTPUT_CHANGED` (422, complete: the attempt object changed during verification), and task-create
 422s `UNKNOWN_MODEL`, `MODEL_TYPE_MISMATCH`, `EMPTY_INPUT` (no object under the input prefix),
-`INVALID_URI`, plus `RECORD_COUNT_MISMATCH` and `OUTPUT_MISSING` on complete. A task whose
+`INVALID_URI`, plus `RECORD_COUNT_MISMATCH`, `OUTPUT_MISSING`, `OUTPUT_SIZE_MISMATCH` and `OUTPUT_TOO_LARGE` (attempt object above `MINION_MAX_OUTPUT_BYTES`) on complete. A task whose
 splitting fails becomes `FAILED` with `error` set to a short code-prefixed message, for example
 `LINE_TOO_LONG` (a JSONL line above `MINION_SPLIT_MAX_LINE_BYTES`, default 16 MiB) or
 `INPUT_CHANGED` (the input differs from rows written by an earlier split attempt, or an object
@@ -416,7 +416,15 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   a pool outside `allowed_pools` is `403 POOL_NOT_ALLOWED`, and a team with `allowed_pools` but no default
   needs an explicit pool (`422 POOL_REQUIRED`). Teams without a policy are unrestricted.
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
-  via heartbeat) **[ours]**.
+  via heartbeat) **[ours]**. The input GET URL signs the subtask's `Range: bytes=s-e` header, so it can
+  read only that slice (S3 answers 403 to a missing or different Range). The output PUT is scoped to
+  one attempt key. An attempt object above `MINION_MAX_OUTPUT_BYTES` (default 4 GiB, checked by HEAD
+  at complete) is never promoted: `422 OUTPUT_TOO_LARGE`, which the executor reports as a retryable
+  failure, so the subtask is retried and `FAILED` after `max_attempts`. The executor itself refuses to
+  upload a larger file (`MINION_EXECUTOR_MAX_OUTPUT_BYTES`, fail `OUTPUT_TOO_LARGE`, not retryable).
+  Not enforced at upload time (presigned PUT cannot carry `content-length-range`; deferred, presigned
+  POST would): an executor can still write a large object under its own attempt key until complete
+  rejects it; operators should expire `_attempts/` objects with an S3 lifecycle rule (ARCHITECTURE §3.3).
 - S-3. Executor tokens: random 256-bit (`token_urlsafe(32)`), stored as SHA-256 hash only, revocable,
   scoped to a pool, optional expiry (`token_expires_at`). Tokens are pre-issued by the operator with
   `minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days N]` (N = 1..365,
