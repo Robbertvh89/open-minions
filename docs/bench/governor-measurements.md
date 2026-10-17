@@ -1,4 +1,4 @@
-# Governor measurements on a real Mac (NF-4, NF-8, NF-9)
+# Governor measurements on a real Mac (NF-4, NF-7 proxy, NF-8, NF-9)
 
 How the numbers in [ADR-0006](../adr/0006-cooperative-capacity-governor.md) "Measurements" are
 produced. CI covers the logic with the fake engine; the GPU, `ioreg` and real signals need a Mac.
@@ -112,3 +112,24 @@ A=$(cpu); sleep 60; B=$(cpu); echo "scale=3; ($B - $A) / 60 * 100" | bc   # % of
 If the worker is not running (idle executors unload it), the tree is the control process alone. Adjust
 the `pgrep` pattern if you start the executor another way (`pgrep -fl minion-executor` shows what
 runs).
+
+## NF-7 proxy: foreground responsiveness (frame-latency probe and app launch)
+
+```bash
+uv run minion-executor bench --foreground-check --models deploy/bench-models.yaml \
+  --model qwen2.5-0.5b-mlx --model minilm-mlx --profiles light,balanced,full \
+  --duration 60 --launches 20 --repeats 3 --out fg.json     # about 70 min
+```
+
+Per model x profile x repeat: baseline window (worker loaded, idle) then loaded window (worker runs
+back-to-back batches), each a 60 s frame probe plus 20 Calculator launches. Run on AC power with
+Calculator closed, no call running, nothing else heavy; the first launch may raise a macOS
+Automation prompt for `osascript` (approve once, otherwise launch time is "unavailable" and only
+frames are judged, marked partial). Pass (light, balanced; `full` is informational): frame p95 ratio
+<= 1.10, miss-rate increase <= 1.0 pp, launch p50 ratio <= 1.10, medians over repeats. Exit 1 on a
+failing judged aggregate or a judged error row, 2 if the probe or GPU meter is unavailable.
+
+Caveats: the probe measures GPU scheduling latency for a small kernel on its own command queue, not
+compositor frame drops, and no call app runs; thermal drift over the run is mitigated by pairing a
+baseline with every loaded window. `--out` holds derived figures only (no timestamps, hostnames,
+paths). The human call study is docs/usability/nf7-video-call-protocol.md.

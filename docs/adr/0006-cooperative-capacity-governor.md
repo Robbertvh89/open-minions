@@ -320,6 +320,28 @@ plus memory, computed by the pure `nf8_verdict`. NF-9 reaction time is asserted 
 engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac with the production poll
 (docs/bench/governor-measurements.md); NF-4 with `bench --cpu-check`.
 
+### Gap 2: how NF-7 is measured
+
+NF-7 (no visible degradation in a call; UI frame drops and app-launch time within 10 % of baseline)
+needs people. We add a **synthetic proxy**, `minion-executor bench --foreground-check` (TASK-6.9), and
+say plainly what it is: it measures **GPU scheduling latency**, not compositor frame drops. A small
+child process (not an inference worker: no task data, no network) issues a fixed fp16 matmul, sized
+to about 5 ms on the idle GPU, on an absolute 30 fps schedule and records completion minus
+*scheduled* start; a frame misses when that exceeds 33.3 ms, and slots skipped because it fell
+behind count as misses. App-launch time is the wall time of N cold launches of Calculator via
+`osascript` (never done if Calculator is already running; "unavailable" on a TCC/osascript error,
+and then the row is judged on frames only and marked partial).
+
+Per (model, profile, repeat): a fresh worker, warm-up, a **baseline** window (worker loaded, idle),
+then a **loaded** window with the worker running back-to-back batches at the profile budget. Thresholds
+(per profile, median over repeats): frame p95 ratio loaded/baseline <= 1.10, miss-rate increase
+<= 1.0 pp, launch p50 ratio <= 1.10. Only `light` and `balanced` are judged; `full` is informational.
+A loaded window where the worker used < 2 % of the GPU is an error row, so an idle worker cannot pass.
+This is a stand-in for the compositor and a call app; the probe and the worker share one GPU with
+separate command queues. It does not replace the human study
+([docs/usability/nf7-video-call-protocol.md](../usability/nf7-video-call-protocol.md)), which stays
+open. Procedure: docs/bench/governor-measurements.md.
+
 ## Measurements
 
 > M3 Pro (36 GB, macOS 27.0.1), TASK-5.6: docs/bench/m4-governor-apple-m3-pro.{json,md} (NF-8, NF-9 CI) and docs/bench/m4-governor-cpu-apple-m3-pro.json (NF-4). The first per-process run found a pacing bug (mlx-lm async_eval work running during the pacer sleep: qwen balanced 74–76 % at duty 50 %), fixed by quantum pacing; see the .md for the history.

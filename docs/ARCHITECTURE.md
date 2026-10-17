@@ -546,7 +546,7 @@ token in macOS Keychain.
 5. **M4 – Capacity governor:** profiles, signals, duty-cycle throttle, auto-pause, budget reporting,
    downgrade-release. Measure NF-8/NF-9 (TASK-5.6: `bench --budget-check`, reaction tests; numbers in ADR-0006 and docs/bench/).
 6. **M5 – Ops & usability:** Grafana dashboards, web UI, launchd packaging, auth hardening; usability
-   test with real participants during video calls (NF-7) to tune default profiles.
+   test with real participants during video calls (NF-7) to tune default profiles. NF-7 proxy: `bench --foreground-check` (TASK-6.9); human protocol in docs/usability/nf7-video-call-protocol.md.
 7. **M6 – Scale test & menu-bar app:** simulated 500 executors against 1M subtasks (NF-1..NF-3);
    menu-bar UI for profile/pause.
 
