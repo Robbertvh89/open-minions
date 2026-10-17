@@ -1,9 +1,10 @@
 ---
 id: TASK-6.3
 title: 'M5.3 Presigned scope: Range-signed GET and output size cap (TASK-9 #2)'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 12:33'
 labels:
   - M5
 dependencies: []
