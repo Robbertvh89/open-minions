@@ -13,6 +13,7 @@ import re
 import stat
 import tomllib
 from datetime import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Self
 
@@ -117,12 +118,21 @@ class ScheduleEntry(_Strict):
         return time.fromisoformat(self.end)
 
 
+class OnCall(StrEnum):
+    """What to do while the microphone or a camera is in use (FR-53, ADR-0006 D16)."""
+
+    LIGHT = "light"
+    PAUSE = "pause"
+    IGNORE = "ignore"
+
+
 class ExecutorConfig(_Strict):
     active_profile: CapacityProfile = CapacityProfile.LIGHT
     idle_profile: CapacityProfile = CapacityProfile.FULL
     idle_after_min: float = Field(default=10.0, ge=1, le=1440, allow_inf_nan=False)
     allow_on_battery: StrictBool = False
     min_battery_percent: int = Field(default=30, ge=0, le=100)
+    on_call: OnCall = OnCall.LIGHT
     profiles: ProfilesConfig = Field(default_factory=ProfilesConfig)
     schedule: list[ScheduleEntry] = Field(default_factory=list, max_length=64)
 

@@ -259,3 +259,28 @@ async def test_unhashable_or_non_weakrefable_source_raises_signal_error_before_t
     with pytest.raises(SignalError, match="weak"):
         await read_with_timeout(Slotted())
     assert threading.active_count() <= before
+
+
+def test_call_from_flags() -> None:
+    from minion_executor.capacity.signals import call_from_flags
+
+    assert call_from_flags(False, []) is False
+    assert call_from_flags(False, [False, False]) is False
+    assert call_from_flags(True, [None]) is True
+    assert call_from_flags(False, [True]) is True
+    assert call_from_flags(None, [False]) is None
+    assert call_from_flags(False, [None]) is None
+
+
+def test_file_signals_call_active_optional(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    p = tmp_path / "s.json"
+    p.write_text("{}")
+    p.chmod(0o600)
+    assert FileSignals(p).read().call_active is None
+    p.write_text('{"call_active": true}')
+    assert FileSignals(p).read().call_active is True
+
+
+def test_null_signals_call_unknown() -> None:
+    assert NullSignals().read().call_active is None

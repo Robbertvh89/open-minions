@@ -609,3 +609,62 @@ def test_dropped_profile_still_holds_against_applied() -> None:
     assert d.candidate is not None
     d = g.step(snap(hid_idle_s=IDLE), 61)
     assert d.profile is P.FULL and d.candidate is None
+
+
+# --- call-aware (FR-53, TASK-6.10) ---------------------------------------------------------------
+
+
+def _full_gov(cfg: ExecutorConfig | None = None) -> Gov:
+    g = Gov(cfg)
+    g.step(snap(hid_idle_s=IDLE))
+    g.step(snap(hid_idle_s=IDLE), 61)
+    assert g.d.profile is P.FULL
+    return g
+
+
+def test_call_drops_to_light_within_one_poll_and_returns_after_hold() -> None:
+    g = _full_gov()
+    d = g.step(snap(hid_idle_s=IDLE, call_active=True), 2)
+    assert d.paused_reason is None
+    assert d.budget == budget_for(P.LIGHT, TOTAL).model_copy(update={"profile": d.budget.profile})
+    for _ in range(5):  # a long call stays light and starts no escalation timer
+        assert g.step(snap(hid_idle_s=IDLE, call_active=True), 30).budget.gpu_duty_cycle == 0.30
+    # call ends: still light for the 60 s hold, then back to full
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 1).budget.gpu_duty_cycle == 0.30
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 58).budget.gpu_duty_cycle == 0.30
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 1).budget.gpu_duty_cycle == 0.30
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 1).budget.gpu_duty_cycle == 1.0
+
+
+def test_call_never_raises_a_lower_dimension() -> None:
+    cfg = ExecutorConfig(profiles={"light": {"gpu_duty_cycle": 0.5}})
+    g = Gov(cfg, pinned=P.LIGHT, start=True)
+    g.cfg = cfg
+    d = g.step(snap(call_active=True))
+    assert d.budget.gpu_duty_cycle == 0.5
+
+
+def test_call_pause_mode_pauses_with_in_call_then_resumes() -> None:
+    g = _full_gov(ExecutorConfig(on_call="pause"))
+    assert g.step(snap(hid_idle_s=IDLE, call_active=True), 2).paused_reason is R.IN_CALL
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 2).paused_reason is R.IN_CALL
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 10).paused_reason is None
+
+
+def test_in_call_has_lowest_priority() -> None:
+    g = Gov(ExecutorConfig(on_call="pause"))
+    d = g.step(snap(call_active=True, thermal=Thermal.SERIOUS))
+    assert d.paused_reason is R.THERMAL
+
+
+def test_call_ignore_changes_nothing() -> None:
+    cfg = ExecutorConfig(on_call="ignore")
+    g = _full_gov(cfg)
+    d = g.step(snap(hid_idle_s=IDLE, call_active=True), 2)
+    assert d.paused_reason is None and d.budget.gpu_duty_cycle == 1.0
+
+
+def test_unknown_call_state_is_not_a_call() -> None:
+    g = _full_gov(ExecutorConfig(on_call="pause"))
+    d = g.step(snap(hid_idle_s=IDLE, call_active=None), 2)
+    assert d.paused_reason is None and d.budget.gpu_duty_cycle == 1.0

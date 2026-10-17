@@ -19,9 +19,13 @@ Rules:
   after the conditions were clear for `resume_after_s` (10 s), so a short blip cannot make the
   60 s pause-release fire. An owner `resume` lifts the owner pause at once. Reason priority for the
   single reported reason: user_paused > control_invalid > memory_pressure > thermal >
-  low_power_mode > low_battery > on_battery > signals_unavailable.
+  low_power_mode > low_battery > on_battery > signals_unavailable > in_call.
 - Unusable owner control (present but invalid/unsafe, see `ControlUnusable`) fails closed: paused
   with `control_invalid` and automatic profile selection, at once, until the file is fixed.
+- Call-aware (FR-53, `on_call`). `light` (default): while `call_active` is true every dimension is
+  capped at the light budget at once; afterwards the normal 60 s hold applies. `pause`: paused with
+  `in_call` (lowest priority; resumes after the usual 10 s clear). `ignore`: no effect. An unknown
+  (`None`) call state counts as not in a call.
 - Memory pressure `warning` -> pause + trim; `critical` -> pause + `release_now` (the in-flight
   subtask is released at once). Paused for `pause_release_after_s` (60 s) -> `pause_expired`.
 - Time. Pass a UTC `now` (and the wall clock as `local_now`). If `now` is earlier than a stored
@@ -42,7 +46,7 @@ from enum import StrEnum
 from minion_common.enums import CapacityProfile, CpuPriority, PausedReason
 from minion_common.schemas import Budget
 
-from minion_executor.capacity.config import DAYS, ExecutorConfig, ScheduleEntry
+from minion_executor.capacity.config import DAYS, ExecutorConfig, OnCall, ScheduleEntry
 from minion_executor.capacity.control import ControlUnusable, OwnerControl
 from minion_executor.capacity.profiles import ProfileSpec, budget_for
 from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
@@ -191,6 +195,8 @@ def _signal_reason(
         # an unknown percentage on battery fails closed
         if snap.battery_percent is None or snap.battery_percent < cfg.min_battery_percent:
             return PausedReason.LOW_BATTERY
+    if cfg.on_call is OnCall.PAUSE and snap.call_active is True:  # None (unknown) is not a call
+        return PausedReason.IN_CALL
     return None
 
 
@@ -276,6 +282,16 @@ def decide(
 
     cur, cand, cand_since = state.profile, state.candidate, state.candidate_since
     target_b = budget_for(target, total_gb, specs)
+    if (
+        cfg.on_call is OnCall.LIGHT
+        and effective is not None
+        and effective.call_active is True
+        and CapacityProfile.LIGHT in specs
+    ):
+        # in a call: cap every dimension at light, whatever chose the profile (invariant 6). The
+        # capped budget is what escalation is compared with, so it applies at once, and after the
+        # call it rises only after the usual hold (an owner/pinned choice returns at once)
+        target_b = _min_budget(target_b, budget_for(CapacityProfile.LIGHT, total_gb, specs))
     # budget in force: a held minimum may be below budget_for(cur); a config reload that dropped
     # `cur` still holds against the last applied budget
     in_force = state.applied

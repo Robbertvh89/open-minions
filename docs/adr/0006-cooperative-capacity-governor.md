@@ -249,6 +249,21 @@ within `MINION_EXECUTOR_STOP_GRACE_S` (30). A second signal or the deadline inte
 
 **D14 Never block sleep.** No `caffeinate`, no IOPM assertions in product code.
 
+**D16 Call-aware governor (amendment, TASK-6.10, FR-53 optional).** `SignalSnapshot.call_active` is
+true when the default input device (CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`) or any
+camera (CoreMediaIO, same selector) is running in some process. These are public property reads; they
+open no device, so there is no TCC prompt and no indicator. Device names/UIDs are never read. Any
+failure gives `None` (unknown), treated as not in a call: this is a comfort feature, so unlike the
+safety signals it does not fail closed (and a single unreadable flag cannot pause the Mac).
+`on_call` in `executor.toml`: `light` (default) caps every dimension of the budget at the light
+budget at once, whatever chose the profile (per-dimension minimum with the target, so a lower
+dimension stays lower); `Decision.profile` keeps the chosen name. The cap enters the normal
+escalation comparison, so after the call the budget rises only after the 60 s hold (owner/pinned
+choices return at once). `pause` pauses with `in_call`, the lowest-priority reason, with the usual
+10 s resume hysteresis. `ignore` disables it. The dev signal file accepts an optional `call_active`.
+Privacy: the drop is visible to the server (SPEC S-11). Not verified here: real microphone/camera
+activation (we deliberately do not start them); the live read returns a bool.
+
 ### Gap 1: how NF-8 is measured
 
 NF-8 says "GPU busy share within ±10 pp of `gpu_duty_cycle`". Read literally this fails for any

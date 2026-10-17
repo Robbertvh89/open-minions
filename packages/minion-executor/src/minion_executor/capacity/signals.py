@@ -62,6 +62,9 @@ class SignalSnapshot:
     thermal: Thermal
     memory_pressure: MemPressure
     taken_at: datetime
+    # microphone or camera running somewhere on the Mac (FR-53 call-aware); None: unknown, which
+    # the governor treats as "not in a call" (an optional comfort feature, ADR-0006 D16)
+    call_active: bool | None = None
 
 
 class SignalSource(Protocol):
@@ -111,6 +114,150 @@ class NullSignals:
         return SignalSnapshot(0.0, True, None, False, Thermal.NOMINAL, MemPressure.NORMAL, _now())
 
 
+def _fourcc(code: bytes) -> int:
+    return int.from_bytes(code, "big")
+
+
+class _PropAddress(ctypes.Structure):
+    """AudioObjectPropertyAddress / CMIOObjectPropertyAddress: selector, scope, element."""
+
+    _fields_ = [
+        ("selector", ctypes.c_uint32),
+        ("scope", ctypes.c_uint32),
+        ("element", ctypes.c_uint32),
+    ]
+
+
+_SYSTEM_OBJECT = 1
+_SCOPE_GLOBAL = _fourcc(b"glob")
+_ELEMENT_MAIN = 0
+_DEFAULT_INPUT_DEVICE = _fourcc(b"dIn ")  # kAudioHardwarePropertyDefaultInputDevice
+_CMIO_DEVICES = _fourcc(b"dev#")  # kCMIOHardwarePropertyDevices
+_IS_RUNNING_SOMEWHERE = _fourcc(b"gone")  # kAudioDevicePropertyDeviceIsRunningSomewhere (== CMIO)
+_MAX_CAMERAS = 64
+
+
+def call_from_flags(mic: bool | None, cameras: Sequence[bool | None]) -> bool | None:
+    """Combine the microphone and camera "running somewhere" flags. Any True is a call; otherwise
+    any unreadable flag leaves it unknown (None); else False."""
+    flags = [mic, *cameras]
+    if any(f is True for f in flags):
+        return True
+    return None if any(f is None for f in flags) else False
+
+
+class _CallProbe:
+    """Reads the "is running somewhere" property of the default input device (CoreAudio) and of
+    every camera (CoreMediaIO). Public APIs; they only query device state and never open a device,
+    so no TCC (camera/microphone) prompt appears and no indicator lights up. Device names, UIDs
+    and counts are never read or kept. Any failure yields None (unknown)."""
+
+    def __init__(self) -> None:
+        self._audio: Any = None
+        self._cmio: Any = None
+        try:
+            audio = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+            fn = audio.AudioObjectGetPropertyData
+            fn.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(_PropAddress),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ]
+            fn.restype = ctypes.c_int32
+            self._audio = audio
+        except (OSError, AttributeError):
+            self._audio = None
+        try:
+            cmio = ctypes.CDLL("/System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO")
+            size_fn = cmio.CMIOObjectGetPropertyDataSize
+            size_fn.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(_PropAddress),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            size_fn.restype = ctypes.c_int32
+            data_fn = cmio.CMIOObjectGetPropertyData
+            data_fn.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(_PropAddress),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            ]
+            data_fn.restype = ctypes.c_int32
+            self._cmio = cmio
+        except (OSError, AttributeError):
+            self._cmio = None
+
+    def _mic(self) -> bool | None:
+        if self._audio is None:
+            return None
+        get = self._audio.AudioObjectGetPropertyData
+        dev = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(dev))
+        addr = _PropAddress(_DEFAULT_INPUT_DEVICE, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+        if get(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)):
+            return None
+        if dev.value == 0:  # kAudioObjectUnknown: no input device, so no microphone in use
+            return False
+        running = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(running))
+        addr = _PropAddress(_IS_RUNNING_SOMEWHERE, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+        if get(dev.value, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(running)):
+            return None
+        return running.value != 0
+
+    def _cameras(self) -> list[bool | None]:
+        if self._cmio is None:
+            return [None]
+        size_fn, data_fn = (
+            self._cmio.CMIOObjectGetPropertyDataSize,
+            self._cmio.CMIOObjectGetPropertyData,
+        )
+        addr = _PropAddress(_CMIO_DEVICES, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+        size = ctypes.c_uint32(0)
+        if size_fn(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size)):
+            return [None]
+        n = size.value // ctypes.sizeof(ctypes.c_uint32)
+        if n == 0:
+            return []
+        if n > _MAX_CAMERAS:
+            return [None]
+        ids = (ctypes.c_uint32 * n)()
+        used = ctypes.c_uint32(0)
+        if data_fn(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, size, ctypes.byref(used), ids):
+            return [None]
+        out: list[bool | None] = []
+        for dev in ids[: used.value // ctypes.sizeof(ctypes.c_uint32)]:
+            running = ctypes.c_uint32(0)
+            raddr = _PropAddress(_IS_RUNNING_SOMEWHERE, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+            rused = ctypes.c_uint32(0)
+            rc = data_fn(
+                dev,
+                ctypes.byref(raddr),
+                0,
+                None,
+                ctypes.c_uint32(ctypes.sizeof(running)),
+                ctypes.byref(rused),
+                ctypes.byref(running),
+            )
+            out.append(None if rc else running.value != 0)
+        return out
+
+    def call_active(self) -> bool | None:
+        try:
+            return call_from_flags(self._mic(), self._cameras())
+        except Exception:  # never let an optional signal break a read
+            return None
+
+
 _CF_RETAINED: dict[str, Any] = {"retval": {"already_cfretained": True}}
 
 
@@ -122,6 +269,7 @@ class MacSignals:
     _foundation: Any
     _iokit: dict[str, Any]
     _libc: Any
+    _call: _CallProbe
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
@@ -157,6 +305,7 @@ class MacSignals:
         self._quartz = Quartz
         self._foundation = Foundation
         self._iokit = iokit
+        self._call = _CallProbe()
 
     def _hid_idle_s(self) -> float:
         q = self._quartz
@@ -216,6 +365,7 @@ class MacSignals:
                     thermal=thermal_from_ns(int(info.thermalState())),
                     memory_pressure=self._memory_pressure(),
                     taken_at=_now(),
+                    call_active=self._call.call_active(),
                 )
         except SignalError:
             raise
@@ -234,6 +384,7 @@ class _FileSnapshot(BaseModel):
     low_power_mode: bool = False
     thermal: Thermal = Thermal.NOMINAL
     memory_pressure: MemPressure = MemPressure.NORMAL
+    call_active: bool | None = None
 
 
 class FileSignals:

@@ -78,3 +78,4 @@ class PausedReason(StrEnum):
     ON_BATTERY = "on_battery"
     CONTROL_INVALID = "control_invalid"
     SIGNALS_UNAVAILABLE = "signals_unavailable"
+    IN_CALL = "in_call"

@@ -1,6 +1,6 @@
-"""NF-9 on CI (TASK-5.6): the governor reacts to memory pressure, thermal stress, power and user
-return within 5 s. 20 trials in total with the fake engine in a real worker subprocess and
-`FileSignals` steered through a file; no server, no GPU.
+"""NF-9 on CI (TASK-5.6): the governor reacts to memory pressure, thermal stress, power, user
+return and a call starting within 5 s. 24 trials in total with the fake engine in a real worker
+subprocess and `FileSignals` steered through a file; no server, no GPU.
 
 Reaction time = from the moment the signal file holds the new value to the moment the worker has
 acknowledged the matching control message (paused, or the new duty) or, for memory `critical`, to
@@ -41,7 +41,7 @@ from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 NF9_LIMIT_S = 5.0
 POLL_S = 0.25
 STEP_S = 0.1
-TRIALS_PER_EVENT = 4  # 5 events x 4 = 20 trials
+TRIALS_PER_EVENT = 4  # 6 events x 4 = 24 trials
 TOTAL_GB = 32.0
 MODEL = ModelEntry(
     model_id="fake-c",
@@ -80,6 +80,15 @@ EVENTS = [
         "user-return",
         {**QUIET, "hid_idle_s": 3600.0},
         QUIET,
+        None,
+        expect_duty=budget_for(CapacityProfile.LIGHT, TOTAL_GB).gpu_duty_cycle,
+        run_profile=CapacityProfile.FULL,
+    ),
+    # a call starts while the owner is away on the full profile: duty falls to light (FR-53)
+    Event(
+        "call-start",
+        {**QUIET, "hid_idle_s": 3600.0},
+        {**QUIET, "hid_idle_s": 3600.0, "call_active": True},
         None,
         expect_duty=budget_for(CapacityProfile.LIGHT, TOTAL_GB).gpu_duty_cycle,
         run_profile=CapacityProfile.FULL,

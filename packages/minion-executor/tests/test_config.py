@@ -24,6 +24,7 @@ idle_profile = "custom"
 idle_after_min = 5
 allow_on_battery = true
 min_battery_percent = 40
+on_call = "pause"
 
 [profiles.light]
 gpu_duty_cycle = 0.2
@@ -70,6 +71,7 @@ def test_defaults_when_default_file_absent(tmp_path: Path, monkeypatch: pytest.M
         10,
     )
     assert (cfg.allow_on_battery, cfg.min_battery_percent) == (False, 30)
+    assert cfg.on_call == "light"
 
 
 def test_explicit_missing_file_is_an_error(tmp_path: Path) -> None:
@@ -81,6 +83,7 @@ def test_full_config_parses_and_resolves(tmp_path: Path) -> None:
     cfg = load_config(_write(tmp_path, FULL_TOML))
     assert cfg.idle_profile is CapacityProfile.CUSTOM
     assert cfg.idle_after_min == 5 and cfg.allow_on_battery and cfg.min_battery_percent == 40
+    assert cfg.on_call == "pause"
     assert [s.profile for s in cfg.schedule] == [CapacityProfile.FULL, CapacityProfile.CUSTOM]
     assert cfg.schedule[0].start_time.hour == 19 and cfg.schedule[0].end_time.hour == 7
     assert cfg.schedule[0].days == ["mon", "tue"] and cfg.schedule[1].days is None

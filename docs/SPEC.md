@@ -272,7 +272,11 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   - owner-triggered `minion-executor pause [--for 1h]`;
   - an unusable owner `control.json` (fails closed; `paused_reason` `control_invalid`, listed right
     after `user_paused` in the priority order);
-  - optional: listed foreground apps active (e.g. screen sharing, `zoom.us`) → drop to `light` or pause.
+  - optional, call-aware (TASK-6.10): the default microphone or any camera is in use by some process
+    (CoreAudio / CoreMediaIO "running somewhere" flags; no device is opened, no permission prompt) →
+    `on_call = "light"` (default: every budget dimension capped at `light` at once, back up after the
+    usual 60 s hold), `"pause"` (reason `in_call`, lowest in the priority order) or `"ignore"`. An
+    unreadable flag counts as not in a call. Listed foreground apps (screen sharing) are not detected.
 - FR-54. **Budget changes mid-subtask.** Duty cycle, batch size and CPU priority apply at the next
   generation step / batch. A memory budget below the loaded model's `memory_gb` causes the executor to
   finish the current batch, `release` the subtask (immediate requeue, not a failure), and unload the model.
@@ -490,6 +494,9 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   acquire/heartbeat/presence; with adaptive switching (FR-52) a profile change from `light` to `full`
   reveals that the owner went idle (away from the keyboard), and back. Owners who do not want that pin a
   profile (`run --profile` or `minion-executor profile <name>`). Keyboard idle time itself is never sent.
+  Likewise a drop to `light` (or `paused_reason = in_call`) that coincides with a meeting reveals that the
+  owner is probably in a call; set `on_call = "ignore"` in `executor.toml` (or pin a profile and use
+  `ignore`) to avoid it. The microphone/camera state itself is never sent.
 - S-12. Read-endpoint cost **[ours]**. `GET /tasks` aggregates subtask counts per page and `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter. Per-status counters on `minion_task` are tracked in the backlog.
 - S-13. Web UI **[ours]** (ADR-0010). Off (`404`) unless `MINION_UI_SESSION_SECRET` (>= 32 bytes) is set. Login with
   a user API key (checked like an API request; wrong, expired and removed keys all get one `401` page; the

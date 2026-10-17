@@ -59,3 +59,12 @@ def test_mac_signals_reads_do_not_leak_core_foundation_objects() -> None:
     t.join()
     assert fp["before"] > 0
     assert fp["after"] - fp["before"] < 1_000_000
+
+
+def test_mac_signals_call_active_is_a_bool() -> None:
+    """Reads the CoreAudio / CoreMediaIO flags; opens no device, so no permission prompt.
+
+    Real microphone/camera activation is NOT exercised here (not verifiable without starting them).
+    """
+    v = MacSignals().read().call_active
+    assert isinstance(v, bool)
