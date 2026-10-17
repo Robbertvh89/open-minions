@@ -3200,7 +3200,7 @@ async def test_presence_429_honours_retry_after_and_keeps_the_pending_state(
         gov.update(dec(state.budget, reason=PausedReason.MEMORY_PRESSURE))  # changed, limited
         await until(partial(_grew, gov.timeouts, seen))  # the loop looked and waited again
     assert len(client.presences) == 1  # nothing sent inside Retry-After
-    now[0] += 25.0  # past the 30 s deadline
+    now[0] += 31.0  # past the 30 s Retry-After plus its maximum 20 % jitter (1036 s)
     gov.update(dec(reason=PausedReason.THERMAL))
     await until(lambda: len(client.presences) == 2)
     assert client.presences[1].paused_reason == "thermal"
