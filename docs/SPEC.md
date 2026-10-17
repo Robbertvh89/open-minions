@@ -51,7 +51,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 ## 4. Functional requirements
 
 ### 4.1 Task submission (Server)
-- FR-1. Users create tasks via REST API and web UI **[paper]**.
+- FR-1. Users create tasks via REST API, web UI and the `minion` submitter CLI (`minion submit`, which uploads local JSONL to S3 with the submitter's own credentials, then creates the task via the REST API) **[paper]**.
 - FR-2. Server validates parameters synchronously; rejects with `422` on invalid input **[paper]**.
 - FR-3. Server partitions the task into subtasks **asynchronously** and persists them **[paper]**. Task
   status is `SPLITTING` until done, then `PENDING`.
@@ -521,6 +521,24 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (with `no-referrer` browsers send `Origin: null` on same-origin form POSTs, which are rejected), `Strict-Transport-Security` when the server sees https, `Cache-Control: no-store`. Templates are
   autoescaped: executor-supplied strings (owner, hostname, task `error`) are rendered inert. Rate-limit
   `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`; entries are bare `host[:port]` (a scheme, `/`, `@`, whitespace or an empty item fails at startup). Production should set it (DNS rebinding). Generate the secret with `minion-server-admin generate-ui-secret` (hand-picked phrases are weak; only single-character secrets are rejected). OIDC/SSO: put a proxy in front.
+- S-14. Submitter S3 credentials **[ours]**. The `minion` CLI (`minion-cli`, TASK-25) uploads inputs
+  itself, so it holds S3 credentials (`MINION_CLI_S3_ACCESS_KEY`/`MINION_CLI_S3_SECRET_KEY`, or the boto3
+  default chain). These must never be the server's credentials. The policy must grant: `s3:PutObject`,
+  `s3:AbortMultipartUpload` and `s3:GetObject` on `inputs/{team}/*` (inputs above 8 MiB upload as
+  multipart; configure a bucket lifecycle rule that aborts incomplete multipart uploads after a few
+  days so interrupted uploads do not accumulate); `s3:GetObject` on `outputs/{team}/*`; `s3:ListBucket`
+  conditioned on `s3:prefix` being `inputs/{team}/*` or `outputs/{team}/*`. It must **not** grant
+  `s3:DeleteObject` on either prefix and must not grant `s3:PutObject` on `outputs/` (results are
+  written only through presigned URLs). Write access to `inputs/{team}/` is team-wide, so submitters
+  of one team trust each other (intra-team trust); enable bucket versioning or Object Lock on
+  `inputs/` to make an overwrite of another submitter's input recoverable. Executors never hold these
+  credentials (S-2); they keep using presigned URLs. The CLI's API key comes from `MINION_API_KEY` or
+  the Keychain item `open-minions-api-key` and is never printed. Only `https` server and S3 endpoints
+  are accepted (as for the executor), including an endpoint taken from the boto3 environment/config.
+  `minion fetch` claims its output directory with a `manifest.json` naming the task (team, project,
+  name, output URI, creation time) and refuses another task's directory; a part is reused only if its
+  content matches the remote object (md5 of a plain ETag, else ETag + sha256 recorded in the manifest).
+  Input resume likewise compares content (`x-amz-meta-sha256` set at upload, else a plain-md5 ETag).
 
 ## 9. Non-functional requirements
 

@@ -1,22 +1,17 @@
 """Process-level e2e (TASK-2.3 AC #1/#2): real uvicorn, Postgres, SeaweedFS, fake runner."""
 
 import asyncio
-import contextlib
 import dataclasses
-import hashlib
 import json
 import os
 import signal
-import socket
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-import uvicorn
 from minion_common.client import ApiError, ExecutorClient, UserClient
 from minion_common.enums import Engine, PausedReason
 from minion_common.schemas import (
@@ -24,70 +19,24 @@ from minion_common.schemas import (
     Budget,
     PreferenceRequest,
     PresenceRequest,
-    TaskCreate,
 )
 from minion_executor.capacity.runtime import FixedGovernor
 from minion_executor.loop import ExecutorLoop
 from minion_executor.main import _send_preference
 from minion_executor.worker.process import WorkerHandle
-from minion_server.admin import issue_executor_token
-from minion_server.app import create_app
 from minion_server.services.reclaim import reclaim_stale
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
 
-from conftest import S3Env, _settings, seed_task
+from conftest import TEAM, Live, S3Env, _serve, eventually, seed_task
 
 pytestmark = pytest.mark.integration
 
-API_KEY = "e2e-user-key"
-TEAM = "e2e"
 FAST = (0.02, 0.1)
 BUDGET = Budget.model_validate(
     {"profile": "balanced", "memory_gb": 8, "gpu_duty_cycle": 0.5, "max_batch_size": 7}
 )
-
-
-@dataclass
-class Live:
-    url: str
-    sm: Any
-    s3: S3Env
-    api_key: str = API_KEY
-
-    async def token(self, owner: str) -> str:
-        return (await issue_executor_token(self.sm, owner=owner, pool="default", ttl_days=1))[1]
-
-    def put_input(self, name: str, obj: str, body: bytes) -> None:
-        self.s3.client.put_object(
-            Bucket=self.s3.bucket, Key=f"inputs/{TEAM}/{name}/{obj}", Body=body
-        )
-
-    async def submit(self, name: str, rps: int) -> None:
-        async with UserClient(self.url, SecretStr(self.api_key)) as uc:
-            await uc.create_task(
-                TaskCreate.model_validate(
-                    {
-                        "team": TEAM,
-                        "project": "p",
-                        "task_name": name,
-                        "type": "embedding",
-                        "model": "fake-embed",
-                        "input_uri": f"s3://{self.s3.bucket}/inputs/{TEAM}/{name}/",
-                        "output_uri": f"s3://{self.s3.bucket}/outputs/{TEAM}/{name}/",
-                        "records_per_subtask": rps,
-                    }
-                )
-            )
-
-    async def task_status(self, name: str) -> str:
-        async with UserClient(self.url, SecretStr(self.api_key)) as uc:
-            return str((await uc.get_task(TEAM, "p", name)).status)
-
-    async def rows(self, sql: str, **p: Any) -> list[Any]:
-        async with self.sm() as s:
-            return list((await s.execute(text(sql), p)).all())
 
 
 async def spawned(worker: WorkerHandle) -> int:
@@ -99,20 +48,6 @@ async def spawned(worker: WorkerHandle) -> int:
     await eventually(up, 30)
     assert worker.pid is not None
     return worker.pid
-
-
-async def eventually(cond: Callable[[], Awaitable[bool]], limit_s: float = 60.0) -> None:
-    deadline = time.monotonic() + limit_s
-    while not await cond():
-        if time.monotonic() > deadline:
-            raise TimeoutError("condition not met")
-        await asyncio.sleep(0.05)
-
-
-@pytest.fixture
-async def live(fresh_url: str, s3: S3Env, tmp_path: Path) -> AsyncIterator[Live]:
-    async with _serve(fresh_url, s3, tmp_path, {}) as lv:
-        yield lv
 
 
 @pytest.fixture
@@ -131,43 +66,6 @@ async def live_default_limits(fresh_url: str, s3: S3Env, tmp_path: Path) -> Asyn
     }
     async with _serve(fresh_url, s3, tmp_path, limits) as lv:
         yield lv
-
-
-@contextlib.asynccontextmanager
-async def _serve(
-    fresh_url: str, s3: S3Env, tmp_path: Path, extra: dict[str, Any]
-) -> AsyncIterator[Live]:
-    keys = tmp_path / "keys.yaml"
-    digest = hashlib.sha256(API_KEY.encode()).hexdigest()
-    keys.write_text(f"keys:\n  - name: u\n    sha256: {digest}\n    teams: [{TEAM}]\n")
-    cfg = _settings(fresh_url).model_copy(
-        update={
-            "s3_endpoint_url": s3.endpoint_url,
-            "s3_access_key": SecretStr(s3.access_key),
-            "s3_secret_key": SecretStr(s3.secret_key),
-            "s3_bucket": s3.bucket,
-            "api_keys_file": str(keys),
-            "splitter_poll_s": 0.1,
-            **extra,
-        }
-    )
-    app = create_app(cfg)
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
-    serve = asyncio.create_task(server.serve(sockets=[sock]))
-    try:
-        await eventually(lambda: _started(server))
-        yield Live(f"http://127.0.0.1:{port}", app.state.sessionmaker, s3)
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(serve, 30)
-        sock.close()
-
-
-async def _started(server: uvicorn.Server) -> bool:
-    return server.started
 
 
 def _records(prefix: str, n: int) -> bytes:

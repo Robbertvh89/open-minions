@@ -42,6 +42,7 @@ packages/
   minion-server/     # FastAPI app: task API, executor API, splitter, web UI
   minion-executor/   # macOS agent: poll → acquire → run → upload → report
   minion-watchdog/   # heartbeat monitor; requeues orphaned subtasks
+  minion-cli/        # `minion` submitter: upload JSONL to S3, submit, follow, fetch results
 migrations/          # Alembic
 deploy/              # docker-compose (postgres, s3, grafana, server, watchdog), launchd plist
 docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
@@ -75,6 +76,7 @@ uv run minion-executor status            # profile, budget, paused_reason, curre
 uv run minion-executor service install|uninstall|status [--label com.open-minions.executor] [--server URL] [--profile P] [--engines E] [--dry-run] [--no-load]  # per-user LaunchAgent (ADR-0011): token must be in the Keychain, refuses MINION_EXECUTOR_DEV=1; ExitTimeOut = ceil(STOP_GRACE_S)+15; `run` exits 2 if MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S < grace+15
 uv run minion-executor bench --models deploy/bench-models.yaml --model <id> [--model <id>...] [--records 256] [--batch-sizes 1,8,32] [--max-tokens 128] [--profile full] [--out FILE.json]  # engine throughput/memory on this Mac (real worker path, no server/token); results in docs/bench/
 uv run minion-executor bench --budget-check --models deploy/bench-models.yaml --model <id> [--profiles light,balanced,full] [--duration 60] [--baseline-s 20] [--repeats 1] [--out FILE.json]  # NF-8 on this Mac: worker GPU busy share (per-process `accumulatedGPUTime` from `ioreg -c AGXDeviceUserClient`, ~2 Hz; device utilization informational) + worker footprint vs budget per profile, pass/fail per ADR-0006 Gap 1; exit 1 on a fail, 2 without ioreg. Also `bench --foreground-check [--launches 20]` (NF-7 proxy: GPU frame-latency probe + Calculator launch time, idle vs loaded worker; light/balanced judged, exit 1 on fail), `bench --cpu-check [--duration 60]` (NF-4: governor CPU % idle/paused, < 1 %) and `bench --watch-reactions --duration 120` (NF-9 timestamps on real signals); procedure in docs/bench/governor-measurements.md
+uv run minion submit FILE... --type embedding|completion --model M [-o DIR] [--name N] [--team T] [--project P] [--server URL] [--no-wait] [--timeout S] [--params JSON] [--pool P]  # upload, submit, wait, download to DIR; needs MINION_API_KEY or Keychain open-minions-api-key, S3 creds via MINION_CLI_S3_* or boto chain (inputs/outputs scoped per team, S-14); also `minion status|fetch|cancel NAME`; exit 0 ok, 1 FAILED/CANCELLED, 2 usage/auth/4xx, 3 PARTIAL, 4 timeout/unreachable, 130 Ctrl-C (never cancels)
 uv run pytest                             # all tests
 uv run pytest -m "not integration"        # fast unit tests only (the `macos` sandbox tests run on darwin, skip elsewhere)
 uv run pytest -m "gpu or model"            # real MLX models on this Mac (mlx extra + network once); auto-skipped elsewhere

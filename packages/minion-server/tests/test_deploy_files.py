@@ -155,3 +155,15 @@ def test_watchdog_healthcheck_expression(tmp_path: Path, interval: str | None) -
     assert _health(f, interval) == 0  # just inside the window
     os.utime(f, (time.time() - limit - 20, time.time() - limit - 20))
     assert _health(f, interval) != 0  # stale
+
+
+def test_every_workspace_member_pyproject_is_copied_before_the_locked_sync() -> None:
+    """`uv sync --locked` needs every workspace member's pyproject.toml in the build context."""
+    copied = {
+        ln.split()[1]
+        for ln in _lines(DOCKERFILE)
+        if ln.upper().startswith("COPY ") and not ln.split()[1].startswith("--")
+    }
+    for pyproject in sorted((ROOT / "packages").glob("*/pyproject.toml")):
+        rel = pyproject.relative_to(ROOT).as_posix()
+        assert rel in copied, f"deploy/Dockerfile has no COPY line for {rel}"

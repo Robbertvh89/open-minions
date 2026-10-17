@@ -9,6 +9,7 @@ dependencies = [
     "minion-server",
     "minion-executor",
     "minion-watchdog",
+    "minion-cli",
 ]
 
 [tool.uv]
@@ -22,6 +23,7 @@ minion-common = { workspace = true }
 minion-server = { workspace = true }
 minion-executor = { workspace = true }
 minion-watchdog = { workspace = true }
+minion-cli = { workspace = true }
 
 [dependency-groups]
 dev = [

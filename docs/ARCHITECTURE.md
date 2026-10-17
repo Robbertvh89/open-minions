@@ -280,9 +280,25 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 Pydantic request/response models, enums (`TaskType`, `SubtaskStatus`, ...), typed `httpx` API client
 used by the executor and by tests, shared settings base.
 
+### 2.5 minion-cli (submitter)
+- Console script `minion` (`minion_cli.main:app`, typer) in `packages/minion-cli`; subcommands
+  `submit`, `status`, `fetch`, `cancel`. Kept out of minion-common so boto3 and submitter S3 credentials
+  stay out of the executor's dependency closure (S-2, S-14).
+- Uses the typed `UserClient` from minion-common with the user API key (`MINION_API_KEY` or Keychain
+  item `open-minions-api-key`). Settings are `MINION_CLI_*` env vars (no env file).
+- `submit` uploads the JSONL files to `inputs/{team}/{project}/{name}/` via boto3 (path-style, S3 API),
+  creates the task with `output_uri` under `outputs/{team}/{project}/{name}/`, polls progress and downloads
+  the `SUCCEEDED` parts to a local directory (`results.jsonl`, `manifest.json`). The server never proxies
+  payloads (invariant 4). Output is never printed or logged.
+- Exit codes: 0 ok, 1 FAILED/CANCELLED, 2 usage/config/auth/4xx, 3 PARTIAL, 4 timeout or server/S3
+  unreachable, 130 Ctrl-C. Ctrl-C never cancels the task; only `minion cancel` does.
+
 ## 3. Key flows
 
 ### 3.1 Task submission
+The `minion submit` CLI (§2.5) performs the same steps from a workstation: it uploads the input JSONL
+under `inputs/{team}/…` with its own S3 credentials (S-14), then calls `POST /api/v1/tasks` with the
+`output_uri` it derived. Everything below applies unchanged to CLI-created tasks.
 ```
 User ─POST /tasks─▶ Server: validate (team membership, model allow-list + type, team-scoped S3 URIs
                     `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output;

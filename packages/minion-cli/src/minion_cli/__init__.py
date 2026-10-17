@@ -1,0 +1,1 @@
+"""open-minions submitter CLI."""
