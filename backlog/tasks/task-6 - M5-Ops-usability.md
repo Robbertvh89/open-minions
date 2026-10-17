@@ -461,5 +461,5 @@ AC:
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-M5 complete: 6.1 auth v2 (#24), 6.2 rate limits + prefer (#29), 6.3 Range-signed GET + output cap (#30), 6.4 list/fleet API (#25), 6.5 read-only views + Grafana + metrics (#26), 6.6 web UI (#27), 6.7 UI create/cancel/fleet (#28), 6.8 launchd service (#23), 6.9 NF-7 proxy bench + protocol (#36; minion fails light/balanced, follow-up TASK-24), 6.10 call-aware governor (#35), 6.11 compose app containers (#37).
+M5 complete: 6.1 auth v2 (#24), 6.2 rate limits + prefer (#29), 6.3 Range-signed GET + output cap (#30), 6.4 list/fleet API (#25), 6.5 read-only views + Grafana + metrics (#26), 6.6 web UI (#27), 6.7 UI create/cancel/fleet (#28), 6.8 launchd service (#23), 6.9 NF-7 proxy bench + protocol (#36; minilm fails light/balanced, follow-up TASK-24), 6.10 call-aware governor (#35), 6.11 compose app containers (#37).
 <!-- SECTION:FINAL_SUMMARY:END -->

@@ -3,10 +3,10 @@ id: TASK-25
 title: >-
   minion submit CLI: upload local JSONL, submit task, follow progress, download
   results
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 17:54'
-updated_date: '2026-10-17 18:36'
+updated_date: '2026-10-17 19:44'
 labels:
   - cli
 dependencies: []
@@ -21,10 +21,10 @@ Submitting a task today needs a manual S3 upload plus curl. Add a submitter CLI 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 minion submit --type embedding|completion --model M data.jsonl -o out/ uploads, submits, waits and downloads; exit non-zero on FAILED/CANCELLED
-- [ ] #2 API key from env or Keychain, never printed; insecure URLs refused like the executor CLI
-- [ ] #3 Integration test end to end with the fake engine
-- [ ] #4 README quick start uses it
+- [x] #1 minion submit --type embedding|completion --model M data.jsonl -o out/ uploads, submits, waits and downloads; exit non-zero on FAILED/CANCELLED
+- [x] #2 API key from env or Keychain, never printed; insecure URLs refused like the executor CLI
+- [x] #3 Integration test end to end with the fake engine
+- [x] #4 README quick start uses it
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -39,3 +39,9 @@ TASK-25 plan (planner, based on main):
 - Step 5 docs: README quick start, CLAUDE.md, SPEC FR-1 + new S-14 (submitter S3 creds scoped to inputs/{team}/ outputs/{team}/, never server's), ARCHITECTURE §2.5/§3.1, .env.example.
 - Risks: same-name concurrent submit (server 409 decides); boto3 checksum vs SeaweedFS (request_checksum_calculation="when_required"); remote DOCKER_HOST -> skip; uv.lock conflict with TASK-6.11 -> branch after 6.11 merges.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #38: packages/minion-cli with minion submit/status/fetch/cancel (exit 0/1/2/3/4/130), S3 creds submitter-side only (S-14), content-verified resume and fetch, exclusive locked output dir, results in record order. CI run 39062777152: 1722 passed; live run against compose stack passed.
+<!-- SECTION:FINAL_SUMMARY:END -->
