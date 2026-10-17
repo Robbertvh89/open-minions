@@ -41,6 +41,7 @@ class ServerSettings(BaseSettings):
     # Config files and background work.
     models_file: str = "deploy/models.yaml"
     api_keys_file: str | None = None
+    api_keys_reload_s: float = Field(default=5.0, ge=0)  # keys file change check; 0 = every request
     splitter_poll_s: float = Field(default=2.0, gt=0)
     executor_token_ttl_days: int = Field(default=90, gt=0)
 

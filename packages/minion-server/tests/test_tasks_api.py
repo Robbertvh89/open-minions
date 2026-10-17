@@ -11,7 +11,7 @@ from minion_common.enums import Engine, TaskType
 from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.api.tasks import create_task, validate_uris
 from minion_server.app import create_app
-from minion_server.auth import User
+from minion_server.auth import KeysConfig, User
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
@@ -67,6 +67,7 @@ async def _create_with(model: ModelEntry, params: dict[str, Any]) -> None:
         settings=cast(Any, None),
         storage=cast(Any, None),
         models={model.model_id: model},
+        keys_config=KeysConfig({}, {}),
     )
 
 
@@ -141,7 +142,12 @@ async def app_client(
 ) -> AsyncIterator[tuple[AsyncClient, FastAPI]]:
     keys = tmp_path / "keys.yaml"
     digest = hashlib.sha256(KEY.encode()).hexdigest()
-    keys.write_text(f"keys:\n  - name: alice\n    sha256: {digest}\n    teams: [api1, api2]\n")
+    keys.write_text(
+        f"keys:\n  - name: alice\n    sha256: {digest}\n    teams: [api1, api2, api3]\n"
+        "teams:\n"
+        "  api2: {default_pool: pa, allowed_pools: [pa, pb]}\n"
+        "  api3: {allowed_pools: [pa]}\n"
+    )
     app = create_app(_settings(migrated_url, s3, keys))
     async with app.router.lifespan_context(app):
         # Tests drive split_one themselves; a live background splitter would race for the lease.
@@ -202,6 +208,34 @@ async def test_create_params_allow_list(app_client: tuple[AsyncClient, FastAPI],
     ok = await c.post("/api/v1/tasks", json=_payload("api1", "prm", params={"normalize": False}))
     assert ok.status_code == 202, ok.text
     assert ok.json()["params"] == {"normalize": False}
+
+
+@pytest.mark.integration
+async def test_create_team_pool_policy(app_client: tuple[AsyncClient, FastAPI], s3: S3Env) -> None:
+    c, _ = app_client
+    for team in ("api1", "api2", "api3"):
+        _put(s3, f"inputs/{team}/pol/a.jsonl", _jsonl(1, "x"))
+
+    async def post(team: str, name: str, **kw: Any) -> Any:
+        return await c.post("/api/v1/tasks", json=_payload(team, "pol", project=name, **kw))
+
+    r = await post("api2", "d")  # team default applied
+    assert r.status_code == 202, r.text
+    assert r.json()["allowed_pool"] == "pa"
+    r = await post("api2", "b", allowed_pool="pb", output_uri="s3://minion/outputs/api2/pb")
+    assert r.status_code == 202 and r.json()["allowed_pool"] == "pb"
+    r = await post("api2", "x", allowed_pool="evil")
+    assert (r.status_code, r.json()["detail"]["code"]) == (403, "POOL_NOT_ALLOWED")
+    r = await post("api3", "n")  # allowed_pools but no default, none given
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "POOL_REQUIRED")
+    r = await post("api3", "o", allowed_pool="pa")
+    assert r.status_code == 202
+    r = await post("api1", "free")  # no policy: as before
+    assert r.status_code == 202 and r.json()["allowed_pool"] is None
+    r = await post(
+        "api1", "anypool", allowed_pool="whatever", output_uri="s3://minion/outputs/api1/q"
+    )
+    assert r.status_code == 202
 
 
 @pytest.mark.integration

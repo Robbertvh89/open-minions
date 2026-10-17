@@ -27,3 +27,12 @@ def test_generate_api_key_output_loads_and_authenticates(tmp_path: Path) -> None
 def test_generate_api_key_rejects_bad_name(name: str) -> None:
     result = CliRunner().invoke(app, ["generate-api-key", "--name", name, "--teams", "ml"])
     assert result.exit_code == 2
+
+
+def test_printable_escapes_control_chars() -> None:
+    from minion_server.admin import printable
+
+    out = printable("ev\x1b]0;pwn\x07il\tho\nst")
+    assert all(c.isprintable() for c in out)
+    assert "\x1b" not in out and "\\x1b" in out and "\\t" in out and "\\n" in out
+    assert printable("alice@x.io") == "alice@x.io"

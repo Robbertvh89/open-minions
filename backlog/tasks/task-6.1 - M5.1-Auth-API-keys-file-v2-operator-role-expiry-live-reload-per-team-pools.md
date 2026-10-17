@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-17 03:32'
-updated_date: '2026-10-17 05:23'
+updated_date: '2026-10-17 05:54'
 labels:
   - M5
 dependencies: []
@@ -22,10 +22,10 @@ Keys file v2 (auth.py:48-102): per-key operator flag + expires_at; teams: {slug:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A key removed from the file is rejected within reload_s + 1 s without restart
-- [ ] #2 A malformed rewrite gives 401 for all keys plus an error log; fixing the file restores access
-- [ ] #3 An expired key gives 401
-- [ ] #4 Task without allowed_pool gets the team default; pool outside the allowed set gives 403; teams without a policy behave as before
-- [ ] #5 require_operator gives 403 to non-operator keys
-- [ ] #6 rotate-executor-token: old token 401, new works with same executor_id; list-executors never prints token_hash
+- [x] #1 A key removed from the file is rejected within reload_s + 1 s without restart
+- [x] #2 A malformed rewrite gives 401 for all keys plus an error log; fixing the file restores access
+- [x] #3 An expired key gives 401
+- [x] #4 Task without allowed_pool gets the team default; pool outside the allowed set gives 403; teams without a policy behave as before
+- [x] #5 require_operator gives 403 to non-operator keys
+- [x] #6 rotate-executor-token: old token 401, new works with same executor_id; list-executors never prints token_hash
 <!-- AC:END -->

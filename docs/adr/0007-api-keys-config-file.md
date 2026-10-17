@@ -1,6 +1,6 @@
 # ADR-0007: User API keys from a config file, not a database table
 
-- Status: **Accepted** (implemented in TASK-2.1; `auth.lookup_user` full-scan and startup load verified)
+- Status: **Accepted** (implemented in TASK-2.1; amended by TASK-6.1, see the Amendment below)
 - Date: 2026-10-15
 - Deciders: project owner
 - Deviates from paper: **no** — internal design choice; the paper does not specify user authentication.
@@ -28,10 +28,54 @@ authorized by team.
 ## Consequences
 
 - No schema change and no 8th table; the SPEC §7 count holds.
-- **Revoking a user key requires removing it from the file and restarting the server.** Keys are not
-  re-read at runtime. Executor tokens are different: they live in the database and are revoked
+- ~~Revoking a user key requires a restart~~ (superseded by the Amendment: keys are re-read live). Executor tokens are different: they live in the database and are revoked
   immediately (`minion-server-admin revoke-executor-token`).
-- Keys are not individually expirable; rotation means generating a new entry and deleting the old one.
+- Keys can carry `expires_at` (Amendment); rotation means adding a new entry and deleting the old one.
 - `created_by` is not referentially checked and can outlive a removed key; audit by name only.
 - Migrating to a table (or OIDC) in M5 is a migration plus a change to `current_user` only; the
   route-level contract (`Authorization: Bearer`, team scoping) stays the same.
+
+## Amendment (TASK-6.1, M5): keys file v2
+
+- Entries gain `operator: bool` (default false) and `expires_at` (timezone-aware ISO timestamp;
+  an expired key gets `401`). A top-level `teams: {slug: {default_pool, allowed_pools}}` map holds
+  per-team pool policy (SPEC S-1). Parsing stays strict (`extra=forbid`); a v1 file is valid unchanged.
+- **Live reload replaces "loaded once at startup".** `KeyStore` stats the file at most every
+  `MINION_API_KEYS_RELOAD_S` (default 5) on the next request and re-reads it when mtime, size or
+  inode changed. The file is read through one file descriptor (fstat then read), must be a regular
+  file and at most 1 MiB; symlinked files are allowed because secret mounts use them. A removed key
+  is therefore rejected within the reload interval without a restart.
+- **A malformed, unreadable or vanished file after startup fails closed**: every key gets `401` and an
+  error is logged (path and validation error types only, never file content or key material) until a
+  valid file is back. The first load at startup still aborts the server. Fixing the file restores access.
+- `require_operator` is a FastAPI dependency (`403 OPERATOR_REQUIRED`). No existing endpoint uses it yet;
+  the fleet endpoints of M5 will.
+- Task creation applies the team policy: no `allowed_pool` gets `default_pool`; a pool outside
+  `allowed_pools` is `403 POOL_NOT_ALLOWED`; `allowed_pools` without a default and no pool given is
+  `422 POOL_REQUIRED`. A team with only `default_pool` accepts any explicit pool. No policy = as before.
+- `created_by` stays a plain string: the FK is **won't-do** (it would need an 8th table, SPEC section 7).
+- Executor tokens: `rotate-executor-token` replaces the hash on the same row (same `executor_id`);
+  no schema change. Revoked executors are not rotated.
+- Hardening of the live reload: each interval the file (<= 1 MiB, local storage; not NFS/FUSE) is read
+  through one fd and its sha256 compared, so same-size in-place rewrites with a restored mtime are
+  seen. The file must be replaced **atomically** (write a temp file, then `rename`); a parse result is
+  discarded when the content changed while parsing. I/O and permission errors are retried every
+  interval; content errors are remembered by hash. The file must be owned by root or the server's euid
+  and not group/world-writable, and its resolved directory chain must not be group/world-writable
+  (sticky + root-owned excepted); otherwise startup fails and a reload fails closed. Docker/K8s secret
+  mounts (root-owned 0444/0644) pass. Each request uses one config snapshot for auth and pool policy.
+- Hardening round 2: the file is opened `O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW` (a FIFO fails
+  closed instead of hanging), after the configured path is resolved component by component (OpenSSH
+  `safe_path` style, symlinks followed by hand, at most 40 hops). **Every directory in which a name is
+  looked up** (including the directory holding the configured symlink and any symlinked intermediate
+  directory) must be owned by root or the server's euid and not group/world-writable; sticky +
+  root-owned directories (K8s 1777 mount) are exempt from the writable rule. After the open,
+  `fstat(fd)` (device, inode) must equal `stat` of the checked path (TOCTOU guard). Docker
+  `/run/secrets` (root 0755, file root 0444) and K8s `..data` layouts pass.
+- YAML mappings with duplicate keys (duplicate team slug, repeated top-level key) are rejected
+  (`DuplicateKeyError`, fail closed) instead of letting the last one win.
+- The reload runs synchronously on the request that crosses the interval. This is accepted: the file is
+  capped at 1 MiB, parsed by `CSafeLoader`, on local storage, and checked at most once per interval.
+- A non-atomic in-place rewrite can be observed half-written; a truncated file that still parses may
+  briefly drop team pool policies (fail open for one interval). This is why atomic replace
+  (temp + rename) is required, not just recommended.
