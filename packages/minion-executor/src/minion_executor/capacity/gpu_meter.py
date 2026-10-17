@@ -216,8 +216,9 @@ def process_gpu_share(samples: list[GpuSample], start: float, end: float) -> flo
     Uses the last sample at or before each bound, so the divisor is the true span between the two
     readings. Per client: the start value is 0 when the client is not yet listed (it appeared
     inside the window), the end value is the last one seen (a client that closed inside the window
-    keeps what it accumulated). Positive deltas are summed per consecutive sample pair, so a
-    counter that goes backwards costs at most one interval. Clients of the process are summed.
+    keeps what it accumulated). Positive deltas are summed per consecutive sample pair (each
+    reading compared with the client's last seen value), so a counter that goes backwards costs at
+    most one interval. Clients of the process are summed.
     Raises GpuMeterError without a usable pair of readings."""
     usable = [s for s in samples if s.clients is not None]
     before = [s for s in usable if s.at <= start]

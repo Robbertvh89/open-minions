@@ -46,6 +46,8 @@ class DutyCyclePacer:
         self._quantum = max(0.0, quantum_s)
         self._acc = 0.0  # busy seconds since the last sleep
         self._force = False  # duty just dropped: the next step drains and sleeps at once
+        self._asked = False  # quantum_due() was asked for the step in progress ...
+        self._due = False  # ... and this was the answer: step_done() honours it
         self._clock = clock
         self._wait = wait
         self._start = self._last = clock()
@@ -77,12 +79,17 @@ class DutyCyclePacer:
         self._start = self._last = self._clock()
         self._busy = self._excluded = self._credit = self._acc = 0.0
         self._force = False
+        self._asked = self._due = False
 
     def quantum_due(self) -> bool:
-        """True if the step in progress will end a quantum (so it must sync the GPU first)."""
-        if self._duty >= 1.0:
-            return False
-        return self._force or self._acc + max(0.0, self._clock() - self._last) >= self._quantum
+        """True if the step in progress will end a quantum (so it must sync the GPU first). The
+        answer is latched: step_done() ends the quantum only if this said so, so a step never
+        sleeps without the caller having drained the GPU first."""
+        due = self._duty < 1.0 and (
+            self._force or self._acc + max(0.0, self._clock() - self._last) >= self._quantum
+        )
+        self._asked, self._due = True, due
+        return due
 
     def exclude(self, seconds: float) -> None:
         """Remove `seconds` just spent paused from both busy and wall time."""
@@ -97,6 +104,7 @@ class DutyCyclePacer:
         if self._duty >= 1.0 or self._acc + (self._clock() - self._last) <= 0.0:
             return 0.0
         self._force = True
+        self._asked = False  # the batch is done and the GPU idle: no drain to wait for
         return self.step_done()
 
     def step_done(self) -> float:
@@ -110,8 +118,10 @@ class DutyCyclePacer:
             self._credit = 0.0
             self._last = self._clock()
             return 0.0
-        if not self._force and self._acc < self._quantum:
-            self._last = self._clock()  # mid-quantum: no sync, no sleep
+        ends = self._due if self._asked else (self._force or self._acc >= self._quantum)
+        self._asked = self._due = False
+        if not ends:
+            self._last = self._clock()  # mid-quantum: no sync, no sleep (a force carries over)
             return 0.0
         self._force = False
         busy = self._acc

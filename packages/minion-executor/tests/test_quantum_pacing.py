@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import time
 import types
 from typing import Any
 
@@ -61,9 +62,9 @@ def test_pacer_sleep_length_follows_duty_and_credit_is_capped() -> None:
     q = DutyCyclePacer(0.5, over, late, quantum_s=0.05)
     over.now += 0.1
     q.step_done()
-    over.now += 0.1
-    # the credit (capped at 0.5 s) covers the 0.1 s owed: no further sleep
-    assert q.step_done() == 0.0
+    over.now += 0.6  # owes 0.6 s; the credit is capped at 0.5 s, so ~0.1 s is slept
+    slept = q.step_done()
+    assert slept == pytest.approx(5.0 + 0.1) and over.now > 0  # late wake-up of 5 s on top
 
 
 def test_pacer_full_duty_never_due_or_sleeping() -> None:
@@ -99,6 +100,47 @@ def test_pacer_flush_pays_the_partial_quantum() -> None:
     assert _pacer(1.0, c).flush() == 0.0
 
 
+def test_latched_answer_busy_crossing_quantum_after_will_sleep_does_not_sleep() -> None:
+    c = _Clock()
+    p = _pacer(0.5, c)
+    c.now += 0.01
+    assert not p.quantum_due()  # asked: no
+    c.now += 0.06  # busy crosses the quantum before the checkpoint
+    assert p.step_done() == 0.0 and c.slept == []
+    c.now += 0.01
+    assert p.quantum_due()
+    assert p.step_done() == pytest.approx(0.08)
+
+
+def test_latched_answer_duty_drop_at_checkpoint_syncs_next_step() -> None:
+    c = _Clock()
+    p = _pacer(1.0, c)
+    c.now += 0.001
+    assert not p.quantum_due()
+    p.set_duty(0.5)  # applied at the checkpoint, after will_sleep said no
+    assert p.step_done() == 0.0 and c.slept == []
+    c.now += 0.001
+    assert p.quantum_due()  # the force carried over
+    assert p.step_done() == pytest.approx(0.002)
+
+
+def test_unasked_step_done_falls_back_to_the_quantum() -> None:
+    c = _Clock()
+    p = _pacer(0.5, c)
+    c.now += 0.06
+    assert p.step_done() == pytest.approx(0.06)
+
+
+def test_finish_returns_from_the_flush_when_paused() -> None:
+    ctl, parent = _ctl(0.5)
+    ctl._pacer._acc = 0.0
+    ctl._pacer._last = time.monotonic() - 2.0  # owes ~2 s
+    _send(parent, WorkerCtl(gen=1, duty=0.5, paused=True).to_msg())
+    t0 = time.monotonic()
+    ctl.finish()
+    assert time.monotonic() - t0 < 1.0
+
+
 def test_quantum_default_constant() -> None:
     assert 0 < QUANTUM_S <= 0.1
 
@@ -111,17 +153,17 @@ def _ctl(duty: float, cap: float = 1.0) -> tuple[_Ctl, Any]:
 
 def test_ctl_will_sleep_follows_live_duty_and_the_budget_cap() -> None:
     ctl, parent = _ctl(1.0)
-    assert not ctl.will_sleep() and not ctl.paced
+    assert not ctl.will_sleep()
     _send(parent, WorkerCtl(gen=1, duty=0.5, paused=False).to_msg())
     assert ctl.will_sleep()  # message applied by will_sleep itself; duty just dropped
-    assert ctl.paced
+    assert ctl._pacer.duty == 0.5
     ctl.checkpoint(1)  # drains the quantum
     assert not ctl.will_sleep()
     _send(parent, WorkerCtl(gen=2, duty=1.0, paused=False).to_msg())
-    assert not ctl.will_sleep() and not ctl.paced
+    assert not ctl.will_sleep()
 
     capped, _ = _ctl(1.0, cap=0.4)  # the budget's duty bounds a looser live duty
-    assert capped.paced
+    assert capped._pacer.duty == 0.4
 
 
 def test_completion_runner_syncs_only_when_the_quantum_is_due(

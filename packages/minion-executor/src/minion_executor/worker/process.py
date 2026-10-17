@@ -165,14 +165,10 @@ class _Ctl:
         self._max = max_message_bytes
         self._on_trim = on_trim
         self._last_tick = 0.0
+        self._flushing = False  # finish(): a pause pays off the remaining sleep
         self._done: int | None = None  # last records_done seen; re-sent on pacer ticks
         self.ctl = ctl
         self._pacer = DutyCyclePacer(min(ctl.duty, duty_cap), time.monotonic, self._wait)
-
-    @property
-    def paced(self) -> bool:
-        """The pacer will sleep at checkpoints: runners must drain async GPU work first."""
-        return self._pacer.duty < 1.0
 
     def will_sleep(self) -> bool:
         """The coming checkpoint ends a pacing quantum: runners must drain async GPU work first.
@@ -196,7 +192,11 @@ class _Ctl:
     def finish(self) -> None:
         """Pay the partial quantum's sleep, then send the final usage totals (the run's GPU
         share)."""
-        self._pacer.flush()
+        self._flushing = True
+        try:
+            self._pacer.flush()
+        finally:
+            self._flushing = False
         self._send_tick()
 
     def _send_tick(self, *, ack: bool = False) -> None:
@@ -254,6 +254,8 @@ class _Ctl:
         end = time.monotonic() + seconds
         while (left := end - time.monotonic()) > 0:
             if self._read_ctl(min(left, self._tick_s)):
+                if self._flushing and self.ctl.paused:
+                    return False  # end of run: the control side gates the next one
                 self._block_while_paused()
                 return True
             self._tick()

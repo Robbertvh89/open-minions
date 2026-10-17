@@ -71,13 +71,14 @@ therefore accumulates busy time across steps and only ends a *quantum* when it r
 (50 ms): that step syncs the GPU first (so the sync counts as busy), then sleeps
 `busy x (1 - d) / d` (oversleep credit capped at 0.5 s) and resets the accumulator. Between quanta
 there is neither a sync nor a sleep, so pipelining works inside a quantum and the GPU holds at most one
-quantum of queued work (<= the quantum plus one step) when the sleep starts: invariant 6 and NF-8(b)
+quantum of queued work (<= the quantum plus one step) when the sleep starts: invariant 6 and NF-8(a)
 (share <= duty + 10 pp) hold with a bounded overshoot. Runners ask `StepControl.will_sleep()` before
 the checkpoint and sync only when it is True (controls without it sync every step, the safe side).
 Pause and control-message reading still happen at every checkpoint (NF-9 reaction is unchanged). A
 live duty drop (1.0 -> 0.5) makes the next step a quantum end regardless of accumulated time:
 `will_sleep()` applies pending control messages first. A message arriving between `will_sleep()` and
-`checkpoint()` is applied at the checkpoint and takes effect one step later. Ollama is not
+`checkpoint()` is applied at the checkpoint and takes effect one step later: the pacer latches the
+`will_sleep()` answer, so that step does not sleep unsynced (a duty drop forces the next one). Ollama is not
 controllable: the daemon owns the GPU queue, so its duty is best-effort (request-level pacing only).
 
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
