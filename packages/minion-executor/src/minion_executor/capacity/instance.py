@@ -12,10 +12,13 @@ import contextlib
 import errno
 import fcntl
 import os
-import stat
 from pathlib import Path
 
-from minion_executor.capacity.safefile import SafeFileError, open_private_dir
+from minion_executor.capacity.safefile import (
+    SafeFileError,
+    open_lock_fd,
+    open_private_dir,
+)
 
 LOCK_FILE = "executor.lock"
 
@@ -32,24 +35,10 @@ def acquire_instance_lock(state_dir: Path) -> int:
     """
     dfd = open_private_dir(state_dir)
     try:
-        try:
-            fd = os.open(
-                LOCK_FILE,
-                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                0o600,
-                dir_fd=dfd,
-            )
-        except OSError as exc:
-            raise SafeFileError(
-                f"cannot open lock file {state_dir / LOCK_FILE}: {exc.strerror}"
-            ) from None
+        fd = open_lock_fd(dfd, LOCK_FILE, state_dir / LOCK_FILE)
     finally:
         os.close(dfd)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
-            raise SafeFileError(f"lock file {state_dir / LOCK_FILE} is not a regular file of ours")
-        os.fchmod(fd, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Self
 
@@ -12,6 +13,36 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from minion_executor.capacity.control import default_state_dir
 from minion_executor.model_cache import default_cache_dir
+
+STATE_DIR_ENV = "MINION_EXECUTOR_STATE_DIR"
+
+
+def normalize_state_dir(value: object) -> Path:
+    """The state directory for a configured value: blank = default, `~` expanded, absolute only.
+
+    Shared by `ExecutorSettings` and the menu bar so that they always agree on the directory.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default_state_dir()
+    if not isinstance(value, (str, os.PathLike)):
+        raise ValueError(f"{STATE_DIR_ENV} must be a path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{STATE_DIR_ENV} must be an absolute path")
+    return path
+
+
+def state_dir_from_env(environ: Mapping[str, str] | None = None) -> Path:
+    """`normalize_state_dir` of the environment; the variable name is case-insensitive.
+
+    pydantic-settings matches env names case-insensitively (the last match wins); so do we.
+    """
+    env = os.environ if environ is None else environ
+    raw: str | None = None
+    for key, val in env.items():
+        if key.upper() == STATE_DIR_ENV:
+            raw = val
+    return normalize_state_dir(raw)
 
 
 class ExecutorSettings(BaseSettings):
@@ -84,13 +115,10 @@ class ExecutorSettings(BaseSettings):
     # Same for the model-fetch subprocess (network allowed, writes only to its staging dir).
     fetch_sandbox: bool = True
 
-    @field_validator("state_dir")
+    @field_validator("state_dir", mode="before")
     @classmethod
-    def _state_dir_absolute(cls, v: Path) -> Path:
-        v = v.expanduser()
-        if not v.is_absolute():
-            raise ValueError("MINION_EXECUTOR_STATE_DIR must be an absolute path")
-        return v
+    def _state_dir_normalized(cls, v: object) -> Path:
+        return normalize_state_dir(v)
 
     @field_validator("config_path", "fake_signals", "launchd_exit_timeout_s", mode="before")
     @classmethod

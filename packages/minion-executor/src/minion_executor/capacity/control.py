@@ -122,12 +122,15 @@ def update_control(
     explicitly, the result is paused (no end time) and `warn` is told why. `resume` is the
     explicit way out.
     """
-    # one writer at a time (CLI and menu bar): an unsafe directory is reported below as before
+    # One writer at a time (CLI and menu bar). Only an unsafe directory skips the lock: that is
+    # safe because _update_locked then reports it and write_control refuses the same directory.
+    lock: contextlib.AbstractContextManager[None]
     try:
         ensure_private_dir(state_dir)
-        lock: contextlib.AbstractContextManager[None] = private_lock(state_dir, CONTROL_LOCK_FILE)
     except UnsafeDirError:
         lock = contextlib.nullcontext()
+    else:
+        lock = private_lock(state_dir, CONTROL_LOCK_FILE)
     with lock:
         return _update_locked(
             state_dir,

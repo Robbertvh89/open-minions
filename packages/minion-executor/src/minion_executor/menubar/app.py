@@ -4,7 +4,10 @@ A status item with a menu: status lines, Pause (30 min / 1 h / 2 h / until resum
 Profile (automatic / light / balanced / full / custom) and Quit. It reads `status.json` every
 `POLL_INTERVAL_S` and writes only through `update_control`. No network, no token, no subprocess,
 no power assertion: the app never keeps the Mac awake (invariant 6). `NSTimer` with a tolerance
-lets the system coalesce wake-ups; the menu is rebuilt only when the view changed.
+lets the system coalesce wake-ups; the menu is rebuilt when the view changed (the "updated"
+age line is excluded) and whenever the menu is about to open, so the age is fresh when shown.
+The guarantee is about this package's own code only (no network, token or subprocess code,
+checked by a source test); the `minion-executor` entry point that starts it loads httpx anyway.
 """
 
 from __future__ import annotations
@@ -26,18 +29,20 @@ from AppKit import (
 )
 from Foundation import NSTimer
 
-from minion_executor.capacity.control import update_control
+from minion_executor.capacity.control import read_control, update_control
 from minion_executor.capacity.safefile import SafeFileError
 from minion_executor.capacity.status import read_status, safe_text
 from minion_executor.menubar.model import (
     PAUSE_CHOICES,
     POLL_INTERVAL_S,
-    PROFILE_CHOICES,
     RESUME,
     Action,
     View,
+    action_error,
+    available_profiles,
     build_view,
     control_kwargs,
+    profile_choices,
 )
 
 
@@ -54,6 +59,10 @@ class _Target(NSObject):  # type: ignore[misc]
         if self.owner is not None:
             self.owner.refresh()
 
+    def menuWillOpen_(self, _menu: Any) -> None:  # noqa: N802 (NSMenuDelegate selector)
+        if self.owner is not None:
+            self.owner.refresh(force=True)
+
     def quit_(self, _sender: Any) -> None:
         NSApplication.sharedApplication().terminate_(None)
 
@@ -61,8 +70,9 @@ class _Target(NSObject):  # type: ignore[misc]
 class MenuBarApp:
     """Builds the status item and menu; `refresh` re-reads the status file."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(self, state_dir: Path, config_path: Path | None = None) -> None:
         self.state_dir = state_dir
+        self.config_path = config_path
         self._actions: list[Action] = []
         self._view: View | None = None
         self._notice: str | None = None
@@ -71,6 +81,7 @@ class MenuBarApp:
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
         self._menu = NSMenu.alloc().init()
         self._menu.setAutoenablesItems_(False)
+        self._menu.setDelegate_(self._target)
         self._item.setMenu_(self._menu)
         self._timer: Any = None
         self.refresh()
@@ -91,12 +102,13 @@ class MenuBarApp:
             self._timer = None
         NSStatusBar.systemStatusBar().removeStatusItem_(self._item)
 
-    def refresh(self) -> None:
+    def refresh(self, force: bool = False) -> None:
+        control = read_control(self.state_dir)  # never raises: absent / valid / unusable
         try:
-            view = build_view(read_status(self.state_dir))
+            view = build_view(read_status(self.state_dir), control=control)
         except (ValueError, SafeFileError, OSError) as exc:
-            view = build_view(None, error=str(exc))
-        if view != self._view:
+            view = build_view(None, error=str(exc), control=control)
+        if force or view != self._view:
             self._view = view
             self._rebuild(view)
 
@@ -104,16 +116,19 @@ class MenuBarApp:
         if not 0 <= index < len(self._actions):
             return
         self._notice = None
+        action = self._actions[index]
+        problem = action_error(action, available_profiles(self.config_path))
         try:
+            if problem is not None:
+                raise ValueError(problem)
             update_control(
                 self.state_dir,
                 warn=lambda m: setattr(self, "_notice", safe_text(m)[:200]),
-                **control_kwargs(self._actions[index]),  # type: ignore[arg-type]
+                **control_kwargs(action),  # type: ignore[arg-type]
             )
-        except (ValueError, SafeFileError) as exc:
+        except (ValueError, OSError) as exc:  # SafeFileError is a ValueError
             self._notice = safe_text(f"Action failed: {exc}")[:200]
-        self._view = None  # force a rebuild (shows the notice)
-        self.refresh()
+        self.refresh(force=True)  # shows the notice
 
     # menu construction -------------------------------------------------------------------
 
@@ -151,7 +166,7 @@ class MenuBarApp:
         self._menu.removeAllItems()
         self._actions = []
         self._item.button().setTitle_(view.title)
-        for line in view.lines:
+        for line in (*view.lines, *((view.updated,) if view.updated else ())):
             self._add(self._menu, line)
         if self._notice:
             self._add(self._menu, self._notice)
@@ -161,7 +176,7 @@ class MenuBarApp:
             self._add(sub, label, action)
         self._add(self._menu, "Resume", RESUME, enabled=view.can_resume)
         sub = self._submenu("Profile", True)
-        for label, action in PROFILE_CHOICES:
+        for label, action in profile_choices(available_profiles(self.config_path)):
             self._add(sub, label, action, checked=label == view.profile_checked)
         self._menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -171,13 +186,12 @@ class MenuBarApp:
         self._menu.addItem_(quit_item)
 
 
-def run(state_dir: Path) -> None:
+def run(state_dir: Path, config_path: Path | None = None) -> None:
     """Run the menu-bar app until Quit (blocks)."""
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # no Dock icon
-    bar = MenuBarApp(state_dir)
+    bar = MenuBarApp(state_dir, config_path)
     bar.start_timer()
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # the Cocoa loop never runs Python handlers
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    app.run()
-    bar.stop()
+    app.run()  # Quit terminates the process; the status item goes away with it
