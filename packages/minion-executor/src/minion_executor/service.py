@@ -184,7 +184,9 @@ def is_tcc_protected(path: Path | str, roots: list[Path]) -> bool:
     if not root_ids:
         return False
     return any(
-        (i := _identity(a)) is not None and i in root_ids for c in cands for a in (c, *c.parents)
+        (i := _identity(a)) is not None and i in root_ids
+        for c in cands
+        for a in (*reversed(c.parents), c)  # outermost first: never stat inside a protected dir
     )
 
 

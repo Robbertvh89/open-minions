@@ -434,7 +434,8 @@ def run(
         )
     except ApiError as exc:
         # Permanent only when the server itself refused us: 401/403 carrying its own error code
-        # (a proxy/WAF 403 has none) or 400/422. 429/5xx and the rest are retried.
+        # (a proxy/WAF 403 has none), 400 with a server code, or 422.
+        # 429/5xx and the rest are retried.
         if exc.status_code == 429 or not 400 <= exc.status_code < 500:
             raise
         auth = exc.status_code in (401, 403) and exc.code in SERVER_AUTH_CODES
