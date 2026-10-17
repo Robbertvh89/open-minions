@@ -383,12 +383,15 @@ class ExecutorLoop:
         lo, hi = self._backoff
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
-    def _rate_limit_delay(self, exc: Exception, n: int) -> float:
-        """Backoff for attempt `n`; a 429 waits at least its numeric `Retry-After` (cap 300 s)."""
-        delay = self._delay(n)
+    def _rate_limit_delay(self, exc: Exception, n: int, *, repeated: bool = False) -> float:
+        """Backoff for attempt `n`. A first 429 waits its numeric `Retry-After` (cap 300 s) plus
+        0-20 % jitter; when 429s repeat (`repeated`) it escalates to max(backoff, Retry-After)."""
         if isinstance(exc, ApiError) and exc.status_code == 429 and exc.retry_after is not None:
-            delay = max(delay, min(exc.retry_after, MAX_RETRY_AFTER_S))
-        return delay
+            ra = min(exc.retry_after, MAX_RETRY_AFTER_S)
+            if repeated:
+                return max(self._delay(n), ra)
+            return float(ra * random.uniform(1.0, 1.2))  # noqa: S311
+        return self._delay(n)
 
     async def _pause(self, delay: float, *, until: asyncio.Event | None = None) -> None:
         if self._sleep_fn is not None:
@@ -507,7 +510,7 @@ class ExecutorLoop:
                 if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     raise
                 log.warning("register_failed", error=type(exc).__name__)
-                await self._pause(self._rate_limit_delay(exc, attempt))
+                await self._pause(self._rate_limit_delay(exc, attempt, repeated=attempt > 0))
                 attempt += 1
 
     async def run(self, max_subtasks: int | None = None) -> int:
@@ -572,7 +575,7 @@ class ExecutorLoop:
                     await self._enforce_idle_budget()
                     if limited:  # 429: back off at least Retry-After, also across a pause
                         limited_n += 1
-                        delay = self._rate_limit_delay(exc, limited_n - 1)
+                        delay = self._rate_limit_delay(exc, limited_n - 1, repeated=limited_n > 1)
                         self._rate_limited_until = self._clock() + delay
                         await self._sleep(version, delay=delay)
                         if not self._gov.decision.paused:  # waited it out (a pause keeps the rest)

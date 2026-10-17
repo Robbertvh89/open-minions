@@ -4,7 +4,7 @@ title: Security hardening follow-ups from TASK-2.1 audit
 status: To Do
 assignee: []
 created_date: '2026-10-15 14:41'
-updated_date: '2026-10-16 21:36'
+updated_date: '2026-10-17 12:10'
 labels:
   - security
 dependencies: []
@@ -40,4 +40,6 @@ macOS ACLs are not checked on the state dir, control.json or executor.toml (mode
 TASK-5.4 review: O_NOFOLLOW covers only the last path component; symlinks in state dir parents are followed (same-user/admin only). Consider an openat component walk.
 
 TASK-5.5 review follow-up: POST /executor/presence has no server-side minimum interval / 429 like heartbeat. A misbehaving or hostile executor can spam it (DB write per call). Add a per-executor min interval and a 429 with Retry-After, and honor it in the executor's presence sender.
+
+Follow-up (TASK-6.2): document an example reverse-proxy per-IP/per-token rate-limit config (nginx limit_req / Caddy) for executor and read endpoints; the in-app limiter is per replica, per executor only.
 <!-- SECTION:NOTES:END -->

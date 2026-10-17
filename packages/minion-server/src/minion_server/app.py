@@ -49,7 +49,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 "register": cfg.register_min_interval_s,
                 "acquire": cfg.acquire_min_interval_s,
                 "presence": cfg.presence_min_interval_s,
-            }
+                "preference": cfg.preference_min_interval_s,
+            },
+            max_entries=cfg.rate_limit_max_entries,
         )
         app.state.api_keys = api_keys
         app.state.ui_secret = (

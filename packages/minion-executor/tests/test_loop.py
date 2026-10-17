@@ -3101,7 +3101,7 @@ async def test_register_429_backs_off_honouring_retry_after(tmp_path: Path) -> N
     client.on_empty = loop.stop
     await loop.run()
     assert client.kinds().count("register") == 2
-    assert sleeps[0] == 120.0
+    assert 120.0 <= sleeps[0] <= 144.0  # Retry-After + 0-20 % jitter
 
 
 async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None:
@@ -3110,7 +3110,7 @@ async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None
     loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
     client.on_empty = loop.stop
     await loop.run()
-    assert sleeps[0] == 300.0  # Retry-After is capped
+    assert 300.0 <= sleeps[0] <= 360.0  # Retry-After is capped, then jittered
 
 
 def _grew(items: list[float], seen: int) -> bool:
@@ -3167,7 +3167,7 @@ async def test_429_backoff_cut_short_by_a_pause_is_waited_out_after_resume(
     now[0] += 100.0  # 100 s of the 250 s passed while paused
     gov.timeouts.clear()
     gov.update(dec())  # resume
-    await until(lambda: any(100 <= t <= 160 for t in gov.timeouts))  # ~150 s still to wait
+    await until(lambda: any(100 <= t <= 210 for t in gov.timeouts))  # 150-200 s still to wait
     assert client.kinds().count("acquire") == 1  # not retried before Retry-After elapsed
     loop.stop()
     await asyncio.wait_for(task, 10)
@@ -3212,3 +3212,23 @@ def test_release_code_is_upper_cased_before_falling_back() -> None:
     assert _release_code("budget_downgrade") == "BUDGET_DOWNGRADE"
     assert _release_code("STOP") == "STOP"
     assert _release_code("free text!") == "EXECUTOR_RELEASE"
+
+
+async def test_repeated_429_escalates_to_max_of_backoff_and_retry_after(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "x", retry_after=3.0)] * 2)
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert 3.0 <= sleeps[0] <= 3.6  # first: Retry-After + jitter
+    assert sleeps[1] >= 3.0  # repeated: at least Retry-After
+
+
+def test_rate_limit_delay_first_vs_repeated(tmp_path: Path) -> None:
+    loop = make_loop(FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [])
+    exc = ApiError(429, "RATE_LIMITED", "x", retry_after=2.0)
+    for _ in range(50):
+        assert 2.0 <= loop._rate_limit_delay(exc, 0) <= 2.4
+        assert loop._rate_limit_delay(exc, 0, repeated=True) >= 2.0
+    other = ApiError(503, "X", "x")
+    assert loop._rate_limit_delay(other, 0) <= loop._delay(0) * 2

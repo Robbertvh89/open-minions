@@ -1,7 +1,7 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -50,12 +50,14 @@ def _models(request: Request) -> dict[str, ModelEntry]:
     return m
 
 
-def _limited(op: str) -> Callable[[Request, ExecutorPrincipal], None]:
+def _limited(op: str) -> Callable[[Request, ExecutorPrincipal], Awaitable[None]]:
     """Dependency: 429 + Retry-After when this executor called `op` too soon. Declared after
     `current_executor` (unauthenticated callers never touch the counters) and before any DB
-    work. It only sheds load: ownership is still decided by the acquirement INSERT (invariant 2)."""
+    work. `async` on purpose: a sync dependency would run in the
+    threadpool. It only sheds load: ownership is still decided by the acquirement INSERT
+    (invariant 2)."""
 
-    def check(
+    async def check(
         request: Request, principal: Annotated[ExecutorPrincipal, Depends(current_executor)]
     ) -> None:
         limiter = getattr(request.app.state, "limiter", None)
@@ -93,7 +95,7 @@ async def register(
     return RegisterResponse(executor_id=principal.executor_id)
 
 
-@router.put("/preference", status_code=204)
+@router.put("/preference", status_code=204, dependencies=[Depends(_limited("preference"))])
 async def set_preference(
     body: PreferenceRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],

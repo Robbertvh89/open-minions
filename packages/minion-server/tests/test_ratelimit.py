@@ -1,6 +1,8 @@
 """Executor endpoint rate limits (TASK-6.2, NF-5): limiter unit tests, integration over HTTP."""
 
+import asyncio
 import re
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -80,6 +82,51 @@ def test_limiter_is_bounded_lru() -> None:
     assert lim.check(ids[3], "x") is not None  # recent entries are still limited
 
 
+def test_limiter_threaded_admits_exactly_one_per_key_per_interval() -> None:
+    lim = MinIntervalLimiter({"acquire": 3600.0})
+    keys = [uuid.uuid4() for _ in range(5)]
+    admitted: list[uuid.UUID] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(40)
+
+    def work(i: int) -> None:
+        try:
+            barrier.wait()
+            for k in keys:
+                if lim.check(k, "acquire") is None:
+                    admitted.append(k)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert sorted(admitted) == sorted(keys)
+
+
+def test_limiter_threaded_eviction_churn_has_no_errors() -> None:
+    lim = MinIntervalLimiter({"x": 0.0001}, max_entries=8)
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            for _ in range(3000):
+                lim.check(uuid.uuid4(), "x")
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert len(lim._last) <= 8
+
+
 def test_retry_after_is_whole_seconds_at_least_one() -> None:
     assert retry_after_header(0.01) == "1"
     assert retry_after_header(1.2) == "2"
@@ -87,8 +134,8 @@ def test_retry_after_is_whole_seconds_at_least_one() -> None:
 
 
 @pytest.fixture
-async def limited(migrated_url: str, s3: S3Env) -> AsyncIterator[tuple[AsyncClient, Any]]:
-    cfg = _settings(migrated_url).model_copy(
+async def limited(fresh_url: str, s3: S3Env) -> AsyncIterator[tuple[AsyncClient, Any]]:
+    cfg = _settings(fresh_url).model_copy(
         update={
             "s3_endpoint_url": s3.endpoint_url,
             "public_s3_endpoint_url": s3.endpoint_url,
@@ -171,13 +218,53 @@ async def test_acquire_too_fast_is_429_and_does_not_acquire(
     c, app = limited
     sm = app.state.sessionmaker
     await seed_task(sm, "rl", 2)
-    [(_, token)] = await make_executors(sm, 1)
+    [(p, token)] = await make_executors(sm, 1)
     body = _req().model_dump(mode="json")
     assert (await c.post(f"{BASE}/acquire", json=body, headers=_auth(token))).status_code == 200
     _assert_limited(await c.post(f"{BASE}/acquire", json=body, headers=_auth(token)))
     async with sm() as s:
-        n = (await s.execute(text("SELECT count(*) FROM minion_subtask_acquirement"))).scalar_one()
+        n = (
+            await s.execute(
+                text("SELECT count(*) FROM minion_subtask_acquirement WHERE executor_id = :e"),
+                {"e": p.executor_id},
+            )
+        ).scalar_one()
     assert n == 1
+
+
+@pytest.mark.integration
+async def test_concurrent_acquires_with_one_token_admit_exactly_one(
+    limited: tuple[AsyncClient, Any],
+) -> None:
+    c, app = limited
+    sm = app.state.sessionmaker
+    await seed_task(sm, "rlc", 20)
+    [(p, token)] = await make_executors(sm, 1)
+    body = _req().model_dump(mode="json")
+    rs = await asyncio.gather(
+        *(c.post(f"{BASE}/acquire", json=body, headers=_auth(token)) for _ in range(20))
+    )
+    codes = sorted(r.status_code for r in rs)
+    assert codes == [200] + [429] * 19
+    async with sm() as s:
+        n = (
+            await s.execute(
+                text("SELECT count(*) FROM minion_subtask_acquirement WHERE executor_id = :e"),
+                {"e": p.executor_id},
+            )
+        ).scalar_one()
+    assert n == 1
+
+
+@pytest.mark.integration
+async def test_preference_too_fast_is_429(limited: tuple[AsyncClient, Any]) -> None:
+    c, app = limited
+    app.state.limiter._intervals["preference"] = 3600.0
+    [(_, token)] = await make_executors(app.state.sessionmaker, 1)
+    body = {"team": "t"}
+    r = await c.put(f"{BASE}/preference", json=body, headers=_auth(token))
+    assert r.status_code == 204, r.text
+    _assert_limited(await c.put(f"{BASE}/preference", json=body, headers=_auth(token)))
 
 
 @pytest.mark.integration

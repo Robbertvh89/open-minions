@@ -72,6 +72,9 @@ class ServerSettings(BaseSettings):
     register_min_interval_s: float = Field(default=5.0, ge=0)
     acquire_min_interval_s: float = Field(default=0.5, ge=0)
     presence_min_interval_s: float = Field(default=5.0, ge=0)
+    preference_min_interval_s: float = Field(default=1.0, ge=0)
+    # Limiter LRU bound: 10k executors x 3 ops; eviction only admits one extra call.
+    rate_limit_max_entries: int = Field(default=30_000, gt=0)
     # Fleet view (ARCHITECTURE §7): online = heard from within this window.
     executor_online_idle_s: float = Field(default=120.0, gt=0)  # acquire poll / presence ping
     executor_online_busy_s: float = Field(default=600.0, gt=0)  # running: heartbeat

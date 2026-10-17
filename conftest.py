@@ -249,6 +249,7 @@ def _settings(url: str) -> ServerSettings:
         register_min_interval_s=0,  # likewise for the in-memory executor limits (TASK-6.2)
         acquire_min_interval_s=0,
         presence_min_interval_s=0,
+        preference_min_interval_s=0,
     )
 
 

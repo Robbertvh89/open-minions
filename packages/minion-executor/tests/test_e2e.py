@@ -1,6 +1,8 @@
 """Process-level e2e (TASK-2.3 AC #1/#2): real uvicorn, Postgres, SeaweedFS, fake runner."""
 
 import asyncio
+import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -15,15 +17,24 @@ from typing import Any
 
 import pytest
 import uvicorn
-from minion_common.client import ExecutorClient, UserClient
-from minion_common.enums import Engine
-from minion_common.schemas import AcquireRequest, Budget, PreferenceRequest, TaskCreate
+from minion_common.client import ApiError, ExecutorClient, UserClient
+from minion_common.enums import Engine, PausedReason
+from minion_common.schemas import (
+    AcquireRequest,
+    Budget,
+    CompleteRequest,
+    PreferenceRequest,
+    PresenceRequest,
+    TaskCreate,
+)
+from minion_executor.capacity.runtime import FixedGovernor
 from minion_executor.loop import ExecutorLoop
 from minion_executor.main import _send_preference
 from minion_executor.worker.process import WorkerHandle
 from minion_server.admin import issue_executor_token
 from minion_server.app import create_app
 from minion_server.services.reclaim import reclaim_stale
+from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
 
@@ -101,6 +112,32 @@ async def eventually(cond: Callable[[], Awaitable[bool]], limit_s: float = 60.0)
 
 @pytest.fixture
 async def live(fresh_url: str, s3: S3Env, tmp_path: Path) -> AsyncIterator[Live]:
+    async with _serve(fresh_url, s3, tmp_path, {}) as lv:
+        yield lv
+
+
+@pytest.fixture
+async def live_default_limits(fresh_url: str, s3: S3Env, tmp_path: Path) -> AsyncIterator[Live]:
+    """Like `live`, but with the production rate-limit intervals (tests disable them)."""
+    defaults = ServerSettings.model_fields
+    limits = {
+        k: defaults[k].default
+        for k in (
+            "register_min_interval_s",
+            "acquire_min_interval_s",
+            "presence_min_interval_s",
+            "preference_min_interval_s",
+            "heartbeat_min_interval_s",
+        )
+    }
+    async with _serve(fresh_url, s3, tmp_path, limits) as lv:
+        yield lv
+
+
+@contextlib.asynccontextmanager
+async def _serve(
+    fresh_url: str, s3: S3Env, tmp_path: Path, extra: dict[str, Any]
+) -> AsyncIterator[Live]:
     keys = tmp_path / "keys.yaml"
     digest = hashlib.sha256(API_KEY.encode()).hexdigest()
     keys.write_text(f"keys:\n  - name: u\n    sha256: {digest}\n    teams: [{TEAM}]\n")
@@ -112,6 +149,7 @@ async def live(fresh_url: str, s3: S3Env, tmp_path: Path) -> AsyncIterator[Live]
             "s3_bucket": s3.bucket,
             "api_keys_file": str(keys),
             "splitter_poll_s": 0.1,
+            **extra,
         }
     )
     app = create_app(cfg)
@@ -537,3 +575,79 @@ async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live
         await _send_preference(live.url, token, PreferenceRequest())  # --clear
         got = await c.acquire(req)
         assert got is not None and got.team == "aaa"
+
+
+class RecordingClient(ExecutorClient):
+    """Records every 429; each subtask lasts like a real one (>= the 0.5 s acquire limit)."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self.limited: list[str] = []
+
+    async def acquire(self, req: AcquireRequest) -> Any:
+        try:
+            return await super().acquire(req)
+        except ApiError as exc:
+            if exc.status_code == 429:
+                self.limited.append("acquire")
+            raise
+
+    async def presence(self, req: PresenceRequest) -> None:
+        try:
+            await super().presence(req)
+        except ApiError as exc:
+            if exc.status_code == 429:
+                self.limited.append("presence")
+            raise
+
+    async def complete(self, subtask_id: Any, req: CompleteRequest) -> None:
+        await asyncio.sleep(0.6)  # a real subtask takes seconds; the fake runner is instant
+        await super().complete(subtask_id, req)
+
+
+async def test_default_rate_limits_never_trip_a_healthy_loop(
+    live_default_limits: Live, tmp_path: Path
+) -> None:
+    """TASK-6.2: several subtasks and a pause/resume at the production intervals: no 429."""
+    live = live_default_limits
+    live.put_input("rl", "a.jsonl", _records("a", 60))
+    await live.submit("rl", rps=10)  # 6 subtasks
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    gov = FixedGovernor(BUDGET)
+    client = RecordingClient(live.url, SecretStr(await live.token("rl")))
+    loop = ExecutorLoop(
+        client,
+        WorkerHandle([Engine.FAKE]),
+        BUDGET,
+        [Engine.FAKE],
+        tmp_root=scratch,
+        allow_http_loopback=True,
+        governor=gov,
+        backoff=(1.0, 2.0),
+    )
+    paused = dataclasses.replace(gov.decision, paused_reason=PausedReason.THERMAL)
+    resumed = gov.decision
+    task = asyncio.create_task(loop.run())
+    try:
+
+        async def two_done() -> bool:
+            rows = await live.rows(
+                "SELECT count(*) FROM minion_subtask WHERE task_name='rl' AND status='SUCCEEDED'"
+            )
+            return int(rows[0][0]) >= 2
+
+        await eventually(two_done)
+        gov.update(paused)
+        await asyncio.sleep(1.0)
+        gov.update(resumed)
+
+        async def done() -> bool:
+            return await live.task_status("rl") == "SUCCEEDED"
+
+        await eventually(done, 120)
+    finally:
+        loop.stop()
+        await asyncio.wait_for(task, 30)
+        await client.aclose()
+    assert client.limited == []
