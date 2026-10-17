@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 _MAX_CREDIT_S = 0.5  # how much oversleep a later step may repay (bounds the catch-up burst)
+QUANTUM_S = 0.05  # busy time accumulated across steps before the pacer sleeps (duty < 1)
 
 
 def _check(duty: float) -> float:
@@ -19,9 +20,17 @@ def _check(duty: float) -> float:
 
 
 class DutyCyclePacer:
-    """After a step that took `t` seconds, wait `t * (1 - d) / d` so busy time is a fraction `d`
-    of wall time. `d == 1` never waits. Oversleep (a late wake-up) is credited against the next
-    wait, so the measured share converges on `d` even when the scheduler is slow.
+    """Quantum pacing. Busy time accumulates across steps; once it reaches `quantum_s` (or the duty
+    was just lowered) the step ends a quantum: the pacer waits `busy * (1 - d) / d`, so busy time
+    is a fraction `d` of wall time, and the accumulator resets. Between quanta steps cost no sync
+    and no sleep, so the CPU can build the next graph while the GPU computes (a sync every step
+    would serialise them and under-use the granted duty). `d == 1` never waits.
+
+    Callers ask `quantum_due()` *before* syncing the GPU: when True they drain async work, and the
+    following `step_done()` is then guaranteed to sleep (the sync time counts as busy).
+
+    Oversleep (a late wake-up) is credited against the next wait, so the measured share
+    converges on `d` even when the scheduler is slow.
 
     `busy_s` / `wall_s` accumulate since `reset()`; time reported through `exclude()` (a pause)
     counts as neither."""
@@ -31,8 +40,14 @@ class DutyCyclePacer:
         duty: float,
         clock: Callable[[], float],
         wait: Callable[[float], bool | None],
+        quantum_s: float = QUANTUM_S,
     ) -> None:
         self._duty = _check(duty)
+        self._quantum = max(0.0, quantum_s)
+        self._acc = 0.0  # busy seconds since the last sleep
+        self._force = False  # duty just dropped: the next step drains and sleeps at once
+        self._asked = False  # quantum_due() was asked for the step in progress ...
+        self._due = False  # ... and this was the answer: step_done() honours it
         self._clock = clock
         self._wait = wait
         self._start = self._last = clock()
@@ -55,13 +70,26 @@ class DutyCyclePacer:
     def set_duty(self, duty: float) -> None:
         _check(duty)
         if duty != self._duty:
+            self._force = self._force or duty < self._duty
             self._duty = duty
             self._credit = 0.0  # the credit was earned under the old duty
 
     def reset(self) -> None:
         """Mark the start of a run: the next step is measured from now."""
         self._start = self._last = self._clock()
-        self._busy = self._excluded = self._credit = 0.0
+        self._busy = self._excluded = self._credit = self._acc = 0.0
+        self._force = False
+        self._asked = self._due = False
+
+    def quantum_due(self) -> bool:
+        """True if the step in progress will end a quantum (so it must sync the GPU first). The
+        answer is latched: step_done() ends the quantum only if this said so, so a step never
+        sleeps without the caller having drained the GPU first."""
+        due = self._duty < 1.0 and (
+            self._force or self._acc + max(0.0, self._clock() - self._last) >= self._quantum
+        )
+        self._asked, self._due = True, due
+        return due
 
     def exclude(self, seconds: float) -> None:
         """Remove `seconds` just spent paused from both busy and wall time."""
@@ -69,10 +97,35 @@ class DutyCyclePacer:
         self._last += seconds
         self._excluded += seconds
 
+    def flush(self) -> float:
+        """End the run: pay the sleep owed for the partial quantum (the batch's results are in, so
+        the GPU is idle). Without it a stream of short batches, each under one quantum, would
+        never be paced."""
+        if self._duty >= 1.0 or self._acc + (self._clock() - self._last) <= 0.0:
+            return 0.0
+        self._force = True
+        self._asked = False  # the batch is done and the GPU idle: no drain to wait for
+        return self.step_done()
+
     def step_done(self) -> float:
         """Pace after a finished step; returns the seconds slept (pauses excluded)."""
-        busy = max(0.0, self._clock() - self._last)
-        self._busy += busy
+        step = max(0.0, self._clock() - self._last)
+        self._busy += step
+        self._acc += step
+        if self._duty >= 1.0:
+            self._acc = 0.0
+            self._force = False
+            self._credit = 0.0
+            self._asked = self._due = False  # a latched answer never outlives its step
+            self._last = self._clock()
+            return 0.0
+        ends = self._due if self._asked else (self._force or self._acc >= self._quantum)
+        self._asked = self._due = False
+        if not ends:
+            self._last = self._clock()  # mid-quantum: no sync, no sleep (a force carries over)
+            return 0.0
+        self._force = False
+        busy = self._acc
         slept = 0.0
         owed = 0.0
         while self._duty < 1.0:  # set_duty() mid-wait changes duty and clears the credit
@@ -88,5 +141,7 @@ class DutyCyclePacer:
         else:
             owed = slept = 0.0  # duty is 1: nothing owed, no credit to carry
         self._credit = max(-_MAX_CREDIT_S, min(0.0, owed - slept))
+        self._acc = 0.0
+        self._force = False  # a duty change during the wait was already paid for by it
         self._last = self._clock()
         return slept

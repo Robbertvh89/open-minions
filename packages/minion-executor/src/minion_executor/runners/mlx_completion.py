@@ -15,6 +15,7 @@ from minion_executor.runners.base import (
     Record,
     RunnerError,
     StepControl,
+    sync_due,
 )
 from minion_executor.runners.pooling import read_json
 from minion_executor.runners.prompts import build_messages
@@ -99,7 +100,7 @@ class MlxCompletionRunner:
 
     def _run(self, batch: list[Record], params: CompletionParams, ctl: StepControl) -> list[Record]:
         import mlx.core as mx
-        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.generate import BatchGenerator, generation_stream
         from mlx_lm.sample_utils import make_sampler
 
         assert self._budget is not None  # noqa: S101 - narrowed by run()
@@ -152,6 +153,8 @@ class MlxCompletionRunner:
                         tokens[r.uid].append(int(r.token))
                     if r.finish_reason is not None:
                         reasons[r.uid] = str(r.finish_reason)
+                if sync_due(ctl):  # quantum ends: drain async_eval work
+                    common.sync_gpu(generation_stream)
                 ctl.checkpoint(done + len(reasons))
         finally:
             gen.close()

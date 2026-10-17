@@ -69,6 +69,9 @@ class Ctl:
         self.last_done: int | None = None
         self.probe = probe
 
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         self.calls += 1
         self.last_done = records_done
@@ -524,3 +527,53 @@ def test_worker_applies_the_run_budget_to_mlx_in_the_subprocess(qwen_path: Path)
         assert h.stats()["active_bytes"] > 0
     finally:
         h.close()
+
+
+class _PacedCtl:
+    """A real `DutyCyclePacer` behind `StepControl`, as the worker wires it."""
+
+    def __init__(self, duty: float) -> None:
+        from minion_executor.worker.throttle import DutyCyclePacer
+
+        self._pacer = DutyCyclePacer(duty, time.monotonic, lambda s: time.sleep(s))
+
+    def will_sleep(self) -> bool:
+        return self._pacer.quantum_due()
+
+    def checkpoint(self, records_done: int | None = None) -> None:
+        self._pacer.step_done()
+
+
+def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionRunner) -> None:
+    """Regression: mlx-lm pipelines tokens with `mx.async_eval`, so without a sync at the
+    checkpoint the GPU kept running through the pacer's sleep (50 % duty measured ~75 %)."""
+    from minion_executor.capacity.gpu_meter import make_sampler, process_gpu_share
+
+    duty = 0.5
+    completion.set_budget(_budget_gb(2, batch=16))
+    recs = _recs([f"Count upward from {i}, one number per line, never stop." for i in range(16)])
+    params = CompletionParams(max_tokens=300, temperature=0.0)
+    completion.run(recs[:2], CompletionParams(max_tokens=4), Ctl())  # warm up kernels
+
+    def measure(d: float) -> tuple[float, float, int]:
+        sampler = make_sampler(os.getpid)
+        sampler.start()
+        time.sleep(1.0)
+        t0 = time.monotonic()
+        out = []
+        for _ in range(2):  # long enough for the paced run to span several meter samples
+            out = completion.run(recs, params, _PacedCtl(d))
+        t1 = time.monotonic()
+        time.sleep(1.0)
+        samples = sampler.stop()
+        return process_gpu_share(samples, t0, t1), t1 - t0, len(out)
+
+    unpaced, _, n0 = measure(1.0)
+    share, secs, n = measure(duty)
+    print(f"gpu share unpaced {unpaced:.3f}, paced {share:.3f} over {secs:.1f}s")
+    assert n0 == n == 16
+    assert secs > 5, "run too short to measure"
+    assert share <= duty + 0.10, f"worker GPU share {share:.2f} exceeds duty {duty}"
+    assert share >= duty * unpaced - 0.10, (
+        f"worker GPU share {share:.2f} under-uses the duty (expected ~{duty * unpaced:.2f})"
+    )

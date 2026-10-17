@@ -1,6 +1,6 @@
 # ADR-0006: Cooperative capacity governor
 
-- Status: **Draft** (written in TASK-5.1, wired in TASK-5.5; finalized with measurements in TASK-5.6)
+- Status: **Accepted** (written in TASK-5.1, wired in TASK-5.5, measured in TASK-5.6)
 - Date: 2026-10-16
 - Deciders: project owner
 - Deviates from paper: **no** (the paper has no partial allocation; this refines ARCHITECTURE §3.6
@@ -16,7 +16,7 @@ so the sub-tasks (5.1..5.6) share one design. Decisions D1..D14 are from the TAS
 ## Decision
 
 **D1 Governor placement.** An asyncio task in the control process, polling signals every
-`MINION_EXECUTOR_SIGNAL_POLL_S` (2 s, range 0.5..5) in `asyncio.to_thread`. The decision function
+`MINION_EXECUTOR_SIGNAL_POLL_S` (2 s, range 0.5..4: detection plus one engine step must stay under NF-9's 5 s) in `asyncio.to_thread`. The decision function
 `governor.decide(snapshot, config, owner_ctl, now, prev_state)` is pure. **Deviation** from
 ARCHITECTURE §3.6 ("polled + notifications"): no NSWorkspace / dispatch notifications. Polling bounds
 detection at the poll interval, which leaves headroom under NF-9 (5 s) and keeps one code path.
@@ -56,6 +56,30 @@ frame is being written), the newest state is kept (`_sent_gen` / `_unsent`) and 
 call between replies, so the latest decision is never lost. In-flight Ollama requests cannot be
 suspended: a pause stops *new* requests (the runner submits lazily, at most `max_batch_size`
 outstanding, with a checkpoint before each) and the requests already sent finish during the pause.
+
+*Pacing requires synchronous GPU completion (TASK-5.6 NF-8 finding).* The pacer measures busy time as
+wall time between checkpoints. mlx-lm pipelines the next token with `mx.async_eval`, so at a
+checkpoint the GPU still holds queued work that runs through the pacer's sleep (measured: balanced
+duty 0.5 gave 74-76 % GPU share on qwen2.5-0.5b, larger batches worse). Runners therefore drain the
+GPU before the checkpoint that ends a pacing quantum (`mx.synchronize` incl. mlx-lm's generation
+stream; HF: `torch.mps.synchronize()`). At duty 1.0 nothing is synced and async pipelining stays on.
+
+*Quantum pacing (TASK-5.6 round 3).* Syncing at every step at duty < 1 serialises CPU graph build and
+GPU compute (no pipelining), so the paced share fell to about duty x G/(G+C): measured light 14-15 %
+(expected 23 %), balanced 27-31 % (expected 40 %), i.e. the owner's granted duty was wasted. The pacer
+therefore accumulates busy time across steps and only ends a *quantum* when it reaches `QUANTUM_S`
+(50 ms): that step syncs the GPU first (so the sync counts as busy), then sleeps
+`busy x (1 - d) / d` (oversleep credit capped at 0.5 s) and resets the accumulator. Between quanta
+there is neither a sync nor a sleep, so pipelining works inside a quantum and the GPU holds at most one
+quantum of queued work (<= the quantum plus one step) when the sleep starts: invariant 6 and NF-8(a)
+(share <= duty + 10 pp) hold with a bounded overshoot. Runners ask `StepControl.will_sleep()` before
+the checkpoint and sync only when it is True (controls without it sync every step, the safe side).
+Pause and control-message reading still happen at every checkpoint (NF-9 reaction is unchanged). A
+live duty drop (1.0 -> 0.5) makes the next step a quantum end regardless of accumulated time:
+`will_sleep()` applies pending control messages first. A message arriving between `will_sleep()` and
+`checkpoint()` is applied at the checkpoint and takes effect one step later: the pacer latches the
+`will_sleep()` answer, so that step does not sleep unsynced (a duty drop forces the next one). Ollama is not
+controllable: the daemon owns the GPU queue, so its duty is best-effort (request-level pacing only).
 
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
 memory/wired limits and batch caps; `Runner.trim` frees allocator caches. The loop re-slices records
@@ -239,12 +263,42 @@ share can be below `duty` however well the governor works. We therefore split th
 
 Memory: worker footprint ≤ `memory_gb` × 1.10, enforced by D7 and measured in TASK-5.6.
 
+**How it is measured (TASK-5.6).** `minion-executor bench --budget-check` runs, per profile, the real
+worker path (sandboxed worker, runner) and compares three sources: the worker's own GPU time, from
+`ioreg -r -l -w 0 -c AGXDeviceUserClient` (the worker pid's summed `accumulatedGPUTime` delta over a
+phase window divided by its wall time, sampled ~2 Hz in the bench process; the sandboxed worker
+cannot exec; the first 1.5 s of a phase are dropped). The device-wide `Device Utilization %` (IOAccelerator)
+is reported but not judged: on a Mac in use it moves with other apps, the display and DVFS (a first
+run showed an idle device at 30-43 % and an unpaced load only +33 pp, so a baseline-subtracted
+device figure failed `light` at 32 % against 20 % expected). The worker
+footprint sampled at 10 Hz from the control side (`phys_footprint`, D7); and the pacer's own
+`busy_s / wall_s` (advisory: the worker is the party being limited). Phases: idle (device info), unpaced
+(duty 1.0, giving `unpaced_share`; skipped at duty 1.0, where there is no accuracy verdict), a 2 s
+gap, paced at the profile duty. `unavailable` rows are not judged; an `error` row fails the check. The verdicts are the two checks above
+plus memory, computed by the pure `nf8_verdict`. NF-9 reaction time is asserted in CI (20 trials, fake
+engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac with the production poll
+(docs/bench/governor-measurements.md); NF-4 with `bench --cpu-check`.
+
+## Measurements
+
+> M3 Pro (36 GB, macOS 27.0.1), TASK-5.6: docs/bench/m4-governor-apple-m3-pro.{json,md} (NF-8, NF-9 CI) and docs/bench/m4-governor-cpu-apple-m3-pro.json (NF-4). The first per-process run found a pacing bug (mlx-lm async_eval work running during the pacer sleep: qwen balanced 74–76 % at duty 50 %), fixed by quantum pacing; see the .md for the history.
+
+| Check | Result | Verdict |
+|---|---|---|
+| NF-8 hard bound (share <= duty + 10 pp), light / balanced / full | qwen2.5-0.5b-mlx 21–22 % / 31–35 % / 77–78 %; minilm-mlx 12–13 % / 20–22 % / 54–55 % (per-process GPU time, 3 repeats) | pass (18/18 rows) |
+| NF-8 accuracy (+-10 pp of duty x unpaced share) | qwen light 21–22 vs 22–23 %, balanced 31–35 vs 39–41 %; minilm light 12–13 vs 10 %, balanced 20–22 vs 28–29 %; errs low | pass (12/12 paced rows) |
+| NF-8 memory (footprint <= 1.1 x memory_gb) | peak 0.45–2.09 GB vs 9.0 / 14.4 / 25.2 GB | pass |
+| NF-9 CI, 20 trials, poll 0.25 s: max | 0.433 s (on battery 5 %); p50 0.10–0.25 s per event | pass (< 5 s) |
+| NF-9 Mac, production poll 2 s: memory pressure / user return / thermal+power (FileSignals) | not run on this Mac (needs a person at the keyboard and induced swap); opt-in procedure in docs/bench/governor-measurements.md; bound by poll (≤ 4 s cap) + one step + ack | open (opt-in) |
+| NF-4 control-process CPU, idle / paused (60 s) | 0.134 % / 0.162 % (`bench --cpu-check`); whole `run` process tree (control + worker, `ps` procedure) not recorded here | pass for the control process; whole tree open |
+| Q5 (adaptive duty from total GPU utilization): answered by the data above? | Partly: device-wide utilization is 31–39 % on an idle desktop and moves with DVFS, so a policy keyed on total GPU utilization would need a per-process signal (AGX accumulatedGPUTime works) and its own experiment; Q5 stays open | |
+
 ## Consequences
 
 - SPEC FR-51/FR-52 default wording changes (balanced is no longer the implicit default); NF-8 is
-  restated as the two checks above (TASK-5.6 updates the SPEC text with the data).
+  restated as the two checks above (SPEC NF-8 carries the restated text since TASK-5.6).
 - A pause shorter than 10 s of clear signals never resumes early; a flapping signal costs at most
   one release per 60 s of pause.
 - One new darwin-only dependency (D2); Linux CI stays green through `NullSignals` / `FileSignals`.
-- Reaction to signals is bounded by poll interval + one engine step (NF-9); TASK-5.6 measures it.
-- Open: Q5 adaptive total-GPU mode stays off; TASK-5.6 records the data for it.
+- Reaction to signals is bounded by poll interval + one engine step (NF-9); TASK-5.6 measured it (see Measurements).
+- Open: Q5 adaptive total-GPU mode stays off; the Measurements section records the data for it.

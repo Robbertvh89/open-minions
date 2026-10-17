@@ -449,7 +449,7 @@ when utilization from *other* processes rises (e.g. a video call). Off by defaul
 **Not done on purpose:** no `caffeinate`, no sleep prevention, no kernel extensions, no root.
 
 **Tests:** governor is pure (signals in → events out) and unit-tested with fake signal sources;
-throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-executor bench --profile X`.
+throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-executor bench --budget-check` (`bench_budget.py`: per-process GPU time of the worker from `ioreg -c AGXDeviceUserClient` via `capacity/gpu_meter.py`, device utilization informational, worker footprint, pacer share; verdicts per ADR-0006 Gap 1); reaction time (NF-9) by `tests/test_governor_reaction.py` (CI) and `bench --watch-reactions` (Mac); idle/paused CPU (NF-4) by `bench --cpu-check`.
 
 ## 4. Concurrency & correctness argument
 
@@ -513,7 +513,7 @@ token in macOS Keychain.
    mlx-lm batched vs Ollama(MLX) vs HF/mps — tokens/s, records/h, peak memory. Confirms/adjusts ADR-0005 defaults.
    Done (TASK-4.4): mlx vs hf measured on M3 Pro, ADR-0005 confirmed; Ollama unmeasured (TASK-13).
 5. **M4 – Capacity governor:** profiles, signals, duty-cycle throttle, auto-pause, budget reporting,
-   downgrade-release. Measure NF-8/NF-9.
+   downgrade-release. Measure NF-8/NF-9 (TASK-5.6: `bench --budget-check`, reaction tests; numbers in ADR-0006 and docs/bench/).
 6. **M5 – Ops & usability:** Grafana dashboards, web UI, launchd packaging, auth hardening; usability
    test with real participants during video calls (NF-7) to tune default profiles.
 7. **M6 – Scale test & menu-bar app:** simulated 500 executors against 1M subtasks (NF-1..NF-3);

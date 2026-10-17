@@ -65,6 +65,19 @@ class StepControl(Protocol):
         """
         ...
 
+    def will_sleep(self) -> bool:
+        """True if the coming `checkpoint` ends a pacing quantum (duty < 1 and enough busy time
+        accumulated): drain async GPU work first, so the pacer measures it as busy time."""
+        ...
+
+
+def sync_due(ctl: StepControl) -> bool:
+    """Whether a runner must drain queued GPU work before `ctl.checkpoint` (the pacer will sleep
+    there; async work still in flight would run during the sleep and exceed the duty, invariant 6).
+    Controls without `will_sleep` count as due (sync + sleep every step, the safe side)."""
+    fn = getattr(ctl, "will_sleep", None)
+    return True if fn is None else bool(fn())
+
 
 class Runner(Protocol):
     def load(

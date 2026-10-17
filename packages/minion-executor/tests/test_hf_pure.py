@@ -72,6 +72,9 @@ def test_run_before_load_is_not_loaded() -> None:
     from minion_common.schemas import EmbeddingParams
 
     class Ctl:
+        def will_sleep(self) -> bool:
+            return False
+
         def checkpoint(self, records_done: int | None = None) -> None: ...
 
     with pytest.raises(RunnerError) as ei:

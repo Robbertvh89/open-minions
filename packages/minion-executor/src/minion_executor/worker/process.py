@@ -165,9 +165,21 @@ class _Ctl:
         self._max = max_message_bytes
         self._on_trim = on_trim
         self._last_tick = 0.0
+        self._flushing = False  # finish(): a pause pays off the remaining sleep
         self._done: int | None = None  # last records_done seen; re-sent on pacer ticks
         self.ctl = ctl
         self._pacer = DutyCyclePacer(min(ctl.duty, duty_cap), time.monotonic, self._wait)
+
+    def will_sleep(self) -> bool:
+        """The coming checkpoint ends a pacing quantum: runners must drain async GPU work first.
+        Pending control messages are applied first, so a duty that just dropped (say 1.0 -> 0.5)
+        makes this step drain too instead of leaving the queued work to run through the sleep."""
+        try:
+            while self._read_ctl(0):
+                pass
+        except _ParentGone:
+            return True  # the checkpoint right after raises it; draining first is harmless
+        return self._pacer.quantum_due()
 
     def start(self) -> None:
         """Ack the starting state; a run that begins paused does no work until resumed."""
@@ -178,7 +190,13 @@ class _Ctl:
         self._pacer.reset()
 
     def finish(self) -> None:
-        """Final usage totals, so the control side can read the run's GPU share."""
+        """Pay the partial quantum's sleep, then send the final usage totals (the run's GPU
+        share)."""
+        self._flushing = True
+        try:
+            self._pacer.flush()
+        finally:
+            self._flushing = False
         self._send_tick()
 
     def _send_tick(self, *, ack: bool = False) -> None:
@@ -236,6 +254,8 @@ class _Ctl:
         end = time.monotonic() + seconds
         while (left := end - time.monotonic()) > 0:
             if self._read_ctl(min(left, self._tick_s)):
+                if self._flushing and self.ctl.paused:
+                    return False  # end of run: the control side gates the next one
                 self._block_while_paused()
                 return True
             self._tick()

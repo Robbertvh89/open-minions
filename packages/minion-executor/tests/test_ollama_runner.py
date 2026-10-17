@@ -85,6 +85,9 @@ class Ctl:
     def __init__(self) -> None:
         self.ticks: list[int | None] = []
 
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         self.ticks.append(records_done)
 
@@ -392,6 +395,9 @@ def test_checkpoint_raising_aborts_the_run(monkeypatch: pytest.MonkeyPatch) -> N
         pass
 
     class StopCtl:
+        def will_sleep(self) -> bool:
+            return False
+
         def checkpoint(self, records_done: int | None = None) -> None:
             raise StopError
 

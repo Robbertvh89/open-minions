@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -26,9 +28,11 @@ from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
+from minion_executor import bench_budget as budget_mod
 from minion_executor.capacity.config import ExecutorConfig, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
+from minion_executor.capacity.gpu_meter import GpuMeterError
 from minion_executor.capacity.instance import acquire_instance_lock
 from minion_executor.capacity.profiles import (
     ProfileSpec,
@@ -494,6 +498,92 @@ def _check_out_path(out: Path) -> None:
         raise ValueError("--out must be a regular file")
 
 
+def _emit(table: str, data: dict[str, object], out: Path | None) -> None:
+    """Markdown to stdout, JSON to `--out` (exit 1 when it cannot be written)."""
+    typer.echo(table)
+    if out is not None:
+        try:
+            _write_out(out, json.dumps(data, indent=2) + "\n")
+        except OSError as exc:
+            typer.echo(f"error: cannot write --out: {exc}", err=True)
+            raise typer.Exit(code=1) from None
+
+
+@contextlib.contextmanager
+def _logs_to_stderr() -> Iterator[None]:
+    """Keep stdout for the tables / timestamps (structlog prints to stdout by default)."""
+    saved = structlog.get_config()
+    try:
+        structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+        yield
+    finally:
+        structlog.configure(**saved)
+
+
+def _watch_reactions(duration: float, out: Path | None) -> None:
+    try:
+        if out is not None:
+            raise ValueError("--watch-reactions prints to stdout; --out is not supported")
+        if not 1.0 <= duration <= 3600.0:
+            raise ValueError("duration must be in 1..3600 seconds")
+        settings = ExecutorSettings()
+        config = load_config(settings.config_path)
+        source = default_source(settings.fake_signals)
+    except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    with _logs_to_stderr():
+        asyncio.run(
+            budget_mod.watch_reactions(
+                source,
+                duration_s=duration,
+                poll_s=settings.signal_poll_s,
+                config=config,
+                total_gb=total_memory_gb(),
+                emit=lambda line: typer.echo(line),
+            )
+        )
+
+
+def _cpu_check(duration: float, out: Path | None) -> None:
+    """NF-4 on this process: a real GovernorRuntime polling the real signals, idle then paused."""
+    try:
+        if not 1.0 <= duration <= 3600.0:
+            raise ValueError("duration must be in 1..3600 seconds")
+        if out is not None:
+            _check_out_path(out)
+        settings = ExecutorSettings()
+        config = load_config(settings.config_path)
+        source = default_source(settings.fake_signals)
+    except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    poll_s, total_gb = settings.signal_poll_s, total_memory_gb()
+
+    async def both() -> list[budget_mod.CpuResult]:
+        return [
+            await budget_mod.measure_governor_cpu(
+                source,
+                paused=p,
+                duration_s=duration,
+                poll_s=poll_s,
+                config=config,
+                total_gb=total_gb,
+            )
+            for p in (False, True)
+        ]
+
+    with _logs_to_stderr():
+        results = asyncio.run(both())
+    _emit(
+        budget_mod.render_cpu_table(results),
+        {"schema_version": 1, "kind": "cpu-check", "results": [r.__dict__ for r in results]},
+        out,
+    )
+    if not all(r.passed for r in results):
+        raise typer.Exit(code=1)
+
+
 def _write_out(out: Path, text: str) -> None:
     # O_NONBLOCK so a FIFO cannot hang the open; O_TRUNC only after the S_ISREG check below
     fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
@@ -525,8 +615,45 @@ def bench(
         str, typer.Option(help="Capacity profile: light, balanced, full or custom")
     ] = "full",
     out: Annotated[Path | None, typer.Option(help="Also write the JSON report here")] = None,
+    budget_check: Annotated[
+        bool,
+        typer.Option(
+            "--budget-check",
+            help="NF-8: worker GPU time share (ioreg) and footprint per profile",
+        ),
+    ] = False,
+    profiles: Annotated[
+        str, typer.Option(help="--budget-check: comma-separated profiles")
+    ] = "light,balanced,full",
+    duration: Annotated[
+        float, typer.Option(help="--budget-check: seconds per phase / --cpu-check: window")
+    ] = budget_mod.DEFAULT_DURATION_S,
+    baseline_s: Annotated[
+        float, typer.Option(help="--budget-check: idle seconds before the phases (device info)")
+    ] = budget_mod.DEFAULT_BASELINE_S,
+    repeats: Annotated[int, typer.Option(help="--budget-check: repetitions per profile")] = 1,
+    cpu_check: Annotated[
+        bool,
+        typer.Option("--cpu-check", help="NF-4: governor CPU % while idle and while paused"),
+    ] = False,
+    watch_reactions: Annotated[
+        bool,
+        typer.Option(
+            "--watch-reactions",
+            help="NF-9 on this Mac: print timestamped governor reactions for --duration seconds",
+        ),
+    ] = False,
 ) -> None:
     """Benchmark engines on this Mac through the real worker path. No server or token needed."""
+    if sum((cpu_check, budget_check, watch_reactions)) > 1:
+        typer.echo("error: --budget-check, --cpu-check, --watch-reactions are separate", err=True)
+        raise typer.Exit(code=2)
+    if watch_reactions:
+        _watch_reactions(duration, out)
+        return
+    if cpu_check:
+        _cpu_check(duration, out)
+        return
     try:
         settings = ExecutorSettings()
         specs = resolve_profiles(load_config(settings.config_path))
@@ -547,6 +674,14 @@ def bench(
             _require_dev_for_fake()
         if out is not None:
             _check_out_path(out)
+        check_cfg = budget_mod.BudgetCheckConfig(
+            duration_s=duration, baseline_s=baseline_s, repeats=repeats, max_tokens=max_tokens
+        )
+        check_profiles = [
+            parse_profile(p.value, specs) for p in budget_mod.parse_profiles(profiles)
+        ]
+        if budget_check and not entries:
+            raise ValueError("--budget-check needs at least one benchable --model")
         fetch_env = FetchEnv.capture()
     except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -563,6 +698,14 @@ def bench(
         )
         engines = list(dict.fromkeys(e.engine for e in entries))
         sandbox = sandbox_policy(settings, engines)
+
+        def budget_factory(engine: Engine, b: Budget) -> WorkerHandle:
+            return WorkerHandle(
+                [engine],
+                nice=nice_for(b.cpu_priority),
+                sandbox=sandbox,
+                engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
+            )
 
         def factory(engine: Engine) -> WorkerHandle:
             return WorkerHandle(
@@ -581,6 +724,19 @@ def bench(
             nice=nice_for(base.cpu_priority),
             sandbox=settings.fetch_sandbox,
         )
+        if budget_check:
+            budgets = {p: budget_for(p, specs=specs) for p in check_profiles}
+            try:
+                check = asyncio.run(
+                    budget_mod.run_budget_check(cache, budget_factory, entries, budgets, check_cfg)
+                )
+            except GpuMeterError as exc:
+                typer.echo(f"error: {exc}", err=True)
+                raise typer.Exit(code=2) from None
+            _emit(budget_mod.render_budget_table(check), check.to_json(), out)
+            if not check.all_passed:
+                raise typer.Exit(code=1)
+            return
         report = asyncio.run(
             bench_mod.run_bench(cache, factory, entries, config, budget, pending=pending)
         )

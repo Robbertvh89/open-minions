@@ -15,6 +15,9 @@ from minion_executor.runners.mlx_embedding import MlxEmbeddingRunner
 
 
 class _Ctl:
+    def will_sleep(self) -> bool:
+        return False
+
     def checkpoint(self, records_done: int | None = None) -> None:
         pass
 
@@ -123,3 +126,33 @@ def test_context_window_from_config() -> None:
     assert _context_window({"max_position_embeddings": "x"}) == 0
     assert _context_window({"max_position_embeddings": True}) == 0
     assert _context_window({}) == 0
+
+
+def test_sync_due_follows_the_control_and_defaults_to_the_safe_side() -> None:
+    from typing import cast
+
+    from minion_executor.runners.base import StepControl, sync_due
+
+    class Quiet(_Ctl):
+        def will_sleep(self) -> bool:
+            return False
+
+    assert sync_due(cast(StepControl, object()))  # no will_sleep: drain GPU work
+    assert not sync_due(Quiet())
+
+
+def test_sync_gpu_synchronizes_default_and_given_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    from minion_executor.runners.mlx_common import sync_gpu
+
+    calls: list[object] = []
+    core = types.ModuleType("mlx.core")
+    core.synchronize = lambda s=None: calls.append(s)  # type: ignore[attr-defined]
+    pkg = types.ModuleType("mlx")
+    pkg.core = core  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx", pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    sync_gpu("gen-stream")
+    assert calls == [None, "gen-stream"]
