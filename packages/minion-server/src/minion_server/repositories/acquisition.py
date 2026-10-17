@@ -8,10 +8,10 @@ import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
-from sqlalchemy import exists, literal, select, update
+from sqlalchemy import Select, exists, literal, select, update
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,8 +48,7 @@ class Won:
     attempt: int
 
 
-async def candidates(
-    session: AsyncSession,
+def candidates_stmt(
     *,
     engines: list[Engine],
     model_ids: Collection[str],
@@ -57,13 +56,8 @@ async def candidates(
     pool: str,
     preference: tuple[str | None, str | None, str | None] | None,
     limit: int = CANDIDATE_LIMIT,
-) -> list[Candidate]:
-    """Unlocked read of PENDING subtasks this executor may run, in queue order.
-
-    `preference` filters (None entries are wildcards); `None` means no preference filter.
-    """
-    if not model_ids:
-        return []
+) -> Select[Any]:
+    """The candidate query (also what the scale harness EXPLAINs)."""
     stmt = (
         select(
             Subtask.team,
@@ -108,6 +102,33 @@ async def candidates(
         ):
             if value is not None:
                 stmt = stmt.where(col == value)
+    return cast("Select[Any]", stmt)
+
+
+async def candidates(
+    session: AsyncSession,
+    *,
+    engines: list[Engine],
+    model_ids: Collection[str],
+    memory_gb: float,
+    pool: str,
+    preference: tuple[str | None, str | None, str | None] | None,
+    limit: int = CANDIDATE_LIMIT,
+) -> list[Candidate]:
+    """Unlocked read of PENDING subtasks this executor may run, in queue order.
+
+    `preference` filters (None entries are wildcards); `None` means no preference filter.
+    """
+    if not model_ids:
+        return []
+    stmt = candidates_stmt(
+        engines=engines,
+        model_ids=model_ids,
+        memory_gb=memory_gb,
+        pool=pool,
+        preference=preference,
+        limit=limit,
+    )
     rows = (await session.execute(stmt)).all()
     return [
         Candidate(

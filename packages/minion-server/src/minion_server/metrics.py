@@ -9,10 +9,17 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+)
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+ACQUIRE_BUCKETS_S = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 UNMATCHED = "unmatched"  # 404s and other requests that match no route: one bucket, not the URL
 
 
@@ -33,6 +40,16 @@ class Metrics:
             ("outcome",),
             registry=self.registry,
         )
+        self.acquire_seconds = Histogram(
+            "minion_acquire_seconds",
+            "Server-side acquire duration (selection, race, presign) by outcome.",
+            ("outcome",),
+            buckets=ACQUIRE_BUCKETS_S,
+            registry=self.registry,
+        )
+
+    def observe_acquire(self, outcome: str, seconds: float) -> None:
+        self.acquire_seconds.labels(outcome=outcome).observe(seconds)
 
     def observe(self, route: str | None, method: str, status: int) -> None:
         self.requests.labels(

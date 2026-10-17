@@ -7,13 +7,15 @@ FROM python:3.12.15-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /src
-# The workspace glob needs every member's metadata, the executor's and the CLI's included.
+# The workspace glob needs every member's metadata, the executor's, the CLI's and the (dev-only)
+# scale harness's included. Only the metadata: no scale source is copied or installed.
 COPY pyproject.toml uv.lock ./
 COPY packages/minion-common/pyproject.toml packages/minion-common/pyproject.toml
 COPY packages/minion-server/pyproject.toml packages/minion-server/pyproject.toml
 COPY packages/minion-watchdog/pyproject.toml packages/minion-watchdog/pyproject.toml
 COPY packages/minion-executor/pyproject.toml packages/minion-executor/pyproject.toml
 COPY packages/minion-cli/pyproject.toml packages/minion-cli/pyproject.toml
+COPY packages/minion-scale/pyproject.toml packages/minion-scale/pyproject.toml
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-workspace --package minion-watchdog
 COPY packages/minion-common/src packages/minion-common/src

@@ -293,6 +293,21 @@ used by the executor and by tests, shared settings base.
 - Exit codes: 0 ok, 1 FAILED/CANCELLED, 2 usage/config/auth/4xx, 3 PARTIAL, 4 timeout or server/S3
   unreachable, 130 Ctrl-C. Ctrl-C never cancels the task; only `minion cancel` does.
 
+### 2.6 minion-scale (dev-only scale harness)
+- `packages/minion-scale`, console script `minion-scale` (TASK-7.2); never part of the server image
+  (only its `pyproject.toml` is copied for the workspace sync). Operator tooling: it may talk SQL
+  directly (bulk seed, verifier, EXPLAIN), but the simulated executors (`sim.py`) use the executor REST
+  API and presigned URLs only (invariants 1 and 4) and import no database code.
+- `seed` inserts N tasks x M PENDING subtasks with `INSERT ... SELECT generate_series` and issues
+  executor tokens into the dedicated pool `scale` (tasks get `allowed_pool = 'scale'`, so no real
+  executor can acquire them); `run` drives the simulated executors with fault injection and fails
+  fast (exit 1) when the queue does not drain; `verify` checks NF-2/NF-3 in one read-only snapshot;
+  `cleanup` revokes the issued tokens. Settings come from `MINION_*` environment variables only, and
+  writes refuse a non-loopback database or one holding tasks it did not create unless
+  `--yes-this-is-a-scale-db`.
+- `deploy/compose.scale.yml` is an overlay with its own project name (`open-minions-scale`) and
+  loopback-only ports. Report schema: `docs/bench/scale-report-schema.md`.
+
 ## 3. Key flows
 
 ### 3.1 Task submission

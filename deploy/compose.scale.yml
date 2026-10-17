@@ -1,0 +1,61 @@
+# DEV ONLY - DO NOT DEPLOY. Overlay for the scale harness (packages/minion-scale, TASK-7.2):
+# Postgres with pg_stat_statements and bigger buffers, a short watchdog heartbeat timeout so
+# injected "vanish" faults are reclaimed within seconds, the scale model allow-list, /metrics on.
+# Own project name and own host ports, so it never touches the regular dev stack (or host 8080):
+#   export MINION_PG_PORT=55432 MINION_S3_PORT=59000 MINION_SERVER_HOST_PORT=58080 MINION_GRAFANA_PORT=53000
+#   docker compose -p open-minions-scale -f deploy/compose.yml -f deploy/compose.scale.yml \
+#     --profile app up -d --build --wait postgres s3 s3-init migrate server watchdog
+#   docker compose -p open-minions-scale ... down -v        # drops the scale volumes only
+# Then: minion-scale seed / run / explain / verify / report (see docs/bench/scale-report-schema.md).
+# The server needs MINION_API_KEYS_FILE content as in the base file (secrets dir with api-keys.yaml).
+# Own compose project name (volumes and containers are open-minions-scale_*): `down -v` on this
+# overlay can never drop the regular dev stack's volumes, even if -p is forgotten.
+name: open-minions-scale
+
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - max_connections=300
+    shm_size: 1gb
+    ports: !override
+      - "127.0.0.1:${MINION_PG_PORT:-55432}:5432"
+
+  s3:
+    ports: !override
+      - "127.0.0.1:${MINION_S3_PORT:-59000}:9000"
+
+  grafana:
+    ports: !override
+      - "127.0.0.1:${MINION_GRAFANA_PORT:-53000}:3000"
+
+  server:
+    ports: !override
+      - "127.0.0.1:${MINION_SERVER_HOST_PORT:-58080}:8080"
+    environment:
+      MINION_S3_PUBLIC_ENDPOINT_URL: http://localhost:${MINION_S3_PORT:-59000}
+      MINION_MODELS_FILE: /run/minion-models/models.scale.yaml
+      MINION_METRICS_ENABLED: "true"
+      MINION_DB_POOL_SIZE: ${MINION_DB_POOL_SIZE:-20}
+      MINION_DB_MAX_OVERFLOW: ${MINION_DB_MAX_OVERFLOW:-20}
+    volumes:
+      - ./scale/models.scale.yaml:/run/minion-models/models.scale.yaml:ro
+
+  watchdog:
+    environment:
+      MINION_S3_PUBLIC_ENDPOINT_URL: http://localhost:${MINION_S3_PORT:-59000}
+      # Short timeout and tick: a simulated executor that stops beating is reclaimed in ~20-25 s.
+      # Sims beat every few seconds (minion-scale run --heartbeat-interval-s), well inside it.
+      MINION_HEARTBEAT_TIMEOUT_S: ${MINION_HEARTBEAT_TIMEOUT_S:-20}
+      MINION_WATCHDOG_INTERVAL_S: ${MINION_WATCHDOG_INTERVAL_S:-5}

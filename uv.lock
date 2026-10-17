@@ -11,6 +11,7 @@ members = [
     "minion-cli",
     "minion-common",
     "minion-executor",
+    "minion-scale",
     "minion-server",
     "minion-watchdog",
     "open-minions",
@@ -1091,6 +1092,33 @@ requires-dist = [
 provides-extras = ["mlx", "hf"]
 
 [[package]]
+name = "minion-scale"
+version = "0.1.0"
+source = { editable = "packages/minion-scale" }
+dependencies = [
+    { name = "boto3" },
+    { name = "httpx" },
+    { name = "minion-common" },
+    { name = "minion-server" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.43.114" },
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "minion-common", editable = "packages/minion-common" },
+    { name = "minion-server", editable = "packages/minion-server" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
+    { name = "typer", specifier = ">=0.15" },
+]
+
+[[package]]
 name = "minion-server"
 version = "0.1.0"
 source = { editable = "packages/minion-server" }
@@ -1319,6 +1347,7 @@ dependencies = [
     { name = "minion-cli" },
     { name = "minion-common" },
     { name = "minion-executor" },
+    { name = "minion-scale" },
     { name = "minion-server" },
     { name = "minion-watchdog" },
 ]
@@ -1340,6 +1369,7 @@ requires-dist = [
     { name = "minion-cli", editable = "packages/minion-cli" },
     { name = "minion-common", editable = "packages/minion-common" },
     { name = "minion-executor", editable = "packages/minion-executor" },
+    { name = "minion-scale", editable = "packages/minion-scale" },
     { name = "minion-server", editable = "packages/minion-server" },
     { name = "minion-watchdog", editable = "packages/minion-watchdog" },
 ]
