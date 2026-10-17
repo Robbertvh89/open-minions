@@ -73,3 +73,17 @@ governor needs.
 - Changing grace or any setting means `service uninstall` + `service install`.
 - Reboot and login behaviour is launchd's; the executor still takes its single-instance lock.
 - Windows/Linux are unsupported (macOS only).
+
+## Addendum (TASK-7.6): menu-bar agent
+
+`minion-executor menubar install|uninstall|status` installs a second, separate LaunchAgent
+(`com.open-minions.menubar`) for the menu-bar app, reusing the service helpers (executable
+resolution, TCC check, agents-dir vetting, `O_EXCL|O_NOFOLLOW` plist write, `launchctl` wrapper).
+Differences: `LimitLoadToSessionType=Aqua` and `ProcessType=Interactive` (it is UI, not background
+work), `ThrottleInterval` 30 s, `KeepAlive {SuccessfulExit: false}` so Quit stays quit but a crash
+restarts it, no `ExitTimeOut` tuning (nothing to release), and no Keychain requirement or engine probe
+because it never touches the server. The plist carries no secret; only an explicitly set
+`MINION_EXECUTOR_STATE_DIR` / `MINION_EXECUTOR_CONFIG` is copied. It refuses `MINION_EXECUTOR_DEV=1`
+and the executor's label; each uninstall only removes a plist whose `ProgramArguments` are its own
+(`[..., run, ...]` vs `[..., menubar]`), so neither agent can remove the other. Re-installing an
+identical plist is a no-op (loads it if not loaded).
