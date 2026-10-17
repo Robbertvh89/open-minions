@@ -145,10 +145,6 @@ def nf7_proxy_verdict(baseline: PhaseMeasure, loaded: PhaseMeasure) -> Nf7Verdic
     )
 
 
-def _med(values: Sequence[float]) -> float:
-    return statistics.median(values)
-
-
 def aggregate(
     rows: Sequence[tuple[str, CapacityProfile, PhaseMeasure, PhaseMeasure]],
 ) -> dict[tuple[str, CapacityProfile], Nf7Verdict]:
@@ -163,14 +159,15 @@ def aggregate(
     one_sided: set[tuple[str, CapacityProfile]] = set()
     for model, profile, base, loaded in rows:
         groups[(model, profile)].append(nf7_proxy_verdict(base, loaded))
+        # defence in depth: `_measure_row` already turns a one-sided launch into an error row
         if (base.launch_p50_s is None) != (loaded.launch_p50_s is None):
             one_sided.add((model, profile))
     out: dict[tuple[str, CapacityProfile], Nf7Verdict] = {}
     for key, vs in groups.items():
-        frame_ratio = _med([v.frame_p95_ratio for v in vs])
-        delta = _med([v.miss_delta_pp for v in vs])
+        frame_ratio = statistics.median([v.frame_p95_ratio for v in vs])
+        delta = statistics.median([v.miss_delta_pp for v in vs])
         launch_ratios = [v.launch_p50_ratio for v in vs if v.launch_p50_ratio is not None]
-        launch_ratio = _med(launch_ratios) if launch_ratios else None
+        launch_ratio = statistics.median(launch_ratios) if launch_ratios else None
         launch_ok: bool | None = (
             None if launch_ratio is None else launch_ratio <= RATIO_LIMIT + _EPS
         )
@@ -249,8 +246,10 @@ def measure_app_launch(
     osascript startup), or None when unavailable. One warm-up launch is excluded.
 
     Before every launch the app must not be running; if it is (the owner started it) the result is
-    None and it is never touched. Only PIDs that appear after our own launch are signalled (SIGTERM,
-    then SIGKILL after `EXIT_WAIT_S`); nothing is ever killed by name at close time. None on
+    None and it is never touched. Only PIDs that appeared after a launch that completed successfully
+    are signalled (SIGTERM, then SIGKILL after `EXIT_WAIT_S`); on a failed or timed-out launch
+    nothing is signalled (a leaked instance makes later pre-checks return None); nothing is ever
+    killed by name. None on
     non-darwin and on any osascript/TCC error or timeout."""
     if not _BUNDLE_ID_RE.fullmatch(bundle_id):
         raise ValueError("invalid bundle id")
@@ -298,8 +297,7 @@ def measure_app_launch(
         try:
             r = run(argv, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S, check=False)
         except (OSError, subprocess.SubprocessError):
-            close_ours(set(_running_pids(proc_name, run) or []))
-            return None
+            return None  # failed/timed-out launch: signal nothing, leave any instance alone
         elapsed = clock() - t0
         ok = r.returncode == 0
         closed = close_ours(set(_running_pids(proc_name, run) or []))
@@ -559,12 +557,16 @@ async def run_foreground_check(
 ) -> ForegroundReport:
     """NF-7 proxy per (entry, profile, repeat): frame probe + app launches with the worker idle,
     then again while it runs back-to-back batches at the profile's budget. A missing GPU meter or
-    a probe failure (`ProbeError`) aborts the whole check."""
+    a `ProbeError` during calibration aborts the whole check; in a baseline window it aborts too
+    (a loaded-window probe failure is an error row)."""
     meter_probe()
     report = ForegroundReport(
         environment=environment if environment is not None else host_environment(),
         config={**asdict(cfg), "profiles": [p.value for p in budgets]},
     )
+    if launcher is not None and cfg.launches > 0:
+        # throwaway launch: any first-run Automation prompt is answered before measurement
+        await asyncio.to_thread(launcher, 1)
     size = await asyncio.to_thread(probe.calibrate)
     report.probe_size = size
     for entry in entries:

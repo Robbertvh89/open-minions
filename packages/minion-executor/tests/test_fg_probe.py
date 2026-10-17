@@ -78,9 +78,9 @@ def test_decode_reply_rejects_non_finite_and_negative() -> None:
 
 
 def test_timeout_kills_child() -> None:
-    from minion_executor.runners.fg_probe import MlxFrameProbe, hang_child_for_tests
+    from minion_executor.runners.fg_probe import MlxFrameProbe, _hang_child_for_tests
 
-    probe = MlxFrameProbe(target=hang_child_for_tests)
+    probe = MlxFrameProbe(target=_hang_child_for_tests)
     with pytest.raises(ProbeError, match="timed out"):
         probe._call("run", 1.0, 64, 0.5)
-    assert probe._last_proc is not None and not probe._last_proc.is_alive()
+    assert probe.last_proc is not None and not probe.last_proc.is_alive()

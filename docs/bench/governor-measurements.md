@@ -127,7 +127,8 @@ back-to-back batches), each a 60 s frame probe plus 20 Calculator relaunches (wa
 call running, nothing else heavy. If Calculator is running before any launch the owner's instance is
 never touched and launch time is "unavailable".
 
-Automation prompt: the first launch may raise a macOS Automation prompt. The grant goes to the
+Automation prompt: one throwaway priming launch runs before calibration (result discarded) so the
+prompt is answered before any measurement. The first launch may raise a macOS Automation prompt. The grant goes to the
 terminal app you run the bench from (the responsible process), not to `minion-executor`. Revoke it in
 System Settings > Privacy & Security > Automation, or with `tccutil reset AppleEvents <terminal
 bundle id>`. `--launches 0` skips launches entirely (no prompt). While a prompt is pending,

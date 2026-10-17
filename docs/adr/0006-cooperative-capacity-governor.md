@@ -330,7 +330,8 @@ to about 5 ms on the idle GPU, on an absolute 30 fps schedule and records comple
 *scheduled* start; a frame misses when that exceeds 33.3 ms, and slots skipped because it fell
 behind count as misses. App-launch time is the wall time of N warm relaunches of Calculator via
 `osascript` (includes osascript startup; never done if Calculator is running before any launch, and
-only PIDs started by us are signalled; "unavailable" on a TCC/osascript error, and then the row is
+only PIDs that appeared after a launch that completed successfully are signalled, on a failed or
+timed-out launch nothing is signalled; "unavailable" on a TCC/osascript error, and then the row is
 judged on frames only and marked partial; available in one window only is an error row).
 The probe child runs `mlx` outside the Seatbelt sandbox (it handles no task data, its environment
 is scrubbed, and the bench is run by the Mac's owner only).

@@ -161,6 +161,7 @@ def test_non_darwin_unavailable() -> None:
 def test_launch_timeout_and_error_unavailable() -> None:
     f = FakeSys(launch_exc=subprocess.TimeoutExpired("osascript", 15))
     assert _measure(f) is None
+    assert f.kills == []  # nothing is signalled after a failed launch
     assert _measure(FakeSys(launch_rc=1)) is None
 
 

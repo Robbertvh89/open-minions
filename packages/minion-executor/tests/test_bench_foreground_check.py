@@ -40,7 +40,7 @@ class FakeProbe:
     def run(self, duration_s: float, size: int) -> ProbeResult:
         v = self.script[self.calls % 2]
         self.calls += 1
-        time.sleep(duration_s)
+        time.sleep(duration_s * 0.4)  # the GPU sampler needs wall time inside the window
         return ProbeResult([v] * 100, 0)
 
 
@@ -196,3 +196,20 @@ def test_cli_bad_launches_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         ["bench", "--foreground-check", "--models", str(models_file(tmp_path)), "--launches", "-5"],
     )
     assert r.exit_code == 2 and "launches" in r.output
+
+
+def test_priming_launch_happens_once_before_calibrate(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class Probe(FakeProbe):
+        def calibrate(self) -> int:
+            events.append("calibrate")
+            return super().calibrate()
+
+    def spy(n: int) -> list[float]:
+        events.append(f"launch{n}")
+        return [0.5] * n
+
+    run(tmp_path, Probe(), launcher=spy, profiles=(CapacityProfile.LIGHT,))
+    assert events[:2] == ["launch1", "calibrate"]
+    assert events.count("launch1") == 1

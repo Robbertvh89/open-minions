@@ -152,7 +152,7 @@ def _child_main(conn: Connection, mode: str, duration_s: float, size: int) -> No
         conn.close()
 
 
-def hang_child_for_tests(conn: Connection, mode: str, duration_s: float, size: int) -> None:
+def _hang_child_for_tests(conn: Connection, mode: str, duration_s: float, size: int) -> None:
     """Importable stand-in child that never replies (spawn needs a top-level target)."""
     time.sleep(120)
 
@@ -172,6 +172,10 @@ class MlxFrameProbe:
     def __init__(self, target: Callable[[Connection, str, float, int], None] = _child_main) -> None:
         self._target = target
         self._last_proc: BaseProcess | None = None
+
+    @property
+    def last_proc(self) -> BaseProcess | None:
+        return self._last_proc
 
     def _call(self, mode: str, duration_s: float, size: int, timeout_s: float) -> list[float]:
         ctx = mp.get_context("spawn")
