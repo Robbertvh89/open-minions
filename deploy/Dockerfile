@@ -26,6 +26,8 @@ RUN groupadd --gid 10001 minion \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent \
        --shell /usr/sbin/nologin minion
 COPY --from=build /opt/venv /opt/venv
+# No setuid/setgid binaries (su, mount, ...): nothing to escalate through.
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 WORKDIR /app
 COPY alembic.ini ./
 COPY migrations/ migrations/

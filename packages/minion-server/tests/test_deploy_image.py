@@ -44,7 +44,20 @@ def test_runs_non_root_and_read_only(image: str) -> None:
     out = _run(image, "id", "-u")
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "10001"
-    assert _run(image, "sh", "-c", "touch /app/x").returncode != 0
+    assert _run(image, "sh", "-c", "touch /tmp/x").returncode == 0  # the tmpfs is writable
+    ro = _run(image, "sh", "-c", "touch /app/x")
+    assert ro.returncode != 0
+    assert "Read-only file system" in ro.stderr
+
+
+def test_no_setuid_or_setgid_files(image: str) -> None:
+    # As root, so that find can traverse every directory (the image user cannot).
+    out = _docker(
+        "run", "--rm", "--user", "0", "--entrypoint", "find", image,
+        "/", "-xdev", "-perm", "/6000", "-type", "f",
+    )  # fmt: skip
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == ""
 
 
 @pytest.mark.parametrize("cmd", ["alembic", "minion-server-admin", "minion-watchdog"])

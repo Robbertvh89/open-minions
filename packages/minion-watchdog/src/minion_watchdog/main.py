@@ -91,9 +91,11 @@ def touch_health_file(path: str | None) -> None:
     if not path:
         return
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
-        os.close(fd)
-        os.utime(path)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.utime(fd)
+        finally:
+            os.close(fd)
     except OSError as exc:
         log.error("watchdog_health_file_failed", error_class=type(exc).__name__)
 

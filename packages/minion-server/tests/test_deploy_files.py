@@ -1,9 +1,14 @@
 """Static checks of deploy/Dockerfile and .dockerignore (TASK-6.11)."""
 
+import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -67,7 +72,7 @@ def test_app_services_are_hardened_and_in_profile() -> None:
         assert svc["cap_drop"] == ["ALL"], name
         assert "no-new-privileges:true" in svc["security_opt"], name
         assert svc["user"] == "10001:10001", name
-        assert "/tmp" in svc["tmpfs"], name  # noqa: S108
+        assert svc["tmpfs"] == ["/tmp:size=64m,mode=1777"], name  # noqa: S108
     assert not {"postgres", "s3", "s3-init", "grafana"} & {
         n for n, s in services.items() if "profiles" in s
     }
@@ -104,3 +109,49 @@ def test_secrets_are_interpolated_not_literal() -> None:
 
 def test_secrets_dir_is_gitignored() -> None:
     assert "deploy/secrets/" in (ROOT / ".gitignore").read_text().splitlines()
+
+
+def test_restart_policies_and_image_reuse() -> None:
+    services = _services()
+    assert services["migrate"]["restart"] == "no"
+    assert "build" in services["migrate"]
+    for name in ("server", "watchdog"):
+        assert services[name]["restart"] == "unless-stopped", name
+        assert "build" not in services[name], name
+        assert services[name]["pull_policy"] == "never", name
+        assert services[name]["image"] == services["migrate"]["image"], name
+
+
+def test_third_party_images_are_pinned_by_digest() -> None:
+    for name in ("postgres", "s3", "s3-init", "grafana"):
+        assert re.search(r"@sha256:[0-9a-f]{64}$", _services()[name]["image"]), name
+
+
+def test_watchdog_passes_interval_to_its_healthcheck() -> None:
+    env = _services()["watchdog"]["environment"]
+    assert env["MINION_WATCHDOG_INTERVAL_S"] == "${MINION_WATCHDOG_INTERVAL_S:-60}"
+
+
+def _health(path: Path, interval: str | None) -> int:
+    test = _services()["watchdog"]["healthcheck"]["test"]
+    assert test[:3] == ["CMD", "python", "-c"]
+    code = test[3].replace("/tmp/watchdog.health", str(path))  # noqa: S108
+    env = {k: v for k, v in os.environ.items() if k != "MINION_WATCHDOG_INTERVAL_S"}
+    if interval is not None:
+        env["MINION_WATCHDOG_INTERVAL_S"] = interval
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-c", code], env=env, capture_output=True, check=False
+    ).returncode
+
+
+@pytest.mark.parametrize("interval", [None, "5"])
+def test_watchdog_healthcheck_expression(tmp_path: Path, interval: str | None) -> None:
+    f = tmp_path / "h"
+    assert _health(f, interval) != 0  # missing
+    f.touch()
+    assert _health(f, interval) == 0  # fresh
+    limit = 3 * float(interval or "60") + 30
+    os.utime(f, (time.time() - limit + 20, time.time() - limit + 20))
+    assert _health(f, interval) == 0  # just inside the window
+    os.utime(f, (time.time() - limit - 20, time.time() - limit - 20))
+    assert _health(f, interval) != 0  # stale
