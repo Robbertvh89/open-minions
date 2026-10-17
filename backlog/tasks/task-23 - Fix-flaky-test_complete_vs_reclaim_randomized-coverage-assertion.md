@@ -4,7 +4,7 @@ title: Fix flaky test_complete_vs_reclaim_randomized coverage assertion
 status: In Progress
 assignee: []
 created_date: '2026-10-17 14:14'
-updated_date: '2026-10-17 14:14'
+updated_date: '2026-10-17 14:15'
 labels:
   - server
   - test
@@ -20,6 +20,6 @@ The test runs a fixed 4 rounds and asserts both race orderings occurred (0 < com
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Rounds continue until both orderings are seen (bounded), so the coverage check no longer depends on runner speed
-- [ ] #2 Per-round correctness assertions unchanged
+- [x] #1 Rounds continue until both orderings are seen (bounded), so the coverage check no longer depends on runner speed
+- [x] #2 Per-round correctness assertions unchanged
 <!-- AC:END -->

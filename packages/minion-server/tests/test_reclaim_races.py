@@ -155,10 +155,15 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
     c, app = env
     sm: Sm = app.state.sessionmaker
     rng = random.Random(1234)  # noqa: S311
-    n, rounds = 16, 4
+    n, min_rounds, max_rounds = 16, 4, 16
     complete_wins = 0
+    played = 0
     execs = await make_executors(sm, n)
-    for rnd in range(rounds):
+    for rnd in range(max_rounds):
+        # keep playing until both orderings were seen (runner speed shifts the odds)
+        if rnd >= min_rounds and 0 < complete_wins < n * played:
+            break
+        played += 1
         team, name = f"rr{rnd}", f"rr{rnd}"
         await seed_task(sm, name, n, team=team)
         owned = await _acquire_all(c, execs)
@@ -169,8 +174,12 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
             await asyncio.sleep(rng.random() * 0.01)
             return int((await _call(c, a, tok, "complete")).status_code)
 
-        async def reclaim(a: dict[str, Any]) -> ReclaimResult:
-            await asyncio.sleep(rng.random() * 0.06)
+        # alternate the reclaim timing so both orderings occur on fast and slow runners alike:
+        # even rounds reclaim early (mostly before complete), odd rounds late (mostly after)
+        early = rnd % 2 == 0
+
+        async def reclaim(a: dict[str, Any], early: bool = early) -> ReclaimResult:
+            await asyncio.sleep(rng.random() * 0.01 if early else 0.05 + rng.random() * 0.25)
             return await _reclaim(sm, a["acquirement_id"])
 
         results = await asyncio.gather(
@@ -228,7 +237,7 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
         # drain: finish this round's leftovers so the next round starts from an empty queue
         await _cancel_pending(sm, name)
     # both orderings must have been exercised, else the race is not actually being tested
-    assert 0 < complete_wins < n * rounds, complete_wins
+    assert 0 < complete_wins < n * played, (complete_wins, played)
 
 
 async def _cancel_pending(sm: Sm, name: str) -> None:
