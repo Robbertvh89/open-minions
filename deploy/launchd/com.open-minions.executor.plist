@@ -37,5 +37,7 @@
 	<string>/Users/example/Library/Logs/open-minions/executor.log</string>
 	<key>ThrottleInterval</key>
 	<integer>60</integer>
+	<key>Umask</key>
+	<integer>63</integer>
 </dict>
 </plist>

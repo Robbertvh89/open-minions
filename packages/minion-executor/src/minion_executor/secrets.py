@@ -31,6 +31,22 @@ def keychain_token() -> SecretStr | None:
     return None
 
 
+def keychain_present() -> bool:
+    """Whether the Keychain item exists. Never reads the secret (no `-w`)."""
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["/usr/bin/security", "find-generic-password", "-s", KEYCHAIN_SERVICE],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env=scrub_env(os.environ),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
 def load_token() -> SecretStr:
     env = os.environ.get(ENV_VAR)
     if env:

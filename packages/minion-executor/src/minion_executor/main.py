@@ -16,13 +16,13 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 from urllib.parse import urlsplit
 
 import httpx
 import structlog
 import typer
-from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
+from minion_common.client import LOCAL_HOSTS, ApiError, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
 from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
@@ -51,7 +51,12 @@ from minion_executor.loop import ExecutorLoop, GovernorStoppedError
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.secrets import ENV_VAR, load_token
-from minion_executor.service import check_launchd_timeout, service_app
+from minion_executor.service import (
+    check_launchd_timeout,
+    check_server_url,
+    service_app,
+    service_mode,
+)
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
 from minion_executor.worker.sandbox import SandboxPolicy
@@ -371,6 +376,7 @@ def run(
     """Poll the server and run subtasks. Token: $MINION_EXECUTOR_TOKEN or Keychain."""
     try:
         require_secure_url(server)
+        check_server_url(server)
         requested = _requested_engines(engines, runner)
         _validate_heartbeat(heartbeat_interval_s)
         settings = ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
@@ -386,24 +392,42 @@ def run(
         plan = CapacityPlan(config, specs, pinned, source, settings)
         token = load_token()  # fail fast, before starting anything
     except (ValueError, RuntimeError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _permanent_failure("config_invalid", str(exc))
     try:  # one executor per state dir: held until this function returns (or the process dies)
         lock_fd = acquire_instance_lock(settings.state_dir)
     except SafeFileError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _permanent_failure("instance_lock", str(exc))
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
     try:
         asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s, plan))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _permanent_failure("startup_failed", str(exc))
+    except ApiError as exc:
+        # The server refused us for good (credential revoked, bad request): retrying cannot help.
+        if exc.status_code == 429 or not 400 <= exc.status_code < 500:
+            raise
+        reason = "credential_rejected" if exc.status_code in (401, 403) else "request_rejected"
+        _permanent_failure(reason, f"server answered {exc.status_code} {exc.code}", code=1)
     except GovernorStoppedError as exc:  # nothing steers the budget: exit non-zero, never run on
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
     finally:
         os.close(lock_fd)
+
+
+def _permanent_failure(reason: str, detail: str, code: int = 2) -> NoReturn:
+    """A failure that a restart cannot fix. Under launchd (KeepAlive SuccessfulExit=false) it exits
+    0 with one clear log line, so the service is not relaunched every ThrottleInterval; see
+    `minion-executor service status` for the last exit. Elsewhere it exits `code`."""
+    typer.echo(f"error: {detail}", err=True)
+    if service_mode():
+        typer.echo(
+            f"permanent_failure reason={reason}: exiting 0 so launchd does not relaunch; "
+            "fix the cause, then `launchctl kickstart` (or reinstall) the service",
+            err=True,
+        )
+        raise typer.Exit(code=0)
+    raise typer.Exit(code=code)
 
 
 def _warn(message: str) -> None:
