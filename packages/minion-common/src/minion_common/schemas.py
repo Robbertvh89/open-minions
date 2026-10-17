@@ -218,6 +218,13 @@ class ExecutorOut(_Model):
     busy: bool
 
 
+class ExecutorPage(_Model):
+    """One page of `GET /executors`; `next_cursor` is opaque (None = last page)."""
+
+    items: list[ExecutorOut]
+    next_cursor: str | None = None
+
+
 class RegisterRequest(_Model):
     hostname: str = Field(min_length=1, max_length=255)
     chip: str = Field(min_length=1, max_length=100)
@@ -334,6 +341,7 @@ __all__ = [
     "EmbeddingParams",
     "ErrorBody",
     "ExecutorOut",
+    "ExecutorPage",
     "FailRequest",
     "HeartbeatRequest",
     "HeartbeatResponse",

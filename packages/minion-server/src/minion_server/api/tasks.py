@@ -200,7 +200,7 @@ async def list_tasks(
     team: Annotated[str | None, Query(pattern=SLUG_PATTERN)] = None,
     project: Annotated[str | None, Query(pattern=SLUG_PATTERN)] = None,
     status: TaskStatus | None = None,
-    cursor: Annotated[str | None, Query(max_length=512)] = None,
+    cursor: str | None = None,
     limit: _Limit = 50,
 ) -> TaskPage:
     """Tasks of the caller's teams, newest first (keyset pagination)."""
@@ -252,7 +252,7 @@ async def list_subtasks(
     user: Annotated[User, Depends(current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
     status: SubtaskStatus | None = None,
-    cursor: Annotated[str | None, Query(max_length=512)] = None,
+    cursor: str | None = None,
     limit: _Limit = 100,
 ) -> SubtaskPage:
     for part in (team, project, task_name):

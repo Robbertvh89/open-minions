@@ -14,7 +14,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, SecretStr
 
-from minion_common.enums import SubtaskStatus, TaskStatus
+from minion_common.enums import ExecutorStatus, SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     SLUG_PATTERN,
     AcquireRequest,
@@ -22,7 +22,7 @@ from minion_common.schemas import (
     Budget,
     CompleteRequest,
     ErrorBody,
-    ExecutorOut,
+    ExecutorPage,
     FailRequest,
     HeartbeatRequest,
     HeartbeatResponse,
@@ -120,13 +120,21 @@ class _BaseClient:
     ) -> None:
         await self.aclose()
 
-    async def _send(self, method: str, path: str, body: BaseModel | None = None) -> httpx.Response:
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        body: BaseModel | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        query = {k: v for k, v in (params or {}).items() if v is not None}
         if body is None:
-            resp = await self._http.request(method, path)
+            resp = await self._http.request(method, path, params=query)
         else:
             resp = await self._http.request(
                 method,
                 path,
+                params=query,
                 content=body.model_dump_json(),
                 headers={"Content-Type": "application/json"},
             )
@@ -190,13 +198,6 @@ class UserClient(_BaseClient):
         resp = await self._send("POST", self._task_path(team, project, task_name) + "/cancel")
         return TaskOut.model_validate_json(resp.content)
 
-    async def _get_page(self, path: str, params: dict[str, Any]) -> httpx.Response:
-        query = {k: v for k, v in params.items() if v is not None}
-        resp = await self._http.get(path, params=query)
-        if resp.status_code >= 400:
-            raise _error_from(resp)
-        return resp
-
     async def list_tasks(
         self,
         *,
@@ -206,9 +207,10 @@ class UserClient(_BaseClient):
         cursor: str | None = None,
         limit: int | None = None,
     ) -> TaskPage:
-        resp = await self._get_page(
+        resp = await self._send(
+            "GET",
             "/tasks",
-            {
+            params={
                 "team": team,
                 "project": project,
                 "status": status.value if status else None,
@@ -228,15 +230,32 @@ class UserClient(_BaseClient):
         cursor: str | None = None,
         limit: int | None = None,
     ) -> SubtaskPage:
-        resp = await self._get_page(
+        resp = await self._send(
+            "GET",
             self._task_path(team, project, task_name) + "/subtasks",
-            {"status": status.value if status else None, "cursor": cursor, "limit": limit},
+            params={"status": status.value if status else None, "cursor": cursor, "limit": limit},
         )
         return SubtaskPage.model_validate_json(resp.content)
 
-    async def list_executors(self) -> list[ExecutorOut]:
-        resp = await self._send("GET", "/executors")
-        return [ExecutorOut.model_validate(x) for x in resp.json()]
+    async def list_executors(
+        self,
+        *,
+        status: ExecutorStatus | None = None,
+        pool: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> ExecutorPage:
+        resp = await self._send(
+            "GET",
+            "/executors",
+            params={
+                "status": status.value if status else None,
+                "pool": pool,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
+        return ExecutorPage.model_validate_json(resp.content)
 
 
 __all__ = [

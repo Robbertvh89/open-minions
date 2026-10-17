@@ -8,6 +8,7 @@ page window within what the caller may already see.
 
 import base64
 import binascii
+import uuid
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -39,7 +40,14 @@ class SubtaskCursor(BaseModel):
     subtask_id: int = Field(ge=0, le=2**31 - 1)
 
 
-def encode_cursor(cursor: TaskCursor | SubtaskCursor) -> str:
+class ExecutorCursor(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    k: Literal["executor"] = "executor"
+    executor_id: uuid.UUID
+
+
+def encode_cursor(cursor: TaskCursor | SubtaskCursor | ExecutorCursor) -> str:
     raw = cursor.model_dump_json().encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
@@ -70,6 +78,16 @@ def decode_task_cursor(token: str) -> TaskCursor:
 def decode_subtask_cursor(token: str) -> SubtaskCursor:
     try:
         cur = SubtaskCursor.model_validate_json(_decode_json(token))
+    except ValidationError as exc:
+        raise InvalidCursorError("invalid cursor") from exc
+    if encode_cursor(cur) != token.rstrip("="):
+        raise InvalidCursorError("invalid cursor")
+    return cur
+
+
+def decode_executor_cursor(token: str) -> ExecutorCursor:
+    try:
+        cur = ExecutorCursor.model_validate_json(_decode_json(token))
     except ValidationError as exc:
         raise InvalidCursorError("invalid cursor") from exc
     if encode_cursor(cur) != token.rstrip("="):

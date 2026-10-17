@@ -2,14 +2,24 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
-from minion_common.schemas import ExecutorOut
+from fastapi import APIRouter, Depends, Query, Request
+from minion_common.enums import ExecutorStatus
+from minion_common.schemas import SLUG_PATTERN, ExecutorOut, ExecutorPage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import User, require_operator
+from minion_server.cursor import (
+    ExecutorCursor,
+    InvalidCursorError,
+    decode_executor_cursor,
+    encode_cursor,
+)
 from minion_server.db.session import get_session
+from minion_server.errors import api_error
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
+
+MAX_PAGE = 500
 
 router = APIRouter(prefix="/api/v1/executors", tags=["fleet"])
 
@@ -19,15 +29,29 @@ async def list_executors(
     request: Request,
     _op: Annotated[User, Depends(require_operator)],
     session: Annotated[AsyncSession, Depends(get_session)],
-) -> list[ExecutorOut]:
+    status: ExecutorStatus | None = None,
+    pool: Annotated[str | None, Query(pattern=SLUG_PATTERN)] = None,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 200,
+) -> ExecutorPage:
     settings: ServerSettings = request.app.state.settings
+    after_id = None
+    if cursor is not None:
+        try:
+            after_id = decode_executor_cursor(cursor).executor_id
+        except InvalidCursorError as exc:
+            raise api_error(422, "INVALID_CURSOR", "invalid cursor") from exc
     async with session.begin():
-        rows = await executors_repo.list_fleet(
+        rows, more = await executors_repo.list_fleet(
             session,
             idle_online_s=settings.executor_online_idle_s,
             busy_online_s=settings.executor_online_busy_s,
+            status=status,
+            pool=pool,
+            after_id=after_id,
+            limit=limit,
         )
-    return [
+    items = [
         ExecutorOut(
             executor_id=r.executor.executor_id,
             owner=r.executor.owner,
@@ -50,3 +74,5 @@ async def list_executors(
         )
         for r in rows
     ]
+    nxt = encode_cursor(ExecutorCursor(executor_id=rows[-1].executor.executor_id)) if more else None
+    return ExecutorPage(items=items, next_cursor=nxt)

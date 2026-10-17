@@ -271,11 +271,12 @@ async def seed_task(
     status: str = "PENDING",
     team: str = "acq",
     model_id: str = "fake-embed",
+    project: str = "p",
 ) -> None:
     body = TaskCreate.model_validate(
         {
             "team": team,
-            "project": "p",
+            "project": project,
             "task_name": name,
             "type": "embedding",
             "model": model_id,
@@ -308,7 +309,7 @@ async def seed_task(
             s.add(
                 Subtask(
                     team=team,
-                    project="p",
+                    project=project,
                     task_name=name,
                     subtask_id=i,
                     input_object_key=f"inputs/{team}/{name}/a.jsonl",

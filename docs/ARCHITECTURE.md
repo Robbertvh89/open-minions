@@ -479,6 +479,7 @@ race, stale-acquirement rejection, splitter restart.
 - `minion_subtask`: partial index on `status='PENDING'`; index on `(team, project, task_name, status)` for progress.
 - `minion_executor_heartbeat`: index on `last_seen_at`.
 - `minion_task`: index on `(status, priority DESC, created_at)`.
+- `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
 
 ### 5.2 Input slicing **[ours]**
 Splitter records `(object_key, byte_start, byte_end, first_record, record_count)` per subtask, aligned to

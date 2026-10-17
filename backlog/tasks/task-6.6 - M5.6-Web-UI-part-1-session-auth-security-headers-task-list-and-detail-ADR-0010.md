@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 07:22'
 labels:
   - M5
 dependencies:
@@ -28,3 +29,9 @@ minion_server/ui/{routes.py, session.py, templates/, static/htmx.min.js vendored
 - [ ] #4 CSP header present; an error string with <script> renders escaped
 - [ ] #5 UI returns 404 when MINION_UI_SESSION_SECRET is unset
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Owner and hostname are free-form executor-supplied strings: the UI must autoescape them (Jinja autoescape on, no |safe). From TASK-6.4 review.
+<!-- SECTION:NOTES:END -->

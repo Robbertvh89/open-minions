@@ -258,9 +258,18 @@ class FleetRow:
 
 
 async def list_fleet(
-    session: AsyncSession, *, idle_online_s: float, busy_online_s: float
-) -> list[FleetRow]:
-    """All executors with derived `busy` / `online` (ARCHITECTURE §7).
+    session: AsyncSession,
+    *,
+    idle_online_s: float,
+    busy_online_s: float,
+    status: ExecutorStatus | None = None,
+    pool: str | None = None,
+    after_id: uuid.UUID | None = None,
+    limit: int = 200,
+) -> tuple[list[FleetRow], bool]:
+    """A keyset page (by `executor_id`; `limit + 1` probe) of executors, `busy` / `online` derived.
+
+    See ARCHITECTURE §7.
 
     busy: the executor owns an acquirement that still has a heartbeat row (the row exists exactly
     while the subtask is RUNNING under it). online: ACTIVE and heard from within `busy_online_s`
@@ -291,9 +300,15 @@ async def list_fleet(
             else_=func.make_interval(0, 0, 0, 0, 0, 0, idle_online_s),
         ),
     )
-    rows = await session.execute(
-        select(Executor, busy, hb.c.last_hb, online)
-        .outerjoin(hb, hb.c.executor_id == Executor.executor_id)
-        .order_by(Executor.registered_at, Executor.executor_id)
+    stmt = select(Executor, busy, hb.c.last_hb, online).outerjoin(
+        hb, hb.c.executor_id == Executor.executor_id
     )
-    return [FleetRow(r[0], bool(r[1]), r[2], bool(r[3])) for r in rows.all()]
+    if status is not None:
+        stmt = stmt.where(Executor.status == status.value)
+    if pool is not None:
+        stmt = stmt.where(Executor.pool == pool)
+    if after_id is not None:
+        stmt = stmt.where(Executor.executor_id > after_id)
+    rows = (await session.execute(stmt.order_by(Executor.executor_id).limit(limit + 1))).all()
+    out = [FleetRow(r[0], bool(r[1]), r[2], bool(r[3])) for r in rows]
+    return out[:limit], len(out) > limit
