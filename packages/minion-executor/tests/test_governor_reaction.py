@@ -3,12 +3,14 @@ return within 5 s. 20 trials in total with the fake engine in a real worker subp
 `FileSignals` steered through a file; no server, no GPU.
 
 Reaction time = from the moment the signal file holds the new value to the moment the worker has
-acknowledged the matching control message (paused, or the new duty) or, for memory `critical`,
-has been interrupted (the release path). The bridge below mirrors the loop's `_push_control` and
-release handling (`loop.py`), so what is timed is poll + decide + control round trip + one 100 ms
-engine step. The poll is 0.25 s here (production 2 s, bounded by `MINION_EXECUTOR_SIGNAL_POLL_S`)
-to keep the suite short; the Mac procedure with the production poll is in
-docs/bench/governor-measurements.md. The bound asserted is the SPEC one, 5 s.
+acknowledged the matching control message (paused, or the new duty) or, for memory `critical`, to
+the moment the worker process is gone (the release path: verdict, `interrupt()`, the in-flight call
+failing with `WorkerCrashed`). The steering is the real `ExecutorLoop._watch` / `_push_control`
+over a real `GovernorRuntime`, `FileSignals` and a fake-engine worker subprocess, so what is
+timed is poll + decide + control round trip + one 100 ms engine step. The poll is 0.25 s here
+(production 2 s, at most 4 s: `MINION_EXECUTOR_SIGNAL_POLL_S`) to keep the suite short; the Mac
+procedure with the production poll is in docs/bench/governor-measurements.md.
+Asserted: the SPEC bound, 5 s, and the tighter poll + step + 0.5 s.
 """
 
 from __future__ import annotations
@@ -19,18 +21,21 @@ import json
 import random
 import statistics
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from minion_common.enums import CapacityProfile, Engine, TaskType
-from minion_common.schemas import Budget, ModelEntry
+from minion_common.schemas import Assignment, Budget, ModelEntry
 from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
 from minion_executor.capacity.governor import GovernorTiming
 from minion_executor.capacity.profiles import budget_for
 from minion_executor.capacity.runtime import GovernorRuntime
 from minion_executor.capacity.signals import FileSignals
+from minion_executor.loop import ExecutorLoop, _Verdict
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 
 NF9_LIMIT_S = 5.0
@@ -82,34 +87,38 @@ EVENTS = [
 ]
 
 
-@dataclass
-class Bridge:
-    """Pushes governor decisions to the worker like `ExecutorLoop._push_control`, and records
-    (control-side ack time, paused, duty) per push. A critical memory verdict interrupts."""
+class RecordingWorker(WorkerHandle):
+    """A real worker subprocess that also records every control push `ExecutorLoop` makes."""
 
-    gov: GovernorRuntime
-    worker: WorkerHandle
-    acks: list[tuple[float, bool, float]] = field(default_factory=list)
-    released_at: float | None = None
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self.pushes: list[tuple[int, bool, float]] = []  # (generation, paused, duty)
 
-    async def run(self) -> None:
-        version, key = self.gov.version, None
-        while True:
-            d = self.gov.decision
-            if d.release_now:
-                self.worker.interrupt()
-                self.released_at = time.monotonic()
-                return
-            k = (d.budget.gpu_duty_cycle, d.paused)
-            if k != key:
-                key = k
-                gen = await asyncio.to_thread(self.worker.control, duty=k[0], paused=k[1])
-                ack = None
-                while ack is None or ack.gen < gen:
-                    await asyncio.sleep(0.002)
-                    ack = self.worker.last_ack()
-                self.acks.append((ack.at, k[1], k[0]))
-            version = await self.gov.wait_change(version, 0.5)
+    def control(self, *, duty: float, paused: bool, trim: bool = False) -> int:
+        gen = super().control(duty=duty, paused=paused, trim=trim)
+        self.pushes.append((gen, paused, duty))
+        return gen
+
+
+def assignment() -> Assignment:
+    return Assignment.model_validate(
+        {
+            "acquirement_id": str(uuid.uuid4()),
+            "attempt": 1,
+            "team": "t",
+            "project": "p",
+            "task_name": "n",
+            "subtask_id": 0,
+            "type": "completion",
+            "model": MODEL.model_dump(mode="json"),
+            "input_url": "https://s3.test/in",
+            "byte_start": 0,
+            "byte_end": 1,
+            "record_count": 1,
+            "output_url": "https://s3.test/out",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        }
+    )
 
 
 def write_signals(path: Path, fields: dict[str, Any]) -> None:
@@ -124,6 +133,10 @@ def budget_of(profile: CapacityProfile) -> Budget:
 
 
 async def one_trial(tmp: Path, ev: Event, rng: random.Random) -> float:
+    """One reaction time. The governor is a real `GovernorRuntime`; the steering is the real
+    `ExecutorLoop._watch` (which calls `_push_control` and returns the memory-critical verdict)
+    over a real worker subprocess. Only the server client is absent: `_watch` never touches it, and
+    on the memory-critical verdict the test does what `_on_verdict` does first: `interrupt()`."""
     state = tmp / "state"
     state.mkdir(mode=0o700, exist_ok=True)
     sig = state / "signals.json"
@@ -139,33 +152,53 @@ async def one_trial(tmp: Path, ev: Event, rng: random.Random) -> float:
         timing=GovernorTiming(escalate_after_s=0.0),  # idle -> full at once; not under test
     )
     await gov.prime()
-    worker = WorkerHandle([Engine.FAKE], test_hooks=True, tick_interval_s=0.05)
-    bridge = Bridge(gov, worker)
+    worker = RecordingWorker([Engine.FAKE], test_hooks=True, tick_interval_s=0.05)
+    loop = ExecutorLoop(
+        cast(Any, None),  # ExecutorClient: unused by _watch / _push_control
+        worker,
+        budget_of(ev.run_profile),
+        [Engine.FAKE],
+        governor=gov,
+        guard_interval_s=100.0,
+    )
+    crashed_at: list[float] = []
+
+    async def run_work() -> None:
+        records = [{"id": i, "sleep_s": STEP_S, "text": "x"} for i in range(600)]  # ~60 s of steps
+        try:
+            await asyncio.to_thread(worker.run, records, None, None, budget_of(ev.run_profile))
+        except WorkerCrashed:
+            crashed_at.append(time.monotonic())  # the worker process is gone
+
     tasks: list[asyncio.Task[Any]] = []
     try:
         await asyncio.to_thread(worker.ensure_model, MODEL, budget_of(ev.run_profile))
-        records = [{"id": i, "sleep_s": STEP_S, "text": "x"} for i in range(600)]  # ~60 s of steps
-        work = asyncio.create_task(
-            asyncio.to_thread(worker.run, records, None, None, budget_of(ev.run_profile))
-        )
-        tasks += [work, asyncio.create_task(gov.run()), asyncio.create_task(bridge.run())]
+        watch = asyncio.create_task(loop._watch(assignment()))
+        tasks += [asyncio.create_task(gov.run()), asyncio.create_task(run_work()), watch]
         deadline = time.monotonic() + 10
-        while not bridge.acks:  # steady state: the initial decision is applied
-            assert time.monotonic() < deadline, "worker never acked the initial control"
+        while not worker.pushes:  # steady state: the initial decision is applied
+            assert time.monotonic() < deadline, "the watcher never pushed the initial control"
             await asyncio.sleep(0.01)
+        await _acked(worker, worker.pushes[-1][0], deadline)
         await asyncio.sleep(rng.uniform(0, POLL_S))  # inject at a random phase of the poll
-        before = len(bridge.acks)
+        before = len(worker.pushes)
         write_signals(sig, ev.after)
         t0 = time.monotonic()
+        give_up = t0 + 3 * NF9_LIMIT_S
+        if ev.release:
+            verdict = await asyncio.wait_for(watch, 3 * NF9_LIMIT_S)
+            assert verdict is _Verdict.MEMORY_CRITICAL, verdict
+            await asyncio.to_thread(worker.interrupt)
+            while not crashed_at:
+                assert time.monotonic() < give_up, f"{ev.name}: the worker never exited"
+                await asyncio.sleep(0.002)
+            return crashed_at[0] - t0
         while True:
-            if ev.release:
-                if bridge.released_at is not None:
-                    return bridge.released_at - t0
-            else:
-                for at, paused, duty in bridge.acks[before:]:
-                    if paused if ev.expect_paused else (not paused and duty == ev.expect_duty):
-                        return at - t0
-            assert time.monotonic() - t0 < 3 * NF9_LIMIT_S, f"{ev.name}: no reaction"
+            assert not watch.done(), f"{ev.name}: the watcher ended: {watch}"
+            for gen, paused, duty in worker.pushes[before:]:
+                if paused if ev.expect_paused else (not paused and duty == ev.expect_duty):
+                    return await _acked(worker, gen, give_up) - t0
+            assert time.monotonic() < give_up, f"{ev.name}: no reaction"
             await asyncio.sleep(0.002)
     finally:
         worker.interrupt()
@@ -175,6 +208,15 @@ async def one_trial(tmp: Path, ev: Event, rng: random.Random) -> float:
             with contextlib.suppress(asyncio.CancelledError, WorkerCrashed, Exception):
                 await t
         await asyncio.to_thread(worker.close)
+        await loop._http.aclose()
+
+
+async def _acked(worker: WorkerHandle, gen: int, deadline: float) -> float:
+    """Wait until the worker acknowledged control generation `gen`; the ack's time."""
+    while (ack := worker.last_ack()) is None or ack.gen < gen:
+        assert time.monotonic() < deadline, "the worker never acked the control message"
+        await asyncio.sleep(0.002)
+    return ack.at
 
 
 @pytest.fixture(autouse=True)
@@ -195,4 +237,6 @@ async def test_reaction_within_five_seconds(
             f"max={ordered[-1]:.3f}s (poll {POLL_S}s, step {STEP_S}s)"
         )
     assert ordered[-1] < NF9_LIMIT_S, times
+    # poll + one engine step + scheduling slack: a regression that merely stays under 5 s is caught
+    assert ordered[-1] < POLL_S + STEP_S + 0.5, times
     assert ordered[0] >= 0

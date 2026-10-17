@@ -4,14 +4,25 @@ Budget check, per (model, profile, repeat), through the real worker path (model 
 `WorkerHandle`, runner), engine-agnostic like `bench.py`:
 
 1. a fresh worker loads the model and runs one warm-up batch (excluded);
-2. idle baseline: the GPU meter alone for `baseline_s` (median), so other GPU users are subtracted;
+2. idle phase for `baseline_s`: only the device-wide utilization is read (informational);
 3. unpaced phase at duty 1.0 -> `unpaced_share` (skipped for a profile whose duty is 1.0);
-4. paced phase at the profile's `gpu_duty_cycle` -> `measured_share`.
+4. a 2 s gap, then the paced phase at the profile's `gpu_duty_cycle` -> `measured_share`.
 
-GPU share = mean `Device Utilization %` (ioreg, ~4 Hz) over the phase minus the baseline. The worker
-footprint is sampled at 10 Hz from here (`WorkerHandle.footprint_bytes`, i.e. `phys_footprint`), and
-the pacer's own `busy_s / wall_s` is reported next to it (advisory: the worker is the party being
-limited). Verdicts follow ADR-0006 Gap 1; see `nf8_verdict`. Payloads are never logged or written.
+Primary metric: the worker pid's GPU time. `ioreg` lists the worker's Metal user clients with
+`accumulatedGPUTime` (ns); the delta over a phase window divided by the window's wall time is the
+share of the GPU our process kept busy (`gpu_meter.process_gpu_share`). It needs no baseline: other
+apps, the display and frequency scaling do not enter. The first 1.5 s of each phase are dropped (the
+pacer and the GPU clock settle). `Device Utilization %` is device-wide and DVFS-affected; it is
+reported as an informational column only. Sampling is ~2 Hz from the control process, started
+before the model loads, so the footprint peak (10 Hz, `WorkerHandle.footprint_bytes`, i.e.
+`phys_footprint`) includes the load. The pacer's own `busy_s / wall_s` is reported too (advisory:
+the worker is the party being limited). Verdicts follow ADR-0006 Gap 1; see `nf8_verdict`. Rows
+with status `unavailable` (engine missing, model too big for the profile) are excluded from
+pass/fail; any `error` row fails the check. Payloads are never logged or written.
+
+`--cpu-check` (NF-4) measures the CPU of this process while a real `GovernorRuntime` polls, i.e. the
+control-process governor only. A whole `minion-executor run` (control plus worker process tree) is
+measured with `ps`, see docs/bench/governor-measurements.md.
 """
 
 from __future__ import annotations
@@ -19,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
+import statistics
 import tempfile
 import threading
 import time
@@ -45,10 +57,11 @@ from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
 from minion_executor.capacity.control import OwnerControl, write_control
 from minion_executor.capacity.gpu_meter import (
     GpuMeterError,
+    GpuSample,
     GpuSampler,
-    mean_percent,
-    median_percent,
-    read_gpu_utilization,
+    make_sampler,
+    probe_meters,
+    process_gpu_share,
     window_percent,
 )
 from minion_executor.capacity.runtime import GovernorRuntime
@@ -59,6 +72,8 @@ from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 
 log = structlog.get_logger()
 
+SETTLE_S = 1.5  # dropped from the start of each phase window
+PHASE_GAP_S = 2.0  # idle between the unpaced and the paced phase
 TOLERANCE = 0.10  # NF-8: +-10 pp (accuracy) and +10 pp (hard bound)
 MEMORY_FACTOR = 1.10  # NF-8 / D7: worker footprint <= memory_gb x 1.10
 DEFAULT_DURATION_S = 60.0
@@ -71,44 +86,40 @@ CPU_LIMIT_PCT = 1.0  # NF-4
 
 @dataclass(frozen=True)
 class Nf8Verdict:
-    expected_share: float  # duty x unpaced share: what the control law should give
+    expected_share: float | None  # duty x unpaced share (None: no unpaced phase, duty 1.0)
     hard_ok: bool  # measured <= duty + 10 pp (the invariant-6 check)
-    accuracy_ok: bool  # |measured - expected| <= 10 pp
+    accuracy_ok: bool | None  # |measured - expected| <= 10 pp (None: nothing to compare with)
     memory_ok: bool  # footprint peak <= memory_gb x 1.10
 
     @property
     def passed(self) -> bool:
-        return self.hard_ok and self.accuracy_ok and self.memory_ok
+        return self.hard_ok and self.accuracy_ok is not False and self.memory_ok
 
 
 def nf8_verdict(
     *,
     duty: float,
     measured: float,
-    unpaced: float,
+    unpaced: float | None,
     footprint_peak_gb: float,
     memory_gb: float,
 ) -> Nf8Verdict:
-    """NF-8 as restated in ADR-0006 Gap 1. Shares are fractions (0..1), baseline-subtracted.
+    """NF-8 as restated in ADR-0006 Gap 1. Shares are fractions (0..1) of the worker's own GPU time.
 
     Hard bound: `measured <= duty + 0.10`. Accuracy: `|measured - duty x unpaced| <= 0.10`, where
-    `unpaced` is the same workload's share with the pacer off, so CPU-bound phases the pacer cannot
-    compress are not held against it. Memory: `footprint_peak_gb <= memory_gb x 1.10`."""
+    `unpaced` is the same workload's share with the pacer off, measured the same way, so CPU-bound
+    phases the pacer cannot compress are not held against it; without an unpaced phase (duty 1.0)
+    there is no accuracy verdict. Memory: `footprint_peak_gb <= memory_gb x 1.10`."""
     for name, v in (("duty", duty), ("measured", measured), ("unpaced", unpaced)):
-        if not math.isfinite(v) or v < 0:
+        if v is not None and (not math.isfinite(v) or v < 0):
             raise ValueError(f"{name} must be a finite non-negative number")
-    expected = duty * unpaced
+    expected = None if unpaced is None else duty * unpaced
     return Nf8Verdict(
         expected_share=expected,
         hard_ok=measured <= duty + TOLERANCE + 1e-9,
-        accuracy_ok=abs(measured - expected) <= TOLERANCE + 1e-9,
+        accuracy_ok=None if expected is None else abs(measured - expected) <= TOLERANCE + 1e-9,
         memory_ok=footprint_peak_gb <= memory_gb * MEMORY_FACTOR + 1e-9,
     )
-
-
-def share_from_percent(phase_pct: float, baseline_pct: float) -> float:
-    """Baseline-subtracted busy share as a fraction, clamped to 0..1."""
-    return min(1.0, max(0.0, (phase_pct - baseline_pct) / 100.0))
 
 
 # -- results --
@@ -126,7 +137,6 @@ class BudgetCheckResult:
     duty: float | None = None
     budget_memory_gb: float | None = None
     max_batch_size: int | None = None
-    baseline_pct: float | None = None
     unpaced_share: float | None = None
     measured_share: float | None = None
     expected_share: float | None = None
@@ -135,6 +145,9 @@ class BudgetCheckResult:
     footprint_peak_gb: float | None = None
     worker_rss_peak_gb: float | None = None
     engine_peak_gb: float | None = None
+    device_baseline_pct: float | None = None  # informational: device-wide, not per process
+    device_unpaced_pct: float | None = None
+    device_paced_pct: float | None = None
     gpu_samples: int = 0
     duration_s: float = 0.0
     records_done: int = 0
@@ -161,8 +174,14 @@ class BudgetCheckReport:
 
     @property
     def all_passed(self) -> bool:
+        """Every `ok` row passes and no row errored. `unavailable` rows (engine missing, model too
+        big for the profile) are not judged; with nothing judged the check does not pass."""
         ok = [r for r in self.results if r.status == "ok"]
-        return bool(ok) and all(r.passed for r in ok) and len(ok) == len(self.results)
+        return (
+            bool(ok)
+            and all(r.passed for r in ok)
+            and not any(r.status == "error" for r in self.results)
+        )
 
 
 @dataclass(frozen=True)
@@ -258,6 +277,83 @@ def _run_phase(
     return _Phase(t0, time.monotonic(), weighted / total if total else None, done)
 
 
+SamplerFactory = Callable[[Callable[[], int | None]], GpuSampler]  # worker pid getter -> sampler
+
+
+@dataclass
+class _Phases:
+    idle: tuple[float, float]  # (t0, t1) of the idle phase
+    unpaced: _Phase | None
+    paced: _Phase
+
+
+def _run_phases(
+    worker: WorkerHandle,
+    entry: ModelEntry,
+    path: Path | None,
+    budget: Budget,
+    cfg: BudgetCheckConfig,
+) -> _Phases:
+    """Load, warm up (excluded), idle, unpaced (duty < 1 only), gap, paced."""
+    unpaced_budget = _with_duty(budget, 1.0)
+    params = _params(entry, BenchConfig(max_tokens=cfg.max_tokens))
+    batch = synthetic_records(entry.type, budget.max_batch_size, cfg.seed)
+    worker.ensure_model(entry, unpaced_budget, path)
+    worker.run(batch, params, budget=unpaced_budget)  # warm-up, excluded
+    t_idle = time.monotonic()
+    time.sleep(cfg.baseline_s)  # nothing of ours is running
+    idle = (t_idle, time.monotonic())
+    unpaced: _Phase | None = None
+    if budget.gpu_duty_cycle < 1.0:
+        unpaced = _run_phase(worker, batch, params, unpaced_budget, cfg.duration_s)
+        time.sleep(PHASE_GAP_S)  # let the GPU go quiet so the phases do not bleed into each other
+    return _Phases(idle, unpaced, _run_phase(worker, batch, params, budget, cfg.duration_s))
+
+
+def _device_pct(samples: list[GpuSample], t0: float, t1: float) -> float | None:
+    values = window_percent(samples, t0, t1)
+    return statistics.fmean(values) if values else None
+
+
+def _fill_shares(
+    res: BudgetCheckResult, samples: list[GpuSample], ph: _Phases, cfg: BudgetCheckConfig
+) -> None:
+    """Per-process GPU shares (primary) and device utilization (informational), settled windows."""
+    if not samples:
+        raise GpuMeterError("the GPU sampler produced no samples")
+    settle = min(SETTLE_S, cfg.duration_s / 4)
+    res.measured_share = process_gpu_share(samples, ph.paced.t0 + settle, ph.paced.t1)
+    res.device_paced_pct = _device_pct(samples, ph.paced.t0 + settle, ph.paced.t1)
+    res.device_baseline_pct = _device_pct(samples, *ph.idle)
+    if ph.unpaced is not None:
+        res.unpaced_share = process_gpu_share(samples, ph.unpaced.t0 + settle, ph.unpaced.t1)
+        res.device_unpaced_pct = _device_pct(samples, ph.unpaced.t0 + settle, ph.unpaced.t1)
+        res.unpaced_reported_share = ph.unpaced.reported_share
+    res.worker_reported_share = ph.paced.reported_share
+    res.gpu_samples = len(samples)
+    res.duration_s = ph.paced.t1 - ph.paced.t0
+    res.records_done = ph.paced.records
+
+
+def _judge(res: BudgetCheckResult, budget: Budget) -> None:
+    if res.measured_share is None or res.footprint_peak_gb is None:
+        raise RuntimeError("_judge needs the measurements first")
+    v = nf8_verdict(
+        duty=budget.gpu_duty_cycle,
+        measured=res.measured_share,
+        unpaced=res.unpaced_share,
+        footprint_peak_gb=res.footprint_peak_gb,
+        memory_gb=budget.memory_gb,
+    )
+    res.expected_share = v.expected_share
+    res.hard_ok, res.accuracy_ok, res.memory_ok, res.passed = (
+        v.hard_ok,
+        v.accuracy_ok,
+        v.memory_ok,
+        v.passed,
+    )
+
+
 def _check_one(
     worker: WorkerHandle,
     entry: ModelEntry,
@@ -265,7 +361,7 @@ def _check_one(
     budget: Budget,
     cfg: BudgetCheckConfig,
     repeat: int,
-    sampler_factory: Callable[[], GpuSampler],
+    sampler_factory: SamplerFactory,
 ) -> BudgetCheckResult:
     res = BudgetCheckResult(
         model_id=entry.model_id,
@@ -281,64 +377,22 @@ def _check_one(
     if entry.memory_gb > budget.memory_gb:
         res.status, res.detail = "unavailable", "model does not fit the profile's memory budget"
         return res
-    duty = budget.gpu_duty_cycle
-    unpaced_budget = _with_duty(budget, 1.0)
-    params = _params(entry, BenchConfig(max_tokens=cfg.max_tokens))
-    batch = synthetic_records(entry.type, budget.max_batch_size, cfg.seed)
-    worker.ensure_model(entry, unpaced_budget, path)
-    worker.run(batch, params, budget=unpaced_budget)  # warm-up, excluded
-
-    sampler = sampler_factory()
-    sampler.start()
+    sampler = sampler_factory(lambda: worker.pid)
+    sampler.start()  # both samplers run from before the load: the peak includes it
     try:
         with _FootprintSampler(worker) as fp:
-            time.sleep(
-                cfg.baseline_s
-            )  # nothing of ours is running: whatever the GPU shows is not us
-            t_base = time.monotonic()
-            unpaced: _Phase | None = None
-            if duty < 1.0:
-                unpaced = _run_phase(worker, batch, params, unpaced_budget, cfg.duration_s)
-            paced = _run_phase(worker, batch, params, budget, cfg.duration_s)
+            phases = _run_phases(worker, entry, path, budget, cfg)
     finally:
         samples = sampler.stop()
-    base_pct = median_percent(window_percent(samples, samples[0].at, t_base))
-    paced_pct = mean_percent(window_percent(samples, paced.t0, paced.t1))
-    res.baseline_pct = base_pct
-    res.measured_share = share_from_percent(paced_pct, base_pct)
-    if unpaced is None:
-        res.unpaced_share = res.measured_share
-        res.unpaced_reported_share = paced.reported_share
-    else:
-        res.unpaced_share = share_from_percent(
-            mean_percent(window_percent(samples, unpaced.t0, unpaced.t1)), base_pct
-        )
-        res.unpaced_reported_share = unpaced.reported_share
-    res.worker_reported_share = paced.reported_share
-    res.gpu_samples = len(samples)
-    res.duration_s = paced.t1 - paced.t0
-    res.records_done = paced.records
+    _fill_shares(res, samples, phases, cfg)
     stats = worker.stats()
     res.footprint_peak_gb = fp.peak / GIB
     res.worker_rss_peak_gb = stats.get("max_rss_bytes", 0) / GIB
     res.engine_peak_gb = stats.get("peak_bytes", 0) / GIB
-    if paced.records == 0:
+    if phases.paced.records == 0:
         res.status, res.detail = "error", "no record succeeded"
         return res
-    v = nf8_verdict(
-        duty=duty,
-        measured=res.measured_share,
-        unpaced=res.unpaced_share,
-        footprint_peak_gb=res.footprint_peak_gb,
-        memory_gb=budget.memory_gb,
-    )
-    res.expected_share = v.expected_share
-    res.hard_ok, res.accuracy_ok, res.memory_ok, res.passed = (
-        v.hard_ok,
-        v.accuracy_ok,
-        v.memory_ok,
-        v.passed,
-    )
+    _judge(res, budget)
     return res
 
 
@@ -364,8 +418,8 @@ async def run_budget_check(
     cfg: BudgetCheckConfig,
     *,
     environment: dict[str, Any] | None = None,
-    sampler_factory: Callable[[], GpuSampler] = GpuSampler,
-    meter_probe: Callable[[], float] = read_gpu_utilization,
+    sampler_factory: SamplerFactory = make_sampler,
+    meter_probe: Callable[[], object] = probe_meters,
 ) -> BudgetCheckReport:
     """Check every (entry, profile, repeat). A failing model/engine becomes a row, but a missing
     GPU meter aborts the whole check (`GpuMeterError`): there is nothing to measure without it."""
@@ -438,21 +492,28 @@ def _verdict(v: bool | None) -> str:
     return "-" if v is None else ("pass" if v else "FAIL")
 
 
+def _dev(r: BudgetCheckResult) -> str:
+    def one(v: float | None) -> str:
+        return "-" if v is None else f"{v:.0f}"
+
+    return f"{one(r.device_baseline_pct)}/{one(r.device_unpaced_pct)}/{one(r.device_paced_pct)}%"
+
+
 def render_budget_table(report: BudgetCheckReport) -> str:
-    """Markdown table, one row per (model, profile, repeat)."""
+    """Markdown table, one row per (model, profile, repeat). Shares are the worker's own GPU time;
+    the device column (idle/unpaced/paced utilization, device-wide) is informational."""
     head = (
-        "| model | profile | rep | status | duty | baseline | unpaced | expected | measured "
-        "| pacer-reported | footprint GB | budget GB | hard (<= duty+10pp) | accuracy (+-10pp) "
-        "| memory (<= 1.1x) |"
+        "| model | profile | rep | status | duty | unpaced | expected | measured "
+        "| pacer-reported | device idle/unpaced/paced (info) | footprint GB | budget GB "
+        "| hard (<= duty+10pp) | accuracy (+-10pp) | memory (<= 1.1x) |"
     )
     lines = [head, "|" + "---|" * 15]
     for r in report.results:
         status = r.status if not r.detail else f"{r.status} ({r.detail})"
-        base = "-" if r.baseline_pct is None else f"{r.baseline_pct:.0f}%"
         lines.append(
-            f"| {r.model_id} | {r.profile} | {r.repeat} | {status} | {_pct(r.duty)} | {base} "
+            f"| {r.model_id} | {r.profile} | {r.repeat} | {status} | {_pct(r.duty)} "
             f"| {_pct(r.unpaced_share)} | {_pct(r.expected_share)} | {_pct(r.measured_share)} "
-            f"| {_pct(r.worker_reported_share)} | {_f(r.footprint_peak_gb)} "
+            f"| {_pct(r.worker_reported_share)} | {_dev(r)} | {_f(r.footprint_peak_gb)} "
             f"| {_f(r.budget_memory_gb, 1)} | {_verdict(r.hard_ok)} | {_verdict(r.accuracy_ok)} "
             f"| {_verdict(r.memory_ok)} |"
         )
@@ -484,6 +545,8 @@ async def measure_governor_cpu(
     paused: bool,
     duration_s: float,
     poll_s: float,
+    config: ExecutorConfig,
+    total_gb: float,
     state_dir: Path | None = None,
     cpu_clock: Callable[[], float] = time.process_time,
     limit_pct: float = CPU_LIMIT_PCT,
@@ -498,13 +561,12 @@ async def measure_governor_cpu(
             write_control(sd, OwnerControl(paused=True))
         else:
             sd.mkdir(mode=0o700, exist_ok=True)
-        cfg = ExecutorConfig()
         gov = GovernorRuntime(
             source,
-            cfg,
-            resolve_profiles(cfg),
+            config,
+            resolve_profiles(config),
             state_dir=sd,
-            total_gb=32.0,
+            total_gb=total_gb,
             poll_s=poll_s,
         )
         await gov.prime()
@@ -566,18 +628,20 @@ async def watch_reactions(
     *,
     duration_s: float,
     poll_s: float,
+    config: ExecutorConfig,
+    total_gb: float,
     emit: Callable[[str], None],
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> None:
     """Run a real `GovernorRuntime` on `source` for `duration_s` and print, with epoch seconds,
     every decision change and every user return. For memory pressure / thermal / power the operator
-    prints `date +%s.%N` just before triggering the condition and subtracts it."""
+    prints the epoch (`python3 -c 'import time; print(time.time())'`) just before triggering the
+    condition and subtracts it."""
     with tempfile.TemporaryDirectory(prefix="minion-nf9-") as tmp:
         sd = Path(tmp) / "state"
         sd.mkdir(mode=0o700)
-        cfg = ExecutorConfig()
         gov = GovernorRuntime(
-            source, cfg, resolve_profiles(cfg), state_dir=sd, total_gb=32.0, poll_s=poll_s
+            source, config, resolve_profiles(config), state_dir=sd, total_gb=total_gb, poll_s=poll_s
         )
         await gov.prime()
         task = asyncio.create_task(gov.run())

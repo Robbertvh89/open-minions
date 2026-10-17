@@ -467,12 +467,12 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 | NF-1 | Acquire endpoint p99 < 200 ms with 500 executors and 1M pending subtasks. |
 | NF-2 | Zero double-completion: a subtask's final output is written by exactly one attempt. |
 | NF-3 | No lost subtasks: every subtask reaches a terminal state given ≥1 live executor. |
-| NF-4 | Executor idle CPU < 1 %; no work while user has stopped it. Measured for the idle and the paused control process (`bench --cpu-check`, `ps`; docs/bench/governor-measurements.md). |
+| NF-4 | Executor idle CPU < 1 %; no work while user has stopped it. Measured for the idle and the paused executor: `bench --cpu-check` covers the control process only (governor loop, no server round trips); the whole `run` (control plus worker process tree) is measured with `ps` (docs/bench/governor-measurements.md). |
 | NF-5 | Server and watchdog are stateless and horizontally scalable (all state in Postgres). |
 | NF-6 | Executor runs on macOS 14+ on M1 or newer. |
 | NF-7 | Foreground responsiveness under `light`/`balanced`: no audible/visible degradation in a Teams/Zoom video call; UI frame drops and app-launch time within 10 % of baseline (measured in M5 usability test). |
-| NF-8 | Budget adherence, measured by `bench --budget-check` (ADR-0006 Gap 1): (a) hard bound: GPU busy share ≤ `gpu_duty_cycle` + 10 pp; (b) accuracy: busy share within ±10 pp of `gpu_duty_cycle` × the unpaced share of the same workload (a CPU-bound workload cannot reach `gpu_duty_cycle`; the pacer only adds idle time); (c) worker footprint (`phys_footprint`) ≤ `memory_gb` × 1.10. |
-| NF-9 | Reaction time: governor reacts to memory-pressure / thermal / power / user-return events within 5 s (pause new steps, or release on memory `critical`). CI: 20 trials with the fake engine (`test_governor_reaction.py`); Mac: docs/bench/governor-measurements.md. |
+| NF-8 | Budget adherence, measured by `bench --budget-check` (ADR-0006 Gap 1): (a) hard bound: the worker process's GPU busy share (its `accumulatedGPUTime` delta from `ioreg -c AGXDeviceUserClient` over wall time; device-wide utilization is not a valid per-process share on a Mac in use) ≤ `gpu_duty_cycle` + 10 pp; (b) accuracy: busy share within ±10 pp of `gpu_duty_cycle` × the unpaced share of the same workload (a CPU-bound workload cannot reach `gpu_duty_cycle`; the pacer only adds idle time); (c) worker footprint (`phys_footprint`) ≤ `memory_gb` × 1.10. |
+| NF-9 | Reaction time: governor reacts to memory-pressure / thermal / power / user-return events within 5 s (`MINION_EXECUTOR_SIGNAL_POLL_S` is capped at 4 s so poll plus one engine step fits; pause new steps, or release on memory `critical`). Release is measured to worker exit. CI: 20 trials with the fake engine (`test_governor_reaction.py`); Mac: docs/bench/governor-measurements.md. |
 
 ## 10. Future work (out of scope for v1) **[paper]**
 - Distributed training on the fleet.

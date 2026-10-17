@@ -520,11 +520,14 @@ def _logs_to_stderr() -> Iterator[None]:
         structlog.configure(**saved)
 
 
-def _watch_reactions(duration: float) -> None:
+def _watch_reactions(duration: float, out: Path | None) -> None:
     try:
+        if out is not None:
+            raise ValueError("--watch-reactions prints to stdout; --out is not supported")
         if not 1.0 <= duration <= 3600.0:
             raise ValueError("duration must be in 1..3600 seconds")
         settings = ExecutorSettings()
+        config = load_config(settings.config_path)
         source = default_source(settings.fake_signals)
     except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
         typer.echo(f"error: {exc}", err=True)
@@ -535,6 +538,8 @@ def _watch_reactions(duration: float) -> None:
                 source,
                 duration_s=duration,
                 poll_s=settings.signal_poll_s,
+                config=config,
+                total_gb=total_memory_gb(),
                 emit=lambda line: typer.echo(line),
             )
         )
@@ -547,16 +552,23 @@ def _cpu_check(duration: float, out: Path | None) -> None:
             raise ValueError("duration must be in 1..3600 seconds")
         if out is not None:
             _check_out_path(out)
-        source = default_source(ExecutorSettings().fake_signals)
+        settings = ExecutorSettings()
+        config = load_config(settings.config_path)
+        source = default_source(settings.fake_signals)
     except (ValueError, OSError, RuntimeError) as exc:  # SignalError is a RuntimeError
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
-    poll_s = ExecutorSettings().signal_poll_s
+    poll_s, total_gb = settings.signal_poll_s, total_memory_gb()
 
     async def both() -> list[budget_mod.CpuResult]:
         return [
             await budget_mod.measure_governor_cpu(
-                source, paused=p, duration_s=duration, poll_s=poll_s
+                source,
+                paused=p,
+                duration_s=duration,
+                poll_s=poll_s,
+                config=config,
+                total_gb=total_gb,
             )
             for p in (False, True)
         ]
@@ -607,7 +619,7 @@ def bench(
         bool,
         typer.Option(
             "--budget-check",
-            help="NF-8: GPU share (ioreg, baseline-subtracted) and worker footprint per profile",
+            help="NF-8: worker GPU time share (ioreg) and footprint per profile",
         ),
     ] = False,
     profiles: Annotated[
@@ -617,7 +629,7 @@ def bench(
         float, typer.Option(help="--budget-check: seconds per phase / --cpu-check: window")
     ] = budget_mod.DEFAULT_DURATION_S,
     baseline_s: Annotated[
-        float, typer.Option(help="--budget-check: idle GPU baseline seconds")
+        float, typer.Option(help="--budget-check: idle seconds before the phases (device info)")
     ] = budget_mod.DEFAULT_BASELINE_S,
     repeats: Annotated[int, typer.Option(help="--budget-check: repetitions per profile")] = 1,
     cpu_check: Annotated[
@@ -637,7 +649,7 @@ def bench(
         typer.echo("error: --budget-check, --cpu-check, --watch-reactions are separate", err=True)
         raise typer.Exit(code=2)
     if watch_reactions:
-        _watch_reactions(duration)
+        _watch_reactions(duration, out)
         return
     if cpu_check:
         _cpu_check(duration, out)

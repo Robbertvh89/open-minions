@@ -449,7 +449,7 @@ when utilization from *other* processes rises (e.g. a video call). Off by defaul
 **Not done on purpose:** no `caffeinate`, no sleep prevention, no kernel extensions, no root.
 
 **Tests:** governor is pure (signals in → events out) and unit-tested with fake signal sources;
-throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-executor bench --budget-check` (`bench_budget.py`: ioreg GPU share via `capacity/gpu_meter.py`, worker footprint, pacer share; verdicts per ADR-0006 Gap 1); reaction time (NF-9) by `tests/test_governor_reaction.py` (CI) and `bench --watch-reactions` (Mac); idle/paused CPU (NF-4) by `bench --cpu-check`.
+throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-executor bench --budget-check` (`bench_budget.py`: per-process GPU time of the worker from `ioreg -c AGXDeviceUserClient` via `capacity/gpu_meter.py`, device utilization informational, worker footprint, pacer share; verdicts per ADR-0006 Gap 1); reaction time (NF-9) by `tests/test_governor_reaction.py` (CI) and `bench --watch-reactions` (Mac); idle/paused CPU (NF-4) by `bench --cpu-check`.
 
 ## 4. Concurrency & correctness argument
 

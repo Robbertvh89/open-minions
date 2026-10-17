@@ -16,7 +16,7 @@ so the sub-tasks (5.1..5.6) share one design. Decisions D1..D14 are from the TAS
 ## Decision
 
 **D1 Governor placement.** An asyncio task in the control process, polling signals every
-`MINION_EXECUTOR_SIGNAL_POLL_S` (2 s, range 0.5..5) in `asyncio.to_thread`. The decision function
+`MINION_EXECUTOR_SIGNAL_POLL_S` (2 s, range 0.5..4: detection plus one engine step must stay under NF-9's 5 s) in `asyncio.to_thread`. The decision function
 `governor.decide(snapshot, config, owner_ctl, now, prev_state)` is pure. **Deviation** from
 ARCHITECTURE §3.6 ("polled + notifications"): no NSWorkspace / dispatch notifications. Polling bounds
 detection at the poll interval, which leaves headroom under NF-9 (5 s) and keeps one code path.
@@ -240,19 +240,24 @@ share can be below `duty` however well the governor works. We therefore split th
 Memory: worker footprint ≤ `memory_gb` × 1.10, enforced by D7 and measured in TASK-5.6.
 
 **How it is measured (TASK-5.6).** `minion-executor bench --budget-check` runs, per profile, the real
-worker path (sandboxed worker, runner) and compares three sources: the GPU busy share from
-`ioreg -r -d 1 -w 0 -c IOAccelerator` (`"Device Utilization %"`, sampled ~4 Hz in the bench process;
-the sandboxed worker cannot exec), minus the median of an idle baseline taken just before; the worker
+worker path (sandboxed worker, runner) and compares three sources: the worker's own GPU time, from
+`ioreg -r -l -w 0 -c AGXDeviceUserClient` (the worker pid's summed `accumulatedGPUTime` delta over a
+phase window divided by its wall time, sampled ~2 Hz in the bench process; the sandboxed worker
+cannot exec; the first 1.5 s of a phase are dropped). The device-wide `Device Utilization %` (IOAccelerator)
+is reported but not judged: on a Mac in use it moves with other apps, the display and DVFS (a first
+run showed an idle device at 30-43 % and an unpaced load only +33 pp, so a baseline-subtracted
+device figure failed `light` at 32 % against 20 % expected). The worker
 footprint sampled at 10 Hz from the control side (`phys_footprint`, D7); and the pacer's own
-`busy_s / wall_s` (advisory: the worker is the party being limited). Phases: baseline, unpaced
-(duty 1.0, giving `unpaced_share`), paced at the profile duty. The verdicts are the two checks above
+`busy_s / wall_s` (advisory: the worker is the party being limited). Phases: idle (device info), unpaced
+(duty 1.0, giving `unpaced_share`; skipped at duty 1.0, where there is no accuracy verdict), a 2 s
+gap, paced at the profile duty. `unavailable` rows are not judged; an `error` row fails the check. The verdicts are the two checks above
 plus memory, computed by the pure `nf8_verdict`. NF-9 reaction time is asserted in CI (20 trials, fake
 engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac with the production poll
 (docs/bench/governor-measurements.md); NF-4 with `bench --cpu-check`.
 
 ## Measurements
 
-> Filled in by TASK-5.6 from the M3 Pro run (docs/bench/m4-governor-apple-m3-pro.{md,json}).
+> Filled in by TASK-5.6 from the M3 Pro run (docs/bench/m4-governor-apple-m3-pro.{json,md}; the table is tee'd to the .md).
 
 | Check | Result | Verdict |
 |---|---|---|

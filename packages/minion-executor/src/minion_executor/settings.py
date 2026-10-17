@@ -48,7 +48,7 @@ class ExecutorSettings(BaseSettings):
 
     # Governor (ADR-0006 D1/D12): seconds between signal polls (bounds NF-9 detection), and between
     # presence pings while paused (the server polls "< 2 min", ARCHITECTURE §7).
-    signal_poll_s: float = Field(default=2.0, ge=0.5, le=5.0, allow_inf_nan=False)
+    signal_poll_s: float = Field(default=2.0, ge=0.5, le=4.0, allow_inf_nan=False)
     presence_interval_s: float = Field(default=60.0, ge=1.0, le=110.0, allow_inf_nan=False)
 
     # Governor timers (ADR-0006 D5/D6). The defaults are the spec; any other value is a test knob

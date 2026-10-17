@@ -86,6 +86,7 @@ def test_governor_poll_and_presence_bounds(monkeypatch: pytest.MonkeyPatch) -> N
     for name, bad in (
         ("SIGNAL_POLL_S", "0.1"),
         ("SIGNAL_POLL_S", "30"),
+        ("SIGNAL_POLL_S", "4.5"),  # NF-9: detection + one engine step must stay < 5 s
         ("PRESENCE_INTERVAL_S", "0"),
         ("PRESENCE_INTERVAL_S", "300"),
     ):
