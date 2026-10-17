@@ -1,10 +1,10 @@
 ---
 id: TASK-6.11
 title: 'M5.11 (optional) Compose: migrate, server and watchdog containers'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 18:08'
+updated_date: '2026-10-17 18:35'
 labels:
   - M5
 dependencies:
@@ -21,7 +21,7 @@ deploy/Dockerfile (one image, non-root, read-only rootfs); compose services migr
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 docker compose -f deploy/compose.yml --profile app up -d brings up postgres, s3, grafana, migrate (one-shot), server and watchdog; server healthy and a fake-engine task completes end to end
+- [x] #1 docker compose -f deploy/compose.yml --profile app up -d brings up postgres, s3, grafana, migrate (one-shot), server and watchdog; server healthy and a fake-engine task completes end to end
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -95,5 +95,5 @@ Docs (step 4): CLAUDE.md Commands (--profile app up line, MINION_SERVER_HOST_POR
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-Compose app profile (migrate, server, watchdog) documented in CLAUDE.md, ARCHITECTURE §2.3/§6, SPEC FR-41 and .env.example. Watchdog health file (MINION_WATCHDOG_HEALTH_FILE) documented. The watchdog and its healthcheck share MINION_WATCHDOG_INTERVAL_S (compose passes it, default 60).
+Merged #37: deploy/Dockerfile (pinned digests, uid 10001, setuid stripped, read-only), compose app profile with migrate one-shot, server (127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}, restart, /healthz) and watchdog (health file), hardening, infra images digest-pinned. Live: fake-engine task SUCCEEDED through the stack. CI run 39057397141: 1633 passed.
 <!-- SECTION:FINAL_SUMMARY:END -->
