@@ -9,13 +9,14 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 from minion_common.enums import Engine, TaskType
 from minion_common.schemas import ModelEntry, TaskCreate
-from minion_server.api.tasks import create_task, validate_uris
+from minion_server.api.tasks import create_task
 from minion_server.app import create_app
 from minion_server.auth import KeysConfig, User
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
 from minion_server.services.splitter import SplitLimits, split_one
+from minion_server.services.tasks import validate_uris
 from minion_server.settings import ServerSettings
 from minion_server.splitting import slice_jsonl
 from minion_server.storage import S3Storage

@@ -14,5 +14,6 @@
   <dt>Created by</dt><dd>{{ task.created_by }} at {{ task.created_at|ts }}</dd>
   <dt>Finished</dt><dd>{{ task.finished_at|ts }}</dd>
 </dl>
+{% if cancellable %}<p><a class="btn" href="{{ base }}/cancel">Cancel task</a></p>{% endif %}
 {% include "_task_live.html" %}
 {% endblock %}

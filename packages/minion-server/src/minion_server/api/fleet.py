@@ -1,10 +1,12 @@
 """Operator-only fleet view (SPEC §6.1, S-11: it reveals when owners are active)."""
 
-from typing import Annotated
+from dataclasses import dataclass
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from minion_common.enums import ExecutorStatus
-from minion_common.schemas import SLUG_PATTERN, ExecutorOut, ExecutorPage
+from minion_common.schemas import SLUG_PATTERN, Budget, ExecutorOut, ExecutorPage
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import User, require_operator
@@ -35,6 +37,28 @@ async def list_executors(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 200,
 ) -> ExecutorPage:
     settings: ServerSettings = request.app.state.settings
+    return await list_fleet_page(session, settings, status, pool, cursor, limit)
+
+
+def _budget(raw: dict[str, Any] | None) -> Budget | None:
+    """The stored budget is executor-supplied JSON: an unreadable one is shown as absent."""
+    if raw is None:
+        return None
+    try:
+        return Budget.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+async def list_fleet_page(
+    session: AsyncSession,
+    settings: ServerSettings,
+    status: ExecutorStatus | None,
+    pool: str | None,
+    cursor: str | None,
+    limit: int,
+) -> ExecutorPage:
+    """Shared by the REST endpoint and the web UI; the caller enforces operator-only access."""
     after = None
     if cursor is not None:
         try:
@@ -66,6 +90,7 @@ async def list_executors(
             engines=list(r.executor.engines),
             status=r.executor.status,
             profile=r.executor.profile,
+            budget=_budget(r.executor.budget),
             paused_reason=r.executor.paused_reason,
             registered_at=r.executor.registered_at,
             last_seen_at=r.executor.last_seen_at,
@@ -86,3 +111,46 @@ async def list_executors(
         else None
     )
     return ExecutorPage(items=items, next_cursor=nxt)
+
+
+@dataclass(frozen=True)
+class FleetSummary:
+    """Online executors only for `profiles`/`paused`; `total` counts every registered one."""
+
+    profiles: list[tuple[str, int, float]]  # (profile, count, sum of budget GB)
+    paused: list[tuple[str, int]]  # (paused_reason, count)
+    online: int
+    total: int
+
+
+def shape_summary(groups: list[executors_repo.FleetGroup]) -> FleetSummary:
+    by_profile: dict[str, tuple[int, float]] = {}
+    paused: dict[str, int] = {}
+    online = total = 0
+    for g in groups:
+        total += g.count
+        if not g.online:
+            continue
+        online += g.count
+        key = g.profile or "unknown"
+        n, gb = by_profile.get(key, (0, 0.0))
+        by_profile[key] = (n + g.count, gb + g.memory_gb)
+        if g.paused_reason:
+            paused[g.paused_reason] = paused.get(g.paused_reason, 0) + g.count
+    return FleetSummary(
+        [(k, n, gb) for k, (n, gb) in sorted(by_profile.items())],
+        sorted(paused.items()),
+        online,
+        total,
+    )
+
+
+async def fleet_summary(session: AsyncSession, settings: ServerSettings) -> FleetSummary:
+    """Operator-only (the caller enforces it): one aggregate query over the whole fleet."""
+    async with session.begin():
+        groups = await executors_repo.fleet_summary(
+            session,
+            idle_online_s=settings.executor_online_idle_s,
+            busy_online_s=settings.executor_online_busy_s,
+        )
+    return shape_summary(groups)

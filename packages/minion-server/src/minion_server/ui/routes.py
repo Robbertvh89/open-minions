@@ -1,4 +1,4 @@
-"""Server-rendered web UI (ADR-0010): login, task list, task detail.
+"""Server-rendered web UI (ADR-0010): login, task list/detail, create, cancel, fleet.
 
 Every route sits behind `require_enabled` (404 until `MINION_UI_SESSION_SECRET` is set). Pages
 reuse the REST handlers' shared helpers, so team scoping and cursors behave identically. All
@@ -6,26 +6,32 @@ templates are autoescaped; executor- and splitter-supplied strings (owner, error
 marked safe.
 """
 
+import json
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
-from minion_common.enums import SubtaskStatus, TaskStatus
-from minion_common.schemas import SLUG_PATTERN
+from minion_common.enums import ExecutorStatus, SubtaskStatus, TaskStatus, TaskType
+from minion_common.schemas import SLUG_PATTERN, ModelEntry, TaskCreate
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from minion_server.api import fleet as fleet_api
 from minion_server.api import tasks as tasks_api
 from minion_server.auth import KeysConfig, User, lookup_user, sha256_hex
 from minion_server.db.session import get_session
+from minion_server.errors import api_error
 from minion_server.netutil import host_header_is_loopback
+from minion_server.services import tasks as tasks_service
 from minion_server.settings import ServerSettings
+from minion_server.storage import S3Storage
 from minion_server.ui import session as sess
 
 log = structlog.get_logger()
@@ -96,9 +102,10 @@ def _clear_cookie(response: Response, name: str) -> None:
 
 
 class UiSession:
-    def __init__(self, user: User, csrf: str) -> None:
+    def __init__(self, user: User, csrf: str, keys_config: KeysConfig) -> None:
         self.user = user
         self.csrf = csrf
+        self.keys_config = keys_config  # the snapshot this request authenticated against
 
 
 def _user_for_kid(secret: bytes, cfg: KeysConfig, kid: str) -> User | None:
@@ -138,7 +145,7 @@ async def ui_session(request: Request) -> UiSession:
     user = _user_for_kid(secret, cfg, claims.kid) if cfg else None
     if cfg is None or user is None or (user.expires_at is not None and user.expires_at <= now):
         raise _login_redirect(request)  # key removed/expired or keys file invalid: fail closed
-    return UiSession(user, sess.csrf_token(secret, claims))
+    return UiSession(user, sess.csrf_token(secret, claims), cfg)
 
 
 Current = Annotated[UiSession, Depends(ui_session)]
@@ -241,9 +248,11 @@ async def logout(request: Request, current: Current, csrf: Annotated[str, Form()
 
 
 def _message(exc: HTTPException) -> str:
+    """API error `code: message` (both server-authored, never request values); autoescaped."""
     d = exc.detail
     if isinstance(d, dict) and isinstance(d.get("message"), str):
-        return d["message"]
+        code = d.get("code")
+        return f"{code}: {d['message']}" if isinstance(code, str) else d["message"]
     return "Request failed."
 
 
@@ -355,4 +364,204 @@ async def task_detail(
         "terminal": task.status
         in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PARTIAL, TaskStatus.CANCELLED),
     }
+    ctx["cancellable"] = not ctx["terminal"]
     return render("_task_live.html" if partial == "1" else "task.html", **ctx)
+
+
+# --- create -------------------------------------------------------------------------------------
+
+_CREATE_FIELDS = (
+    "team", "project", "task_name", "type", "model", "input_uri", "output_uri", "params",
+    "records_per_subtask", "priority", "allowed_pool",
+)  # fmt: skip
+
+
+def _models(request: Request) -> dict[str, ModelEntry]:
+    m: dict[str, ModelEntry] = request.app.state.models
+    return m
+
+
+def _create_form(
+    request: Request,
+    current: UiSession,
+    values: dict[str, str],
+    http_status: int = 200,
+    error: str | None = None,
+) -> HTMLResponse:
+    return render(
+        "new_task.html",
+        http_status,
+        user=current.user,
+        csrf=current.csrf,
+        teams=sorted(current.user.teams),
+        types=[t.value for t in TaskType],
+        models=sorted((m.model_id, m.type.value) for m in _models(request).values()),
+        v=values,
+        error=error,
+    )
+
+
+@router.get("/tasks/new")
+async def new_task_form(request: Request, current: Current) -> Response:
+    return _create_form(
+        request,
+        current,
+        dict.fromkeys(_CREATE_FIELDS, "")
+        | {"records_per_subtask": "500", "priority": "0", "params": "{}"},
+    )
+
+
+def _build_create(values: dict[str, str]) -> TaskCreate:
+    """The form's strings -> `TaskCreate`; errors name fields and reasons, never values."""
+    params_text = values["params"].strip()
+    try:
+        params = json.loads(params_text) if params_text else {}
+    except (ValueError, RecursionError):
+        raise api_error(422, "INVALID_PARAMS", "params is not valid JSON") from None
+    if not isinstance(params, dict):
+        raise api_error(422, "INVALID_PARAMS", "params must be a JSON object")
+    raw: dict[str, object] = {
+        k: v.strip() for k, v in values.items() if k not in ("params", "allowed_pool") and v.strip()
+    }
+    raw["params"] = params
+    if values["allowed_pool"].strip():
+        raw["allowed_pool"] = values["allowed_pool"].strip()
+    try:
+        return TaskCreate.model_validate(raw)
+    except ValidationError as exc:
+        parts = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
+        raise api_error(422, "INVALID_REQUEST", "; ".join(parts)[:500]) from None
+
+
+@router.post("/tasks")
+async def create_task(
+    request: Request,
+    current: Current,
+    session: DbSession,
+    csrf: Annotated[str, Form()] = "",
+    team: Annotated[str, Form()] = "",
+    project: Annotated[str, Form()] = "",
+    task_name: Annotated[str, Form()] = "",
+    type: Annotated[str, Form()] = "",
+    model: Annotated[str, Form()] = "",
+    input_uri: Annotated[str, Form()] = "",
+    output_uri: Annotated[str, Form()] = "",
+    params: Annotated[str, Form()] = "",
+    records_per_subtask: Annotated[str, Form()] = "",
+    priority: Annotated[str, Form()] = "",
+    allowed_pool: Annotated[str, Form()] = "",
+) -> Response:
+    if not _post_allowed(request) or not sess.tokens_equal(csrf, current.csrf):
+        return error_page(403, "Request rejected (CSRF check failed).", current.user)
+    values = {
+        "team": team, "project": project, "task_name": task_name, "type": type, "model": model,
+        "input_uri": input_uri, "output_uri": output_uri, "params": params,
+        "records_per_subtask": records_per_subtask, "priority": priority,
+        "allowed_pool": allowed_pool,
+    }  # fmt: skip
+    storage: S3Storage = request.app.state.storage
+    try:
+        body = _build_create(values)
+        out = await tasks_service.create_task(
+            body,
+            current.user,
+            session,
+            _settings(request),
+            storage,
+            _models(request),
+            current.keys_config,
+        )
+    except HTTPException as exc:
+        return _create_form(request, current, values, exc.status_code, _message(exc))
+    log.info("ui_task_created", user=current.user.name, team=out.team, project=out.project)
+    return RedirectResponse(_task_url(out.team, out.project, out.task_name), status_code=303)
+
+
+def _task_url(team: str, project: str, task_name: str) -> str:
+    return f"/ui/tasks/{quote(team)}/{quote(project)}/{quote(task_name)}"
+
+
+# --- cancel -------------------------------------------------------------------------------------
+
+
+@router.get("/tasks/{team}/{project}/{task_name}/cancel")
+async def cancel_confirm(
+    team: str, project: str, task_name: str, current: Current, session: DbSession
+) -> Response:
+    """Server-rendered confirm step (no JS under the CSP); the POST below does the work."""
+    try:
+        task = await tasks_api.get_task_for(session, current.user, team, project, task_name)
+    except HTTPException as exc:
+        return error_page(exc.status_code, _message(exc), current.user)
+    return render(
+        "cancel.html",
+        user=current.user,
+        csrf=current.csrf,
+        task=task,
+        cancellable=task.status in (TaskStatus.SPLITTING, TaskStatus.PENDING, TaskStatus.RUNNING),
+        back=_task_url(team, project, task_name),
+    )
+
+
+@router.post("/tasks/{team}/{project}/{task_name}/cancel")
+async def cancel(
+    team: str,
+    project: str,
+    task_name: str,
+    request: Request,
+    current: Current,
+    session: DbSession,
+    csrf: Annotated[str, Form()] = "",
+) -> Response:
+    if not _post_allowed(request) or not sess.tokens_equal(csrf, current.csrf):
+        return error_page(403, "Request rejected (CSRF check failed).", current.user)
+    try:
+        await tasks_service.cancel_task(session, current.user, team, project, task_name)
+    except HTTPException as exc:
+        return error_page(exc.status_code, _message(exc), current.user)
+    log.info("ui_task_cancelled", user=current.user.name, team=team, project=project)
+    return RedirectResponse(_task_url(team, project, task_name), status_code=303)
+
+
+# --- fleet (operator only, S-11) ----------------------------------------------------------------
+
+
+@router.get("/fleet")
+async def fleet(
+    request: Request,
+    current: Current,
+    session: DbSession,
+    status: str | None = None,
+    pool: str | None = None,
+    cursor: str | None = None,
+    limit: str | None = None,
+) -> Response:
+    if not current.user.operator:
+        return error_page(403, "OPERATOR_REQUIRED: operator key required", current.user)
+    status, pool, cursor = _opt(status), _opt(pool), _opt(cursor)
+    settings = _settings(request)
+    try:
+        if pool is not None and not re.fullmatch(SLUG_PATTERN, pool):
+            raise HTTPException(422, {"message": "invalid pool filter"})
+        size = _parse_limit(limit, 50)
+        status_enum = _parse_enum(ExecutorStatus, status, "status")
+        page = await fleet_api.list_fleet_page(session, settings, status_enum, pool, cursor, size)
+        summary = await fleet_api.fleet_summary(session, settings)
+    except HTTPException as exc:
+        return error_page(exc.status_code, _message(exc), current.user)
+    return render(
+        "fleet.html",
+        user=current.user,
+        csrf=current.csrf,
+        page=page,
+        statuses=[s.value for s in ExecutorStatus],
+        f_status=status or "",
+        f_pool=pool or "",
+        profiles=summary.profiles,
+        paused=summary.paused,
+        online=summary.online,
+        total=summary.total,
+        next_query=_query(status=status, pool=pool, limit=limit, cursor=page.next_cursor)
+        if page.next_cursor
+        else None,
+    )

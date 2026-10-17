@@ -469,3 +469,64 @@ async def test_executors_pagination_and_filters(http: tuple[AsyncClient, Any]) -
     assert [e["executor_id"] for e in r.json()["items"]] == [str(made[1][0].executor_id)]
     for bad in ("limit=0", "limit=501", "status=nope", "pool=BAD!"):
         assert (await c.get(f"/api/v1/executors?{bad}", headers=_a(OP))).status_code == 422
+
+
+@pytest.mark.integration
+async def test_executors_budget_valid_populated_invalid_null(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    (good, _), (empty, _), (wrong, _), (none, _) = await make_executors(sm, 4)
+    stored = {
+        good.executor_id: '{"profile":"balanced","memory_gb":8,"gpu_duty_cycle":0.5,'
+        '"max_batch_size":8}',
+        empty.executor_id: "{}",
+        wrong.executor_id: '{"profile":"balanced","memory_gb":"lots","gpu_duty_cycle":0.5,'
+        '"max_batch_size":8}',
+    }
+    async with sm() as s, s.begin():
+        for eid, b in stored.items():
+            await s.execute(
+                text("UPDATE minion_executor SET budget=CAST(:b AS jsonb) WHERE executor_id=:id"),
+                {"b": b, "id": eid},
+            )
+    r = await c.get("/api/v1/executors", headers=_a(OP))
+    assert r.status_code == 200, r.text
+    by_id = {e["executor_id"]: e["budget"] for e in r.json()["items"]}
+    assert by_id[str(good.executor_id)]["memory_gb"] == 8
+    assert by_id[str(empty.executor_id)] is None
+    assert by_id[str(wrong.executor_id)] is None
+    assert by_id[str(none.executor_id)] is None
+
+
+@pytest.mark.integration
+async def test_fleet_summary_aggregate_ignores_unreadable_budgets(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    from minion_server.api.fleet import fleet_summary
+
+    _c, app = http
+    sm = app.state.sessionmaker
+    execs = await make_executors(sm, 5)
+    budgets = [
+        '{"memory_gb": 8}',
+        '{"memory_gb": 4.5}',
+        '{"memory_gb": "abc"}',
+        '{"memory_gb": 5000}',
+        "{}",
+    ]
+    async with sm() as s, s.begin():
+        for (p, _), b in zip(execs, budgets, strict=True):
+            await s.execute(
+                text(
+                    "UPDATE minion_executor SET profile='balanced', last_seen_at=now(),"
+                    " budget=CAST(:b AS jsonb), paused_reason=:r WHERE executor_id=:id"
+                ),
+                {"b": b, "r": "thermal" if b == "{}" else None, "id": p.executor_id},
+            )
+    async with sm() as s:
+        summary = await fleet_summary(s, app.state.settings)
+    assert summary.total == 5 and summary.online == 5
+    assert summary.profiles == [("balanced", 5, 12.5)]
+    assert summary.paused == [("thermal", 1)]

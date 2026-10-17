@@ -13,6 +13,8 @@
 <header>
   <a class="brand" href="/ui/tasks">open-minions</a>
   {% if user %}
+  <a href="/ui/tasks/new">New task</a>
+  {% if user.operator %}<a href="/ui/fleet">Fleet</a>{% endif %}
   <span class="who">{{ user.name }}</span>
   <form method="post" action="/ui/logout" class="inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">

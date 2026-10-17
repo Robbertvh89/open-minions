@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Fleet - open-minions{% endblock %}
+{% block content %}
+<h1>Fleet</h1>
+<p>{{ online }} online of {{ total }} registered.</p>
+<h2>Online memory by profile</h2>
+<table class="summary">
+  <thead><tr><th>Profile</th><th>Executors</th><th>Budget memory (GB)</th></tr></thead>
+  <tbody>
+  {% for name, count, gb in profiles %}<tr><td>{{ name }}</td><td>{{ count }}</td><td>{{ "%.1f"|format(gb) }}</td></tr>
+  {% else %}<tr><td colspan="3">No online executors.</td></tr>{% endfor %}
+  </tbody>
+</table>
+<h2>Paused by reason</h2>
+<table class="summary">
+  <thead><tr><th>Reason</th><th>Executors</th></tr></thead>
+  <tbody>
+  {% for reason, count in paused %}<tr><td>{{ reason }}</td><td>{{ count }}</td></tr>
+  {% else %}<tr><td colspan="2">None paused.</td></tr>{% endfor %}
+  </tbody>
+</table>
+<h2>Executors</h2>
+<form method="get" action="/ui/fleet" class="filters">
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for s in statuses %}<option value="{{ s }}"{% if s == f_status %} selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Pool <input type="text" name="pool" value="{{ f_pool }}" maxlength="64"></label>
+  <button type="submit">Filter</button>
+</form>
+<table>
+  <thead><tr><th>Owner</th><th>Host</th><th>Pool</th><th>Status</th><th>Online</th><th>Busy</th><th>Profile</th><th>Budget</th><th>Paused</th><th>Last seen</th></tr></thead>
+  <tbody>
+  {% for e in page.items %}
+  <tr>
+    <td>{{ e.owner }}</td>
+    <td>{{ e.hostname }}</td>
+    <td>{{ e.pool }}</td>
+    <td>{{ e.status.value }}</td>
+    <td>{{ "yes" if e.online else "no" }}</td>
+    <td>{{ "yes" if e.busy else "no" }}</td>
+    <td>{{ e.profile.value if e.profile else "-" }}</td>
+    <td>{% if e.budget %}{{ e.budget.memory_gb }} GB, duty {{ e.budget.gpu_duty_cycle }}, batch {{ e.budget.max_batch_size }}{% else %}-{% endif %}</td>
+    <td>{{ e.paused_reason or "" }}</td>
+    <td>{{ e.last_seen_at|ts }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10">No executors.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="pager">
+  {% if next_query %}<a href="/ui/fleet?{{ next_query }}">Next page</a>{% endif %}
+  {% if next_query or f_status or f_pool %}<a href="/ui/fleet">First page</a>{% endif %}
+</p>
+{% endblock %}
