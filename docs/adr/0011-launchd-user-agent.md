@@ -19,22 +19,37 @@ governor needs.
   `cpu_priority`.
 - **`KeepAlive {SuccessfulExit: false}`**, `ThrottleInterval 60`: restart after a crash (non-zero
   exit or a signal), not after a clean stop. Failures a restart cannot fix must not become a 60 s
-  crash loop, so under the service (`MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S` set) `run` exits **0**
-  with one log line `permanent_failure reason=...` for: invalid configuration (including a
-  too-short launchd timeout), a held instance lock, no usable engine / probe failure, and a server
-  answer of 401/403 (`credential_rejected`) or another 4xx except 429 (`request_rejected`) at
-  register, acquire or presence. Genuine crashes, `GovernorStoppedError` (exit 1), 429/5xx and
-  network errors stay non-zero. Outside the service the same cases exit 2 (config, startup) or 1
-  (API). To see why a service stopped: `minion-executor service status` (last exit code, reason)
-  and `~/Library/Logs/open-minions/executor.log`. After fixing the cause, `launchctl kickstart
-  gui/$UID/<label>` or reinstall.
+  crash loop, so under the service `run` exits **0** with one log line
+  `permanent_failure ts=<UTC> reason=...` for: invalid configuration (including a too-short launchd
+  timeout), an unsafe lock file, no usable engine or a failed sandbox self-test, a missing Keychain
+  item, and a server answer of 401/403 *carrying the server's own error code* (`UNAUTHORIZED`,
+  `FORBIDDEN`; `credential_rejected`) or 400/422 (`request_rejected`). Everything else exits **1**
+  and is relaunched: another executor holding the instance lock, a probe crash or timeout, a locked
+  Keychain, a 4xx without a server code (proxy/WAF 403) or 404/408, 429/5xx, network errors,
+  `GovernorStoppedError`. Outside the service the same cases exit 2 (config, startup) or 1 (API).
+  "Service" means the plist's exit-timeout variable is set *and* `XPC_SERVICE_NAME` equals the
+  plist's label (or the parent is launchd, pid 1), so a shell that exports the variable keeps
+  normal exit codes. A permanent failure is also written (0600, UTC timestamp) to
+  `service_failure.json` in the state dir; `service status` prints it, and the next service start
+  clears it. `ErrorBody.code` is constrained to `^[A-Z0-9_]{1,64}$` in `minion-common`, and
+  anything echoed from the server is sanitised and truncated. To see why a service stopped:
+  `minion-executor service status` and `~/Library/Logs/open-minions/executor.log`. After fixing the
+  cause, `launchctl kickstart gui/$UID/<label>` or reinstall.
+- **TCC-protected folders.** A LaunchAgent cannot read `~/Documents`, `~/Desktop`, `~/Downloads`,
+  iCloud Drive (`~/Library/Mobile Documents`) or `~/Library/CloudStorage` without a Files & Folders
+  grant; Python then blocks in `open()` forever. `service install` therefore refuses (exit 2) when
+  the executable, `sys.prefix`, any `sys.path` entry or `.pth` target, the state dir, the model cache
+  dir or the config file resolves into one of them. The supported install is `uv tool install`
+  (non-editable copy, outside those folders); `uv sync` and `uv pip install ./packages/...` create
+  editable links into the checkout and are refused.
 - **Install preflight.** `service install` (not `--dry-run`) runs the same sandboxed engine probe as
   `run` and refuses (exit 2) when no engine works or the Seatbelt self-test fails, so a broken Mac
   does not install a service that exits at once. It also refuses a non-macOS host, URLs with
   credentials/query/fragment, and an unsafe `~/Library/LaunchAgents` (symlink, not ours, or
   group/other-writable). Uninstall only touches a plist whose `ProgramArguments` are
   `[.../minion-executor, run, ...]`.
-- **Logs.** Directory 0700, file 0600 (pre-created), plist `Umask 077`. Not rotated.
+- **Logs.** Directory 0700 (an existing directory of ours is tightened), file 0600 (pre-created),
+  plist `Umask 077`. Not rotated.
 - **`ExitTimeOut = ceil(grace) + 15`** (FR-17). launchd's default 20 s would SIGKILL a stopping
   executor in the middle of releasing its subtask. The value is also exported as
   `MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S`, and `run` refuses to start when it is below grace + 15:
@@ -51,8 +66,10 @@ governor needs.
 
 ## Consequences
 
-- `bootout` can answer 36 (stop in progress): uninstall polls `launchctl print` until the service is
-  gone (bounded by `ExitTimeOut` + 10 s) and only then removes the plist.
+- `bootout` answers 0 or 36 (EINPROGRESS) *before* the job has exited (measured: rc 0 after 0.6 s,
+  process gone about 5 s later). After either, uninstall polls `launchctl print` until it answers
+  113 (bounded by `ExitTimeOut` + 10 s), reports the stop time, and only then removes the plist. A
+  missing or unreadable plist with the job still loaded exits 2 with the manual commands.
 - Changing grace or any setting means `service uninstall` + `service install`.
 - Reboot and login behaviour is launchd's; the executor still takes its single-instance lock.
 - Windows/Linux are unsupported (macOS only).

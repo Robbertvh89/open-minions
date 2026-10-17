@@ -11,6 +11,7 @@ from minion_common.schemas import (
     CompleteRequest,
     CompletionParams,
     EmbeddingParams,
+    ErrorBody,
     FailRequest,
     ModelEntry,
     PreferenceRequest,
@@ -328,3 +329,14 @@ def test_budget_cpu_priority_optional_and_validated() -> None:
             PresenceRequest(budget=b, paused_reason=bad)
     with pytest.raises(ValidationError):
         PresenceRequest.model_validate({"budget": base, "extra": 1})
+
+
+@pytest.mark.parametrize("code", ["UNAUTHORIZED", "A_1", "X" * 64])
+def test_error_body_accepts_server_style_codes(code: str) -> None:
+    assert ErrorBody(code=code, message="m").code == code
+
+
+@pytest.mark.parametrize("code", ["", "lower", "A B", "A\n", "X" * 65, "\x1b[31m", "A-B"])
+def test_error_body_rejects_odd_codes(code: str) -> None:
+    with pytest.raises(ValidationError):
+        ErrorBody(code=code, message="m")

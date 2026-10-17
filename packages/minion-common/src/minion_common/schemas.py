@@ -260,12 +260,16 @@ class HeartbeatResponse(_Model):
     expires_at: AwareDatetime
 
 
+ERROR_CODE_PATTERN = r"^[A-Z0-9_]{1,64}$"
+
+
 class ErrorBody(_Model):
-    code: str
+    code: str = Field(pattern=ERROR_CODE_PATTERN)
     message: str
 
 
 __all__ = [
+    "ERROR_CODE_PATTERN",
     "SLUG_PATTERN",
     "AcquireRequest",
     "Assignment",

@@ -5,11 +5,35 @@
 ```bash
 uv tool install './packages/minion-executor[mlx]'
 ```
-Run from a repo checkout (the package is not on PyPI). Extras: `[mlx]`, `[hf]`.
+Run from a repo checkout (the package is not on PyPI). Extras: `[mlx]`, `[hf]`. Re-run with
+`--reinstall` after you update the checkout: the install is a copy, not a link to the checkout.
 
-Fallback from a repo checkout: `uv sync --package minion-executor --extra mlx` and use
-`.venv/bin/minion-executor` (the service uses the script next to the Python that runs the command).
-Run `service install` with that same binary.
+**The install must not reference ~/Documents, ~/Desktop, ~/Downloads or iCloud Drive.** macOS (TCC)
+blocks a LaunchAgent from reading those folders without a Files & Folders grant; the executor then
+hangs forever at Python start-up with no error. `service install` refuses (exit 2) when the
+executable, `sys.prefix`, any `sys.path` entry or `.pth` target, the state dir, the model cache dir
+or the config file is under one of them (`~/Library/Mobile Documents` and `~/Library/CloudStorage`
+too). The checkout itself may live there: only the installed copy matters.
+
+Why `uv tool install` works: it builds `minion-executor` and its workspace dependency
+`minion-common` as regular (non-editable) packages into `~/.local/share/uv/tools/minion-executor`
+(checked: `direct_url.json` says `"editable": false`, there are no `.pth` files pointing at the
+checkout, `minion_common` imports from the tool's `site-packages`). Do **not** use `uv sync` or
+`uv pip install ./packages/...` for the service: both leave editable `.pth` links into the checkout
+(the repo `.venv` is refused by `service install`).
+
+Fallback without `uv tool` (wheels, then a venv outside the protected folders):
+
+```bash
+uv build --package minion-common --package minion-executor --out-dir /tmp/minion-wheels
+uv venv ~/.local/share/minion-venv
+uv pip install --python ~/.local/share/minion-venv/bin/python --no-sources \
+    /tmp/minion-wheels/minion_common-*.whl /tmp/minion-wheels/minion_executor-*.whl
+~/.local/share/minion-venv/bin/minion-executor service install ...
+```
+(`--no-sources` keeps uv from resolving `minion-common` to the workspace path.) The service uses
+the script next to the Python that runs `service install`, so run it with that binary. The engine
+extras (`mlx`, `hf`) are added by installing their dependencies into the same venv.
 
 ## 2. Put the token in the Keychain
 
@@ -52,11 +76,18 @@ service; pre-seed the cache or run in the foreground.
 minion-executor service status          # state, last exit code / reason, ExitTimeOut
 tail -n 50 ~/Library/Logs/open-minions/executor.log
 ```
-A permanent failure (bad config, no engine, token rejected with 401/403, other 4xx) is logged as
-`permanent_failure reason=...` and the process exits 0, so launchd does not relaunch it every 60 s.
-Fix the cause (for a rejected token: `security add-generic-password -U ...`), then
-`launchctl kickstart gui/$(id -u)/com.open-minions.executor`. A crash (non-zero exit or signal) is
-restarted after 60 s.
+A permanent failure (bad config, no usable engine, failed sandbox self-test, missing Keychain item,
+unsafe lock file, the server's own 401/403 `UNAUTHORIZED`/`FORBIDDEN`, 400/422) is logged as
+`permanent_failure ts=<UTC> reason=...` and the process exits 0, so launchd does not relaunch it
+every 60 s. `service status` shows the last one (`last permanent failure: ...`, kept in the state
+dir until the service starts again). Fix the cause (for a rejected token:
+`security add-generic-password -U ...`), then
+`launchctl kickstart gui/$(id -u)/com.open-minions.executor`.
+
+Transient problems exit 1 and are relaunched after 60 s: another executor holding the state-dir
+lock, a probe crash or timeout, a locked Keychain, a 403/404/408 without a server error code (a
+proxy or WAF), 429/5xx, network errors, crashes. 429 at register/acquire is retried in the loop with
+backoff (honouring `Retry-After`, capped at 300 s).
 
 The log is not rotated. To shrink it: `: > ~/Library/Logs/open-minions/executor.log` (safe while the
 service runs; the file is opened for append).
@@ -66,6 +97,18 @@ service runs; the file is opened for append).
 ```bash
 minion-executor service uninstall
 ```
-Sends SIGTERM; the in-flight subtask is finished or released within the grace period.
+Sends SIGTERM; the in-flight subtask is finished or released within the grace period. `launchctl
+bootout` can return before the job has exited, so uninstall polls `launchctl print` until the
+service is gone (at most `ExitTimeOut` + 10 s), prints how long that took, and only then removes
+the plist.
+
+If the plist is missing or unreadable, uninstall checks `launchctl print`: when the job is still
+loaded (or launchd cannot be queried, or an unreadable file is there) it exits 2 and leaves
+everything alone. Remove it by hand:
+
+```bash
+launchctl bootout gui/$(id -u)/com.open-minions.executor
+rm ~/Library/LaunchAgents/com.open-minions.executor.plist
+```
 
 See ADR-0011 for the design. `pause`/`resume`/`profile` keep working against the service.

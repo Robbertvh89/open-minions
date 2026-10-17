@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -86,6 +87,7 @@ def test_no_secret_in_plist_even_when_set() -> None:
         **allowed,
         "MINION_EXECUTOR_STOP_GRACE_S": "30",
         "MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S": "45",
+        "MINION_EXECUTOR_SERVICE_LABEL": service.DEFAULT_LABEL,
     }
     for secret in ("tok-secret", "hf-secret", "pw@proxy", "FAKE_SIGNALS", "SANDBOX", "HF_TOKEN"):
         assert secret.encode() not in data
@@ -119,6 +121,8 @@ def test_parse_print() -> None:
 def test_run_exits_2_on_inconsistent_launchd_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_EXECUTOR_STOP_GRACE_S", "30")
     monkeypatch.setenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S", "44")
+    monkeypatch.setenv("MINION_EXECUTOR_SERVICE_LABEL", "com.x")
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.x")
     res = runner.invoke(app, ["run"])
     assert res.exit_code == 0  # service mode: permanent failure, launchd must not relaunch
     assert "LAUNCHD_EXIT_TIMEOUT_S" in res.output and "config_invalid" in res.output
@@ -254,6 +258,7 @@ def test_write_plist_refuses_symlink(tmp_path: Path) -> None:
 
 def test_uninstall_boots_out_and_removes(env: FakeLaunchctl, tmp_path: Path) -> None:
     runner.invoke(app, install_args(tmp_path, "--no-load"))
+    env.queue["print"] = [(113, "")]
     plist = tmp_path / "ag" / "com.test.x.plist"
     res = runner.invoke(
         app, ["service", "uninstall", "--label", "com.test.x", "--agents-dir", str(tmp_path / "ag")]
@@ -377,6 +382,8 @@ def _service_run_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_mo
     monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
     if service_mode:
         monkeypatch.setenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S", "45")
+        monkeypatch.setenv("MINION_EXECUTOR_SERVICE_LABEL", "com.x")
+        monkeypatch.setenv("XPC_SERVICE_NAME", "com.x")
     else:
         monkeypatch.delenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S", raising=False)
 
@@ -414,7 +421,7 @@ def test_permanent_failures(
     res = runner.invoke(app, ["run", "--runner", "fake"])
     assert res.exit_code == (0 if in_service else plain_code), res.output
     assert "Traceback" not in res.output and "tok-secret" not in res.output
-    assert ("permanent_failure reason=" + reason in res.output) is in_service
+    assert (f"reason={reason}:" in res.output and "permanent_failure" in res.output) is in_service
 
 
 def test_config_error_exits_0_in_service_mode(
@@ -424,7 +431,7 @@ def test_config_error_exits_0_in_service_mode(
     monkeypatch.setenv("MINION_EXECUTOR_STOP_GRACE_S", "100")  # 45 < 100 + 15
     res = runner.invoke(app, ["run", "--runner", "fake"])
     assert res.exit_code == 0
-    assert "permanent_failure reason=config_invalid" in res.output
+    assert "reason=config_invalid" in res.output
 
 
 def test_config_error_exits_2_outside_service(
@@ -632,3 +639,362 @@ def test_keychain_present_never_asks_for_the_secret(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(subprocess, "run", fake)
     assert secrets.keychain_present() is True
     assert "-w" not in seen[0] and "-g" not in seen[0]
+
+
+# --- round 2: bootout rc 0 still stopping, missing plist, TCC, failure record ---------------
+
+
+def _uninstall(tmp_path: Path) -> Any:
+    return runner.invoke(
+        app, ["service", "uninstall", "--label", "com.test.x", "--agents-dir", str(tmp_path / "ag")]
+    )
+
+
+def test_uninstall_polls_after_bootout_rc0_and_reports_stop_time(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plist = install_plist(tmp_path)
+    env.queue["bootout"] = [(0, "")]  # launchd answers 0 while the job is still stopping
+    env.queue["print"] = [(0, "state = running")] * 5 + [(113, "")]
+    clock = {"t": 0.0}
+    monkeypatch.setattr(service, "_now", lambda: clock["t"])
+    monkeypatch.setattr(service, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    res = _uninstall(tmp_path)
+    assert res.exit_code == 0, res.output
+    assert [c[0][0] for c in env.calls] == ["bootout"] + ["print"] * 6
+    assert "stopped com.test.x in 5.0 s" in res.output
+    assert not plist.exists()
+
+
+def test_uninstall_rc0_but_never_unloads_keeps_plist(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plist = install_plist(tmp_path)
+    env.queue["bootout"] = [(0, "")]
+    env.rc, env.out = 0, "state = running"
+    clock = {"t": 0.0}
+    monkeypatch.setattr(service, "_now", lambda: clock["t"])
+    monkeypatch.setattr(service, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    res = _uninstall(tmp_path)
+    assert res.exit_code == 2 and plist.exists()
+    assert "launchctl bootout" in res.output
+
+
+def test_uninstall_missing_plist_but_loaded_exits_2_with_manual_commands(
+    env: FakeLaunchctl, tmp_path: Path
+) -> None:
+    (tmp_path / "ag").mkdir()
+    env.rc = 0  # launchctl print: still loaded
+    res = _uninstall(tmp_path)
+    assert res.exit_code == 2
+    assert "launchctl bootout gui/$(id -u)/com.test.x" in res.output and "rm " in res.output
+
+
+def test_uninstall_unreadable_plist_exits_2(env: FakeLaunchctl, tmp_path: Path) -> None:
+    ag = tmp_path / "ag"
+    ag.mkdir()
+    (ag / "com.test.x.plist").write_bytes(b"not a plist")
+    env.rc = 113
+    res = _uninstall(tmp_path)
+    assert res.exit_code == 2 and (ag / "com.test.x.plist").exists()
+    assert "unreadable or malformed" in res.output and "rm " in res.output
+
+
+def test_uninstall_nothing_there_is_clean(env: FakeLaunchctl, tmp_path: Path) -> None:
+    (tmp_path / "ag").mkdir()
+    env.rc = 113
+    res = _uninstall(tmp_path)
+    assert res.exit_code == 0 and "nothing to remove" in res.output
+
+
+# TCC -----------------------------------------------------------------------------------------
+
+
+def _home(tmp_path: Path) -> Path:
+    home = tmp_path / "h"
+    for rel in service.TCC_PROTECTED:
+        (home / rel).mkdir(parents=True)
+    return home
+
+
+@pytest.mark.parametrize("rel", service.TCC_PROTECTED)
+def test_tcc_protected_paths_detected(tmp_path: Path, rel: str) -> None:
+    home = _home(tmp_path)
+    roots = service.tcc_roots(home)
+    assert service.is_tcc_protected(home / rel / "proj" / ".venv" / "bin" / "x", roots)
+    assert service.is_tcc_protected(home / rel, roots)
+    assert not service.is_tcc_protected(home / "Library" / "Logs" / "x", roots)
+    assert not service.is_tcc_protected(home / (rel + "2") / "x", roots)  # prefix, not parent
+
+
+def test_tcc_symlink_into_protected_folder_detected(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    (home / "Documents" / "venv").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(home / "Documents" / "venv")
+    assert service.is_tcc_protected(link / "bin", service.tcc_roots(home))
+
+
+def test_check_not_protected_lists_offenders(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    items: list[tuple[str, Path | str]] = [
+        ("executable", home / "Documents" / "r" / ".venv" / "bin" / "minion-executor"),
+        ("state dir", home / "Library" / "state"),
+        ("model cache dir", home / "Downloads" / "cache"),
+    ]
+    with pytest.raises(ValueError) as ei:
+        service.check_not_protected(home, items)
+    msg = str(ei.value)
+    assert "executable:" in msg and "model cache dir:" in msg and "state dir:" not in msg
+    assert "uv tool install" in msg
+
+
+def test_pth_target_in_protected_folder_found(tmp_path: Path) -> None:
+    home = _home(tmp_path)
+    site = tmp_path / "venv" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "minion_common.pth").write_text(
+        f"# editable\nimport os\n{home / 'Documents' / 'r' / 'packages' / 'src'}\n"
+    )
+    settings = ExecutorSettings(state_dir=tmp_path / "s", model_cache_dir=tmp_path / "c")
+    items = service.install_locations("/opt/bin/minion-executor", settings, [str(site)])
+    with pytest.raises(ValueError, match=r"\.pth target"):
+        service.check_not_protected(home, items)
+
+
+def test_install_refuses_executable_under_documents(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    exe = home / "Documents" / "repo" / ".venv" / "bin" / "minion-executor"
+    monkeypatch.setattr(service, "_executable", lambda: str(exe))
+    for extra in ((), ("--dry-run",)):
+        res = runner.invoke(app, install_args(tmp_path, *extra))
+        assert res.exit_code == 2 and "macOS-protected folder" in res.output
+    assert env.calls == [] and not (tmp_path / "ag" / "com.test.x.plist").exists()
+
+
+def test_install_refuses_state_dir_under_desktop(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(tmp_path / "home" / "Desktop" / "s"))
+    res = runner.invoke(app, install_args(tmp_path))
+    assert res.exit_code == 2 and "state dir" in res.output
+
+
+def test_install_real_locations_pass_with_tmp_home(env: FakeLaunchctl, tmp_path: Path) -> None:
+    # sys.path / sys.prefix of this test run are not under the fake HOME
+    assert runner.invoke(app, install_args(tmp_path, "--no-load")).exit_code == 0
+
+
+# call order, lock, log dir ---------------------------------------------------------------------
+
+
+def test_restrict_environ_runs_before_probe(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        "minion_executor.worker.process.restrict_environ", lambda: order.append("r")
+    )
+
+    def prober(requested: list[Engine], settings: ExecutorSettings) -> list[Engine]:
+        order.append("p")
+        return [Engine.MLX]
+
+    monkeypatch.setattr(service, "probe_engines", prober)
+    assert runner.invoke(app, install_args(tmp_path, "--no-load")).exit_code == 0
+    assert order == ["r", "p"]
+
+
+def test_existing_plist_refused_before_probe(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_plist(tmp_path)
+    probed: list[int] = []
+
+    def prober(requested: list[Engine], settings: ExecutorSettings) -> list[Engine]:
+        probed.append(1)
+        return [Engine.MLX]
+
+    monkeypatch.setattr(service, "probe_engines", prober)
+    res = runner.invoke(app, install_args(tmp_path))
+    assert res.exit_code == 2 and "uninstall" in res.output and probed == []
+
+
+def test_install_warns_when_instance_lock_held(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.capacity.instance import acquire_instance_lock
+    from minion_executor.capacity.safefile import ensure_private_dir
+
+    state = tmp_path / "state"
+    ensure_private_dir(state)
+    fd = acquire_instance_lock(state)
+    try:
+        res = runner.invoke(app, install_args(tmp_path, "--no-load"))
+    finally:
+        os.close(fd)
+    assert res.exit_code == 0 and "already runs" in res.output
+
+
+def test_prepare_log_file_tightens_existing_dir(tmp_path: Path) -> None:
+    d = tmp_path / "logs"
+    d.mkdir(mode=0o755)
+    d.chmod(0o755)
+    service.prepare_log_file(d / "x.log")
+    assert d.stat().st_mode & 0o777 == 0o700
+    assert (d / "x.log").stat().st_mode & 0o777 == 0o600
+
+
+# service mode detection ------------------------------------------------------------------------
+
+
+def test_service_mode_needs_label_match_or_ppid1(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("MINION_EXECUTOR_SERVICE_LABEL", raising=False)
+    monkeypatch.setenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S", "45")
+    monkeypatch.setattr(os, "getppid", lambda: 4242)
+    assert not service.service_mode()  # an exported timeout alone is not enough
+    monkeypatch.setenv("MINION_EXECUTOR_SERVICE_LABEL", "com.x")
+    monkeypatch.setenv("XPC_SERVICE_NAME", "other")
+    assert not service.service_mode()
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.x")
+    assert service.service_mode()
+    monkeypatch.delenv("XPC_SERVICE_NAME")
+    monkeypatch.setattr(os, "getppid", lambda: 1)
+    assert service.service_mode()
+    monkeypatch.delenv("MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S")
+    assert not service.service_mode()
+
+
+# transient vs permanent --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ApiError(403, "HTTP_ERROR", "Forbidden"),  # proxy/WAF: no server error code
+        ApiError(404, "NOT_FOUND", "x"),
+        ApiError(408, "HTTP_ERROR", "timeout"),
+        StartupError("probe crashed", permanent=False),
+    ],
+)
+def test_transient_failures_exit_1_in_service_mode(
+    exc: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, True)
+    _patch_run(monkeypatch, exc)
+    res = runner.invoke(app, ["run", "--runner", "fake"])
+    assert res.exit_code == 1, res.output
+    assert "permanent_failure" not in res.output and "transient_failure" in res.output
+    assert not (tmp_path / "state" / service.FAILURE_FILE).exists()
+
+
+def test_instance_lock_held_is_transient_in_service_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.capacity.instance import acquire_instance_lock
+    from minion_executor.capacity.safefile import ensure_private_dir
+
+    _service_run_env(tmp_path, monkeypatch, True)
+    ensure_private_dir(tmp_path / "state")
+    fd = acquire_instance_lock(tmp_path / "state")
+    try:
+        res = runner.invoke(app, ["run", "--runner", "fake"])
+    finally:
+        os.close(fd)
+    assert res.exit_code == 1 and "instance_lock_held" in res.output
+
+
+def test_unsafe_lock_file_stays_permanent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from minion_executor.capacity.safefile import ensure_private_dir
+
+    _service_run_env(tmp_path, monkeypatch, True)
+    ensure_private_dir(tmp_path / "state")
+    (tmp_path / "state" / "executor.lock").symlink_to(tmp_path / "elsewhere")
+    res = runner.invoke(app, ["run", "--runner", "fake"])
+    assert (
+        res.exit_code == 0 and "permanent_failure" in res.output and "instance_lock" in res.output
+    )
+
+
+def test_proxy_403_is_not_credential_rejected_outside_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, False)
+    _patch_run(monkeypatch, ApiError(403, "HTTP_ERROR", "Forbidden"))
+    assert runner.invoke(app, ["run", "--runner", "fake"]).exit_code == 1
+
+
+@pytest.mark.parametrize(("rc", "transient"), [(44, False), (36, True), (51, True), (127, True)])
+def test_token_unavailable_transient_vs_missing(
+    rc: int, transient: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, True)
+    monkeypatch.delenv("MINION_EXECUTOR_TOKEN")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "", ""),
+    )
+    res = runner.invoke(app, ["run", "--runner", "fake"])
+    assert res.exit_code == (1 if transient else 0), res.output
+
+
+def test_probe_crash_transient_but_sandbox_failed_permanent() -> None:
+    from minion_executor.runners.base import RunnerError
+    from minion_executor.worker.sandbox import SANDBOX_FAILED
+
+    assert StartupError("x").permanent
+    assert StartupError("x", permanent=False).permanent is False
+    assert RunnerError(SANDBOX_FAILED, "m").code == SANDBOX_FAILED
+
+
+# failure record + status -------------------------------------------------------------------------
+
+
+def test_permanent_failure_recorded_with_utc_timestamp_and_shown_by_status(
+    env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, True)
+    _patch_run(monkeypatch, ApiError(401, "UNAUTHORIZED", "bad token"))
+    res = runner.invoke(app, ["run", "--runner", "fake"])
+    assert res.exit_code == 0
+    assert re.search(
+        r"permanent_failure ts=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reason=credential", res.output
+    )
+    f = tmp_path / "state" / service.FAILURE_FILE
+    assert f.stat().st_mode & 0o777 == 0o600
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(tmp_path / "state"))
+    env.rc, env.out = 113, ""
+    st = runner.invoke(app, ["service", "status", "--label", "com.test.x"])
+    assert "last permanent failure:" in st.output and "reason=credential_rejected" in st.output
+
+
+def test_failure_file_cleared_on_next_service_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _service_run_env(tmp_path, monkeypatch, True)
+    _patch_run(monkeypatch, ApiError(401, "UNAUTHORIZED", "bad token"))
+    runner.invoke(app, ["run", "--runner", "fake"])
+    f = tmp_path / "state" / service.FAILURE_FILE
+    assert f.exists()
+    _patch_run(monkeypatch, ApiError(503, "DOWN", "x"))
+    runner.invoke(app, ["run", "--runner", "fake"])
+    assert not f.exists()
+
+
+def test_sanitize_and_read_failure_untrusted(tmp_path: Path) -> None:
+    from minion_executor.capacity.safefile import ensure_private_dir
+
+    assert service.sanitize("a\x1b[31mb\nc" + "x" * 500, 20) == "a?[31mb?cxxxxxxxx..."
+    state = tmp_path / "s"
+    ensure_private_dir(state)
+    assert service.read_failure(state) is None
+    (state / service.FAILURE_FILE).write_text("[1]")
+    (state / service.FAILURE_FILE).chmod(0o600)
+    assert service.read_failure(state) is None
+    service.record_failure(state, "r\x1b", "d" * 1000, "2026-01-01T00:00:00Z")
+    got = service.read_failure(state)
+    assert got is not None and got["reason"] == "r?" and len(got["detail"]) <= 300

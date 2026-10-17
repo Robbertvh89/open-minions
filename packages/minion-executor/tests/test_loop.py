@@ -3034,3 +3034,23 @@ async def test_watcher_does_not_busy_spin_while_a_model_is_fetched(tmp_path: Pat
     assert count <= 10
     cache.release.set()
     assert await asyncio.wait_for(task, 10) == 1
+
+
+async def test_register_429_backs_off_honouring_retry_after(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([]), list[float]()
+    client.register_excs = [ApiError(429, "RATE_LIMITED", "slow", retry_after=120.0)]
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    loop._register = object()  # type: ignore[assignment]
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.kinds().count("register") == 2
+    assert sleeps[0] == 120.0
+
+
+async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "slow", retry_after=9999.0)])
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert sleeps[0] == 300.0  # Retry-After is capped

@@ -6,6 +6,8 @@
 	<dict>
 		<key>MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S</key>
 		<string>45</string>
+		<key>MINION_EXECUTOR_SERVICE_LABEL</key>
+		<string>com.open-minions.executor</string>
 		<key>MINION_EXECUTOR_STOP_GRACE_S</key>
 		<string>30</string>
 	</dict>
