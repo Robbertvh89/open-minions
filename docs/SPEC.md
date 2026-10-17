@@ -547,7 +547,11 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - Q5. Is step-level duty cycling enough to keep video calls smooth, or do we also need to throttle on
   measured *total* GPU utilization (ioreg `Device Utilization %`)? **Open.** The M3 benchmark ran at
   duty cycle 1.0 with no foreground load, so it does not answer this; decide with the M4 governor
-  measurements (NF-7, NF-8).
+  measurements (NF-7, NF-8). **Still open after the TASK-6.9 NF-7 proxy run**
+  ([docs/bench/m5-foreground-apple-m3-pro.md](bench/m5-foreground-apple-m3-pro.md)): within its NF-8
+  duty, minilm-mlx fails the probe's miss-rate criterion at light (+1.1 pp) and balanced (+1.6 pp)
+  while qwen2.5-0.5b-mlx passes, so duty share alone does not bound foreground tail latency for short,
+  frequent steps; GPU frequency scaling confounds the latency ratios. Follow-up TASK-24.
 - Q6. Should `memory_gb` estimates in `models.yaml` be measured automatically by `minion-executor bench`
   and fed back to the server? **Partly answered by M3:** `bench` measures worker RSS peak and
   per-engine peak; `memory_gb` is still hand-set in `deploy/bench-models.yaml`, and feeding measured
