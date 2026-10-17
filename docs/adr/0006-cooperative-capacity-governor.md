@@ -192,7 +192,7 @@ active, `full` while idle on AC). **Deviation** from SPEC FR-51, which called `b
 **D11 Owner control (FR-56).** `control.json` / `status.json` files in a 0700 state dir
 (`MINION_EXECUTOR_STATE_DIR`), written atomically. The directory is created 0700; an existing one must be owned by the user and
 not group/world-writable (it is not chmod-ed). Files are refused if not owned by the user or writable
-by others. Works with launchd and the later menu-bar app; no socket. **Implemented in TASK-5.4:**
+by others. Works with launchd and the menu-bar app (`minion-executor menubar`, TASK-7.5); no socket. Every read-modify-write of `control.json` (CLI and menu bar) holds an exclusive `flock` on `control.lock` in the state dir (0600, `O_NOFOLLOW`, non-blocking retries for at most 2 s, then "another control update is in progress"), so concurrent writers cannot lose each other's fields; readers (the governor) take no lock because the file is replaced atomically. **Implemented in TASK-5.4:**
 `minion-executor pause [--for 30m|1h|2h30m]`, `resume` and `profile <name|auto>` do a read-modify-write
 of `control.json` (strict schema, `extra=forbid`; tmp file + fsync + rename, 0600, state dir created
 0700). All file operations are relative to one vetted directory fd and never follow symlinks. A

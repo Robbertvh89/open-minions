@@ -12,9 +12,13 @@ False (file in place, durability unconfirmed) and the caller decides how to tell
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import os
 import secrets
 import stat
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -156,3 +160,81 @@ def atomic_write_private(path: Path, data: bytes) -> bool:
     finally:
         os.close(dfd)
     return durable
+
+
+def open_lock_fd(dfd: int, name: str, path: Path) -> int:
+    """Open (creating, 0600) the lock file `name` relative to the vetted directory fd `dfd`.
+
+    Never follows a symlink; the opened file must be a regular file of ours, and its mode is set
+    to 0600 on the fd. Returns the fd (the caller closes it). Raises SafeFileError otherwise.
+    """
+    fd = -1
+    for attempt in range(5):
+        try:
+            fd = os.open(
+                name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd
+            )
+            break
+        except FileNotFoundError:
+            # openat(O_CREAT) race on Darwin: concurrent first-time creates can report ENOENT
+            # although the file now exists, so retry briefly
+            time.sleep(0.01 * (attempt + 1))
+        except OSError as exc:
+            raise SafeFileError(f"cannot open lock file {path}: {exc.strerror}") from None
+    if fd < 0:
+        raise SafeFileError(f"cannot open lock file {path}: No such file or directory")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise SafeFileError(f"lock file {path} is not a regular file of ours")
+        os.fchmod(fd, 0o600)
+    except OSError as exc:
+        os.close(fd)
+        raise SafeFileError(f"cannot use lock file {path}: {exc.strerror}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+LOCK_WAIT_S = 2.0
+
+
+@contextlib.contextmanager
+def private_lock(
+    directory: Path, name: str, wait_s: float = LOCK_WAIT_S, busy_message: str | None = None
+) -> Iterator[None]:
+    """Hold an exclusive `flock` on `directory/name` (0600, O_NOFOLLOW, created when missing).
+
+    Serialises read-modify-write cycles across threads and processes. The directory is vetted
+    first and the lock file is opened relative to that fd. Waits at most `wait_s` (non-blocking
+    attempts, so a stuck holder cannot hang the caller). Raises SafeFileError when the directory
+    or lock file is unsafe, the lock cannot be taken, or the wait runs out. The lock file is never
+    removed (that would race). `busy_message` replaces the default "lock {name} is busy".
+    """
+    dfd = open_private_dir(directory)
+    try:
+        fd = open_lock_fd(dfd, name, directory / name)
+    finally:
+        os.close(dfd)
+    try:
+        deadline = time.monotonic() + wait_s
+        delay = 0.005
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise SafeFileError(f"cannot lock {directory / name}: {exc.strerror}") from None
+            if time.monotonic() >= deadline:
+                raise SafeFileError(busy_message or f"lock {name} is busy")
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)

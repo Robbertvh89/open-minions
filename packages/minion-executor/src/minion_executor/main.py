@@ -646,6 +646,30 @@ def status() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command()
+def menubar() -> None:
+    """Show a menu-bar item to pause/resume and pick the profile (macOS, as your own user).
+
+    Talks only to the local status.json / control.json: no server, no token.
+    """
+    if sys.platform != "darwin":
+        typer.echo("error: the menu-bar app needs macOS", err=True)
+        raise typer.Exit(code=2)
+    if os.geteuid() == 0:
+        typer.echo("error: refusing to run the menu-bar app as root", err=True)
+        raise typer.Exit(code=2)
+    try:
+        settings = ExecutorSettings()  # same validation as `run`
+        state_dir, config_path = settings.state_dir, settings.config_path
+        ensure_private_dir(state_dir)
+    except (ValueError, SafeFileError) as exc:  # pydantic's ValidationError is a ValueError
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    from minion_executor.menubar.app import run as run_menubar  # no AppKit import off macOS
+
+    run_menubar(state_dir, config_path)
+
+
 def _check_out_path(out: Path) -> None:
     """Fail before the (long) run if the report cannot be written. Symlinks are refused."""
     parent = out.parent

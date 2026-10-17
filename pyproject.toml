@@ -71,7 +71,7 @@ follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 # pyobjc: darwin-only dependency, absent on Linux CI; skipped so both type-check identically.
-module = ["Quartz", "Quartz.*", "Foundation", "Foundation.*", "objc"]
+module = ["Quartz", "Quartz.*", "Foundation", "Foundation.*", "AppKit", "AppKit.*", "objc"]
 ignore_missing_imports = true
 follow_imports = "skip"
 

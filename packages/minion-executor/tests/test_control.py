@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import pytest
 from minion_common.enums import CapacityProfile
 from minion_executor.capacity.control import (
     CONTROL_FILE,
+    CONTROL_LOCK_FILE,
     ControlUnusable,
     OwnerControl,
     parse_duration,
@@ -19,7 +22,7 @@ from minion_executor.capacity.control import (
     update_control,
     write_control,
 )
-from minion_executor.capacity.safefile import SafeFileError
+from minion_executor.capacity.safefile import SafeFileError, private_lock
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 
@@ -257,3 +260,154 @@ def test_update_control_warns_when_not_durably_synced(
     msgs: list[str] = []
     update_control(state, paused=True, warn=msgs.append)
     assert msgs == [f"written but not durably synced: {state / 'control.json'}"]
+
+
+def _blocked_update_thread(sd: Path, **kw: object) -> threading.Thread:
+    def go() -> None:
+        update_control(sd, warn=lambda _m: None, **kw)  # type: ignore[arg-type]
+
+    t = threading.Thread(target=go)
+    t.start()
+    return t
+
+
+def test_update_control_waits_for_the_lock_thread(sd: Path) -> None:
+    write_control(sd, OwnerControl(profile=CapacityProfile.FULL))
+    before = (sd / CONTROL_FILE).read_bytes()
+    with private_lock(sd, CONTROL_LOCK_FILE):
+        t = _blocked_update_thread(sd, paused=True)
+        t.join(0.5)
+        assert t.is_alive()  # blocked on the lock
+        assert (sd / CONTROL_FILE).read_bytes() == before
+    t.join(5)
+    assert not t.is_alive()
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl) and ctl.paused and ctl.profile is CapacityProfile.FULL
+
+
+_CHILD = """
+import sys
+from pathlib import Path
+from minion_executor.capacity.control import update_control
+print("ready", flush=True)
+update_control(Path(sys.argv[1]), paused=True, warn=lambda m: None)
+"""
+
+
+def test_update_control_waits_for_the_lock_process(sd: Path) -> None:
+    import subprocess
+    import sys
+
+    write_control(sd, OwnerControl(profile=CapacityProfile.FULL))
+    before = (sd / CONTROL_FILE).read_bytes()
+    with private_lock(sd, CONTROL_LOCK_FILE):
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", _CHILD, str(sd)], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert proc.stdout is not None and proc.stdout.readline().strip() == "ready"
+            time.sleep(0.5)  # the child is now in update_control, waiting for us
+            assert proc.poll() is None
+            assert (sd / CONTROL_FILE).read_bytes() == before
+        except BaseException:
+            proc.kill()
+            raise
+    assert proc.wait(timeout=30) == 0
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl) and ctl.paused and ctl.profile is CapacityProfile.FULL
+
+
+def test_interleaved_read_modify_write_loses_no_field(
+    sd: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writer 1 stalls between its read and its write; writer 2 must not slip in between."""
+    import minion_executor.capacity.control as ctl_mod
+
+    write_control(sd, OwnerControl())
+    real_read = ctl_mod.read_control
+    read_done, go, first = threading.Event(), threading.Event(), threading.Lock()
+
+    def slow_read(state_dir: Path) -> object:
+        got = real_read(state_dir)
+        if first.acquire(blocking=False):  # only the first reader stalls
+            read_done.set()
+            assert go.wait(10)
+        return got
+
+    monkeypatch.setattr(ctl_mod, "read_control", slow_read)
+    t1 = _blocked_update_thread(sd, paused=True)
+    assert read_done.wait(10)
+    t2 = _blocked_update_thread(sd, profile=CapacityProfile.FULL)
+    time.sleep(0.3)  # writer 2 gets as far as it can; with the lock that is the lock wait
+    go.set()
+    t1.join(10)
+    t2.join(10)
+    assert not t1.is_alive() and not t2.is_alive()
+    monkeypatch.undo()
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl)
+    assert ctl.paused and ctl.profile is CapacityProfile.FULL
+
+
+def test_many_threads_lose_no_field(sd: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def pause() -> None:
+        update_control(sd, paused=True, warn=lambda _m: None)
+
+    def pin() -> None:
+        update_control(sd, profile=CapacityProfile.FULL, warn=lambda _m: None)
+
+    with ThreadPoolExecutor(8) as pool:
+        futs = [pool.submit(pause if i % 2 else pin) for i in range(100)]
+        for f in futs:
+            f.result()
+    ctl = read_control(sd)
+    assert isinstance(ctl, OwnerControl)
+    assert ctl.paused and ctl.profile is CapacityProfile.FULL
+
+
+def test_private_lock_gives_up_with_a_clear_error(sd: Path) -> None:
+    write_control(sd, OwnerControl())
+    with private_lock(sd, CONTROL_LOCK_FILE):
+        started = time.monotonic()
+        with (
+            pytest.raises(SafeFileError, match=f"lock {CONTROL_LOCK_FILE} is busy"),
+            private_lock(sd, CONTROL_LOCK_FILE, wait_s=0.2),
+        ):
+            pass
+        with (
+            pytest.raises(SafeFileError, match="custom busy"),
+            private_lock(sd, CONTROL_LOCK_FILE, wait_s=0.1, busy_message="custom busy"),
+        ):
+            pass
+        assert time.monotonic() - started < 2
+
+
+def test_lock_open_errors_are_safefile_errors(sd: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import errno
+
+    write_control(sd, OwnerControl())
+
+    real = os.fstat
+
+    def boom(fd: int) -> os.stat_result:
+        st = real(fd)
+        if stat.S_ISREG(st.st_mode):  # the lock file; directory checks are not under test
+            raise OSError(errno.EIO, "io")
+        return st
+
+    monkeypatch.setattr(os, "fstat", boom)
+    with pytest.raises(SafeFileError):
+        update_control(sd, paused=True, warn=_nowarn)
+
+
+def test_control_lock_is_private_and_symlink_refused(sd: Path) -> None:
+    update_control(sd, paused=True, warn=lambda _m: None)
+    lock = sd / "control.lock"
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    lock.unlink()
+    (sd / "elsewhere").write_text("")
+    lock.symlink_to(sd / "elsewhere")
+    with pytest.raises(SafeFileError):
+        update_control(sd, paused=False, warn=lambda _m: None)
