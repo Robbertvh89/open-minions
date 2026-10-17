@@ -3,9 +3,10 @@ id: TASK-26
 title: >-
   Comprehensive README: what it is, quick start, operator, Mac owner and
   submitter guides
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 17:54'
+updated_date: '2026-10-17 19:44'
 labels:
   - docs
 dependencies: []
