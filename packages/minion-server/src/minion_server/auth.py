@@ -26,6 +26,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StringConstraints,
     ValidationError,
     model_validator,
@@ -79,7 +80,7 @@ class _KeyEntry(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     teams: list[_Slug]
-    operator: bool = False
+    operator: StrictBool = False
     expires_at: AwareDatetime | None = None
 
 
@@ -114,23 +115,42 @@ class KeysConfig:
 
 
 MAX_KEYS_FILE_BYTES = 1 << 20
-_Sig = tuple[int, int, int]
+_FIELD_NAMES = frozenset(
+    {"keys", "teams", "name", "sha256", "operator", "expires_at", "default_pool", "allowed_pools"}
+)
+_YamlLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
-def _sig(st: os.stat_result) -> _Sig:
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
+class KeysFileUnsafeError(Exception):
+    """The keys file (or its directory chain) is writable by someone other than root/this user."""
 
 
-def _read_file(path: str | Path) -> tuple[str, _Sig]:
-    """Read through one file descriptor so the signature belongs to exactly the bytes parsed.
+def _check_parents(path: Path) -> None:
+    """Refuse a target whose directory chain is group/world-writable (unless sticky and root-owned).
+
+    Docker/K8s secret mounts are root-owned and not writable by others, so they pass.
+    """
+    for directory in Path(os.path.realpath(path)).parents:
+        st = directory.stat()
+        if st.st_mode & 0o022 and not (st.st_mode & stat.S_ISVTX and st.st_uid == 0):
+            raise KeysFileUnsafeError("api keys file directory is group/world-writable")
+
+
+def _read_file(path: str | Path) -> bytes:
+    """Read through one file descriptor after checking ownership and permissions.
 
     Symlinked files are allowed (secret mounts use them); only regular files are read.
     """
+    _check_parents(Path(path))
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise ValueError("api keys file is not a regular file")
+        if st.st_uid not in (0, os.geteuid()):
+            raise KeysFileUnsafeError("api keys file is not owned by root or the server user")
+        if st.st_mode & 0o022:
+            raise KeysFileUnsafeError("api keys file is group/world-writable")
         if st.st_size > MAX_KEYS_FILE_BYTES:
             raise ValueError("api keys file too large")
         with os.fdopen(fd, "rb", closefd=False) as fh:
@@ -139,11 +159,11 @@ def _read_file(path: str | Path) -> tuple[str, _Sig]:
         os.close(fd)
     if len(data) > MAX_KEYS_FILE_BYTES:
         raise ValueError("api keys file too large")
-    return data.decode("utf-8"), _sig(st)
+    return data
 
 
 def parse_keys_config(text: str) -> KeysConfig:
-    raw = yaml.safe_load(text) or {}
+    raw = yaml.load(text, Loader=_YamlLoader) or {}  # noqa: S506  (safe loader)
     parsed = _KeysFile.model_validate(raw)
     keys: dict[str, User] = {}
     names: set[str] = set()
@@ -160,11 +180,15 @@ def parse_keys_config(text: str) -> KeysConfig:
         )
         for slug, t in parsed.teams.items()
     }
+    member_teams = {t for u in keys.values() for t in u.teams}
+    orphans = sorted(set(teams) - member_teams)
+    if orphans:
+        log.warning("api_keys_policy_for_unused_teams", count=len(orphans), teams=orphans[:20])
     return KeysConfig(keys, teams)
 
 
 def load_keys_config(path: str | Path) -> KeysConfig:
-    return parse_keys_config(_read_file(path)[0])
+    return parse_keys_config(_read_file(path).decode("utf-8"))
 
 
 def load_api_keys(path: str | Path) -> dict[str, User]:
@@ -173,24 +197,37 @@ def load_api_keys(path: str | Path) -> dict[str, User]:
 
 
 def _safe_detail(exc: Exception) -> str:
-    """Error summary without input values (which could echo key hashes or secrets)."""
+    """Error summary without input values or user-chosen keys (which could echo secrets)."""
     if isinstance(exc, ValidationError):
-        return "; ".join(
-            f"{'.'.join(str(p) for p in e['loc']) or 'file'}: {e['type']}" for e in exc.errors()
-        )[:500]
+
+        def loc(parts: tuple[int | str, ...]) -> str:
+            kept = [str(p) for p in parts if isinstance(p, int) or p in _FIELD_NAMES]
+            return ".".join(kept) or "file"
+
+        return "; ".join(f"{loc(e['loc'])}: {e['type']}" for e in exc.errors())[:500]
     if isinstance(exc, yaml.YAMLError):
         return "yaml syntax error"
+    if isinstance(exc, KeysFileUnsafeError):
+        return str(exc)
     if isinstance(exc, ValueError) and not isinstance(exc, UnicodeDecodeError):
         return str(exc)[:200]
     return type(exc).__name__
 
 
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 class KeyStore:
     """Live view of the keys file (ADR-0007 amendment).
 
-    Every `reload_s` seconds the next request stats the file; a changed (mtime, size, inode)
-    triggers a re-read. A file that fails validation, vanishes or is unreadable after startup
-    fails closed: no key authenticates until a valid file is back. The first load raises.
+    Every `reload_s` seconds the next request reads the file (<= 1 MiB, local storage) and
+    compares its sha256; changed content triggers a re-parse. A file that fails validation,
+    vanishes, is unreadable or unsafe after startup fails closed: no key authenticates until a
+    valid file is back. Content failures are remembered by hash (not re-parsed until the file
+    changes); read failures (I/O, permissions) are retried every interval. The first load raises.
+    The file must be replaced atomically (write temp, then rename); a result is discarded when
+    the content changed while it was being parsed.
     """
 
     def __init__(
@@ -202,31 +239,48 @@ class KeyStore:
         self._path = Path(path)
         self._reload_s = reload_s
         self._clock = clock
-        text, first_sig = _read_file(self._path)
-        self._sig: _Sig | None = first_sig
-        self._config: KeysConfig | None = parse_keys_config(text)
+        data = _read_file(self._path)
+        self._digest: str | None = _digest(data)
+        self._config: KeysConfig | None = parse_keys_config(data.decode("utf-8"))
+        self._last_error: str | None = None
         self._next_check = clock() + reload_s
+
+    def _fail(self, exc: Exception, digest: str | None) -> None:
+        detail = _safe_detail(exc)
+        if self._config is not None or self._last_error != detail:
+            log.error("api_keys_reload_failed", path=str(self._path), error=detail)
+        self._last_error = detail
+        self._config = None
+        self._digest = digest
 
     def _refresh(self) -> None:
         now = self._clock()
         if now < self._next_check:
             return
         self._next_check = now + self._reload_s
-        sig: _Sig | None = None
         try:
-            sig = _sig(self._path.stat())
-            if sig == self._sig:
-                return  # unchanged (if invalid: stays closed, already logged)
-            text, sig = _read_file(self._path)
-            config = parse_keys_config(text)
-        except Exception as exc:  # fail closed on anything; never log content or key material
-            if self._config is not None or sig != self._sig:
-                log.error("api_keys_reload_failed", path=str(self._path), error=_safe_detail(exc))
-            self._config = None
-            self._sig = sig
+            data = _read_file(self._path)
+        except Exception as exc:  # I/O, permission, size: transient; retry next interval
+            self._fail(exc, None)
             return
-        self._sig = sig
+        digest = _digest(data)
+        if digest == self._digest:
+            return  # unchanged (if invalid: stays closed, already logged)
+        try:
+            config = parse_keys_config(data.decode("utf-8"))
+        except Exception as exc:  # content failure: remember the hash, fail closed
+            self._fail(exc, digest)
+            return
+        try:
+            again = _digest(_read_file(self._path))
+        except Exception as exc:
+            self._fail(exc, None)
+            return
+        if again != digest:
+            return  # changed while parsing: discard, re-evaluate next interval
+        self._digest = digest
         self._config = config
+        self._last_error = None
         log.info("api_keys_reloaded", path=str(self._path), keys=len(config.keys))
 
     @property
@@ -263,7 +317,18 @@ async def current_user(
         raise _unauthorized()
     if user.expires_at is not None and user.expires_at <= datetime.now(UTC):
         raise _unauthorized()
+    request.state.keys_config = cfg  # one snapshot per request (no second reload in handlers)
     return user
+
+
+async def request_keys_config(
+    request: Request, _user: Annotated[User, Depends(current_user)]
+) -> KeysConfig:
+    """The KeysConfig snapshot taken during authentication of this request."""
+    cfg: KeysConfig | None = getattr(request.state, "keys_config", None)
+    if cfg is None:
+        raise _unauthorized()
+    return cfg
 
 
 async def require_operator(user: Annotated[User, Depends(current_user)]) -> User:

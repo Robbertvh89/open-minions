@@ -20,6 +20,15 @@ from minion_server.settings import ServerSettings
 MAX_TTL_DAYS = 365
 NAME_PATTERN = r"[\w.@-]{1,100}"
 
+
+def printable(value: str) -> str:
+    """Escape control characters (ANSI/OSC, tabs, newlines) so output cannot spoof the terminal."""
+    return "".join(
+        c if c.isprintable() and c not in "\\" else c.encode("unicode_escape").decode("ascii")
+        for c in value
+    )
+
+
 app = typer.Typer(help="open-minions server administration", no_args_is_help=True)
 
 
@@ -140,15 +149,17 @@ def list_executors_cmd() -> None:
     def ts(v: datetime | None) -> str:
         return v.isoformat(timespec="seconds") if v else "-"
 
+    header = ["executor_id", "owner", "pool", "status", "hostname", "last_seen", "token_expires"]
+    typer.echo("\t".join(header))
     for e in asyncio.run(_run()):
         typer.echo(
             "\t".join(
                 [
                     str(e.executor_id),
-                    e.owner,
-                    e.pool,
+                    printable(e.owner),
+                    printable(e.pool),
                     e.status.value,
-                    e.hostname,
+                    printable(e.hostname),
                     f"last_seen={ts(e.last_seen_at)}",
                     f"token_expires={ts(e.token_expires_at)}",
                 ]

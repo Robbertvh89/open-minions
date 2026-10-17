@@ -56,3 +56,11 @@ authorized by team.
 - `created_by` stays a plain string: the FK is **won't-do** (it would need an 8th table, SPEC section 7).
 - Executor tokens: `rotate-executor-token` replaces the hash on the same row (same `executor_id`);
   no schema change. Revoked executors are not rotated.
+- Hardening of the live reload: each interval the file (<= 1 MiB, local storage; not NFS/FUSE) is read
+  through one fd and its sha256 compared, so same-size in-place rewrites with a restored mtime are
+  seen. The file must be replaced **atomically** (write a temp file, then `rename`); a parse result is
+  discarded when the content changed while parsing. I/O and permission errors are retried every
+  interval; content errors are remembered by hash. The file must be owned by root or the server's euid
+  and not group/world-writable, and its resolved directory chain must not be group/world-writable
+  (sticky + root-owned excepted); otherwise startup fails and a reload fails closed. Docker/K8s secret
+  mounts (root-owned 0444/0644) pass. Each request uses one config snapshot for auth and pool policy.

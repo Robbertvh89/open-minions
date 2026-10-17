@@ -223,3 +223,215 @@ def test_store_team_policy_follows_reload(tmp_path: Path) -> None:
     _write(f, "keys:\n" + _entry("a", K1), bump=5)
     clock.t = 2
     assert store.team_policy("t1") is None
+
+
+async def test_transient_read_error_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.auth as auth
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    clock = Clock()
+    app = _app(KeyStore(f, reload_s=1, clock=clock))
+    real = auth._read_file
+    calls = {"n": 0}
+
+    def flaky(path: str | Path) -> bytes:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("EIO")
+        return real(path)
+
+    monkeypatch.setattr(auth, "_read_file", flaky)
+    clock.t = 2
+    assert await _status(app, K1) == 401
+    clock.t = 4
+    assert await _status(app, K1) == 200
+
+
+async def test_policy_uses_single_snapshot_per_request(tmp_path: Path) -> None:
+    from minion_server.auth import KeysConfig, request_keys_config
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1) + "teams:\n  t1: {default_pool: p1}\n")
+    store = KeyStore(f, reload_s=0)
+    app = _app(store)
+
+    @app.get("/snap")
+    async def snap(cfg: KeysConfig = Depends(request_keys_config)) -> dict[str, str | None]:  # noqa: B008
+        _write(f, "keys: nope\n", bump=7)  # file turns invalid after auth
+        assert store.config is None  # a second reload would fail closed
+        pol = cfg.teams.get("t1")
+        return {"pool": pol.default_pool if pol else None}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        r = await c.get("/snap", headers={"Authorization": f"Bearer {K1}"})
+        assert (r.status_code, r.json()) == (200, {"pool": "p1"})
+        r = await c.get("/snap", headers={"Authorization": f"Bearer {K1}"})
+        assert r.status_code == 401
+
+    @app.get("/nosnap")
+    async def nosnap(cfg: KeysConfig = Depends(request_keys_config)) -> dict[str, str]:  # noqa: B008
+        return {}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        assert (await c.get("/nosnap")).status_code == 401
+
+
+async def test_same_size_rewrite_with_restored_mtime_detected(tmp_path: Path) -> None:
+    import os
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    st = f.stat()
+    clock = Clock()
+    app = _app(KeyStore(f, reload_s=1, clock=clock))
+    assert await _status(app, K1) == 200
+    other = _h(K2)
+    with f.open("r+b") as fh:  # in place, same size
+        fh.write(("keys:\n" + _entry("a", K2)).encode())
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert f.stat().st_size == st.st_size and other
+    clock.t = 2
+    assert await _status(app, K1) == 401
+    assert await _status(app, K2) == 200
+
+
+def test_unsafe_mode_refused(tmp_path: Path) -> None:
+    from minion_server.auth import KeysFileUnsafeError
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    f.chmod(0o666)
+    with pytest.raises(KeysFileUnsafeError):
+        KeyStore(f)
+    f.chmod(0o664)
+    with pytest.raises(KeysFileUnsafeError):
+        KeyStore(f)
+    f.chmod(0o644)
+    KeyStore(f)
+
+
+def test_foreign_owner_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from minion_server.auth import KeysFileUnsafeError
+
+    if os.geteuid() == 0:
+        pytest.skip("root owns everything")
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    monkeypatch.setattr("minion_server.auth.os.geteuid", lambda: os.getuid() + 12345)
+    with pytest.raises(KeysFileUnsafeError, match="owned"):
+        KeyStore(f)
+
+
+def test_writable_directory_refused(tmp_path: Path) -> None:
+    from minion_server.auth import KeysFileUnsafeError
+
+    d = tmp_path / "d"
+    d.mkdir()
+    f = d / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    d.chmod(0o777)
+    try:
+        with pytest.raises(KeysFileUnsafeError, match="directory"):
+            KeyStore(f)
+        d.chmod(0o755)
+        KeyStore(f)
+    finally:
+        d.chmod(0o755)
+
+
+async def test_reload_fails_closed_on_unsafe_then_recovers(tmp_path: Path) -> None:
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    clock = Clock()
+    app = _app(KeyStore(f, reload_s=1, clock=clock))
+    assert await _status(app, K1) == 200
+    f.chmod(0o666)
+    clock.t = 2
+    assert await _status(app, K1) == 401
+    f.chmod(0o644)  # content unchanged: must recover (read failures are not remembered)
+    clock.t = 4
+    assert await _status(app, K1) == 200
+
+
+async def test_change_during_parse_is_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.auth as auth
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    clock = Clock()
+    app = _app(KeyStore(f, reload_s=1, clock=clock))
+    _write(f, "keys:\n" + _entry("a", K2), bump=3)
+    real_parse = auth.parse_keys_config
+
+    def racing(text: str) -> auth.KeysConfig:
+        cfg = real_parse(text)
+        _write(f, "keys:\n" + _entry("a", K1) + _entry("b", K2), bump=9)
+        return cfg
+
+    monkeypatch.setattr(auth, "parse_keys_config", racing)
+    clock.t = 2
+    assert await _status(app, K2) == 401  # discarded; old config still serves
+    monkeypatch.setattr(auth, "parse_keys_config", real_parse)
+    clock.t = 4
+    assert await _status(app, K2) == 200
+
+
+def test_safe_detail_drops_user_chosen_keys() -> None:
+    from minion_server.auth import _safe_detail
+
+    secret = "pasted-secret-key"
+    with pytest.raises(ValidationError) as ei:
+        parse_keys_config(f"keys:\n  - {{name: a, sha256: {_h(K1)}, teams: [t1], {secret}: 1}}\n")
+    detail = _safe_detail(ei.value)
+    assert secret not in detail and "keys.0" in detail
+    with pytest.raises(ValidationError) as ei2:
+        parse_keys_config(f"teams:\n  t1: {{{secret}: 1}}\n")
+    assert secret not in _safe_detail(ei2.value)
+
+
+@pytest.mark.parametrize("val", ["'yes'", "1", "'true'"])
+def test_operator_is_strict_bool(val: str) -> None:
+    with pytest.raises(ValidationError):
+        parse_keys_config("keys:\n" + _entry("a", K1, f", operator: {val}"))
+
+
+def test_policy_for_unused_team_warns() -> None:
+    with capture_logs() as logs:
+        parse_keys_config("keys:\n" + _entry("a", K1) + "teams:\n  t1: {}\n  typo: {}\n")
+    w = [e for e in logs if e["event"] == "api_keys_policy_for_unused_teams"]
+    assert w and w[0]["teams"] == ["typo"]
+
+
+async def test_concurrent_requests_during_rewrites(tmp_path: Path) -> None:
+    import asyncio
+
+    f = tmp_path / "k.yaml"
+    f.write_text("keys:\n" + _entry("a", K1))
+    app = _app(KeyStore(f, reload_s=0))
+    stop = False
+
+    async def writer() -> None:
+        i = 0
+        while not stop:
+            i += 1
+            tmp = tmp_path / "tmp.yaml"
+            tmp.write_text("keys:\n" + _entry("a", K1) + _entry(f"n{i}", K2))
+            tmp.replace(f)  # atomic
+            await asyncio.sleep(0)
+
+    w = asyncio.create_task(writer())
+    results = await asyncio.gather(*[_status(app, K1) for _ in range(150)])
+    stop = True
+    await w
+    assert set(results) <= {200, 401}
+    assert results.count(200) > 0
+    f.write_text("keys:\n" + _entry("a", K2))
+    assert await _status(app, K1) == 401
+    assert await _status(app, K2) == 200

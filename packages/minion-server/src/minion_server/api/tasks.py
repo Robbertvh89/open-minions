@@ -17,7 +17,7 @@ from minion_common.schemas import (
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from minion_server.auth import KeyStore, User, current_user, resolve_pool
+from minion_server.auth import KeysConfig, User, current_user, request_keys_config, resolve_pool
 from minion_server.db.models import Task
 from minion_server.db.session import get_session
 from minion_server.errors import api_error
@@ -111,11 +111,6 @@ def _storage(request: Request) -> S3Storage:
     return s
 
 
-def _keystore(request: Request) -> KeyStore | None:
-    k: KeyStore | None = getattr(request.app.state, "api_keys", None)
-    return k
-
-
 def _models(request: Request) -> dict[str, ModelEntry]:
     m: dict[str, ModelEntry] = request.app.state.models
     return m
@@ -129,11 +124,11 @@ async def create_task(
     settings: Annotated[ServerSettings, Depends(_settings)],
     storage: Annotated[S3Storage, Depends(_storage)],
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
-    keystore: Annotated[KeyStore | None, Depends(_keystore)],
+    keys_config: Annotated[KeysConfig, Depends(request_keys_config)],
 ) -> TaskOut:
     if body.team not in user.teams:
         raise api_error(403, "FORBIDDEN", "not a member of this team")
-    pool = resolve_pool(keystore.team_policy(body.team) if keystore else None, body.allowed_pool)
+    pool = resolve_pool(keys_config.teams.get(body.team), body.allowed_pool)
     if pool != body.allowed_pool:
         body = body.model_copy(update={"allowed_pool": pool})
     model = models.get(body.model)

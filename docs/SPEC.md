@@ -430,7 +430,9 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   re-read when it changes (checked every `MINION_API_KEYS_RELOAD_S`, default 5 s), so removing a key
   revokes it within that interval without a restart. A file that becomes invalid fails closed (`401` for
   all keys, error logged) until fixed. Keys may carry `expires_at` (expired = `401`) and `operator: true`
-  (`require_operator`, `403 OPERATOR_REQUIRED` otherwise). No DB table (ADR-0007).
+  (`require_operator`, `403 OPERATOR_REQUIRED` otherwise). No DB table (ADR-0007). Replace the file
+  atomically (temp + rename); it must be on local storage, owned by root or the server user, and not
+  group/world-writable (nor its directories), else the server refuses it (fails closed).
   `created_by` on a task records the key name; there is no foreign key (won't-do, ADR-0007 amendment).
   Executor tokens: `list-executors` (never prints hashes) and `rotate-executor-token --executor-id`
   (same id, new token shown once, old token `401`).

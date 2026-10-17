@@ -11,7 +11,7 @@ from minion_common.enums import Engine, TaskType
 from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.api.tasks import create_task, validate_uris
 from minion_server.app import create_app
-from minion_server.auth import User
+from minion_server.auth import KeysConfig, User
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
@@ -67,7 +67,7 @@ async def _create_with(model: ModelEntry, params: dict[str, Any]) -> None:
         settings=cast(Any, None),
         storage=cast(Any, None),
         models={model.model_id: model},
-        keystore=None,
+        keys_config=KeysConfig({}, {}),
     )
 
 
