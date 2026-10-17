@@ -560,8 +560,8 @@ async def test_stale_acquirement_409_stops_work_sends_nothing_and_continues(
 
 
 async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live) -> None:
-    """TASK-6.2 AC #4: `prefer` (the CLI's request) sets the preference over real HTTP; clearing
-    restores plain FIFO."""
+    """TASK-6.2 AC #4: `prefer` (the CLI's request) sets the preference over real HTTP; `--clear`
+    removes it. (Acquisition shuffles the candidate head, so plain FIFO order is not asserted.)"""
     await seed_task(live.sm, "older", 3, team="aaa")  # older: FIFO would serve this first
     await seed_task(live.sm, "newer", 3, team="bbb")
     token = SecretStr(await live.token("pref"))
@@ -572,8 +572,10 @@ async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live
             got = await c.acquire(req)
             assert got is not None and got.team == "bbb"
         await _send_preference(live.url, token, PreferenceRequest())  # --clear
+        rows = await live.rows("SELECT team, project, task_name FROM minion_executor_preference")
+        assert [tuple(r) for r in rows] == [(None, None, None)]  # cleared: all wildcards
         got = await c.acquire(req)
-        assert got is not None and got.team == "aaa"
+        assert got is not None  # plain acquisition still serves work
 
 
 class RecordingClient(ExecutorClient):
