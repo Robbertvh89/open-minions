@@ -1,10 +1,10 @@
 ---
 id: TASK-6.3
 title: 'M5.3 Presigned scope: Range-signed GET and output size cap (TASK-9 #2)'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 12:33'
+updated_date: '2026-10-17 14:32'
 labels:
   - M5
 dependencies: []
@@ -20,8 +20,14 @@ storage.py presign_get(key, ttl, byte_range) signs Range=bytes=s-e; services/acq
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Integration (SeaweedFS): signed-range GET gives 206; no/other Range gives 403, or the PR records SeaweedFS does not enforce it
-- [ ] #2 Existing e2e passes unchanged
-- [ ] #3 Oversize attempt object never promoted (422); retried then FAILED after max_attempts
-- [ ] #4 Executor refuses an oversize upload with OUTPUT_TOO_LARGE
+- [x] #1 Integration (SeaweedFS): signed-range GET gives 206; no/other Range gives 403, or the PR records SeaweedFS does not enforce it
+- [x] #2 Existing e2e passes unchanged
+- [x] #3 Oversize attempt object never promoted (422); retried then FAILED after max_attempts
+- [x] #4 Executor refuses an oversize upload with OUTPUT_TOO_LARGE
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+CI run 39040593000: SeaweedFS enforces the signed Range (no warning). All ACs verified in CI integration.
+<!-- SECTION:NOTES:END -->
