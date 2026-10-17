@@ -30,6 +30,7 @@ from pydantic import SecretStr
 
 from minion_executor import bench as bench_mod
 from minion_executor import bench_budget as budget_mod
+from minion_executor import bench_foreground as fg_mod
 from minion_executor.capacity.config import ExecutorConfig, OnCall, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
@@ -51,6 +52,7 @@ from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop, GovernorStoppedError
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
+from minion_executor.runners.fg_probe import MlxFrameProbe, ProbeError
 from minion_executor.secrets import ENV_VAR, TokenUnavailableError, load_token
 from minion_executor.service import (
     SERVER_AUTH_CODES,
@@ -783,15 +785,18 @@ def bench(
         ),
     ] = False,
     profiles: Annotated[
-        str, typer.Option(help="--budget-check: comma-separated profiles")
+        str, typer.Option(help="--budget-check/--foreground-check: comma-separated profiles")
     ] = "light,balanced,full",
     duration: Annotated[
-        float, typer.Option(help="--budget-check: seconds per phase / --cpu-check: window")
+        float,
+        typer.Option(help="--budget-check/--foreground-check: s per phase; --cpu-check: window"),
     ] = budget_mod.DEFAULT_DURATION_S,
     baseline_s: Annotated[
         float, typer.Option(help="--budget-check: idle seconds before the phases (device info)")
     ] = budget_mod.DEFAULT_BASELINE_S,
-    repeats: Annotated[int, typer.Option(help="--budget-check: repetitions per profile")] = 1,
+    repeats: Annotated[
+        int, typer.Option(help="--budget-check/--foreground-check: repetitions")
+    ] = 1,
     cpu_check: Annotated[
         bool,
         typer.Option("--cpu-check", help="NF-4: governor CPU % while idle and while paused"),
@@ -803,10 +808,24 @@ def bench(
             help="NF-9 on this Mac: print timestamped governor reactions for --duration seconds",
         ),
     ] = False,
+    foreground_check: Annotated[
+        bool,
+        typer.Option(
+            "--foreground-check",
+            help="NF-7 proxy: GPU frame-latency probe and app-launch time, idle vs loaded worker",
+        ),
+    ] = False,
+    launches: Annotated[
+        int, typer.Option(help="--foreground-check: app launches per window (0 = skip)")
+    ] = 20,
 ) -> None:
     """Benchmark engines on this Mac through the real worker path. No server or token needed."""
-    if sum((cpu_check, budget_check, watch_reactions)) > 1:
-        typer.echo("error: --budget-check, --cpu-check, --watch-reactions are separate", err=True)
+    if sum((cpu_check, budget_check, watch_reactions, foreground_check)) > 1:
+        typer.echo(
+            "error: --budget-check, --cpu-check, --watch-reactions, --foreground-check "
+            "are separate",
+            err=True,
+        )
         raise typer.Exit(code=2)
     if watch_reactions:
         _watch_reactions(duration, out)
@@ -840,8 +859,15 @@ def bench(
         check_profiles = [
             parse_profile(p.value, specs) for p in budget_mod.parse_profiles(profiles)
         ]
-        if budget_check and not entries:
-            raise ValueError("--budget-check needs at least one benchable --model")
+        fg_cfg = (
+            fg_mod.ForegroundCheckConfig(
+                duration_s=duration, launches=launches, repeats=repeats, max_tokens=max_tokens
+            )
+            if foreground_check
+            else None
+        )
+        if (budget_check or foreground_check) and not entries:
+            raise ValueError("this check needs at least one benchable --model")
         fetch_env = FetchEnv.capture()
     except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -895,6 +921,27 @@ def bench(
                 raise typer.Exit(code=2) from None
             _emit(budget_mod.render_budget_table(check), check.to_json(), out)
             if not check.all_passed:
+                raise typer.Exit(code=1)
+            return
+        if fg_cfg is not None:
+            budgets = {p: budget_for(p, specs=specs) for p in check_profiles}
+            try:
+                fg = asyncio.run(
+                    fg_mod.run_foreground_check(
+                        cache,
+                        budget_factory,
+                        entries,
+                        budgets,
+                        fg_cfg,
+                        probe=MlxFrameProbe(),
+                        launcher=lambda n: fg_mod.measure_app_launch(n),
+                    )
+                )
+            except (GpuMeterError, ProbeError) as exc:
+                typer.echo(f"error: {exc}", err=True)
+                raise typer.Exit(code=2) from None
+            _emit(fg_mod.render_foreground_table(fg), fg.to_json(), out)
+            if fg.failed:
                 raise typer.Exit(code=1)
             return
         report = asyncio.run(

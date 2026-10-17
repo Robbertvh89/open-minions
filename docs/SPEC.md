@@ -531,7 +531,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 | NF-4 | Executor idle CPU < 1 %; no work while user has stopped it. Measured for the idle and the paused executor: `bench --cpu-check` covers the control process only (governor loop, no server round trips); the whole `run` (control plus worker process tree) is measured with `ps` (docs/bench/governor-measurements.md). |
 | NF-5 | Server and watchdog are stateless and horizontally scalable (all state in Postgres). The one exception is soft, per-replica state: the executor-endpoint rate limiter (TASK-6.2, ADR-0012) keeps its counters in memory, so with N replicas an executor may be admitted up to N times per interval. Counters are never coordination state; correctness stays in the database. |
 | NF-6 | Executor runs on macOS 14+ on M1 or newer. |
-| NF-7 | Foreground responsiveness under `light`/`balanced`: no audible/visible degradation in a Teams/Zoom video call; UI frame drops and app-launch time within 10 % of baseline (measured in M5 usability test). |
+| NF-7 | Foreground responsiveness under `light`/`balanced`: no audible/visible degradation in a Teams/Zoom video call; UI frame drops and app-launch time within 10 % of baseline (measured in M5 usability test). Synthetic proxy on a Mac: `bench --foreground-check` (ADR-0006 Gap 2: GPU scheduling latency and app-launch time, idle vs loaded worker); the human call study is [docs/usability/nf7-video-call-protocol.md](usability/nf7-video-call-protocol.md) and is not verifiable in CI. |
 | NF-8 | Budget adherence, measured by `bench --budget-check` (ADR-0006 Gap 1): (a) hard bound: the worker process's GPU busy share (its `accumulatedGPUTime` delta from `ioreg -c AGXDeviceUserClient` over wall time; device-wide utilization is not a valid per-process share on a Mac in use) ≤ `gpu_duty_cycle` + 10 pp; (b) accuracy: busy share within ±10 pp of `gpu_duty_cycle` × the unpaced share of the same workload (a CPU-bound workload cannot reach `gpu_duty_cycle`; the pacer only adds idle time); (c) worker footprint (`phys_footprint`) ≤ `memory_gb` × 1.10. |
 | NF-9 | Reaction time: governor reacts to memory-pressure / thermal / power / user-return events within 5 s (`MINION_EXECUTOR_SIGNAL_POLL_S` is capped at 4 s so poll plus one engine step fits; pause new steps, or release on memory `critical`). Release is measured to worker exit. CI: 20 trials with the fake engine (`test_governor_reaction.py`); Mac: docs/bench/governor-measurements.md. |
 
@@ -547,7 +547,11 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - Q5. Is step-level duty cycling enough to keep video calls smooth, or do we also need to throttle on
   measured *total* GPU utilization (ioreg `Device Utilization %`)? **Open.** The M3 benchmark ran at
   duty cycle 1.0 with no foreground load, so it does not answer this; decide with the M4 governor
-  measurements (NF-7, NF-8).
+  measurements (NF-7, NF-8). **Still open after the TASK-6.9 NF-7 proxy run**
+  ([docs/bench/m5-foreground-apple-m3-pro.md](bench/m5-foreground-apple-m3-pro.md)): within its NF-8
+  duty, minilm-mlx fails the probe's miss-rate criterion at light (+1.1 pp) and balanced (+1.6 pp)
+  while qwen2.5-0.5b-mlx passes, so duty share alone does not bound foreground tail latency for short,
+  frequent steps; GPU frequency scaling confounds the latency ratios. Follow-up TASK-24.
 - Q6. Should `memory_gb` estimates in `models.yaml` be measured automatically by `minion-executor bench`
   and fed back to the server? **Partly answered by M3:** `bench` measures worker RSS peak and
   per-engine peak; `memory_gb` is still hand-set in `deploy/bench-models.yaml`, and feeding measured

@@ -320,6 +320,35 @@ plus memory, computed by the pure `nf8_verdict`. NF-9 reaction time is asserted 
 engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac with the production poll
 (docs/bench/governor-measurements.md); NF-4 with `bench --cpu-check`.
 
+### Gap 2: how NF-7 is measured
+
+NF-7 (no visible degradation in a call; UI frame drops and app-launch time within 10 % of baseline)
+needs people. We add a **synthetic proxy**, `minion-executor bench --foreground-check` (TASK-6.9), and
+say plainly what it is: it measures **GPU scheduling latency**, not compositor frame drops. A small
+child process (not an inference worker: no task data, no network) issues a fixed fp16 matmul, sized
+to about 5 ms on the idle GPU, on an absolute 30 fps schedule and records completion minus
+*scheduled* start; a frame misses when that exceeds 33.3 ms, and slots skipped because it fell
+behind count as misses. App-launch time is the wall time of N warm relaunches of Calculator via
+`osascript` (includes osascript startup; never done if Calculator is running before any launch, and
+only PIDs that appeared after a launch that completed successfully are signalled, on a failed or
+timed-out launch nothing is signalled; "unavailable" on a TCC/osascript error, and then the row is
+judged on frames only and marked partial; available in one window only is an error row).
+The probe child runs `mlx` outside the Seatbelt sandbox (it handles no task data, its environment
+is scrubbed, and the bench is run by the Mac's owner only).
+
+Per (model, profile, repeat): a fresh worker, warm-up, a **baseline** window (worker loaded, idle),
+then a **loaded** window with the worker running back-to-back batches at the profile budget. Thresholds
+(per profile, median over repeats): frame p95 ratio loaded/baseline <= 1.10, miss-rate increase
+<= 1.0 pp, launch p50 ratio <= 1.10. Only `light` and `balanced` are judged; `full` is informational.
+A loaded window where the worker used < 2 % of the GPU is an error row, so an idle worker cannot pass.
+This is a stand-in for the compositor and a call app; the probe and the worker share one GPU with
+separate command queues. Known limitation (first M3 Pro run): GPU frequency scaling makes the probe
+*faster* when the GPU is busy (about 22 ms/frame idle vs 9.5 ms under `full`), so the latency ratios
+understate contention; the miss rate is the least confounded criterion (TASK-24 makes the proxy
+DVFS-robust). It does not replace the human study
+([docs/usability/nf7-video-call-protocol.md](../usability/nf7-video-call-protocol.md)), which stays
+open. Procedure: docs/bench/governor-measurements.md.
+
 ## Measurements
 
 > M3 Pro (36 GB, macOS 27.0.1), TASK-5.6: docs/bench/m4-governor-apple-m3-pro.{json,md} (NF-8, NF-9 CI) and docs/bench/m4-governor-cpu-apple-m3-pro.json (NF-4). The first per-process run found a pacing bug (mlx-lm async_eval work running during the pacer sleep: qwen balanced 74–76 % at duty 50 %), fixed by quantum pacing; see the .md for the history.
@@ -332,6 +361,7 @@ engine, `FileSignals`, `tests/test_governor_reaction.py`) and measured on a Mac 
 | NF-9 CI, 20 trials, poll 0.25 s: max | 0.433 s (on battery 5 %); p50 0.10–0.25 s per event | pass (< 5 s) |
 | NF-9 Mac, production poll 2 s: memory pressure / user return / thermal+power (FileSignals) | not run on this Mac (needs a person at the keyboard and induced swap); opt-in procedure in docs/bench/governor-measurements.md; bound by poll (≤ 4 s cap) + one step + ack | open (opt-in) |
 | NF-4 control-process CPU, idle / paused (60 s) | 0.134 % / 0.162 % (`bench --cpu-check`); whole `run` process tree (control + worker, `ps` procedure) not recorded here | pass for the control process; whole tree open |
+| NF-7 proxy (TASK-6.9, docs/bench/m5-foreground-apple-m3-pro.{json,md}): 30 fps probe miss-rate delta / p95 ratio / launch ratio, light / balanced (median of 3 paired repeats) | qwen2.5-0.5b-mlx +0.78 / -0.28 pp, 1.01 / 0.89, 0.98 / 0.98; minilm-mlx **+1.11 / +1.56 pp**, 1.04 / 1.04, 1.00 / 1.01. GPU DVFS confound: probe about 22 ms/frame on the idle GPU vs 9.5 ms under `full`, so latency ratios cannot show harm; miss rate is the least confounded figure | qwen pass; minilm **fail** (light, balanced); thresholds kept, follow-up TASK-24; human study open |
 | Q5 (adaptive duty from total GPU utilization): answered by the data above? | Partly: device-wide utilization is 31–39 % on an idle desktop and moves with DVFS, so a policy keyed on total GPU utilization would need a per-process signal (AGX accumulatedGPUTime works) and its own experiment; Q5 stays open | |
 
 ## Consequences
