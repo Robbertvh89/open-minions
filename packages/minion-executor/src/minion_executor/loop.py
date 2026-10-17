@@ -1074,6 +1074,7 @@ class ExecutorLoop:
                     memory_pressure=sig.memory_pressure,
                     hid_idle_s=round(sig.hid_idle_s, 1),
                     taken_at=sig.taken_at,
+                    call_active=sig.call_active,
                 )
                 if sig is not None
                 else None

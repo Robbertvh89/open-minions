@@ -71,7 +71,7 @@ def test_defaults_when_default_file_absent(tmp_path: Path, monkeypatch: pytest.M
         10,
     )
     assert (cfg.allow_on_battery, cfg.min_battery_percent) == (False, 30)
-    assert cfg.on_call == "light"
+    assert cfg.on_call == "auto"
 
 
 def test_explicit_missing_file_is_an_error(tmp_path: Path) -> None:

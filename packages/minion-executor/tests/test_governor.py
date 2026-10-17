@@ -637,11 +637,78 @@ def test_call_drops_to_light_within_one_poll_and_returns_after_hold() -> None:
 
 
 def test_call_never_raises_a_lower_dimension() -> None:
-    cfg = ExecutorConfig(profiles={"light": {"gpu_duty_cycle": 0.5}})
-    g = Gov(cfg, pinned=P.LIGHT, start=True)
-    g.cfg = cfg
+    # balanced with duty below light's 0.30 and a batch size above light's 4: the lower dimension
+    # stays, the higher one is capped; the wire shows plain light
+    cfg = ExecutorConfig(
+        active_profile=P.BALANCED,
+        profiles={"balanced": {"gpu_duty_cycle": 0.2, "max_batch_size": 16}},
+    )
+    g = Gov(cfg, start=True)
+    d0 = g.step(snap())
+    assert d0.budget.gpu_duty_cycle == 0.2 and d0.budget.max_batch_size == 16
+    d = g.step(snap(call_active=True), 1)
+    assert d.budget.gpu_duty_cycle == 0.2
+    assert d.budget.max_batch_size == budget_for(P.LIGHT, TOTAL, g.specs).max_batch_size
+    assert d.profile is P.LIGHT and d.budget.profile is P.LIGHT
+
+
+def test_call_reports_plain_light_on_the_wire() -> None:
+    g = _full_gov()
+    d = g.step(snap(hid_idle_s=IDLE, call_active=True), 2)
+    assert d.profile is P.LIGHT and d.budget.profile is P.LIGHT
+    assert d.budget == budget_for(P.LIGHT, TOTAL)
+
+
+def test_call_during_escalation_hold_clears_candidate_and_restarts_hold() -> None:
+    g = Gov()
+    g.step(snap())
+    g.step(snap(hid_idle_s=IDLE), 1)
+    d = g.step(snap(hid_idle_s=IDLE), 40)
+    assert d.candidate is P.FULL
+    d = g.step(snap(hid_idle_s=IDLE, call_active=True), 1)
+    assert d.candidate is None and d.profile is P.LIGHT
+    g.step(snap(hid_idle_s=IDLE, call_active=False), 30)  # hold restarts after the call
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 29).profile is P.LIGHT
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 31).profile is P.FULL
+
+
+def test_auto_does_not_cap_pinned_or_owner_profiles() -> None:
+    g = Gov(pinned=P.FULL)
     d = g.step(snap(call_active=True))
-    assert d.budget.gpu_duty_cycle == 0.5
+    assert d.profile is P.FULL and d.budget.gpu_duty_cycle == 1.0
+    own = OwnerControl(profile=P.FULL)
+    g = Gov()
+    d = g.step(snap(call_active=True), owner=own)
+    assert d.profile is P.FULL and d.budget.gpu_duty_cycle == 1.0
+
+
+def test_explicit_light_caps_pinned_and_returns_at_once() -> None:
+    g = Gov(ExecutorConfig(on_call="light"), pinned=P.FULL, start=True)
+    assert g.step(snap()).profile is P.FULL
+    d = g.step(snap(call_active=True), 1)
+    assert d.profile is P.LIGHT and d.budget == budget_for(P.LIGHT, TOTAL)
+    d = g.step(snap(call_active=False), 1)  # pinned: no hold
+    assert d.profile is P.FULL and d.budget.gpu_duty_cycle == 1.0
+
+
+def test_failed_read_during_call_keeps_the_cap() -> None:
+    g = _full_gov()
+    g.step(snap(hid_idle_s=IDLE, call_active=True), 2)
+    d = g.step(None, 2)
+    assert d.profile is P.LIGHT and d.budget.gpu_duty_cycle == 0.30
+
+
+def test_signals_unavailable_outranks_in_call() -> None:
+    g = Gov(ExecutorConfig(on_call="pause"))
+    g.step(snap(call_active=True))
+    for _ in range(3):
+        d = g.step(None, 1)
+    assert d.paused_reason is R.SIGNALS_UNAVAILABLE
+
+
+def test_invalid_on_call_rejected() -> None:
+    with pytest.raises(ValueError):
+        ExecutorConfig(on_call="sometimes")
 
 
 def test_call_pause_mode_pauses_with_in_call_then_resumes() -> None:

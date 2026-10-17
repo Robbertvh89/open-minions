@@ -66,5 +66,29 @@ def test_mac_signals_call_active_is_a_bool() -> None:
 
     Real microphone/camera activation is NOT exercised here (not verifiable without starting them).
     """
-    v = MacSignals().read().call_active
-    assert isinstance(v, bool)
+    import time
+
+    m = MacSignals()
+    assert m.read().call_active is None  # the first read only starts the probe (never blocks)
+    for _ in range(50):
+        if m._call.settled():
+            break
+        time.sleep(0.1)
+    assert isinstance(m.read().call_active, bool)
+
+
+def test_mac_signals_hung_call_probe_does_not_block_safety_read() -> None:
+    import threading
+
+    class Hang:
+        def call_active(self) -> bool | None:
+            threading.Event().wait(30)
+            return True
+
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    m = MacSignals()
+    m._call = AsyncCallProbe(Hang(), timeout_s=0.05)
+    for _ in range(3):
+        snap = m.read()
+        assert snap.call_active is None and snap.thermal is not None

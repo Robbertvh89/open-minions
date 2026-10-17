@@ -237,3 +237,18 @@ def test_read_stays_strict_about_types_and_refuses_unknown_versions(state_dir: P
     _raw(state_dir, version=2)
     with pytest.raises(SafeFileError, match="unsupported status format v2"):
         read_status(state_dir)
+
+
+def test_render_in_call_label() -> None:
+    sig = StatusSignals(
+        on_ac=True,
+        battery_percent=None,
+        low_power_mode=False,
+        thermal="nominal",
+        memory_pressure="normal",
+        hid_idle_s=1.0,
+        taken_at=NOW,
+        call_active=True,
+    )
+    out = render(status(held_below_nominal=True, signals=sig), NOW)
+    assert "[light: in call]" in out and "held below nominal" not in out

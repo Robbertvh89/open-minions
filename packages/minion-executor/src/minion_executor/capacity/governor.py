@@ -22,9 +22,12 @@ Rules:
   low_power_mode > low_battery > on_battery > signals_unavailable > in_call.
 - Unusable owner control (present but invalid/unsafe, see `ControlUnusable`) fails closed: paused
   with `control_invalid` and automatic profile selection, at once, until the file is fixed.
-- Call-aware (FR-53, `on_call`). `light` (default): while `call_active` is true every dimension is
-  capped at the light budget at once; afterwards the normal 60 s hold applies. `pause`: paused with
-  `in_call` (lowest priority; resumes after the usual 10 s clear). `ignore`: no effect. An unknown
+- Call-aware (FR-53, `on_call`). `auto` (default) and `light`: while `call_active` is true every
+  dimension is capped at the light budget at once and the decision reports plain `light` (profile
+  and budget.profile), so the wire shows an ordinary drop to light; afterwards the normal 60 s hold
+  applies (owner/pinned choices return at once). `auto` caps only an adaptive profile (not owner or
+  `--profile` chosen); `light` caps those too. `pause`: paused with `in_call` (lowest priority;
+  resumes after the usual 10 s clear; this mode reveals the call). `ignore`: no effect. An unknown
   (`None`) call state counts as not in a call.
 - Memory pressure `warning` -> pause + trim; `critical` -> pause + `release_now` (the in-flight
   subtask is released at once). Paused for `pause_release_after_s` (60 s) -> `pause_expired`.
@@ -282,22 +285,30 @@ def decide(
 
     cur, cand, cand_since = state.profile, state.candidate, state.candidate_since
     target_b = budget_for(target, total_gb, specs)
-    if (
-        cfg.on_call is OnCall.LIGHT
-        and effective is not None
-        and effective.call_active is True
-        and CapacityProfile.LIGHT in specs
-    ):
-        # in a call: cap every dimension at light, whatever chose the profile (invariant 6). The
-        # capped budget is what escalation is compared with, so it applies at once, and after the
-        # call it rises only after the usual hold (an owner/pinned choice returns at once)
-        target_b = _min_budget(target_b, budget_for(CapacityProfile.LIGHT, total_gb, specs))
+    in_force = state.applied
     # budget in force: a held minimum may be below budget_for(cur); a config reload that dropped
     # `cur` still holds against the last applied budget
-    in_force = state.applied
     if in_force is None and cur is not None and cur in specs:
         in_force = budget_for(cur, total_gb, specs)
-    if source in _EXPLICIT or in_force is None or _applies_at_once(target_b, in_force):
+    call_cap = (
+        effective is not None
+        and effective.call_active is True
+        and CapacityProfile.LIGHT in specs
+        and (
+            cfg.on_call is OnCall.LIGHT or (cfg.on_call is OnCall.AUTO and source not in _EXPLICIT)
+        )
+    )
+    if call_cap:
+        # In a call: report plain `light` (an ordinary drop to light on the wire, S-11) with the
+        # per-dimension minimum of light, the target and the budget in force, so a dimension that
+        # is already lower stays lower. Applies at once; the candidate is cleared, so after the
+        # call the usual hold restarts from this capped budget.
+        capped = _min_budget(budget_for(CapacityProfile.LIGHT, total_gb, specs), target_b)
+        if in_force is not None:
+            capped = _min_budget(capped, in_force)
+        applied, cand, cand_since = CapacityProfile.LIGHT, None, None
+        applied_b = capped.model_copy(update={"profile": CapacityProfile.LIGHT})
+    elif source in _EXPLICIT or in_force is None or _applies_at_once(target_b, in_force):
         applied, cand, cand_since, applied_b = target, None, None, target_b
     else:
         if cand != target or cand_since is None:

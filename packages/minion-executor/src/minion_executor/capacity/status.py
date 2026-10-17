@@ -56,6 +56,8 @@ class StatusSignals(_Model):
     memory_pressure: MemPressure
     hid_idle_s: float
     taken_at: AwareDatetime
+    # local file only (0600), never sent to the server; None: unknown or not applicable
+    call_active: bool | None = None
 
 
 class StatusToday(_Model):
@@ -235,7 +237,8 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
     b = st.budget
     lines = [f"profile:   {st.profile.value} (source: {st.profile_source.value})"]
     if st.held_below_nominal:
-        lines[0] += "  [held below nominal]"
+        in_call = st.signals is not None and st.signals.call_active is True
+        lines[0] += "  [light: in call]" if in_call else "  [held below nominal]"
     if st.candidate is not None and st.candidate != st.profile:
         since = st.candidate_since
         wait = f" for {_dur((now - since).total_seconds())}" if since is not None else ""

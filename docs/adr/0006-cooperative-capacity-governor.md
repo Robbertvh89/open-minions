@@ -108,7 +108,7 @@ level-triggered, so the actions are idempotent) and interrupts + releases. A pau
 60 s simply lets the same attempt continue (the worker blocked in its checkpoint, heartbeats kept
 going).
 Reason priority for the single `paused_reason`: `user_paused` > `control_invalid` > `memory_pressure` >
-`thermal` > `low_power_mode` > `low_battery` > `on_battery` > `signals_unavailable`. `control_invalid`
+`thermal` > `low_power_mode` > `low_battery` > `on_battery` > `signals_unavailable` > `in_call`. `control_invalid`
 is the fail-closed pause for a present-but-unusable `control.json` (D11). On battery with
 `allow_on_battery` and an unknown percentage also pauses (`low_battery`). Automatic profile changes
 compare the resolved budgets per dimension (memory, duty, batch, CPU priority): no higher anywhere
@@ -176,7 +176,8 @@ server answers 422 to a new executor's `cpu_priority`.
 
 **D9 Configuration (FR-51/52/53).** `~/.config/minion/executor.toml` (or `MINION_EXECUTOR_CONFIG`),
 parsed with `tomllib` into a Pydantic model with `extra=forbid`: `active_profile`, `idle_profile`,
-`idle_after_min`, `allow_on_battery`, `min_battery_percent`, `[profiles.<name>]` partial overrides,
+`idle_after_min`, `allow_on_battery`, `min_battery_percent`, `on_call` (`auto|light|pause|ignore`,
+default `auto`, D16), `[profiles.<name>]` partial overrides,
 `[profiles.custom]` (all dimensions required), `[[schedule]]` (profile, `HH:MM` start/end, optional
 days). The file is refused (exit 2) if it is not owned by the user or is group/world-writable, or if
 its directory is. The 75 % RAM cap always applies, to every profile including `custom`. Schedules use
@@ -250,19 +251,33 @@ within `MINION_EXECUTOR_STOP_GRACE_S` (30). A second signal or the deadline inte
 **D14 Never block sleep.** No `caffeinate`, no IOPM assertions in product code.
 
 **D16 Call-aware governor (amendment, TASK-6.10, FR-53 optional).** `SignalSnapshot.call_active` is
-true when the default input device (CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere`) or any
-camera (CoreMediaIO, same selector) is running in some process. These are public property reads; they
-open no device, so there is no TCC prompt and no indicator. Device names/UIDs are never read. Any
-failure gives `None` (unknown), treated as not in a call: this is a comfort feature, so unlike the
-safety signals it does not fail closed (and a single unreadable flag cannot pause the Mac).
-`on_call` in `executor.toml`: `light` (default) caps every dimension of the budget at the light
-budget at once, whatever chose the profile (per-dimension minimum with the target, so a lower
-dimension stays lower); `Decision.profile` keeps the chosen name. The cap enters the normal
-escalation comparison, so after the call the budget rises only after the 60 s hold (owner/pinned
-choices return at once). `pause` pauses with `in_call`, the lowest-priority reason, with the usual
-10 s resume hysteresis. `ignore` disables it. The dev signal file accepts an optional `call_active`.
-Privacy: the drop is visible to the server (SPEC S-11). Not verified here: real microphone/camera
-activation (we deliberately do not start them); the live read returns a bool.
+true when a process runs audio input or a camera is running. Microphone: input-only detection via
+CoreAudio process objects (`kAudioHardwarePropertyProcessObjectList` + `kAudioProcessPropertyIsRunningInput`,
+macOS 14+, through ctypes), falling back to the default input device's
+`kAudioDevicePropertyDeviceIsRunningSomewhere` when the process list is unavailable. The fallback has
+false positives (output on a combined headset/USB device, an always-open microphone app). Cameras:
+CoreMediaIO `IsRunningSomewhere` per device. These are public property reads; they open no device, so
+there is no TCC prompt and no indicator. Device names/UIDs are never read. Residual risk: loading
+CoreMediaIO may load admin-installed third-party DAL plug-ins into the control process.
+The probe runs on its own daemon thread (`AsyncCallProbe`), apart from the safety read: one read in
+flight, a 0.5 s hang limit, the latest finished value cached (15 s max age). `MacSignals.read` takes
+the cached value without blocking; pending, hung, failed or stale gives `None` (unknown), treated as
+not in a call, and can never cause `signals_unavailable`. The first read only starts the probe, as does
+the startup probe (which has the same 1.5 s timeout as `read_with_timeout`). `call_probe_unavailable`
+is logged once when the probe yields `None`.
+`on_call` in `executor.toml`: `auto` (default) caps to light only while the profile is adaptive (not
+pinned by `run --profile`, not owner-chosen with `minion-executor profile`); `light` caps always;
+`pause` pauses with `in_call`, the lowest-priority reason, with the usual 10 s resume hysteresis;
+`ignore` disables it. While the cap is in force the decision and budget report plain `light` (numbers:
+per-dimension minimum of light, the target and the budget in force, so a lower dimension stays lower),
+so on the wire it is an ordinary drop to light, not a "full with light numbers" fingerprint. The cap
+applies at once and clears the escalation candidate; afterwards the budget rises after the 60 s hold
+(owner/pinned choices return at once). The dev signal file accepts an optional `call_active`.
+`status.json` (local, 0600) carries `call_active` and renders `[light: in call]`; it is never sent to
+the server.
+Privacy: the drop to light is visible to the server (SPEC S-11). Pinning a profile hides calls under
+`auto`; `pause` mode reveals `paused_reason = in_call`, which operators and owners choose knowingly.
+Not verified here: real microphone/camera activation (we deliberately do not start them).
 
 ### Gap 1: how NF-8 is measured
 

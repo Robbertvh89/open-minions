@@ -20,6 +20,7 @@ import ctypes.util
 import os
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -28,12 +29,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from minion_executor.capacity.safefile import SafeFileError, read_private_file
 
 MAX_SIGNAL_FILE_BYTES = 4096
 DEFAULT_READ_TIMEOUT_S = 1.5
+CALL_PROBE_TIMEOUT_S = 0.5  # a call-state read in flight longer than this counts as hung
+CALL_PROBE_MAX_AGE_S = 15.0  # a cached call state older than this is unknown
+
+log = structlog.get_logger()
 
 
 class Thermal(StrEnum):
@@ -134,6 +140,9 @@ _ELEMENT_MAIN = 0
 _DEFAULT_INPUT_DEVICE = _fourcc(b"dIn ")  # kAudioHardwarePropertyDefaultInputDevice
 _CMIO_DEVICES = _fourcc(b"dev#")  # kCMIOHardwarePropertyDevices
 _IS_RUNNING_SOMEWHERE = _fourcc(b"gone")  # kAudioDevicePropertyDeviceIsRunningSomewhere (== CMIO)
+_PROCESS_OBJECTS = _fourcc(b"prs#")  # kAudioHardwarePropertyProcessObjectList (macOS 14+)
+_PROCESS_RUNNING_INPUT = _fourcc(b"piri")  # kAudioProcessPropertyIsRunningInput (macOS 14+)
+_MAX_PROCESSES = 4096
 _MAX_CAMERAS = 64
 
 
@@ -167,6 +176,15 @@ class _CallProbe:
                 ctypes.c_void_p,
             ]
             fn.restype = ctypes.c_int32
+            size_fn = audio.AudioObjectGetPropertyDataSize
+            size_fn.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(_PropAddress),
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            size_fn.restype = ctypes.c_int32
             self._audio = audio
         except (OSError, AttributeError):
             self._audio = None
@@ -196,23 +214,62 @@ class _CallProbe:
         except (OSError, AttributeError):
             self._cmio = None
 
-    def _mic(self) -> bool | None:
-        if self._audio is None:
+    def _get(self, obj: int, selector: int, buf: Any, size: int | None = None) -> int:
+        addr = _PropAddress(selector, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+        used = ctypes.c_uint32(ctypes.sizeof(buf) if size is None else size)
+        rc: int = self._audio.AudioObjectGetPropertyData(
+            obj, ctypes.byref(addr), 0, None, ctypes.byref(used), ctypes.byref(buf)
+        )
+        return rc
+
+    def _mic_by_process(self) -> bool | None:
+        """Input-only: is any process running audio *input*? (macOS 14+ process objects; output
+        on a headset or USB device does not count.) None: unsupported or unreadable."""
+        addr = _PropAddress(_PROCESS_OBJECTS, _SCOPE_GLOBAL, _ELEMENT_MAIN)
+        size = ctypes.c_uint32(0)
+        if self._audio.AudioObjectGetPropertyDataSize(
+            _SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size)
+        ):
             return None
-        get = self._audio.AudioObjectGetPropertyData
+        n = size.value // ctypes.sizeof(ctypes.c_uint32)
+        if n == 0:
+            return False
+        if n > _MAX_PROCESSES:
+            return None
+        ids = (ctypes.c_uint32 * n)()
+        used = ctypes.c_uint32(ctypes.sizeof(ids))
+        if self._audio.AudioObjectGetPropertyData(
+            _SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(used), ids
+        ):
+            return None
+        readable = 0
+        for obj in ids[: used.value // ctypes.sizeof(ctypes.c_uint32)]:
+            running = ctypes.c_uint32(0)
+            if self._get(obj, _PROCESS_RUNNING_INPUT, running):
+                continue  # a process may vanish between the list and the read
+            readable += 1
+            if running.value != 0:
+                return True
+        return False if readable else None
+
+    def _mic_by_device(self) -> bool | None:
+        """Fallback: "running somewhere" of the default input device. Also true while a combined
+        headset/USB device only plays output, or an always-open microphone app holds it."""
         dev = ctypes.c_uint32(0)
-        size = ctypes.c_uint32(ctypes.sizeof(dev))
-        addr = _PropAddress(_DEFAULT_INPUT_DEVICE, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-        if get(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(dev)):
+        if self._get(_SYSTEM_OBJECT, _DEFAULT_INPUT_DEVICE, dev):
             return None
         if dev.value == 0:  # kAudioObjectUnknown: no input device, so no microphone in use
             return False
         running = ctypes.c_uint32(0)
-        size = ctypes.c_uint32(ctypes.sizeof(running))
-        addr = _PropAddress(_IS_RUNNING_SOMEWHERE, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-        if get(dev.value, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(running)):
+        if self._get(dev.value, _IS_RUNNING_SOMEWHERE, running):
             return None
         return running.value != 0
+
+    def _mic(self) -> bool | None:
+        if self._audio is None:
+            return None
+        by_process = self._mic_by_process()
+        return by_process if by_process is not None else self._mic_by_device()
 
     def _cameras(self) -> list[bool | None]:
         if self._cmio is None:
@@ -232,7 +289,8 @@ class _CallProbe:
             return [None]
         ids = (ctypes.c_uint32 * n)()
         used = ctypes.c_uint32(0)
-        if data_fn(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, size, ctypes.byref(used), ids):
+        data_size = ctypes.c_uint32(ctypes.sizeof(ids))
+        if data_fn(_SYSTEM_OBJECT, ctypes.byref(addr), 0, None, data_size, ctypes.byref(used), ids):
             return [None]
         out: list[bool | None] = []
         for dev in ids[: used.value // ctypes.sizeof(ctypes.c_uint32)]:
@@ -258,6 +316,62 @@ class _CallProbe:
             return None
 
 
+class CallReader(Protocol):
+    def call_active(self) -> bool | None: ...
+
+
+class AsyncCallProbe:
+    """Runs a (possibly slow or wedged) call reader on its own daemon thread, apart from the safety
+    read. At most one read is in flight; `value()` never blocks: it starts a read when none is
+    running and returns the latest finished value. Pending-too-long (hung), failed or stale
+    reads give None (unknown, which the governor treats as not in a call) and can never make the
+    safety signals unavailable."""
+
+    def __init__(
+        self,
+        reader: CallReader,
+        timeout_s: float = CALL_PROBE_TIMEOUT_S,
+        max_age_s: float = CALL_PROBE_MAX_AGE_S,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self._reader = reader
+        self._timeout_s = timeout_s
+        self._max_age_s = max_age_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._started: float | None = None  # start of the read in flight
+        self._value: bool | None = None
+        self._finished: float | None = None
+
+    def _run(self) -> None:
+        try:
+            val = self._reader.call_active()
+        except Exception:  # an optional signal never raises
+            val = None
+        with self._lock:
+            self._value, self._finished, self._started = val, self._clock(), None
+
+    def settled(self) -> bool:
+        """True once a read has finished at least once."""
+        with self._lock:
+            return self._finished is not None
+
+    def value(self) -> bool | None:
+        now = self._clock()
+        with self._lock:
+            if self._started is None:
+                self._started = now
+                try:
+                    threading.Thread(target=self._run, name="call-probe", daemon=True).start()
+                except RuntimeError:  # cannot start a thread: unknown
+                    self._started = None
+            elif now - self._started > self._timeout_s:
+                return None  # hung: the read stays in flight, nothing new is started
+            if self._finished is None or now - self._finished > self._max_age_s:
+                return None
+            return self._value
+
+
 _CF_RETAINED: dict[str, Any] = {"retval": {"already_cfretained": True}}
 
 
@@ -269,7 +383,8 @@ class MacSignals:
     _foundation: Any
     _iokit: dict[str, Any]
     _libc: Any
-    _call: _CallProbe
+    _call: AsyncCallProbe
+    _call_warned: bool
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
@@ -305,7 +420,8 @@ class MacSignals:
         self._quartz = Quartz
         self._foundation = Foundation
         self._iokit = iokit
-        self._call = _CallProbe()
+        self._call = AsyncCallProbe(_CallProbe())
+        self._call_warned = False
 
     def _hid_idle_s(self) -> float:
         q = self._quartz
@@ -351,10 +467,18 @@ class MacSignals:
             raise SignalError("memory pressure unreadable")
         return pressure_from_sysctl(val.value)
 
+    def _call_seen(self) -> bool:
+        """True once a probe read has finished (so None then means unreadable, not just new)."""
+        return self._call.settled()
+
     def read(self) -> SignalSnapshot:
         try:
             # reads run on a bare worker thread with no ambient pool: drain autoreleased objects
             with self._objc.autorelease_pool():
+                call = self._call.value()
+                if call is None and not self._call_warned and self._call_seen():
+                    self._call_warned = True
+                    log.info("call_probe_unavailable")
                 info = self._foundation.NSProcessInfo.processInfo()
                 on_ac, percent = self._power()
                 return SignalSnapshot(
@@ -365,7 +489,7 @@ class MacSignals:
                     thermal=thermal_from_ns(int(info.thermalState())),
                     memory_pressure=self._memory_pressure(),
                     taken_at=_now(),
-                    call_active=self._call.call_active(),
+                    call_active=call,
                 )
         except SignalError:
             raise
@@ -432,8 +556,25 @@ def default_source(fake_signals: Path | None) -> SignalSource:
         src = MacSignals()
     else:
         return NullSignals()
-    src.read()
+    _startup_read(src)
     return src
+
+
+def _startup_read(src: SignalSource, timeout_s: float = DEFAULT_READ_TIMEOUT_S) -> None:
+    """The startup probe read, on a daemon thread with the same timeout as `read_with_timeout`."""
+    fut: concurrent.futures.Future[SignalSnapshot] = concurrent.futures.Future()
+
+    def _run() -> None:
+        try:
+            fut.set_result(src.read())
+        except BaseException as exc:
+            fut.set_exception(exc)
+
+    threading.Thread(target=_run, name="signal-startup", daemon=True).start()
+    try:
+        fut.result(timeout_s)
+    except concurrent.futures.TimeoutError:
+        raise SignalError("signal read timed out") from None
 
 
 # At most one read in flight per source: a wedged framework call must not pile up threads, and its
