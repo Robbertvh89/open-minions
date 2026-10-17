@@ -3,10 +3,10 @@ id: TASK-6.8
 title: >-
   M5.8 launchd packaging: minion-executor service install/uninstall/status
   (BLOCKING ExitTimeOut)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 05:14'
+updated_date: '2026-10-17 05:23'
 labels:
   - M5
 dependencies: []

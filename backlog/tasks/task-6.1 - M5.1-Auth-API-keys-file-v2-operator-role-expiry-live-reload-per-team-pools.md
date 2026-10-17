@@ -3,9 +3,10 @@ id: TASK-6.1
 title: >-
   M5.1 Auth: API keys file v2 (operator role, expiry, live reload, per-team
   pools)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:32'
+updated_date: '2026-10-17 05:23'
 labels:
   - M5
 dependencies: []
