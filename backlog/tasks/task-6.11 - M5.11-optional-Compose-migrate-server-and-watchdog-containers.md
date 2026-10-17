@@ -4,7 +4,7 @@ title: 'M5.11 (optional) Compose: migrate, server and watchdog containers'
 status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 17:54'
+updated_date: '2026-10-17 18:08'
 labels:
   - M5
 dependencies:
@@ -23,8 +23,6 @@ deploy/Dockerfile (one image, non-root, read-only rootfs); compose services migr
 <!-- AC:BEGIN -->
 - [ ] #1 docker compose -f deploy/compose.yml --profile app up -d brings up postgres, s3, grafana, migrate (one-shot), server and watchdog; server healthy and a fake-engine task completes end to end
 <!-- AC:END -->
-
-
 
 ## Implementation Plan
 
@@ -87,3 +85,15 @@ One non-root, read-only-rootfs image (deploy/Dockerfile) built with uv from the 
 - The CI integration build adds ~1-2 min. Acceptable; the `docker` skip keeps local runs without Docker green.
 - No deviation from the paper, so no ADR. The watchdog health file is additive config only.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Docs (step 4): CLAUDE.md Commands (--profile app up line, MINION_SERVER_HOST_PORT, MINION_SECRETS_DIR, migrate replaces manual alembic in container mode, native flow kept); docs/ARCHITECTURE.md §6 (container hardening, startup order, loopback port, secrets mount, Linux chown 10001 note, macOS Docker Desktop as is) and §2.3 (MINION_WATCHDOG_HEALTH_FILE); docs/SPEC.md FR-41 status line; .env.example (watchdog health file, compose vars read from deploy/.env). Key files: CLAUDE.md, .env.example, docs/ARCHITECTURE.md, docs/SPEC.md. Open: compose healthcheck for watchdog reads MINION_WATCHDOG_INTERVAL_S from container env, which compose never sets.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Compose app profile (migrate, server, watchdog) documented in CLAUDE.md, ARCHITECTURE §2.3/§6, SPEC FR-41 and .env.example. Watchdog health file (MINION_WATCHDOG_HEALTH_FILE) documented. Known gap: the watchdog healthcheck interval is hardcoded to the 60 s default in the container.
+<!-- SECTION:FINAL_SUMMARY:END -->

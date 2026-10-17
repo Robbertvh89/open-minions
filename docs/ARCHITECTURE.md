@@ -274,6 +274,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 - Replicas are safe: candidates are locked with `SKIP LOCKED` and re-checked (§3.4, ADR-0008).
 - Scans heartbeat rows (executors *currently running* work) **[paper]**, plus acquirements older than
   `MINION_MAX_LEASE_S` **[ours]**.
+- Liveness for container healthchecks: `MINION_WATCHDOG_HEALTH_FILE` (default unset = no file). The file is created (0600) at start and touched after each successful tick; a failed tick does not touch it. A write error is logged (class only) and never stops the loop.
 
 ### 2.4 minion-common
 Pydantic request/response models, enums (`TaskType`, `SubtaskStatus`, ...), typed `httpx` API client
@@ -517,8 +518,14 @@ Local dev uses SeaweedFS instead of MinIO (MinIO community images are no longer 
 
 | Env | Topology |
 |---|---|
-| Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana, server, watchdog; executor runs natively on the Mac (needs Metal — not in Docker) |
+| Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana; with `--profile app` also migrate, server, watchdog (one image, `deploy/Dockerfile`); executor runs natively on the Mac (needs Metal — not in Docker) |
 | Prod | Managed Postgres (separate dev/prod DBs **[paper]**), S3, ≥2 server replicas, 1–2 watchdogs, Grafana. One deployment per team/org for isolation **[paper]** |
+
+Container hardening (`deploy/Dockerfile`, `x-minion-app` in `compose.yml`): one image for migrate, server and watchdog, built from the lockfile with `uv sync --locked --no-dev`; base images pinned by digest; the executor and pyobjc are not installed. Runs as uid/gid 10001 (non-root), `read_only` rootfs with `tmpfs` `/tmp`, `cap_drop: [ALL]`, `no-new-privileges`. No `.env` or secrets in any layer (`.dockerignore` is an allow-list). The watchdog liveness file lives in the `/tmp` tmpfs (`MINION_WATCHDOG_HEALTH_FILE`, touched at start and after each successful tick, so it goes stale while DB errors back off).
+
+Startup order with `docker compose -f deploy/compose.yml --profile app up -d --build`: postgres (healthy via `pg_isready -h 127.0.0.1`, TCP because the socket-only initdb server would report healthy too early) → `migrate` (one-shot `alembic upgrade head`, replaces the manual `uv run alembic upgrade head` in container mode) and `s3-init` → `server` (healthy on `/healthz`) and `watchdog` (healthy while its health file is newer than 3 × interval + 30 s). Only the `app` profile starts these; without it the infra-only flow runs the server natively.
+
+Ports: the server is published on `127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}` only. Secrets: `${MINION_SECRETS_DIR:-./secrets}` (default `deploy/secrets/`, git-ignored) is mounted read-only at `/run/minion-secrets` and holds `api-keys.yaml`; the directory is mounted, not the file, so the atomic temp+rename reload reaches the container. `MINION_UI_SESSION_SECRET` and `MINION_METRICS_TOKEN` come from the environment (compose reads the shell or `deploy/.env`), never from the image. Ownership: `auth.py` refuses a keys file or directory not owned by root or the server uid. On macOS Docker Desktop the bind mount shows the file as owned by the container uid, so it works as is. On Linux hosts, `chown -R 10001:10001` the secrets directory and file (the keys file must not be group/world-writable).
 
 Executor distribution: `uv tool install`, a generated per-user `launchd` plist (`minion-executor service install`, ADR-0011; no code signing), config in `~/.config/minion/executor.toml`,
 token in macOS Keychain.
