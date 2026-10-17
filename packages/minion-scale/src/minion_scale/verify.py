@@ -159,7 +159,9 @@ async def verify(
 ) -> VerifyReport:
     """Run every check for `team`. Without `s3` the object-count check is skipped (and said so)."""
     p = {"team": team}
-    async with sm() as session:
+    # One snapshot for every query: a run that is still finishing cannot make the checks disagree.
+    async with sm() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         counts_row = (await session.execute(_COUNTS, p)).one()
         succ = list((await session.execute(_SUCCESS_ATTEMPTS, p)).all())
         pending = list((await session.execute(_NON_TERMINAL, p)).all())

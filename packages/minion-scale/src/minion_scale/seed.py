@@ -10,6 +10,7 @@ tokens are issued through the admin path and kept in memory or a 0600 file, neve
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING
 from minion_common.schemas import SLUG_PATTERN
 from minion_server.admin import issue_executor_token
 from minion_server.models_registry import load_models
+from minion_server.repositories import executors as executors_repo
 from pydantic import BaseModel, SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -28,6 +30,8 @@ DEFAULT_TEAM = "scale"
 DEFAULT_PROJECT = "load"
 DEFAULT_PREFIX = "scale"
 DEFAULT_MODEL = "scale-fake"
+DEFAULT_POOL = "scale"  # tasks and issued tokens live in their own pool: no real executor matches
+CREATED_BY = "minion-scale"
 RECORDS_PER_SUBTASK = 10
 MAX_TASKS = 99_999
 MAX_SUBTASKS_PER_TASK = 1_000_000
@@ -54,6 +58,7 @@ class SeedSpec:
     model_id: str = DEFAULT_MODEL
     records: int = RECORDS_PER_SUBTASK
     max_attempts: int = 5
+    pool: str = DEFAULT_POOL
 
     def validate(self) -> None:
         if not 1 <= self.tasks <= MAX_TASKS:
@@ -62,7 +67,7 @@ class SeedSpec:
             raise SeedError(f"subtasks must be 1..{MAX_SUBTASKS_PER_TASK}")
         if self.records < 1 or self.max_attempts < 1:
             raise SeedError("records and max_attempts must be >= 1")
-        for what, value in (("team", self.team), ("project", self.project)):
+        for what, value in (("team", self.team), ("project", self.project), ("pool", self.pool)):
             if not _SLUG.fullmatch(value):
                 raise SeedError(f"{what} must be a lowercase slug")
         if not _SLUG.fullmatch(f"{self.prefix}-{self.tasks:05d}"):
@@ -109,13 +114,13 @@ _INSERT_TASKS = text(
     )
     INSERT INTO minion_task (
         team, project, task_name, type, model_id, engine, model_memory_gb, input_uri, output_uri,
-        records_per_subtask, max_attempts, status, total_subtasks, created_by
+        records_per_subtask, max_attempts, allowed_pool, status, total_subtasks, created_by
     )
     SELECT p.team, p.project, p.prefix || '-' || lpad(g::text, 5, '0'), p.type, p.model_id,
            p.engine, :memory_gb, p.input_uri,
            's3://' || p.bucket || '/outputs/' || p.team || '/' || p.prefix || '-'
                || lpad(g::text, 5, '0') || '/',
-           :records, :max_attempts, 'PENDING', :subtasks, 'minion-scale'
+           :records, :max_attempts, CAST(:pool AS text), 'PENDING', :subtasks, 'minion-scale'
     FROM p CROSS JOIN generate_series(1, :tasks) AS g
     """
 )
@@ -127,7 +132,7 @@ _INSERT_SUBTASKS = text(
         byte_start, byte_end, first_record, record_count
     )
     SELECT t.team, t.project, t.task_name, s, 'PENDING', 0, t.max_attempts,
-           CAST(:input_key AS text), 0, :input_bytes, s * :records, :records
+           CAST(:input_key AS text), 0, :input_bytes, CAST(s AS bigint) * :records, :records
     FROM minion_task t
     CROSS JOIN generate_series(0, :subtasks - 1) AS s
     WHERE t.team = CAST(:team AS text) AND t.project = CAST(:project AS text)
@@ -157,6 +162,7 @@ async def seed_queue(sm: Sm, spec: SeedSpec, *, input_bytes: int) -> SeedResult:
                 "bucket": spec.bucket,
                 "records": spec.records,
                 "max_attempts": spec.max_attempts,
+                "pool": spec.pool,
                 "subtasks": spec.subtasks,
                 "tasks": spec.tasks,
             },
@@ -183,7 +189,7 @@ class ExecutorCred(BaseModel):
 
 
 async def seed_executors(
-    sm: Sm, n: int, *, pool: str = "default", ttl_days: int = 1, owner_prefix: str = "scale"
+    sm: Sm, n: int, *, pool: str = DEFAULT_POOL, ttl_days: int = 1, owner_prefix: str = "scale"
 ) -> list[ExecutorCred]:
     """Issue `n` executor tokens through the admin path (only hashes reach the database)."""
     if n < 1:
@@ -195,6 +201,16 @@ async def seed_executors(
         )
         out.append(ExecutorCred(executor_id=eid, token=SecretStr(token)))
     return out
+
+
+async def revoke_executors(sm: Sm, executor_ids: list[str]) -> int:
+    """Revoke the given executors (operator path, like `revoke-executor-token`); returns how many
+    existed."""
+    n = 0
+    async with sm() as session, session.begin():
+        for eid in executor_ids:
+            n += int(await executors_repo.revoke(session, uuid.UUID(eid)))
+    return n
 
 
 def write_tokens_file(path: Path, creds: list[ExecutorCred]) -> None:

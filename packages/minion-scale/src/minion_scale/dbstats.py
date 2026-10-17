@@ -4,6 +4,8 @@
 as a before/after delta per statement; `pg_stat_user_tables` for the minion tables (dead tuples,
 autovacuum); `pg_stat_activity` connection counts. Query texts from pg_stat_statements are the
 normalized statements (parameters already replaced by `$n`), truncated; never row values.
+Only this role's SELECT/INSERT/UPDATE/DELETE/WITH statements are read (not other roles' or utility
+statements such as SET/CREATE/ALTER, which can carry literal values).
 Docker stats only look at containers of one named compose project.
 """
 
@@ -28,6 +30,8 @@ _STATEMENTS = text(
            left(regexp_replace(query, '\\s+', ' ', 'g'), :chars)
     FROM pg_stat_statements
     WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND userid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+      AND query ~* '^\\s*(select|insert|update|delete|with)\\y'
       AND query NOT LIKE '%pg_stat_%'
     """
 )

@@ -3,6 +3,11 @@
 The statements are the repository's own builders (candidate, stale-heartbeat and over-lease
 scans), compiled with inline literals so they can be EXPLAINed. Plans contain table and index
 names and row estimates, no row values.
+
+Plan kind: literals are inlined, so PostgreSQL plans each statement for those exact values (a
+"custom" plan). The server runs the same statements through asyncpg prepared statements, which
+switch to a generic plan after five executions; a generic plan can differ (the report says
+`plan_kind: custom`). Compare with the `pg_stat_statements` timings of the real run.
 """
 
 import re
@@ -16,6 +21,8 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 Sm = async_sessionmaker[AsyncSession]
+
+DEFAULT_POOL = "scale"  # the pool `seed` issues tokens into (and allows tasks in)
 
 EXPLAIN = "EXPLAIN (ANALYZE, BUFFERS) "
 STATEMENT_TIMEOUT_MS = 60_000
@@ -40,7 +47,7 @@ def hot_statements(
     heartbeat_timeout_s: float,
     max_lease_s: float,
     memory_gb: float = 8.0,
-    pool: str = "default",
+    pool: str = DEFAULT_POOL,
     limit: int = 500,
 ) -> dict[str, Select[Any]]:
     common: dict[str, Any] = {
@@ -83,5 +90,12 @@ async def explain_all(sm: Sm, statements: dict[str, Select[Any]]) -> list[dict[s
             await session.execute(text("SET TRANSACTION READ ONLY"))
             rows = await session.execute(text(EXPLAIN + sql.replace(":", r"\:")))
             lines = [r[0] for r in rows.all()]
-        out.append({"name": name, "sql": " ".join(sql.split()), **parse_plan(lines)})
+        out.append(
+            {
+                "name": name,
+                "plan_kind": "custom",
+                "sql": " ".join(sql.split()),
+                **parse_plan(lines),
+            }
+        )
     return out

@@ -12,6 +12,7 @@ from minion_scale.seed import (
     count_remaining,
     input_object,
     read_tokens_file,
+    revoke_executors,
     seed_executors,
     seed_queue,
     upload_input,
@@ -100,8 +101,13 @@ async def test_seed_creates_pending_queue_and_hashed_tokens(sm: Sm, s3: S3Env) -
     assert await _one(sm, "SELECT count(DISTINCT input_object_key) FROM minion_subtask") == 1
     assert await _one(sm, "SELECT min(byte_end) FROM minion_subtask") == size
     assert await count_remaining(sm) == 21
+    assert await _one(sm, "SELECT count(*) FROM minion_task WHERE allowed_pool = 'scale'") == 3
     creds = await seed_executors(sm, 4)
     assert len({c.executor_id for c in creds}) == 4
+    assert await _one(sm, "SELECT count(*) FROM minion_executor WHERE pool = 'scale'") == 4
+    assert await _one(sm, "SELECT max(first_record) FROM minion_subtask") == 6 * spec.records
+    assert await revoke_executors(sm, [c.executor_id for c in creds]) == 4
+    assert await _one(sm, "SELECT count(*) FROM minion_executor WHERE status = 'REVOKED'") == 4
     tokens = [c.token.get_secret_value() for c in creds]
     hashes = {r[0] for r in await _rows(sm, "SELECT token_hash FROM minion_executor")}
     assert hashes.isdisjoint(tokens)
