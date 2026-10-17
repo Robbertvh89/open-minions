@@ -41,7 +41,6 @@ minion_server/
   api/
     tasks.py           # user endpoints
     executor.py        # executor endpoints
-    ui.py              # server-rendered UI (Jinja2 + htmx) — minimal
   services/
     task_service.py    # validation, create, cancel, status derivation
     splitter.py        # async partitioning of input into subtasks
@@ -49,6 +48,12 @@ minion_server/
     presign.py         # S3 presigned URL generation
   repositories/        # ALL SQL lives here
   auth.py              # user API keys (file), executor tokens (DB)
+  ui/                  # server-rendered web UI (ADR-0010)
+    routes.py          # /ui: login, logout, task list, task detail (+ ?partial=1 htmx fragment)
+    session.py         # stateless HMAC session cookie, CSRF tokens, Origin check
+    headers.py         # CSP / nosniff / no-referrer / no-store middleware for /ui
+    templates/         # Jinja2, autoescape on, no inline scripts
+    static/            # htmx.min.js (vendored 2.0.4, sha256 pinned in a test), ui.css
   settings.py          # ServerSettings: MINION_* env vars (pydantic-settings)
   admin.py             # minion-server-admin CLI (typer)
 ```
@@ -532,4 +537,5 @@ token in macOS Keychain.
 - [ADR-0007](adr/0007-api-keys-config-file.md): User API keys from a config file, not a DB table — **Accepted**
 - [ADR-0008](adr/0008-fault-tolerance-reclaim-and-cancel.md): Fault-tolerance deviations: SKIP LOCKED reclaim, budget, lazy cancel, max lease, executor interrupt — **Accepted**
 - [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
+- [ADR-0010](adr/0010-web-ui-session-auth.md): Web UI login with an API key and a stateless session cookie; OIDC via reverse proxy — **Accepted**
 - ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*

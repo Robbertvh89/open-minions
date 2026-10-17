@@ -346,7 +346,7 @@ changed while being read), or `SPLIT_ATTEMPTS_EXHAUSTED` (claimed `MINION_SPLIT_
 without finishing).
 
 **Implementation status.** TASK-2.2 implements `POST /tasks`, `GET /tasks/{team}/{project}/{task_name}`,
-and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). TASK-6.4 adds the task list, subtasks and fleet read endpoints; all §6.1 rows are implemented.
+and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and the watchdog reclaim; TASK-3.2 adds `cancel` and the `minion-watchdog` process (reclaim, `MINION_MAX_LEASE_S` hard cap, cancel sweep). TASK-6.4 adds the task list, subtasks and fleet read endpoints; all §6.1 rows are implemented. TASK-6.6 adds the server-rendered web UI under `/ui` (not part of the REST API; ADR-0010): `GET /ui/login`, `POST /ui/login`, `POST /ui/logout`, `GET /ui/tasks`, `GET /ui/tasks/{team}/{project}/{task_name}` (with `?partial=1` for the 5 s htmx refresh) and `GET /ui/static/{htmx.min.js,ui.css}`. Every `/ui` route is `404` unless `MINION_UI_SESSION_SECRET` is set; `POST`s answer `403` on a bad CSRF token or foreign `Origin`.
 
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
@@ -474,6 +474,18 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   reveals that the owner went idle (away from the keyboard), and back. Owners who do not want that pin a
   profile (`run --profile` or `minion-executor profile <name>`). Keyboard idle time itself is never sent.
 - S-12. Read-endpoint cost **[ours]**. `GET /tasks` aggregates subtask counts per page and `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter. Per-status counters on `minion_task` are tracked in the backlog.
+- S-13. Web UI **[ours]** (ADR-0010). Off (`404`) unless `MINION_UI_SESSION_SECRET` (>= 32 bytes) is set. Login with
+  a user API key (checked like an API request; wrong, expired and removed keys all get one `401` page; the
+  key is never logged or echoed) sets `minion_session`, a stateless cookie HMAC-SHA256-signed over the key
+  hash, issue and expiry time (`MINION_UI_SESSION_TTL_S`, default 8 h): `HttpOnly`, `SameSite=Strict`,
+  `Path=/ui`, `Secure` unless the request host is loopback. Each request re-resolves the key in the live
+  keys file, so a removed or expired key ends the session within `MINION_API_KEYS_RELOAD_S`; team scoping is
+  the REST API's (`403` for another team's task). Every `POST` (login included) needs a matching `Origin`
+  (else `Referer`) and a per-session HMAC CSRF token, else `403`. All `/ui` responses carry `Content-Security-Policy:
+  default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. Templates are
+  autoescaped: executor-supplied strings (owner, hostname, task `error`) are rendered inert. Rate-limit
+  `POST /ui/login` at the reverse proxy; the proxy must keep the `Host` header. OIDC/SSO: put a proxy in front.
 
 ## 9. Non-functional requirements
 
@@ -497,7 +509,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - Q1. Server-side splitting: pre-split into separate S3 objects, or byte ranges on the original? (ARCH §5.2 proposes byte ranges.)
 - Q2. Priority/fairness across teams beyond FIFO + preference?
 - Q3. Should executors batch-acquire (N subtasks) to cut round-trips for very small subtasks?
-- Q4. Auth for the web UI (SSO/OIDC vs API keys only)?
+- Q4. Auth for the web UI (SSO/OIDC vs API keys only)? **Answered (ADR-0010):** API-key login with a stateless HMAC session cookie; OIDC/SSO is left to a reverse proxy.
 - Q5. Is step-level duty cycling enough to keep video calls smooth, or do we also need to throttle on
   measured *total* GPU utilization (ioreg `Device Utilization %`)? **Open.** The M3 benchmark ran at
   duty cycle 1.0 with no foreground load, so it does not answer this; decide with the M4 governor

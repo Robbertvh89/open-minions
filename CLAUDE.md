@@ -55,7 +55,7 @@ uv sync --package minion-executor --extra mlx --extra hf  # optional engines: ml
 cp .env.example .env                      # dev settings (database_url is required)
 docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana
 uv run alembic upgrade head               # migrate
-uv run minion-server                      # API on :8080
+uv run minion-server                      # API on :8080; web UI at /ui when MINION_UI_SESSION_SECRET (>= 32 bytes) is set, else /ui is 404; login with a user API key, session cookie MINION_UI_SESSION_TTL_S (8 h), ADR-0010
 uv run minion-watchdog                    # reclaim + cancel sweep; DB only, no S3
 uv run minion-server-admin --help          # operator CLI (typer); subcommands below
 uv run minion-server-admin generate-api-key --name <who> --teams a,b [--operator] [--expires-days N]  # prints key once + keys-file entry (file is live-reloaded, MINION_API_KEYS_RELOAD_S)
