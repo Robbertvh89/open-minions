@@ -1,9 +1,10 @@
 ---
 id: TASK-6.4
 title: 'M5.4 Read API: task list, subtasks, fleet (FR-7, FR-42)'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 06:51'
 labels:
   - M5
 dependencies:
