@@ -1,0 +1,13 @@
+# Allow-list: nothing enters the build context unless re-included here (no .env, no secrets).
+*
+!pyproject.toml
+!uv.lock
+!alembic.ini
+!migrations/
+!packages/*/pyproject.toml
+!packages/minion-common/src/
+!packages/minion-server/src/
+!packages/minion-watchdog/src/
+!deploy/models.yaml
+**/__pycache__
+**/*.pyc

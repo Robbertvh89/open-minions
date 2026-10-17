@@ -1,11 +1,36 @@
 # DEV ONLY - DO NOT DEPLOY. Default passwords, no TLS, ports on loopback; see docs/ARCHITECTURE.md §7.
 # Local development stack. The executor runs natively on macOS (needs Metal), not in Docker.
-# Server and watchdog services are added in a later milestone (ARCHITECTURE §6).
+# migrate/server/watchdog run from one hardened image (deploy/Dockerfile) behind the `app` profile:
+#   docker compose -f deploy/compose.yml --profile app up -d --build
+# Without the profile only the infrastructure starts (run `uv run minion-server` natively).
+# Compose variables (MINION_SERVER_HOST_PORT, MINION_SECRETS_DIR, MINION_UI_SESSION_SECRET, ...) come
+# from the shell or deploy/.env (the compose project directory is deploy/), not the repo-root .env.
+# Before `--profile app up`: create ${MINION_SECRETS_DIR:-./secrets}/api-keys.yaml (see
+# `minion-server-admin generate-api-key`), else Docker creates an empty directory for the mount.
+# Images are pinned by digest (tag kept for readability); bump both together.
 name: open-minions
+
+x-minion-app: &minion-app
+  image: open-minions-app:dev
+  profiles: [app]
+  read_only: true
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+
+x-minion-app-env: &minion-app-env
+  # Explicit, no env_file: the repo-root .env points at localhost. Dev-only defaults, as above.
+  MINION_DATABASE_URL: postgresql+asyncpg://minion:minion@postgres:5432/minion
+  MINION_S3_ENDPOINT_URL: http://s3:9000
+  # What presigned URLs carry; the host-side executor reaches S3 on the loopback port.
+  MINION_S3_PUBLIC_ENDPOINT_URL: http://localhost:${MINION_S3_PORT:-9000}
+  MINION_S3_ACCESS_KEY: minion
+  MINION_S3_SECRET_KEY: minion-secret
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_USER: minion
       POSTGRES_PASSWORD: minion
@@ -18,14 +43,15 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U minion -d minion"]
+      # TCP, not the socket: during first-volume initdb the temporary server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U minion -d minion"]
       interval: 2s
       timeout: 3s
       retries: 30
 
   s3:
     # S3-compatible object store (SeaweedFS). MinIO no longer publishes community images.
-    image: chrislusf/seaweedfs:4.05
+    image: chrislusf/seaweedfs:4.05@sha256:295b8f7bd2209afdf5b3fe5bc3a2ca8a72747365fe111b4de412511aa9f56e99
     command: server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -volume.max=200 -master.volumePreallocate=false
     ports:
       - "127.0.0.1:${MINION_S3_PORT:-9000}:9000"
@@ -39,7 +65,7 @@ services:
       retries: 60
 
   s3-init:
-    image: amazon/aws-cli:2.22.0
+    image: amazon/aws-cli:2.22.0@sha256:de60944022e023e69cc50e3cfc91766d0788c27586b01fb77806bc435b484a35
     depends_on:
       s3:
         condition: service_healthy
@@ -54,7 +80,7 @@ services:
       "
 
   grafana:
-    image: grafana/grafana:11.3.0
+    image: grafana/grafana:11.3.0@sha256:a0f881232a6fb71a0554a47d0fe2203b6888fe77f4cefb7ea62bed7eb54e13c3
     environment:
       GF_SECURITY_ADMIN_USER: admin
       # Dev ergonomics: override with GF_SECURITY_ADMIN_PASSWORD in .env; the 'admin' default is dev only.
@@ -71,6 +97,81 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  migrate:
+    <<: *minion-app
+    # Only migrate builds; server and watchdog reuse the image it tags (pull_policy: never).
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      <<: *minion-app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  server:
+    <<: *minion-app
+    command: ["minion-server"]
+    restart: unless-stopped
+    pull_policy: never
+    environment:
+      <<: *minion-app-env
+      MINION_API_KEYS_FILE: /run/minion-secrets/api-keys.yaml
+      # Empty = web UI off (ADR-0010).
+      MINION_UI_SESSION_SECRET: ${MINION_UI_SESSION_SECRET:-}
+      MINION_UI_ALLOWED_HOSTS: ${MINION_UI_ALLOWED_HOSTS:-}
+      MINION_METRICS_TOKEN: ${MINION_METRICS_TOKEN:-}
+    ports:
+      - "127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}:8080"
+    volumes:
+      # The directory, not the file: an atomic temp+rename replace does not reach a file bind mount.
+      # api-keys.yaml must exist before `up` (else Docker creates an empty directory in its place).
+      # Linux hosts: chown the directory and file to 10001, or keep them root:root (file 0644,
+      # directory 0755); auth.py refuses any other owner or a group/world-writable file.
+      - ${MINION_SECRETS_DIR:-./secrets}:/run/minion-secrets:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      s3-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  watchdog:
+    <<: *minion-app
+    command: ["minion-watchdog"]
+    restart: unless-stopped
+    pull_policy: never
+    environment:
+      <<: *minion-app-env
+      MINION_WATCHDOG_HEALTH_FILE: /tmp/watchdog.health
+      # The healthcheck reads the same value, so its staleness threshold follows the loop interval.
+      MINION_WATCHDOG_INTERVAL_S: ${MINION_WATCHDOG_INTERVAL_S:-60}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Healthy while the file is newer than 3 * interval + 30 s (a failed tick does not touch it).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,time; sys.exit(time.time() - os.stat('/tmp/watchdog.health').st_mtime > 3 * float(os.environ.get('MINION_WATCHDOG_INTERVAL_S', '60')) + 30)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   pgdata:

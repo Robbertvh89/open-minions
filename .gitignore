@@ -23,4 +23,5 @@ build/
 
 # Local data
 deploy/data/
+deploy/secrets/
 *.jsonl.tmp

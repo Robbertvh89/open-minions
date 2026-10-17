@@ -7,6 +7,7 @@ Safe to run as several replicas (SKIP LOCKED + re-check per row).
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 
 import structlog
@@ -85,16 +86,32 @@ async def _tick_or_stop(
     return True
 
 
+def touch_health_file(path: str | None) -> None:
+    """Create (0600) or bump the liveness file. Never raises: health must not stop the loop."""
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.utime(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        log.error("watchdog_health_file_failed", error_class=type(exc).__name__)
+
+
 async def run_watchdog(
     sm: async_sessionmaker[AsyncSession], cfg: WatchdogSettings, stop: asyncio.Event
 ) -> None:
     """Loop until `stop` is set. Errors are logged (class only) and retried with backoff."""
     failures = 0
+    touch_health_file(cfg.watchdog_health_file)
     while not stop.is_set():
         try:
             if not await _tick_or_stop(sm, cfg, stop):
                 break
             failures = 0
+            touch_health_file(cfg.watchdog_health_file)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
