@@ -1057,6 +1057,64 @@ async def test_upload_refreshes_url_synchronously_when_expiring(tmp_path: Path) 
     assert urls == ["https://s3.test/out?sig=2"]
 
 
+async def test_oversize_output_fails_non_retryable_without_upload(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [], max_output_bytes=10)
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    assert client.kinds() == ["acquire", "fail", "acquire"]
+    req = client.calls[1][1]
+    assert (req.code, req.retryable) == ("OUTPUT_TOO_LARGE", False)
+    assert s3.puts == []
+
+
+async def test_output_exactly_at_cap_is_uploaded(tmp_path: Path) -> None:
+    probe = FakeS3()
+    await make_loop(FakeClient([assignment()]), FakeWorker(), probe, tmp_path, []).run(
+        max_subtasks=1
+    )
+    size = len(probe.puts[0])
+    a = assignment()
+    a.max_output_bytes = size  # the server cap, tighter than the (default) local one
+    for local in (size, 4 << 30):
+        client, s3 = FakeClient([a.model_copy(update={"acquirement_id": uuid.uuid4()})]), FakeS3()
+        loop = make_loop(client, FakeWorker(), s3, tmp_path, [], max_output_bytes=local)
+        assert await loop.run(max_subtasks=1) == 1
+        assert "complete" in client.kinds() and len(s3.puts) == 1
+
+
+async def test_server_cap_in_assignment_tightens_local_cap(tmp_path: Path) -> None:
+    a = assignment()
+    a.max_output_bytes = 10
+    client, s3 = FakeClient([a]), FakeS3()
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])  # local cap is the 4 GiB default
+    client.on_empty = loop.stop
+    assert await loop.run() == 0
+    req = next(r for k, r in client.calls if k == "fail")
+    assert (req.code, req.retryable) == ("OUTPUT_TOO_LARGE", False)
+    assert s3.puts == []
+
+
+async def test_complete_422_output_too_large_is_non_retryable_fail(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.complete_excs = [ApiError(422, "OUTPUT_TOO_LARGE", "big")]
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    req = next(r for k, r in client.calls if k == "fail")
+    assert (req.code, req.retryable) == ("OUTPUT_TOO_LARGE", False)
+
+
+async def test_complete_other_422_stays_retryable_rejected(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    client.complete_excs = [ApiError(422, "OUTPUT_MISSING", "x")]
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    req = next(r for k, r in client.calls if k == "fail")
+    assert (req.code, req.retryable) == ("COMPLETE_REJECTED", True)
+
+
 async def test_pre_upload_refresh_cancel_releases_without_upload(tmp_path: Path) -> None:
     a = assignment()
     a.expires_at = datetime.now(UTC)

@@ -57,6 +57,13 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
+class _ResponseModel(_Model):
+    """Parsed by the executor from server responses: unknown fields are ignored so a newer
+    server can add fields without breaking older executors (requests stay strict)."""
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
 class Budget(_Model):
     """Capacity budget the Mac's owner granted (SPEC §4.6)."""
 
@@ -236,7 +243,7 @@ class RegisterRequest(_Model):
     budget: Budget
 
 
-class RegisterResponse(_Model):
+class RegisterResponse(_ResponseModel):
     executor_id: uuid.UUID
 
 
@@ -253,7 +260,7 @@ class AcquireRequest(_Model):
     budget: Budget
 
 
-class Assignment(_Model):
+class Assignment(_ResponseModel):
     acquirement_id: uuid.UUID
     attempt: int = Field(ge=1)
     team: str
@@ -269,6 +276,8 @@ class Assignment(_Model):
     record_count: int = Field(ge=1)
     output_url: str
     expires_at: AwareDatetime
+    # The server's output size cap; the executor enforces min(local, this). Absent on old servers.
+    max_output_bytes: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_range(self) -> Self:
@@ -326,10 +335,22 @@ class PresenceRequest(_Model):
     paused_reason: str | None = Field(default=None, max_length=64, pattern=r"^[a-z_]+$")
 
 
-class HeartbeatResponse(_Model):
+class HeartbeatResponse(_ResponseModel):
     cancel: bool
     output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
     expires_at: AwareDatetime
+
+
+# Cap on one subtask output object (server promotion check and executor pre-upload check).
+MAX_OUTPUT_BYTES_DEFAULT = 4 << 30
+MAX_OUTPUT_BYTES_LIMIT = 5 << 30  # S3 single-PUT / CopyObject ceiling (5 GiB)
+
+
+def range_header(start: int, end_exclusive: int) -> str:
+    """HTTP `Range` value for bytes `[start, end_exclusive)`; shared by signer and client."""
+    if start < 0 or end_exclusive <= start:
+        raise ValueError("range must satisfy 0 <= start < end")
+    return f"bytes={start}-{end_exclusive - 1}"
 
 
 ERROR_CODE_PATTERN = r"^[A-Z0-9_]{1,64}$"

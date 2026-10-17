@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
+from minion_common.schemas import range_header
 
 from minion_server.settings import ServerSettings
 
@@ -66,15 +67,24 @@ class S3Storage:
     def bucket(self) -> str:
         return self._bucket
 
-    def _presign(self, op: str, key: str, ttl_s: int | None) -> str:
+    def _presign(
+        self, op: str, key: str, ttl_s: int | None, byte_range: tuple[int, int] | None = None
+    ) -> str:
         ttl = min(ttl_s or self._ttl, self._ttl)
-        url: str = self._signer.generate_presigned_url(
-            op, Params={"Bucket": self._bucket, "Key": key}, ExpiresIn=ttl
-        )
+        params: dict[str, str] = {"Bucket": self._bucket, "Key": key}
+        if byte_range is not None:
+            # `Range` becomes a signed header: S3 rejects (403) a request that omits it or sends
+            # another value, so the URL only reads this subtask's slice of the input object.
+            start, end = byte_range
+            params["Range"] = range_header(start, end)
+        url: str = self._signer.generate_presigned_url(op, Params=params, ExpiresIn=ttl)
         return url
 
-    async def presign_get(self, key: str, ttl_s: int | None = None) -> str:
-        return await asyncio.to_thread(self._presign, "get_object", key, ttl_s)
+    async def presign_get(
+        self, key: str, ttl_s: int | None = None, byte_range: tuple[int, int] | None = None
+    ) -> str:
+        """Presigned GET. `byte_range` is `[start, end)` (like the subtask's byte_start/end)."""
+        return await asyncio.to_thread(self._presign, "get_object", key, ttl_s, byte_range)
 
     async def presign_put(self, key: str, ttl_s: int | None = None) -> str:
         return await asyncio.to_thread(self._presign, "put_object", key, ttl_s)
@@ -129,6 +139,10 @@ class S3Storage:
             return ObjectStat(int(resp["ContentLength"]), str(resp.get("ETag", "")))
 
         return await asyncio.to_thread(_head)
+
+    async def delete(self, key: str) -> None:
+        """Delete one object (idempotent in S3: a missing key is not an error)."""
+        await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
 
     async def head(self, key: str) -> int | None:
         """Object size in bytes, or None if it does not exist."""

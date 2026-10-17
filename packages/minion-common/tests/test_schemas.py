@@ -343,3 +343,53 @@ def test_error_body_accepts_server_style_codes(code: str) -> None:
 def test_error_body_rejects_odd_codes(code: str) -> None:
     with pytest.raises(ValidationError):
         ErrorBody(code=code, message="m")
+
+
+def test_assignment_and_responses_ignore_unknown_fields() -> None:
+    from minion_common.schemas import Assignment, HeartbeatResponse, RegisterResponse
+
+    hb = HeartbeatResponse.model_validate(
+        {"cancel": False, "output_url": "https://s/o", "expires_at": "2030-01-01T00:00:00Z", "x": 1}
+    )
+    assert hb.cancel is False
+    eid = str(uuid.uuid4())
+    assert str(RegisterResponse.model_validate({"executor_id": eid, "new": 1}).executor_id) == eid
+    model = {
+        "model_id": "fake",
+        "type": "embedding",
+        "engine": "fake",
+        "ref": "fake",
+        "memory_gb": 1,
+    }
+    a = Assignment.model_validate(
+        {
+            "acquirement_id": eid, "attempt": 1, "team": "t", "project": "p", "task_name": "n",
+            "subtask_id": 0, "type": "embedding", "model": model, "input_url": "https://s/i",
+            "byte_start": 0, "byte_end": 5, "record_count": 1, "output_url": "https://s/o",
+            "expires_at": "2030-01-01T00:00:00Z", "future_field": {"a": 1},
+        }
+    )  # fmt: skip
+    assert a.byte_end == 5 and not hasattr(a, "future_field")
+
+
+def test_requests_stay_strict() -> None:
+    from minion_common.schemas import CompleteRequest
+
+    with pytest.raises(ValidationError):
+        bad = {"record_count": 1, "byte_size": 1, "sha256": "0" * 64, "x": 1}
+        CompleteRequest.model_validate(bad)
+
+
+def test_range_header_is_inclusive_end() -> None:
+    from minion_common.schemas import range_header
+
+    assert range_header(0, 1) == "bytes=0-0"
+    assert range_header(10, 21) == "bytes=10-20"
+
+
+@pytest.mark.parametrize("start,end", [(5, 5), (6, 5), (-1, 5)])
+def test_range_header_rejects_empty_or_inverted(start: int, end: int) -> None:
+    from minion_common.schemas import range_header
+
+    with pytest.raises(ValueError):
+        range_header(start, end)
