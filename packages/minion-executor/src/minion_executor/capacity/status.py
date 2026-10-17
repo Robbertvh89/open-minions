@@ -56,6 +56,8 @@ class StatusSignals(_Model):
     memory_pressure: MemPressure
     hid_idle_s: float
     taken_at: AwareDatetime
+    # local file only (0600), never sent to the server; None: unknown or not applicable
+    call_active: bool | None = None
 
 
 class StatusToday(_Model):
@@ -76,6 +78,7 @@ class StatusFile(_Model):
     profile_source: ProfileSource
     budget: Budget
     held_below_nominal: bool
+    call_capped: bool = False  # local file only: the in-call cap to light applied
     candidate: CapacityProfile | None = None
     candidate_since: AwareDatetime | None = None
     paused_reason: PausedReason | None = None
@@ -234,7 +237,9 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
     now = now or datetime.now(UTC)
     b = st.budget
     lines = [f"profile:   {st.profile.value} (source: {st.profile_source.value})"]
-    if st.held_below_nominal:
+    if st.call_capped:
+        lines[0] += "  [light: in call]"
+    elif st.held_below_nominal:
         lines[0] += "  [held below nominal]"
     if st.candidate is not None and st.candidate != st.profile:
         since = st.candidate_since

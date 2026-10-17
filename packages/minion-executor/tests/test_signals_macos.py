@@ -30,7 +30,7 @@ def test_mac_signals_read_plausible_values() -> None:
 
 
 def test_mac_signals_repeat_reads_and_default_source() -> None:
-    src = default_source(None)
+    src = default_source(None, want_call=True)
     assert isinstance(src, MacSignals)
     for _ in range(20):
         src.read()
@@ -59,3 +59,53 @@ def test_mac_signals_reads_do_not_leak_core_foundation_objects() -> None:
     t.join()
     assert fp["before"] > 0
     assert fp["after"] - fp["before"] < 1_000_000
+
+
+def test_mac_signals_call_active_is_a_bool() -> None:
+    """Reads the CoreAudio / CoreMediaIO flags; opens no device, so no permission prompt.
+
+    Real microphone/camera activation is NOT exercised here (not verifiable without starting them).
+    """
+    m = MacSignals()
+    assert isinstance(m.read().call_active, bool)  # waits for the fresh read (<= 0.5 s)
+    assert m._call is not None and m._call.settled()
+
+
+def test_mac_signals_skips_the_call_probe_when_not_wanted() -> None:
+    m = MacSignals()
+    m.set_want_call_state(False)
+    assert m.read().call_active is None
+    assert m._call is None  # no thread, no CoreMediaIO load
+    m.set_want_call_state(True)
+    assert isinstance(m.read().call_active, bool)
+    assert m._call is not None
+
+
+def test_mac_signals_hung_call_probe_does_not_block_safety_read() -> None:
+    import threading
+
+    class Hang:
+        def call_active(self) -> bool | None:
+            threading.Event().wait(30)
+            return True
+
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    m = MacSignals()
+    m._call = AsyncCallProbe(Hang(), timeout_s=0.05)
+    import time
+
+    for i in range(3):
+        t0 = time.monotonic()
+        snap = m.read()
+        took = time.monotonic() - t0
+        assert snap.call_active is None and snap.thermal is not None
+        if i > 0:  # a probe already hung is not waited for
+            assert took < 0.04, took
+
+
+def test_default_source_with_want_call_false_builds_no_probe() -> None:
+    src = default_source(None, want_call=False)
+    assert isinstance(src, MacSignals)
+    assert src._call is None and src.read().call_active is None
+    assert src._call is None

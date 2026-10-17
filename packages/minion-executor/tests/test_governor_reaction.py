@@ -1,6 +1,6 @@
-"""NF-9 on CI (TASK-5.6): the governor reacts to memory pressure, thermal stress, power and user
-return within 5 s. 20 trials in total with the fake engine in a real worker subprocess and
-`FileSignals` steered through a file; no server, no GPU.
+"""NF-9 on CI (TASK-5.6): the governor reacts to memory pressure, thermal stress, power, user
+return and a call starting within 5 s. 24 trials in total with the fake engine in a real worker
+subprocess and `FileSignals` steered through a file; no server, no GPU.
 
 Reaction time = from the moment the signal file holds the new value to the moment the worker has
 acknowledged the matching control message (paused, or the new duty) or, for memory `critical`, to
@@ -34,14 +34,14 @@ from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
 from minion_executor.capacity.governor import GovernorTiming
 from minion_executor.capacity.profiles import budget_for
 from minion_executor.capacity.runtime import GovernorRuntime
-from minion_executor.capacity.signals import FileSignals
+from minion_executor.capacity.signals import AsyncCallProbe, FileSignals, SignalSnapshot
 from minion_executor.loop import ExecutorLoop, _Verdict
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 
 NF9_LIMIT_S = 5.0
 POLL_S = 0.25
 STEP_S = 0.1
-TRIALS_PER_EVENT = 4  # 5 events x 4 = 20 trials
+TRIALS_PER_EVENT = 4  # 6 events x 4 = 24 trials
 TOTAL_GB = 32.0
 MODEL = ModelEntry(
     model_id="fake-c",
@@ -80,6 +80,15 @@ EVENTS = [
         "user-return",
         {**QUIET, "hid_idle_s": 3600.0},
         QUIET,
+        None,
+        expect_duty=budget_for(CapacityProfile.LIGHT, TOTAL_GB).gpu_duty_cycle,
+        run_profile=CapacityProfile.FULL,
+    ),
+    # a call starts while the owner is away on the full profile: duty falls to light (FR-53)
+    Event(
+        "call-start",
+        {**QUIET, "hid_idle_s": 3600.0},
+        {**QUIET, "hid_idle_s": 3600.0, "call_active": True},
         None,
         expect_duty=budget_for(CapacityProfile.LIGHT, TOTAL_GB).gpu_duty_cycle,
         run_profile=CapacityProfile.FULL,
@@ -128,6 +137,27 @@ def write_signals(path: Path, fields: dict[str, Any]) -> None:
     tmp.replace(path)  # atomic: the reader never sees half a file
 
 
+class ProbedFileSignals(FileSignals):
+    """FileSignals whose `call_active` comes through an `AsyncCallProbe` reading the same file, so
+    the production async call path is under the NF-9 bound."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self._probe = AsyncCallProbe(_FileCall(path))
+
+    def read(self) -> SignalSnapshot:
+        snap = super().read()
+        return snap.__class__(**{**snap.__dict__, "call_active": self._probe.value()})
+
+
+class _FileCall:
+    def __init__(self, path: Path) -> None:
+        self._inner = FileSignals(path)
+
+    def call_active(self) -> bool | None:
+        return self._inner.read().call_active
+
+
 def budget_of(profile: CapacityProfile) -> Budget:
     return budget_for(profile, TOTAL_GB)
 
@@ -143,7 +173,7 @@ async def one_trial(tmp: Path, ev: Event, rng: random.Random) -> float:
     write_signals(sig, ev.before)
     cfg = ExecutorConfig()
     gov = GovernorRuntime(
-        FileSignals(sig),
+        ProbedFileSignals(sig),
         cfg,
         resolve_profiles(cfg),
         state_dir=state,

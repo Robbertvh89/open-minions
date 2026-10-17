@@ -364,3 +364,30 @@ async def test_recovery_from_staleness_wakes_waiters_even_with_an_unchanged_deci
     assert gov.decision.paused_reason is R.SIGNALS_UNAVAILABLE
     await gov.poll_once()  # same decision key as before, but what `decision` returns changed
     assert gov.version == v + 1 and gov.decision.paused_reason is None
+
+
+@pytest.mark.parametrize(
+    ("on_call", "wanted"), [("auto", True), ("light", True), ("pause", True), ("ignore", False)]
+)
+async def test_runtime_tells_the_source_whether_call_state_is_wanted(
+    state_dir: Path, on_call: str, wanted: bool
+) -> None:
+    class WantSource(Source):
+        want: bool | None = None
+
+        def set_want_call_state(self, want: bool) -> None:
+            self.want = want
+
+    src, clock = WantSource(), Clock()
+    cfg = ExecutorConfig(on_call=on_call)
+    gov = GovernorRuntime(
+        src,
+        cfg,
+        resolve_profiles(cfg),
+        state_dir=state_dir,
+        total_gb=TOTAL,
+        clock=clock,
+        local_clock=lambda: clock().replace(tzinfo=None),
+    )
+    await gov.poll_once()
+    assert src.want is wanted

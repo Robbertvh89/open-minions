@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -99,7 +100,7 @@ def test_file_signals_need_dev(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(SignalError, match="DEV"):
         FileSignals(_file(tmp_path, {}))
     with pytest.raises(SignalError, match="DEV"):
-        default_source(_file(tmp_path, {}))
+        default_source(_file(tmp_path, {}), want_call=True)
 
 
 def test_file_signals_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,7 +109,7 @@ def test_file_signals_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
         tmp_path,
         {"hid_idle_s": 700, "on_ac": False, "battery_percent": 20, "thermal": "serious"},
     )
-    s = default_source(p).read()
+    s = default_source(p, want_call=True).read()
     assert (s.hid_idle_s, s.on_ac, s.battery_percent, s.thermal) == (
         700.0,
         False,
@@ -189,7 +190,7 @@ def test_default_source_off_mac_is_null(monkeypatch: pytest.MonkeyPatch) -> None
     import minion_executor.capacity.signals as sg
 
     monkeypatch.setattr(sg, "sys", types.SimpleNamespace(platform="linux"))
-    assert isinstance(default_source(None), NullSignals)
+    assert isinstance(default_source(None, want_call=True), NullSignals)
 
 
 async def test_hung_source_is_bounded_to_one_extra_thread_and_to_thread_still_works() -> None:
@@ -259,3 +260,155 @@ async def test_unhashable_or_non_weakrefable_source_raises_signal_error_before_t
     with pytest.raises(SignalError, match="weak"):
         await read_with_timeout(Slotted())
     assert threading.active_count() <= before
+
+
+def test_call_from_flags() -> None:
+    from minion_executor.capacity.signals import call_from_flags
+
+    assert call_from_flags(False, []) is False
+    assert call_from_flags(False, [False, False]) is False
+    assert call_from_flags(True, [None]) is True
+    assert call_from_flags(False, [True]) is True
+    assert call_from_flags(None, [False]) is None
+    assert call_from_flags(False, [None]) is None
+
+
+def test_file_signals_call_active_optional(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    p = tmp_path / "s.json"
+    p.write_text("{}")
+    p.chmod(0o600)
+    assert FileSignals(p).read().call_active is None
+    p.write_text('{"call_active": true}')
+    assert FileSignals(p).read().call_active is True
+
+
+def test_null_signals_call_unknown() -> None:
+    assert NullSignals().read().call_active is None
+
+
+class _Reader:
+    def __init__(self, gate: threading.Event | None = None, value: bool | None = True) -> None:
+        self.gate, self.value, self.calls = gate, value, 0
+
+    def call_active(self) -> bool | None:
+        self.calls += 1
+        if self.gate is not None:
+            self.gate.wait(30)
+        return self.value
+
+
+def test_async_call_probe_hung_reader_never_blocks_and_starts_one_thread() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    gate = threading.Event()
+    r = _Reader(gate)
+    t = [0.0]
+    p = AsyncCallProbe(r, timeout_s=0.5, clock=lambda: t[0])
+    try:
+        for _ in range(5):
+            t[0] += 1.0
+            assert p.value() is None
+        assert r.calls == 1  # one read in flight, nothing piles up
+        assert p.settled() is False
+    finally:
+        gate.set()
+
+
+def test_async_call_probe_change_is_visible_on_the_very_next_call() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    r = _Reader(value=False)
+    p = AsyncCallProbe(r)
+    assert p.value() is False  # waits for the fresh read, not "the previous value"
+    r.value = True
+    assert p.value() is True
+    r.value = False
+    assert p.value() is False
+    assert p.read() == (False, True)
+
+
+def test_async_call_probe_stale_value_is_unknown() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    r = _Reader(value=True)
+    t = [0.0]
+    p = AsyncCallProbe(r, timeout_s=0.05, clock=lambda: t[0])
+    assert p.value() is True
+    r.gate = threading.Event()  # the next read hangs
+    t[0] += 100.0
+    assert p.value() is None  # never the stale True
+    r.gate.set()
+
+
+def test_async_call_probe_failing_reader_is_unknown() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    class Boom:
+        def call_active(self) -> bool | None:
+            raise OSError("x")
+
+    p = AsyncCallProbe(Boom())
+    assert p.value() is None
+    assert p.settled() is True
+
+
+def test_call_probe_none_when_frameworks_fail_to_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    from minion_executor.capacity import signals
+
+    def boom(*a: object, **k: object) -> object:
+        raise OSError("no framework")
+
+    monkeypatch.setattr("ctypes.CDLL", boom)
+    assert signals._CallProbe().call_active() is None
+
+
+def test_call_probe_none_when_calls_return_nonzero() -> None:
+    from minion_executor.capacity import signals
+
+    class Fn:
+        def __call__(self, *a: object) -> int:
+            return -1
+
+    class Lib:
+        AudioObjectGetPropertyData = Fn()
+        AudioObjectGetPropertyDataSize = Fn()
+        CMIOObjectGetPropertyData = Fn()
+        CMIOObjectGetPropertyDataSize = Fn()
+
+    probe = signals._CallProbe.__new__(signals._CallProbe)
+    probe._audio = Lib()
+    probe._cmio = Lib()
+    assert probe.call_active() is None
+
+
+def test_startup_read_times_out_on_a_hung_source() -> None:
+    from minion_executor.capacity.signals import SignalError, _startup_read
+
+    gate = threading.Event()
+
+    class Hung:
+        def read(self) -> SignalSnapshot:
+            gate.wait(30)
+            raise AssertionError
+
+    try:
+        with pytest.raises(SignalError, match="timed out"):
+            _startup_read(Hung(), 0.05)
+    finally:
+        gate.set()
+
+
+def test_async_call_probe_recovers_after_a_hung_read_finishes() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    gate = threading.Event()
+    r = _Reader(gate, value=True)
+    p = AsyncCallProbe(r, timeout_s=0.1)
+    assert p.value() is None  # hung
+    gate.set()  # the hung read finishes
+    deadline = time.monotonic() + 5
+    while not p.settled() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert p.value() is True  # a new read started and returned its value
+    assert r.calls == 2
