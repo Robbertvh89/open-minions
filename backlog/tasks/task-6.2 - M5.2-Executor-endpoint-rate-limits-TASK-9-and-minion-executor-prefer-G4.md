@@ -1,10 +1,10 @@
 ---
 id: TASK-6.2
 title: M5.2 Executor endpoint rate limits (TASK-9) and minion-executor prefer (G4)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 11:46'
+updated_date: '2026-10-17 12:33'
 labels:
   - M5
 dependencies: []
@@ -20,12 +20,14 @@ minion_server/ratelimit.py: in-memory min interval per (executor_id, op), monoto
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Presence/acquire/register faster than their interval get 429 with Retry-After and no DB write
-- [ ] #2 Executor survives 429 on acquire/register/presence and waits at least Retry-After
-- [ ] #3 Concurrent-acquire race test and existing e2e stay green
-- [ ] #4 prefer sets and clears the preference; integration: next acquire prefers that team
-- [ ] #5 The limiter never replaces the ON CONFLICT acquisition (invariant 2)
+- [x] #1 Presence/acquire/register faster than their interval get 429 with Retry-After and no DB write
+- [x] #2 Executor survives 429 on acquire/register/presence and waits at least Retry-After
+- [x] #3 Concurrent-acquire race test and existing e2e stay green
+- [x] #4 prefer sets and clears the preference; integration: next acquire prefers that team
+- [x] #5 The limiter never replaces the ON CONFLICT acquisition (invariant 2)
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 
