@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Self
 
-from minion_common.schemas import MAX_OUTPUT_BYTES_DEFAULT
+from minion_common.schemas import MAX_OUTPUT_BYTES_DEFAULT, MAX_OUTPUT_BYTES_LIMIT
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -69,7 +69,7 @@ class ExecutorSettings(BaseSettings):
 
     # Refuse to upload an output file above this many bytes (fail OUTPUT_TOO_LARGE, not retryable).
     # Keep it <= the server's MINION_MAX_OUTPUT_BYTES, which never promotes a larger object.
-    max_output_bytes: int = Field(default=MAX_OUTPUT_BYTES_DEFAULT, gt=0)
+    max_output_bytes: int = Field(default=MAX_OUTPUT_BYTES_DEFAULT, gt=0, le=MAX_OUTPUT_BYTES_LIMIT)
 
     # Governor timers (ADR-0006 D5/D6). The defaults are the spec; any other value is a test knob
     # and needs MINION_EXECUTOR_DEV=1.

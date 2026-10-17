@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
+from minion_common.schemas import range_header
 
 from minion_executor.runners.base import Record
 
@@ -28,7 +29,7 @@ async def download_range(
 ) -> int:
     """GET bytes [start, end_exclusive) of the presigned `url` into `dest`; return bytes written."""
     expected = end_exclusive - start
-    headers = {"Range": f"bytes={start}-{end_exclusive - 1}"}
+    headers = {"Range": range_header(start, end_exclusive)}
     written = 0
     async with http.stream("GET", url, headers=headers) as resp:
         resp.raise_for_status()

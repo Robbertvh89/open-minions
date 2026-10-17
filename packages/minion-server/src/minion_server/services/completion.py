@@ -3,6 +3,7 @@
 import re
 import uuid
 
+import structlog
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
 from minion_common.schemas import CompleteRequest, FailRequest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,16 @@ from minion_server.storage import PreconditionFailedError, S3Storage
 from minion_server.uris import parse_s3_uri
 
 STALE_MESSAGE = "acquirement is not current"
+
+log = structlog.get_logger()
+
+
+async def _discard_oversize(storage: S3Storage, key: str) -> None:
+    """Best effort: drop a rejected oversize attempt object. Never logs the key (SPEC §8)."""
+    try:
+        await storage.delete(key)
+    except Exception as exc:
+        log.warning("oversize_attempt_delete_failed", error=type(exc).__name__)
 
 
 def derive_task_status(total: int, succeeded: int, failed: int) -> TaskStatus | None:
@@ -66,6 +77,7 @@ async def complete(
         if stat is None:
             raise api_error(422, "OUTPUT_MISSING", "attempt output object not found")
         if stat.size > settings.max_output_bytes:  # HEAD only; never promoted or downloaded
+            await _discard_oversize(storage, src)
             raise api_error(422, "OUTPUT_TOO_LARGE", "attempt output exceeds the size cap")
         if stat.size != req.byte_size:
             raise api_error(422, "OUTPUT_SIZE_MISMATCH", "attempt output size differs")

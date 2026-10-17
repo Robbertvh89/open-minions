@@ -159,6 +159,21 @@ async def test_complete_validation_keeps_ownership(
 
 
 @pytest.mark.integration
+async def test_attempt_exactly_at_cap_is_promoted(http: tuple[AsyncClient, Any], s3: S3Env) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    app.state.settings = app.state.settings.model_copy(update={"max_output_bytes": len(DATA)})
+    await seed_task(sm, "edge", 1, team="cmp9")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp9", tok, p.executor_id)
+    assert a["max_output_bytes"] == len(DATA)
+    _, dst = _put(s3, "cmp9", "edge", a)
+    url = f"{BASE}/subtasks/{a['acquirement_id']}/complete"
+    assert (await c.post(url, json=_complete_body(), headers=_auth(tok))).status_code == 204
+    assert _exists(s3, dst)
+
+
+@pytest.mark.integration
 async def test_oversize_attempt_never_promoted_then_failed(
     http: tuple[AsyncClient, Any], s3: S3Env
 ) -> None:
@@ -172,13 +187,14 @@ async def test_oversize_attempt_never_promoted_then_failed(
     for n in (1, 2):
         a = await _own(c, sm, "cmp8", tok, p.executor_id)
         assert a["attempt"] == n
-        _, dst = _put(s3, "cmp8", "big", a)
+        src, dst = _put(s3, "cmp8", "big", a)
         base = f"{BASE}/subtasks/{a['acquirement_id']}"
         r = await c.post(f"{base}/complete", json=_complete_body(), headers=_auth(tok))
         assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_TOO_LARGE")
         assert not _exists(s3, dst)  # never promoted
-        # the executor reports a rejected complete as a retryable fail (COMPLETE_REJECTED)
-        body = FAIL | {"code": "COMPLETE_REJECTED"}
+        assert not _exists(s3, src)  # the rejected attempt object is deleted
+        # the executor reports the rejected complete as a retryable fail
+        body = FAIL | {"code": "OUTPUT_TOO_LARGE"}
         assert (await c.post(f"{base}/fail", json=body, headers=_auth(tok))).status_code == 204
     row = await _one(sm, "SELECT status FROM minion_subtask WHERE task_name='big'")
     assert row[0] == "FAILED"

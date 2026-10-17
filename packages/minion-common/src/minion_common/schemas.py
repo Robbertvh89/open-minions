@@ -269,6 +269,8 @@ class Assignment(_Model):
     record_count: int = Field(ge=1)
     output_url: str
     expires_at: AwareDatetime
+    # The server's output size cap; the executor enforces min(local, this). Absent on old servers.
+    max_output_bytes: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_range(self) -> Self:
@@ -334,6 +336,16 @@ class HeartbeatResponse(_Model):
 
 # Cap on one subtask output object (server promotion check and executor pre-upload check).
 MAX_OUTPUT_BYTES_DEFAULT = 4 << 30
+MAX_OUTPUT_BYTES_LIMIT = 5 << 30  # S3 single-PUT / CopyObject ceiling (5 GiB)
+
+
+def range_header(start: int, end_exclusive: int) -> str:
+    """HTTP `Range` value for bytes `[start, end_exclusive)`; shared by signer and client."""
+    if start < 0 or end_exclusive <= start:
+        raise ValueError("range must satisfy 0 <= start < end")
+    return f"bytes={start}-{end_exclusive - 1}"
+
+
 ERROR_CODE_PATTERN = r"^[A-Z0-9_]{1,64}$"
 
 

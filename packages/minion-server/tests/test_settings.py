@@ -77,3 +77,12 @@ def test_overlapping_prefixes_refused(
     monkeypatch.setenv("MINION_S3_OUTPUT_PREFIXES", outputs)
     with pytest.raises(ValidationError, match="overlap"):
         ServerSettings(_env_file=None)
+
+
+def test_max_output_bytes_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_MAX_OUTPUT_BYTES", str(5 << 30))
+    assert ServerSettings(_env_file=None).max_output_bytes == 5 << 30
+    for bad in ("0", str((5 << 30) + 1)):
+        monkeypatch.setenv("MINION_MAX_OUTPUT_BYTES", bad)
+        with pytest.raises(ValidationError):
+            ServerSettings(_env_file=None)

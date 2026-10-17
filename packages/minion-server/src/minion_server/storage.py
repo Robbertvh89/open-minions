@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
+from minion_common.schemas import range_header
 
 from minion_server.settings import ServerSettings
 
@@ -75,7 +76,7 @@ class S3Storage:
             # `Range` becomes a signed header: S3 rejects (403) a request that omits it or sends
             # another value, so the URL only reads this subtask's slice of the input object.
             start, end = byte_range
-            params["Range"] = f"bytes={start}-{end - 1}"
+            params["Range"] = range_header(start, end)
         url: str = self._signer.generate_presigned_url(op, Params=params, ExpiresIn=ttl)
         return url
 
@@ -138,6 +139,10 @@ class S3Storage:
             return ObjectStat(int(resp["ContentLength"]), str(resp.get("ETag", "")))
 
         return await asyncio.to_thread(_head)
+
+    async def delete(self, key: str) -> None:
+        """Delete one object (idempotent in S3: a missing key is not an error)."""
+        await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
 
     async def head(self, key: str) -> int | None:
         """Object size in bytes, or None if it does not exist."""

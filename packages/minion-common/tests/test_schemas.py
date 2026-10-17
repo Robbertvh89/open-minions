@@ -343,3 +343,18 @@ def test_error_body_accepts_server_style_codes(code: str) -> None:
 def test_error_body_rejects_odd_codes(code: str) -> None:
     with pytest.raises(ValidationError):
         ErrorBody(code=code, message="m")
+
+
+def test_range_header_is_inclusive_end() -> None:
+    from minion_common.schemas import range_header
+
+    assert range_header(0, 1) == "bytes=0-0"
+    assert range_header(10, 21) == "bytes=10-20"
+
+
+@pytest.mark.parametrize("start,end", [(5, 5), (6, 5), (-1, 5)])
+def test_range_header_rejects_empty_or_inverted(start: int, end: int) -> None:
+    from minion_common.schemas import range_header
+
+    with pytest.raises(ValueError):
+        range_header(start, end)

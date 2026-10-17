@@ -1,5 +1,6 @@
 import urllib.error
 import urllib.request
+import warnings
 from urllib.parse import urlsplit
 
 import pytest
@@ -79,11 +80,8 @@ async def test_presign_get_signs_the_range_header() -> None:
 
 @pytest.mark.integration
 async def test_signed_range_get_enforced_by_s3(s3: S3Env) -> None:
-    """206 for the signed range; another or no Range is refused (403), or SeaweedFS ignores it.
-
-    SeaweedFS may not enforce signed headers; the unit test above proves `range` is in
-    SignedHeaders, which real S3 enforces. This test records which behavior the dev store has.
-    """
+    """The signed-range GET returns exactly the slice; other requests are refused (403) where the
+    backend enforces SigV4 signed headers (AWS S3, MinIO). SeaweedFS may not: then warn loudly."""
     cfg = ServerSettings(
         database_url=SecretStr("postgresql+asyncpg://x@h/db"),
         s3_endpoint_url=s3.endpoint_url,
@@ -96,20 +94,28 @@ async def test_signed_range_get_enforced_by_s3(s3: S3Env) -> None:
     s3.client.put_object(Bucket=s3.bucket, Key="rng/in", Body=b"0123456789abcdef")
     url = await st.presign_get("rng/in", None, (4, 10))
 
-    def get(rng: str | None) -> tuple[int, bytes]:
-        req = urllib.request.Request(url, headers={"Range": rng} if rng else {})  # noqa: S310
+    def get(headers: dict[str, str]) -> tuple[int, bytes]:
+        req = urllib.request.Request(url, headers=headers)  # noqa: S310
         try:
             with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310
                 return r.status, bytes(r.read())
         except urllib.error.HTTPError as exc:
             return exc.code, b""
 
-    assert get("bytes=4-9") == (206, b"456789")
-    other, none = get("bytes=0-3")[0], get(None)[0]
-    if other == 403:
-        assert none == 403  # enforced as on AWS S3
-    else:  # SeaweedFS does not verify signed Range; record it rather than hide it
-        assert (other, none) in {(206, 200), (206, 206), (200, 200)}
+    assert get({"Range": "bytes=4-9"}) == (206, b"456789")
+    observed = (
+        get({"Range": "bytes=0-3"})[0],
+        get({})[0],
+        get({"Range": "bytes=4-9", "If-Range": '"bogus"'})[0],
+    )  # (other range, no range, extra If-Range header)
+    if observed != (403, 403, 403):
+        msg = (
+            "backend does NOT enforce the signed Range / signed-header set "
+            f"(other range, no range, extra If-Range) = {observed}; input GET URLs are not "
+            "slice-scoped on this store (SPEC S-2)"
+        )
+        print(f"WARNING: {msg}")
+        warnings.warn(msg, stacklevel=1)
 
 
 @pytest.mark.integration

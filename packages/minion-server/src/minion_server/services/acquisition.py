@@ -105,4 +105,5 @@ async def _assignment(
         record_count=c.record_count,
         output_url=output_url,
         expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
+        max_output_bytes=settings.max_output_bytes,
     )

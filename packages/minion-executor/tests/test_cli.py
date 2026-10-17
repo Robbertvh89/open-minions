@@ -251,6 +251,49 @@ def test_auto_advertises_probed_engines(monkeypatch: pytest.MonkeyPatch) -> None
     assert seen["engines"] == [Engine.MLX, Engine.HF]
 
 
+def test_max_output_bytes_env_reaches_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_TOKEN", "tok")
+    monkeypatch.setenv("MINION_EXECUTOR_MAX_OUTPUT_BYTES", "12345")
+    _no_restrict(monkeypatch)
+    seen: dict[str, object] = {}
+
+    class FakeProbe:
+        def __init__(self, engines: list[Engine], *a: object, **k: object) -> None:
+            pass
+
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            return {"mlx": "0.1", "ollama": None, "hf": None}
+
+        def close(self) -> None:
+            pass
+
+    class StopLoop:
+        def __init__(self, *a: object, **k: object) -> None:
+            seen["cap"] = k.get("max_output_bytes")
+
+        async def run(self) -> int:
+            return 0
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(m, "WorkerHandle", FakeProbe)
+    monkeypatch.setattr(m, "ExecutorLoop", StopLoop)
+    result = runner.invoke(app, ["run"])
+    assert result.exit_code == 0, result.output
+    assert seen["cap"] == 12345
+
+
+def test_max_output_bytes_env_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    from minion_executor.settings import ExecutorSettings
+
+    monkeypatch.setenv("MINION_EXECUTOR_MAX_OUTPUT_BYTES", str((5 << 30) + 1))
+    with pytest.raises(ValueError):
+        ExecutorSettings()
+
+
 def test_keep_alive_is_bounded() -> None:
     from minion_executor.main import keep_alive_s
 

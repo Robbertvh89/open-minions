@@ -1,7 +1,7 @@
 from typing import Self
 
 from minion_common.client import require_secure_url
-from minion_common.schemas import MAX_OUTPUT_BYTES_DEFAULT
+from minion_common.schemas import MAX_OUTPUT_BYTES_DEFAULT, MAX_OUTPUT_BYTES_LIMIT
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -39,7 +39,7 @@ class ServerSettings(BaseSettings):
     s3_output_prefixes: list[str] = ["outputs/"]
     presign_ttl_s: int = Field(default=900, gt=0, le=3600)
     # An attempt object above this is never promoted (422 OUTPUT_TOO_LARGE on complete, S-2).
-    max_output_bytes: int = Field(default=MAX_OUTPUT_BYTES_DEFAULT, gt=0)
+    max_output_bytes: int = Field(default=MAX_OUTPUT_BYTES_DEFAULT, gt=0, le=MAX_OUTPUT_BYTES_LIMIT)
 
     # Prometheus /metrics (FR-41): off by default. The same port serves it, so with a token set
     # only `Authorization: Bearer <token>` scrapes it (>= 32 chars; empty = unset); without one,

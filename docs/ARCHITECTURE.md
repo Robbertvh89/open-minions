@@ -176,7 +176,9 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   | runner returned a different number of records than the input | fail | `OUTPUT_MISMATCH` | yes |
   | any other exception in the handler (poison pill) | fail (type name only in logs) | `EXECUTOR_ERROR` | yes |
   | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: if any 5xx was seen, best-effort `fail` (retryable, burns budget); transport-only, nothing (the watchdog reclaims and counts EXPIRED) | `COMPLETE_FAILED` | yes |
-  | `complete`: 4xx other than 409 | fail | `COMPLETE_REJECTED` | yes |
+  | output file above `min(local, server)` cap (`max_output_bytes`), checked before the PUT | fail | `OUTPUT_TOO_LARGE` | no |
+  | `complete`: `422 OUTPUT_TOO_LARGE` | fail | `OUTPUT_TOO_LARGE` | no |
+  | `complete`: other 4xx except 409 | fail | `COMPLETE_REJECTED` | yes |
   | `complete` or `fail` returns 409 | discard, no retry | — | — |
 - **Failure back-off.** After any failed subtask the loop sleeps (same jittered exponential delay,
   growing per consecutive failure); after `max_consecutive_failures` (5) in a row it pauses for
@@ -356,10 +358,16 @@ Server:   verify acquirement is current (else 409)
 Input GET URLs sign the subtask's exact `Range` header (`bytes=byte_start-(byte_end-1)`), so a URL
 reads only its slice. Before promotion the server HEADs the attempt object: above
 `MINION_MAX_OUTPUT_BYTES` (4 GiB) → `422 OUTPUT_TOO_LARGE`, no copy, no download; the executor
-reports the rejected complete as a retryable fail, so the subtask is retried and `FAILED` after
-`max_attempts`. The executor checks the same cap on its local file before uploading
-(`MINION_EXECUTOR_MAX_OUTPUT_BYTES`, `OUTPUT_TOO_LARGE`, not retryable). A presigned PUT cannot cap
-upload size (`content-length-range` needs presigned POST; deferred).
+best-effort deletes the rejected attempt object (errors logged without the key). The assignment
+carries the server cap as `max_output_bytes`; the executor checks `min(local, server)` on its
+local file before uploading (`MINION_EXECUTOR_MAX_OUTPUT_BYTES`; both settings are `<= 5 GiB`) and
+fails `OUTPUT_TOO_LARGE` (not retryable). A `422 OUTPUT_TOO_LARGE` on complete is reported the same
+way (fail, non-retryable: a re-run yields the same output). A size equal to the cap is accepted on
+both sides. A presigned PUT cannot cap upload size (`content-length-range` needs presigned POST;
+TASK-19), so an executor can still write a large object under its own attempt key until complete.
+Operators should therefore: keep bucket versioning off (or expire noncurrent versions, since a
+delete otherwise keeps the bytes), set a bucket or tenant quota (SeaweedFS `s3.bucket.quota`, AWS
+budget/size alarms), and apply the lifecycle rule below to `_attempts/`.
 
 **Lifecycle rule (operators).** Attempt objects are kept after promotion and unpromoted ones are
 never read again, so expire them (e.g. 7 days). S3 lifecycle filters match key prefixes only and

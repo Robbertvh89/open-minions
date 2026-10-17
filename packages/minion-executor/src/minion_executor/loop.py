@@ -1177,8 +1177,14 @@ class ExecutorLoop:
                     bound.warning("complete_conflict", code=exc.code)
                     return _Outcome.DISCARDED
                 if exc.status_code < 500:
-                    bound.warning("complete_rejected", status=exc.status_code)
-                    err = _FailureError(True, "COMPLETE_REJECTED", f"HTTP {exc.status_code}")
+                    bound.warning("complete_rejected", status=exc.status_code, code=exc.code)
+                    if exc.status_code == 422 and exc.code == "OUTPUT_TOO_LARGE":
+                        # deterministic: a re-run produces the same oversize output
+                        err = _FailureError(
+                            False, "OUTPUT_TOO_LARGE", "output exceeds the size cap"
+                        )
+                    else:
+                        err = _FailureError(True, "COMPLETE_REJECTED", f"HTTP {exc.status_code}")
                     await self._report_failure(a, err, bound)
                     return _Outcome.FAILED
                 saw_5xx = True
@@ -1251,7 +1257,8 @@ class ExecutorLoop:
             except OSError as exc:
                 msg = type(exc).__name__
                 raise _FailureError(True, "LOCAL_IO_ERROR", msg, release=True) from None
-            if size > self._max_output_bytes:  # never upload what the server would not promote
+            cap = min(self._max_output_bytes, a.max_output_bytes or self._max_output_bytes)
+            if size > cap:  # never upload what the server would not promote
                 raise _FailureError(False, "OUTPUT_TOO_LARGE", "output exceeds the size cap")
             if not hb.url_fresh(UPLOAD_URL_MARGIN_S):  # long run or unknown expiry: refresh now
                 signal, _ = await hb.beat(retry_rate_limited=True)
