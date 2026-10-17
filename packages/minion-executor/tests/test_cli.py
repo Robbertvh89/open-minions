@@ -516,15 +516,18 @@ def test_kill_active_probe_kills_the_running_probe_worker(monkeypatch: pytest.Mo
 
     class H:
         killed = False
+        reap: bool | None = None
 
-        def kill(self) -> None:
+        def kill(self, *, reap: bool = True) -> None:
             self.killed = True
+            self.reap = reap
 
     h = H()
     m.kill_active_probe()  # no probe running: a no-op
     monkeypatch.setattr(m, "_active_probe", h)
     m.kill_active_probe()
     assert h.killed
+    assert h.reap is False  # runs on the event loop: must not block on the reap
     m._probe_cancelled.clear()
 
 
