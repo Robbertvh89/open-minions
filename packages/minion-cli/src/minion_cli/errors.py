@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 EXIT_OK = 0
 EXIT_FAILED = 1  # task FAILED / CANCELLED
 EXIT_USAGE = 2  # usage, config, auth, other 4xx
@@ -16,3 +18,11 @@ class CliError(Exception):
     def __init__(self, message: str, exit_code: int = EXIT_USAGE) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(text: object) -> str:
+    """Strip C0/C1 control characters (terminal escapes) from server-supplied text."""
+    return _CONTROL.sub("", str(text))

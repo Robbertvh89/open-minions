@@ -523,10 +523,20 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`; entries are bare `host[:port]` (a scheme, `/`, `@`, whitespace or an empty item fails at startup). Production should set it (DNS rebinding). Generate the secret with `minion-server-admin generate-ui-secret` (hand-picked phrases are weak; only single-character secrets are rejected). OIDC/SSO: put a proxy in front.
 - S-14. Submitter S3 credentials **[ours]**. The `minion` CLI (`minion-cli`, TASK-25) uploads inputs
   itself, so it holds S3 credentials (`MINION_CLI_S3_ACCESS_KEY`/`MINION_CLI_S3_SECRET_KEY`, or the boto3
-  default chain). These must be scoped to `inputs/{team}/*` (write, list) and `outputs/{team}/*` (read,
-  list) only, never the server's credentials. Executors never hold them (S-2); they keep using presigned
-  URLs. The CLI's API key comes from `MINION_API_KEY` or the Keychain item `open-minions-api-key` and is
-  never printed. Only `https` server and S3 endpoints are accepted (as for the executor).
+  default chain). These must never be the server's credentials. The policy must grant: `s3:PutObject`
+  and `s3:GetObject` on `inputs/{team}/*`; `s3:GetObject` on `outputs/{team}/*`; `s3:ListBucket`
+  conditioned on `s3:prefix` being `inputs/{team}/*` or `outputs/{team}/*`. It must **not** grant
+  `s3:DeleteObject` on either prefix and must not grant `s3:PutObject` on `outputs/` (results are
+  written only through presigned URLs). Write access to `inputs/{team}/` is team-wide, so submitters
+  of one team trust each other (intra-team trust); enable bucket versioning or Object Lock on
+  `inputs/` to make an overwrite of another submitter's input recoverable. Executors never hold these
+  credentials (S-2); they keep using presigned URLs. The CLI's API key comes from `MINION_API_KEY` or
+  the Keychain item `open-minions-api-key` and is never printed. Only `https` server and S3 endpoints
+  are accepted (as for the executor), including an endpoint taken from the boto3 environment/config.
+  `minion fetch` claims its output directory with a `manifest.json` naming the task (team, project,
+  name, output URI, creation time) and refuses another task's directory; a part is reused only if its
+  content matches the remote object (md5 of a plain ETag, else ETag + sha256 recorded in the manifest).
+  Input resume likewise compares content (`x-amz-meta-sha256` set at upload, else a plain-md5 ETag).
 
 ## 9. Non-functional requirements
 

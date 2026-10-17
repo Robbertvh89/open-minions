@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,11 +13,13 @@ from minion_cli import flows
 from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError
 from minion_cli.flows import Target
 from minion_cli.settings import CliSettings
-from minion_cli.testing import FakeStore
 from minion_common.client import UserClient
 from minion_common.enums import TaskType
 from minion_common.schemas import TaskOut
 from pydantic import SecretStr
+
+sys.path.insert(0, str(Path(__file__).parent))  # tests/fakes.py (importlib import mode)
+from fakes import FakeStore
 
 SENTINEL = "SENTINEL-PAYLOAD-9f3a"
 T = Target("acme", "default", "job-1")

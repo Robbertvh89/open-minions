@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import math
+import os
 import random
 import re
+import shutil
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -17,11 +20,11 @@ from typing import Any
 import httpx
 from minion_common.client import ApiError, UserClient
 from minion_common.enums import SubtaskStatus, TaskStatus, TaskType
-from minion_common.schemas import TaskCounts, TaskCreate, TaskOut
+from minion_common.schemas import SubtaskOut, SubtaskPage, TaskCounts, TaskCreate, TaskOut
 
-from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError
+from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError, clean
 from minion_cli.settings import CliSettings
-from minion_cli.store import ObjectStore
+from minion_cli.store import ObjectInfo, ObjectStore, md5_file, plain_md5, sha256_file
 
 TERMINAL = frozenset(
     {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PARTIAL, TaskStatus.CANCELLED}
@@ -30,7 +33,9 @@ POLL_START_S = 2.0
 POLL_FACTOR = 1.5
 POLL_MAX_S = 30.0
 MAX_TRANSIENT = 10
-_PART_RE = re.compile(r"^(\d{6})\.jsonl$")
+MAX_PAGE = 100  # server cap on `limit` for GET /tasks/.../subtasks
+MAX_INPUT_FILES = 9999  # keys are `{i:04d}-name`
+_PART_RE = re.compile(r"^(\d{6,})\.jsonl$")
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -63,8 +68,8 @@ def api_failure(exc: Exception) -> CliError:
         if exc.status_code in (401, 403):
             return CliError(f"server refused the API key ({exc.status_code})", EXIT_USAGE)
         if exc.status_code >= 500:
-            return CliError(f"server error: {exc}", EXIT_UNREACHABLE)
-        return CliError(f"server rejected the request: {exc}", EXIT_USAGE)
+            return CliError(f"server error: {clean(exc)}", EXIT_UNREACHABLE)
+        return CliError(f"server rejected the request: {clean(exc)}", EXIT_USAGE)
     return CliError(f"server unreachable: {type(exc).__name__}", EXIT_UNREACHABLE)
 
 
@@ -80,16 +85,29 @@ def _file_sizes(files: list[Path]) -> list[int]:
     return sizes
 
 
+async def _same_content(store: ObjectStore, key: str, path: Path) -> bool:
+    info = await store.head(key)
+    if info is None:
+        return False
+    if info.sha256 is not None:
+        return info.sha256 == await asyncio.to_thread(sha256_file, path)
+    md5 = plain_md5(info.etag)
+    return md5 is not None and md5 == await asyncio.to_thread(md5_file, path)
+
+
 async def upload_inputs(
     store: ObjectStore, settings: CliSettings, target: Target, files: list[Path]
 ) -> str:
     """Upload `files` under the task's input prefix (argv order) and return the input URI.
 
-    Resumes when the prefix holds only our own keys with matching sizes; any other object there
-    is foreign and aborts (exit 2) rather than being mixed into the task input.
+    Resumes when the prefix holds only our own keys whose content matches the local file (sha256
+    metadata we set at upload, else a plain-md5 ETag); any other object there is foreign or
+    different and aborts (exit 2) rather than being mixed into the task input.
     """
     if not files:
         raise CliError("no input files", EXIT_USAGE)
+    if len(files) > MAX_INPUT_FILES:
+        raise CliError(f"too many input files ({len(files)} > {MAX_INPUT_FILES})", EXIT_USAGE)
     sizes = await asyncio.to_thread(_file_sizes, files)
     prefix = target.input_prefix(settings)
     expected = {
@@ -99,15 +117,22 @@ async def upload_inputs(
     if len(expected) != len(files):  # pragma: no cover - index prefix makes keys unique
         raise CliError("duplicate input keys", EXIT_USAGE)
     existing = {o.key: o.size for o in await store.list_objects(prefix)}
+    local = dict(zip(expected, files, strict=True))
     for key, size in existing.items():
         if expected.get(key) != size:
             raise CliError(
                 f"input prefix {prefix!r} already holds other objects; choose another --name",
                 EXIT_USAGE,
             )
-    for f, key in zip(files, expected, strict=True):
+        if not await _same_content(store, key, local[key]):
+            raise CliError(
+                f"input object {key.rsplit('/', 1)[-1]!r} differs from the local file; "
+                "choose another --name",
+                EXIT_USAGE,
+            )
+    for key, f in local.items():
         if key not in existing:
-            await store.upload_file(f, key)
+            await store.upload_file(f, key, sha256=await asyncio.to_thread(sha256_file, f))
     return f"s3://{settings.s3_bucket}/{prefix}"
 
 
@@ -209,8 +234,11 @@ async def wait_task(
                 return task
             delay = min(delay * POLL_FACTOR, POLL_MAX_S)
             wait = delay * jitter()
-        if deadline is not None and clock() + wait > deadline:
-            raise CliError("timed out waiting for the task", EXIT_UNREACHABLE)
+        if deadline is not None:
+            remaining = deadline - clock()
+            if remaining <= 0:  # the poll above was the last one
+                raise CliError("timed out waiting for the task", EXIT_UNREACHABLE)
+            wait = min(wait, remaining)
         await sleep(wait)
 
 
@@ -227,6 +255,61 @@ class FetchResult:
     manifest_path: Path
 
 
+async def _retrying[T](
+    call: Callable[[], Awaitable[T]],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> T:
+    """Run a server call, retrying 5xx / transport errors / 429 like `wait_task` does."""
+    delay = POLL_START_S
+    for attempt in range(MAX_TRANSIENT + 1):
+        wait = delay
+        try:
+            return await call()
+        except ApiError as exc:
+            if exc.status_code == 429:
+                wait = max(exc.retry_after or 0.0, wait)
+            elif exc.status_code < 500:
+                raise api_failure(exc) from None
+            if attempt == MAX_TRANSIENT:
+                raise api_failure(exc) from None
+        except httpx.HTTPError as exc:
+            if attempt == MAX_TRANSIENT:
+                raise api_failure(exc) from None
+        delay = min(delay * POLL_FACTOR, POLL_MAX_S)
+        await sleep(wait)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _list_all_subtasks(
+    client: UserClient,
+    target: Target,
+    total: int,
+    sleep: Callable[[float], Awaitable[None]],
+) -> list[SubtaskOut]:
+    """All subtasks, bounded by the task's `counts.total`, a page cap and cursor-cycle detection."""
+    items: dict[int, SubtaskOut] = {}
+    seen: set[str] = set()
+    cursor: str | None = None
+    max_pages = math.ceil(total / MAX_PAGE) + 2
+    for _ in range(max_pages):
+
+        async def one(c: str | None = cursor) -> SubtaskPage:
+            return await client.list_subtasks(
+                target.team, target.project, target.name, cursor=c, limit=MAX_PAGE
+            )
+
+        page = await _retrying(one, sleep)
+        for st in page.items:
+            items[st.subtask_id] = st
+        cursor = page.next_cursor
+        if cursor is None or len(items) >= total:
+            return sorted(items.values(), key=lambda s: s.subtask_id)
+        if cursor in seen:
+            raise CliError("server pagination loops (repeated cursor)", EXIT_UNREACHABLE)
+        seen.add(cursor)
+    raise CliError("server returned more subtask pages than expected", EXIT_UNREACHABLE)
+
+
 def _size(p: Path) -> int | None:
     try:
         return p.stat().st_size
@@ -234,25 +317,96 @@ def _size(p: Path) -> int | None:
         return None
 
 
+def _atomic_write(dest: Path, write: Callable[[Any], None]) -> None:
+    """Write via a 0600 temp file in the same directory, then rename over `dest`."""
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            write(out)
+        Path(tmp).replace(dest)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _merge(parts: list[Path], dest: Path) -> None:
-    tmp = dest.with_name(dest.name + ".tmp")
-    with tmp.open("wb") as out:
+    def write(out: Any) -> None:
         for p in parts:
-            data = p.read_bytes()
-            out.write(data)
-            if data and not data.endswith(b"\n"):
-                out.write(b"\n")
-    tmp.replace(dest)
+            with p.open("rb") as f:
+                shutil.copyfileobj(f, out)
+                if f.tell() > 0:
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        out.write(b"\n")
+
+    _atomic_write(dest, write)
 
 
 def _write_manifest(path: Path, doc: dict[str, Any]) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-    tmp.replace(path)
+    data = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
+    _atomic_write(path, lambda out: out.write(data))
 
 
-def _sha256(p: Path) -> str:
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+def _identity(target: Target, task: TaskOut) -> dict[str, str]:
+    return {
+        "team": target.team,
+        "project": target.project,
+        "task_name": target.name,
+        "output_uri": task.output_uri,
+        "created_at": task.created_at.astimezone(UTC).isoformat(),
+    }
+
+
+def _prepare_out_dir(out_dir: Path, identity: dict[str, str]) -> dict[int, dict[str, Any]]:
+    """Create the output dir (0700) and claim it for this task.
+
+    Refuses (exit 2) a dir whose manifest belongs to another task or is unreadable, and a `parts/`
+    without a manifest. Returns the part records of an earlier fetch of the same task.
+    """
+    manifest = out_dir / "manifest.json"
+    parts_dir = out_dir / "parts"
+    if manifest.exists():
+        try:
+            doc = json.loads(manifest.read_text())
+            if not isinstance(doc, dict):
+                raise ValueError
+        except ValueError:
+            raise CliError(
+                f"{out_dir} has an unreadable manifest.json; use another -o", EXIT_USAGE
+            ) from None
+        if any(doc.get(k) != v for k, v in identity.items()):
+            raise CliError(
+                f"{out_dir} holds the results of another task; use another -o", EXIT_USAGE
+            )
+        return {int(p["subtask_id"]): p for p in doc.get("parts", []) if isinstance(p, dict)}
+    if parts_dir.exists():
+        raise CliError(f"{out_dir} has parts/ but no manifest.json; use another -o", EXIT_USAGE)
+    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _write_manifest(manifest, {**identity, "parts": []})
+    return {}
+
+
+def _part_is_current(dest: Path, remote: ObjectInfo, prior: dict[str, Any] | None) -> bool:
+    """A local part is reusable only if its content provably equals the remote object."""
+    if _size(dest) != remote.size or remote.etag is None:
+        return False
+    if plain_md5(remote.etag) is not None:
+        return md5_file(dest) == remote.etag
+    # Multipart ETag: trust the earlier fetch's record only if the object is unchanged.
+    return (
+        prior is not None
+        and prior.get("etag") == remote.etag
+        and prior.get("sha256") == sha256_file(dest)
+    )
+
+
+def _remote_parts(listing: list[ObjectInfo], prefix: str) -> dict[int, ObjectInfo]:
+    remote: dict[int, ObjectInfo] = {}
+    for o in listing:
+        m = _PART_RE.match(o.key[len(prefix) :]) if o.key.startswith(prefix) else None
+        if m and f"{int(m.group(1)):06d}" == m.group(1):  # canonical name only
+            remote[int(m.group(1))] = o
+    return remote
 
 
 async def fetch_results(
@@ -262,48 +416,37 @@ async def fetch_results(
     target: Target,
     task: TaskOut,
     out_dir: Path,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> FetchResult:
     """Download SUCCEEDED subtask outputs, merge to results.jsonl (ascending subtask_id).
 
-    Idempotent: a part already on disk with the stored size is skipped. Only
-    `{out}/{id:06d}.jsonl` objects are read; the `_attempts/` namespace is never listed.
+    The output dir is claimed by a manifest naming this task (another task's dir is refused).
+    Idempotent: a part on disk is skipped only when its content matches the remote object (md5
+    for a plain ETag, else the ETag + sha256 recorded in the manifest). Listing is non-recursive,
+    so the `_attempts/` namespace is never listed.
     """
-    records: dict[int, int] = {}
-    not_succeeded = 0
-    cursor: str | None = None
-    try:
-        while True:
-            page = await client.list_subtasks(
-                target.team, target.project, target.name, cursor=cursor
-            )
-            for st in page.items:
-                if st.status is SubtaskStatus.SUCCEEDED:
-                    records[st.subtask_id] = st.record_count
-                else:
-                    not_succeeded += 1
-            cursor = page.next_cursor
-            if cursor is None:
-                break
-    except (ApiError, httpx.HTTPError) as exc:
-        raise api_failure(exc) from None
+    subtasks = await _list_all_subtasks(client, target, task.counts.total, sleep)
+    records = {
+        st.subtask_id: st.record_count for st in subtasks if st.status is SubtaskStatus.SUCCEEDED
+    }
+    failed = [st for st in subtasks if st.status is not SubtaskStatus.SUCCEEDED]
 
     prefix = target.output_prefix(settings)
-    remote = {
-        int(m.group(1)): o.size
-        for o in await store.list_objects(prefix)
-        if o.key.startswith(prefix) and (m := _PART_RE.match(o.key[len(prefix) :]))
-    }
+    remote = _remote_parts(await store.list_objects(prefix, recursive=False), prefix)
+    identity = _identity(target, task)
+    prior = await asyncio.to_thread(_prepare_out_dir, out_dir, identity)
     parts_dir = out_dir / "parts"
-    await asyncio.to_thread(lambda: parts_dir.mkdir(parents=True, exist_ok=True))
+    await asyncio.to_thread(lambda: parts_dir.mkdir(mode=0o700, exist_ok=True))
     downloaded = 0
     ids = sorted(records)
     for sid in ids:
         if sid not in remote:
             raise CliError(f"result object for subtask {sid} is missing", EXIT_USAGE)
         dest = parts_dir / f"{sid:06d}.jsonl"
-        if await asyncio.to_thread(_size, dest) == remote[sid]:
+        if await asyncio.to_thread(_part_is_current, dest, remote[sid], prior.get(sid)):
             continue
-        await store.download_file(f"{prefix}{sid:06d}.jsonl", dest)
+        await store.download_file(remote[sid].key, dest)
         downloaded += 1
 
     part_paths = [parts_dir / f"{sid:06d}.jsonl" for sid in ids]
@@ -315,8 +458,9 @@ async def fetch_results(
             "subtask_id": sid,
             "file": f"parts/{sid:06d}.jsonl",
             "records": records[sid],
-            "bytes": remote[sid],
-            "sha256": await asyncio.to_thread(_sha256, parts_dir / f"{sid:06d}.jsonl"),
+            "bytes": remote[sid].size,
+            "etag": remote[sid].etag,
+            "sha256": await asyncio.to_thread(sha256_file, parts_dir / f"{sid:06d}.jsonl"),
         }
         for sid in ids
     ]
@@ -325,13 +469,21 @@ async def fetch_results(
         _write_manifest,
         manifest,
         {
-            "team": target.team,
-            "project": target.project,
-            "task_name": target.name,
+            **identity,
             "status": task.status.value,
             "counts": counts.model_dump(),
             "records": sum(records.values()),
-            "not_succeeded_subtasks": not_succeeded,
+            "not_succeeded_subtasks": len(failed),
+            "not_succeeded": [
+                {
+                    "subtask_id": st.subtask_id,
+                    "status": st.status.value,
+                    "record_count": st.record_count,
+                    "attempt": st.attempt,
+                    "error_code": st.error_code,
+                }
+                for st in failed
+            ],
             "parts": manifest_parts,
         },
     )
@@ -339,7 +491,7 @@ async def fetch_results(
         parts=len(ids),
         downloaded=downloaded,
         records=sum(records.values()),
-        not_succeeded=not_succeeded,
+        not_succeeded=len(failed),
         results_path=results,
         manifest_path=manifest,
     )

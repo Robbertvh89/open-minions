@@ -8,9 +8,13 @@ Nothing here prints record or line content.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import re
-from collections.abc import Coroutine
+import signal
+import sys
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
@@ -29,16 +33,18 @@ from minion_cli.errors import (
     EXIT_PARTIAL,
     EXIT_USAGE,
     CliError,
+    clean,
 )
 from minion_cli.flows import Target
 from minion_cli.secrets import load_api_key
 from minion_cli.settings import CliSettings
-from minion_cli.store import ObjectStore, make_store
+from minion_cli.store import ObjectStore, abort_transfers, make_store
 
 app = typer.Typer(
     help="open-minions submitter: upload JSONL, submit a task, follow it, fetch results.",
     no_args_is_help=True,
     add_completion=False,
+    pretty_exceptions_show_locals=False,  # locals would include the API key and S3 secrets
 )
 
 ServerOpt = Annotated[str | None, typer.Option(help="Server URL (else $MINION_CLI_SERVER).")]
@@ -72,21 +78,44 @@ def _echo_err(msg: str) -> None:
 
 
 def _fail(err: CliError) -> NoReturn:
-    _echo_err(f"error: {err}")
+    _echo_err(f"error: {clean(err)}")
     raise typer.Exit(err.exit_code)
 
 
-def _run[T](coro: Coroutine[Any, Any, T], task_name: str | None = None) -> T:
+def _hard_exit(*_: object) -> NoReturn:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(EXIT_INTERRUPTED)
+
+
+def _run[T](
+    coro: Coroutine[Any, Any, T],
+    task_name: str | None = None,
+    submitted: Callable[[], bool] = lambda: True,
+) -> T:
+    """Run `coro`. `submitted()` says whether the task exists server-side (for the Ctrl-C hint)."""
     try:
         return asyncio.run(coro)
     except CliError as exc:
         _fail(exc)
     except KeyboardInterrupt:
-        hint = f"; task {task_name!r} keeps running (see `minion status`)" if task_name else ""
+        with contextlib.suppress(ValueError):  # not the main thread (tests): no handler
+            signal.signal(signal.SIGINT, _hard_exit)  # a second Ctrl-C leaves at once
+        hint = (
+            f"; task {task_name!r} keeps running (see `minion status`)"
+            if task_name and submitted()
+            else ""
+        )
         _echo_err(f"interrupted{hint}")
+        if abort_transfers():  # a boto3 thread is mid-transfer: do not join it at exit
+            _hard_exit()
         raise typer.Exit(EXIT_INTERRUPTED) from None
     except (ApiError, httpx.HTTPError) as exc:
         _fail(flows.api_failure(exc))
+    except ValidationError:
+        _fail(CliError("unexpected data in a server response or request", EXIT_USAGE))
+    except OSError as exc:
+        _fail(CliError(f"local file error: {type(exc).__name__}", EXIT_USAGE))
 
 
 def _load(server: str | None, team: str | None, project: str | None) -> tuple[CliSettings, str]:
@@ -181,7 +210,10 @@ def submit(
         parsed = value
     out_dir = output or Path(task_name)
 
+    submitted = False
+
     async def go() -> int:
+        nonlocal submitted
         assert settings.server is not None  # noqa: S101
         store = build_store(settings)
         async with make_client(settings.server, key) as client:
@@ -198,12 +230,13 @@ def submit(
                 priority=priority,
                 allowed_pool=pool,
             )
+            submitted = True
             typer.echo(f"submitted {task.task_name} ({task.status.value})")
             if no_wait:
                 return EXIT_OK
             return await _wait_and_fetch(client, store, settings, target, out_dir, timeout)
 
-    raise typer.Exit(_run(go(), task_name))
+    raise typer.Exit(_run(go(), task_name, lambda: submitted))
 
 
 async def _wait_and_fetch(
@@ -253,7 +286,7 @@ def status(
             task = await client.get_task(target.team, target.project, target.name)
         typer.echo(_summary(task))
         if task.error:
-            typer.echo(f"error: {task.error}")
+            typer.echo(f"error: {clean(task.error)}")
         return exit_code_for(task.status)
 
     raise typer.Exit(_run(go()))

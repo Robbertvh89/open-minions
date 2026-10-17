@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -9,10 +10,12 @@ from typing import Any
 import httpx
 import pytest
 from minion_cli import flows, main
-from minion_cli.testing import FakeStore
 from minion_common.client import UserClient
 from pydantic import SecretStr
 from typer.testing import CliRunner
+
+sys.path.insert(0, str(Path(__file__).parent))  # tests/fakes.py (importlib import mode)
+from fakes import FakeStore
 
 SENTINEL = "SENTINEL-PAYLOAD-77c1"
 OUT = "outputs/acme/default/job-1/"

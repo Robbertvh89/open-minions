@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from boto3.exceptions import Boto3Error, RetriesExceededError, S3TransferFailedError
 from botocore.exceptions import ClientError
 from minion_cli import secrets
 from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError
 from minion_cli.settings import CliSettings
 from minion_cli.store import ObjectStore, S3Store, _wrap
-from minion_cli.testing import FakeStore
+
+sys.path.insert(0, str(Path(__file__).parent))  # tests/fakes.py (importlib import mode)
+from fakes import FakeStore
 
 
 def test_settings_defaults_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,7 +106,9 @@ def _client_error(status: int) -> ClientError:
         (_client_error(403), EXIT_USAGE),
         (_client_error(404), EXIT_USAGE),
         (_client_error(503), EXIT_UNREACHABLE),
-        (OSError("conn"), EXIT_UNREACHABLE),
+        (OSError("disk"), EXIT_USAGE),
+        (RetriesExceededError(Boto3Error()), EXIT_UNREACHABLE),
+        (S3TransferFailedError("x"), EXIT_UNREACHABLE),
     ],
 )
 def test_store_error_mapping(exc: Exception, code: int) -> None:
@@ -127,7 +132,7 @@ async def test_fake_store_roundtrip(tmp_path: Path) -> None:
     store: ObjectStore = FakeStore()
     f = tmp_path / "a.jsonl"
     f.write_bytes(b'{"a":1}\n')
-    await store.upload_file(f, "p/a")
+    await store.upload_file(f, "p/a", sha256="x")
     assert [(o.key, o.size) for o in await store.list_objects("p/")] == [("p/a", 8)]
     await store.download_file("p/a", tmp_path / "out" / "a")
     assert (tmp_path / "out" / "a").read_bytes() == f.read_bytes()
