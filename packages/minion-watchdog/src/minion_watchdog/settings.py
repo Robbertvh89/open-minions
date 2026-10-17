@@ -21,6 +21,8 @@ class WatchdogSettings(BaseSettings):
     cancel_sweep_window_s: float = Field(default=3600.0, gt=0)  # how far back to heal cancels
     db_command_timeout_s: float = Field(default=30.0, gt=0)  # per-statement client timeout
     watchdog_max_backoff_s: float = Field(default=300.0, gt=0)  # cap after repeated DB errors
+    # Liveness file for container healthchecks: touched at start and after each successful tick.
+    watchdog_health_file: str | None = None
 
     @model_validator(mode="after")
     def _lease_exceeds_timeout(self) -> "WatchdogSettings":
