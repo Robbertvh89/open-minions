@@ -130,7 +130,9 @@ def update_control(
     except UnsafeDirError:
         lock = contextlib.nullcontext()
     else:
-        lock = private_lock(state_dir, CONTROL_LOCK_FILE)
+        lock = private_lock(
+            state_dir, CONTROL_LOCK_FILE, busy_message="another control update is in progress"
+        )
     with lock:
         return _update_locked(
             state_dir,

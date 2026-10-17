@@ -57,3 +57,19 @@ def test_unconfigured_profile_is_refused_with_a_notice(tmp_path: Path) -> None:
         assert any("not configured" in t for t in _titles(app))
     finally:
         app.stop()
+
+
+def test_menu_needs_update_refreshes_from_the_status_file(tmp_path: Path) -> None:
+    from minion_executor.menubar.app import MenuBarApp
+
+    sd = tmp_path / "state"
+    ensure_private_dir(sd)
+    app = MenuBarApp(sd, _empty_config(tmp_path))
+    try:
+        assert not any("Status unavailable" in t for t in _titles(app))
+        (sd / "status.json").write_text("{not json")
+        (sd / "status.json").chmod(0o600)
+        app._target.menuNeedsUpdate_(app._menu)  # what AppKit calls before showing the menu
+        assert any("Status unavailable" in t for t in _titles(app))
+    finally:
+        app.stop()

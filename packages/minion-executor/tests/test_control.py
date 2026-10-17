@@ -372,8 +372,13 @@ def test_private_lock_gives_up_with_a_clear_error(sd: Path) -> None:
     with private_lock(sd, CONTROL_LOCK_FILE):
         started = time.monotonic()
         with (
-            pytest.raises(SafeFileError, match="another control update is in progress"),
+            pytest.raises(SafeFileError, match=f"lock {CONTROL_LOCK_FILE} is busy"),
             private_lock(sd, CONTROL_LOCK_FILE, wait_s=0.2),
+        ):
+            pass
+        with (
+            pytest.raises(SafeFileError, match="custom busy"),
+            private_lock(sd, CONTROL_LOCK_FILE, wait_s=0.1, busy_message="custom busy"),
         ):
             pass
         assert time.monotonic() - started < 2

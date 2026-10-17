@@ -64,7 +64,7 @@ from minion_executor.service import (
     service_app,
     service_mode,
 )
-from minion_executor.settings import ExecutorSettings, state_dir_from_env
+from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
 from minion_executor.worker.sandbox import SANDBOX_FAILED, SandboxPolicy
 
@@ -659,8 +659,8 @@ def menubar() -> None:
         typer.echo("error: refusing to run the menu-bar app as root", err=True)
         raise typer.Exit(code=2)
     try:
-        state_dir = state_dir_from_env()
-        config_path = ExecutorSettings().config_path  # same validation as `run`
+        settings = ExecutorSettings()  # same validation as `run`
+        state_dir, config_path = settings.state_dir, settings.config_path
         ensure_private_dir(state_dir)
     except (ValueError, SafeFileError) as exc:  # pydantic's ValidationError is a ValueError
         typer.echo(f"error: {exc}", err=True)

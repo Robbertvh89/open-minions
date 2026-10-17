@@ -5,7 +5,9 @@ Profile (automatic / light / balanced / full / custom) and Quit. It reads `statu
 `POLL_INTERVAL_S` and writes only through `update_control`. No network, no token, no subprocess,
 no power assertion: the app never keeps the Mac awake (invariant 6). `NSTimer` with a tolerance
 lets the system coalesce wake-ups; the menu is rebuilt when the view changed (the "updated"
-age line is excluded) and whenever the menu is about to open, so the age is fresh when shown.
+age line is excluded; volatile running fields such as progress still cause rebuilds, which is
+cheap and the timer does not fire while the menu is tracking) and in `menuNeedsUpdate_`, just
+before the menu opens, so the age is fresh when shown.
 The guarantee is about this package's own code only (no network, token or subprocess code,
 checked by a source test); the `minion-executor` entry point that starts it loads httpx anyway.
 """
@@ -59,7 +61,8 @@ class _Target(NSObject):  # type: ignore[misc]
         if self.owner is not None:
             self.owner.refresh()
 
-    def menuWillOpen_(self, _menu: Any) -> None:  # noqa: N802 (NSMenuDelegate selector)
+    def menuNeedsUpdate_(self, _menu: Any) -> None:  # noqa: N802 (NSMenuDelegate selector)
+        # called by AppKit just before the menu is shown (also while it is tracking)
         if self.owner is not None:
             self.owner.refresh(force=True)
 

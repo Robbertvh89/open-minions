@@ -11,7 +11,7 @@ import pytest
 from minion_common.enums import CapacityProfile as P
 from minion_common.enums import PausedReason
 from minion_common.schemas import Budget
-from minion_executor.capacity.control import OwnerControl
+from minion_executor.capacity.control import ControlUnusable, OwnerControl
 from minion_executor.capacity.safefile import SafeFileError, ensure_private_dir
 from minion_executor.capacity.status import (
     STATUS_FILE,
@@ -225,3 +225,9 @@ def test_owner_pause_and_pin_shown_when_no_executor_runs() -> None:
         status(paused_reason=PausedReason.USER_PAUSED), now=NOW, control=ctl
     )
     assert any(line.startswith("Paused by you until") for line in running_paused.lines)
+
+
+def test_unusable_control_file_is_shown_when_nothing_runs() -> None:
+    view = build_view(None, control=ControlUnusable("not valid JSON"))
+    assert "Control file unusable: not valid JSON" in view.lines
+    assert view.state.value != "working"

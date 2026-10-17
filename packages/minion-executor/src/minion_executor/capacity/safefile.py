@@ -201,14 +201,16 @@ LOCK_WAIT_S = 2.0
 
 
 @contextlib.contextmanager
-def private_lock(directory: Path, name: str, wait_s: float = LOCK_WAIT_S) -> Iterator[None]:
+def private_lock(
+    directory: Path, name: str, wait_s: float = LOCK_WAIT_S, busy_message: str | None = None
+) -> Iterator[None]:
     """Hold an exclusive `flock` on `directory/name` (0600, O_NOFOLLOW, created when missing).
 
     Serialises read-modify-write cycles across threads and processes. The directory is vetted
     first and the lock file is opened relative to that fd. Waits at most `wait_s` (non-blocking
     attempts, so a stuck holder cannot hang the caller). Raises SafeFileError when the directory
     or lock file is unsafe, the lock cannot be taken, or the wait runs out. The lock file is never
-    removed (that would race).
+    removed (that would race). `busy_message` replaces the default "lock {name} is busy".
     """
     dfd = open_private_dir(directory)
     try:
@@ -226,7 +228,7 @@ def private_lock(directory: Path, name: str, wait_s: float = LOCK_WAIT_S) -> Ite
                 if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
                     raise SafeFileError(f"cannot lock {directory / name}: {exc.strerror}") from None
             if time.monotonic() >= deadline:
-                raise SafeFileError("another control update is in progress")
+                raise SafeFileError(busy_message or f"lock {name} is busy")
             time.sleep(delay)
             delay = min(delay * 2, 0.05)
         try:

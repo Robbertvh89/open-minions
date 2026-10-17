@@ -75,7 +75,8 @@ class ExecutorSettings(BaseSettings):
     config_path: Path | None = Field(default=None, validation_alias="MINION_EXECUTOR_CONFIG")
 
     # Owner control (`pause`/`resume`/`profile` write control.json here; ADR-0006 D11). Created
-    # 0700; refused when not ours or writable by others.
+    # 0700; refused when not ours or writable by others. A blank MINION_EXECUTOR_STATE_DIR
+    # means the default directory.
     state_dir: Path = Field(default_factory=default_state_dir)
 
     # Dev/tests only: read host signals from this JSON file instead of macOS. Needs

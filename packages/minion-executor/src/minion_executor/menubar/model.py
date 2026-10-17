@@ -119,7 +119,7 @@ def _title(suffix: str = "") -> str:
     return f"{TITLE} ({suffix})" if suffix else TITLE
 
 
-def _until(ctl: OwnerControl, now: datetime) -> str:
+def _until(ctl: OwnerControl) -> str:
     if ctl.paused_until is None:
         return "Paused by you until you resume"
     return f"Paused by you until {ctl.paused_until.astimezone().strftime('%H:%M')}"
@@ -140,11 +140,13 @@ def _plain(
     checked: str | None = None
     if isinstance(ctl, OwnerControl):
         if paused:
-            lines.append(_until(ctl, now))
+            lines.append(_until(ctl))
         can_pause, can_resume = not paused, bool(paused)
         checked = ctl.profile.value.capitalize() if ctl.profile is not None else AUTOMATIC
     elif ctl is None:
         checked = AUTOMATIC
+    else:  # ControlUnusable: `reason` carries no file contents
+        lines.append(safe_text(f"Control file unusable: {ctl.reason}")[:300])
     return View(state, _title(suffix), tuple(lines), can_pause, can_resume, profile_checked=checked)
 
 
@@ -188,7 +190,7 @@ def build_view(
         and isinstance(control, OwnerControl)
         and control.is_paused(now)
     ):
-        lines.append(_until(control, now))
+        lines.append(_until(control))
     return View(
         state,
         _title(suffix),
