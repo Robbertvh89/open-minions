@@ -1,10 +1,10 @@
 ---
 id: TASK-6
 title: 'M5: Ops & usability'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-17 03:30'
+updated_date: '2026-10-17 18:36'
 labels:
   - milestone
   - M5
@@ -457,3 +457,9 @@ AC:
 - The 10 % NF-7 proxy thresholds may be noisy, hence the median of repeats. The thresholds are provisional until the human study.
 - A camera or microphone "in use" can also be a dictation tool or music app. The default `light` is a de-escalation only (safe direction).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+M5 complete: 6.1 auth v2 (#24), 6.2 rate limits + prefer (#29), 6.3 Range-signed GET + output cap (#30), 6.4 list/fleet API (#25), 6.5 read-only views + Grafana + metrics (#26), 6.6 web UI (#27), 6.7 UI create/cancel/fleet (#28), 6.8 launchd service (#23), 6.9 NF-7 proxy bench + protocol (#36; minion fails light/balanced, follow-up TASK-24), 6.10 call-aware governor (#35), 6.11 compose app containers (#37).
+<!-- SECTION:FINAL_SUMMARY:END -->
