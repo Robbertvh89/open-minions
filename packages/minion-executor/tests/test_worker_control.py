@@ -875,3 +875,19 @@ def test_a_failing_trim_is_counted_and_never_fatal(worker: WorkerHandle) -> None
     bg.join()
     assert worker.stats()["trim_errors"] == 2
     assert worker.run([{"id": 1, "text": "a"}])
+
+
+@pytest.mark.parametrize("how", ["interrupt", "kill"])
+def test_interrupt_and_kill_reap_the_idle_worker(how: str) -> None:
+    """TASK-27: with no call in flight nothing else joins the killed worker; it must not linger
+    as a <defunct> child."""
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    try:
+        w.ensure_model(MODEL, _budget())
+        pid = w.pid
+        assert pid is not None
+        getattr(w, how)()
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)  # already reaped by interrupt()/kill()
+    finally:
+        w.close()

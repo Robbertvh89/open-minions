@@ -189,11 +189,13 @@ def descendants(pid: int, *, tracker: bool = False) -> list[int]:
     """Live descendants of `pid`. Without `tracker`, multiprocessing's resource-tracker helper
     (it lives as long as the executor, not the model) is left out, leaving the worker."""
     out = subprocess.run(
-        ["/bin/ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, check=True
+        ["/bin/ps", "-axo", "pid=,ppid=,stat=,command="], capture_output=True, text=True, check=True
     ).stdout
     kids: dict[int, list[tuple[int, str]]] = {}
     for line in out.splitlines():
-        p, pp, cmd = line.split(None, 2)
+        p, pp, stat, cmd = line.split(None, 3)
+        if stat.startswith("Z"):  # a killed, not yet reaped child is not a live worker
+            continue
         kids.setdefault(int(pp), []).append((int(p), cmd))
     found: list[int] = []
     todo = [pid]
@@ -464,8 +466,12 @@ async def test_memory_critical_releases_immediately(live: Live, ex: Exec) -> Non
     await eventually(released, 15, f"released\n{ex.logs()}")
     await eventually(lambda: not ex.workers(), 15, "worker killed")
     assert live.final_keys("crit") == []
-    st = ex.status()
-    assert st is not None and st.paused_reason == "memory_pressure" and st.subtask is None
+
+    def paused() -> bool:
+        st = ex.status()
+        return st is not None and st.paused_reason == "memory_pressure" and st.subtask is None
+
+    await eventually(paused, 15, f"paused memory_pressure\n{ex.logs()}")
     assert not await live.inflight()
 
     ex.signals()

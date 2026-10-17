@@ -966,6 +966,7 @@ class WorkerHandle:
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+                proc.join(timeout=2)  # reap now: no <defunct> child until the next _reset
             self._release_ollama(ref)
 
     def _release_ollama(self, ref: str | None) -> None:
@@ -990,6 +991,7 @@ class WorkerHandle:
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+                proc.join(timeout=2)  # reap now: no <defunct> child until the next _reset
             self._release_ollama(ref)
 
     def _reset(self) -> None:
