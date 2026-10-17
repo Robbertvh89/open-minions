@@ -24,7 +24,7 @@ def _run_doc() -> dict[str, Any]:
     rec.count("fault_vanish", 2)
     return report.new_report(
         config={"server": report.server_label("http://user:pw@127.0.0.1:58080/x?k=v")},
-        run=report.run_section(rec, duration_s=5.0, sims=3, procs=1),
+        run=report.run_section(rec, duration_s=5.0, sims=3, procs=1, drained=True),
     )
 
 
@@ -107,7 +107,14 @@ def test_compose_scale_overlay() -> None:
     text = COMPOSE.read_text()
     assert text.startswith("# DEV ONLY")
     doc = _load(COMPOSE)
+    assert doc["name"] == "open-minions-scale"  # never the dev stack's project (or its volumes)
     services = doc["services"]
+    for name, svc in services.items():  # everything published is on loopback only
+        for port in svc.get("ports", []):
+            assert str(port).startswith("127.0.0.1:"), (name, port)
+    assert {"postgres", "s3", "server", "grafana"} <= {
+        n for n, v in services.items() if "ports" in v
+    }
     cmd = " ".join(services["postgres"]["command"])
     assert "shared_preload_libraries=pg_stat_statements" in cmd and "shared_buffers=" in cmd
     env = services["watchdog"]["environment"]
@@ -115,6 +122,6 @@ def test_compose_scale_overlay() -> None:
     models_mount = services["server"]["volumes"][0]
     assert models_mount.split(":")[0].endswith("scale/models.scale.yaml")
     # never the regular dev stack's host ports (8080 in particular)
-    for svc in ("postgres", "s3", "server"):
+    for svc in ("postgres", "s3", "server", "grafana"):
         for port in services[svc]["ports"]:
-            assert not any(f":-{d}}}" in port for d in (8080, 5432, 9000)), port
+            assert not any(f":-{d}}}" in port for d in (8080, 5432, 9000, 3000)), port
