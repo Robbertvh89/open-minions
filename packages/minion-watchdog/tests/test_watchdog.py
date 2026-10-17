@@ -331,3 +331,28 @@ def test_command_timeout_setting() -> None:
     assert _cfg().db_command_timeout_s == 30.0
     with pytest.raises(ValidationError):
         _cfg(db_command_timeout_s=0)
+
+
+async def test_tick_logs_counters_and_duration_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from collections import Counter
+
+    from minion_server.services.reclaim import ReclaimResult
+    from structlog.testing import capture_logs
+
+    async def reclaim(*_a: Any, **_k: Any) -> Counter[ReclaimResult]:
+        return Counter({ReclaimResult.EXPIRED_REQUEUED: 2, ReclaimResult.SKIPPED: 1})
+
+    async def sweep(*_a: Any, **_k: Any) -> int:
+        return 0
+
+    monkeypatch.setattr(wd, "reclaim_stale", reclaim)
+    monkeypatch.setattr(wd, "sweep_cancelled", sweep)
+    cfg = _cfg(watchdog_batch_size=500)
+    with capture_logs() as logs:
+        await wd.tick(None, cfg, asyncio.Event())  # type: ignore[arg-type]
+    by_event = {e["event"]: e for e in logs}
+    reclaim_keys = set(by_event["watchdog_reclaim"]) - {"event", "log_level"}
+    assert reclaim_keys == {ReclaimResult.EXPIRED_REQUEUED.value, ReclaimResult.SKIPPED.value}
+    tick_ev = by_event["watchdog_tick"]
+    assert set(tick_ev) - {"event", "log_level"} == {"duration_ms", "rounds"}
+    assert tick_ev["log_level"] == "debug" and tick_ev["rounds"] == 1

@@ -57,7 +57,12 @@ acquirements. That is enough for silent executors, but the M2 review found five 
 - `attempt` can exceed the budget count; the budget is always computed from `minion_subtask_attempt`.
 - Known window: an acquire that committed just before a cancel can leave a `RUNNING` subtask under a
   `CANCELLED` task. The owner stops on its next beat; the sweep heals the rest.
-- The max-lease scan reads `minion_subtask_acquirement` without an index on `acquired_at`. The table
-  only holds running work, so the scan stays small; revisit at M6 scale.
+- The max-lease scan is served by `ix_minion_subtask_acquirement_acquired_at` (migration 0008), so it
+  stays an index range scan at M6 scale. Each tick ends with one `watchdog_tick` event
+  (`duration_ms`, `rounds`) at debug level, or info when the tick takes over 1000 ms; the scan itself
+  logs `over_lease_scan` (`scan_ms`, `hits`) at debug. `watchdog_reclaim` carries only counters.
+- Write cost of that index: one extra btree insert per acquire and one delete per release. Rows are
+  short-lived, so vacuum and bottom-up index deletion keep it small; `acquired_at` is roughly
+  monotonic, so inserts hit the rightmost leaf page and stay cheap.
 - Operators must keep `MINION_HEARTBEAT_TIMEOUT_S` at least 2x (recommended 3x) the executor
   heartbeat interval, or live executors are reclaimed between beats.

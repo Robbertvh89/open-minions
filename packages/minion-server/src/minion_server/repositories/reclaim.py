@@ -7,7 +7,7 @@ Reclaim shares the lock order of every owner op: acquirement -> heartbeat -> sub
 import uuid
 from typing import Any
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.db.models import ExecutorHeartbeat, SubtaskAcquirement
@@ -29,17 +29,23 @@ async def stale_ids(session: AsyncSession, timeout_s: float, limit: int) -> list
     return list(rows.scalars())
 
 
-async def over_lease_ids(session: AsyncSession, max_lease_s: float, limit: int) -> list[uuid.UUID]:
-    """Acquirements older than the max lease, however fresh their heartbeat (unlocked scan).
-
-    The acquirement table only holds currently running work, so the scan stays small.
-    """
-    rows = await session.execute(
+def over_lease_stmt(max_lease_s: float, limit: int) -> Select[uuid.UUID]:
+    """The max-lease scan; served by `ix_minion_subtask_acquirement_acquired_at` (0008)."""
+    return (
         select(SubtaskAcquirement.acquirement_id)
         .where(SubtaskAcquirement.acquired_at < _cutoff(max_lease_s))
         .order_by(SubtaskAcquirement.acquired_at)
         .limit(limit)
     )
+
+
+async def over_lease_ids(session: AsyncSession, max_lease_s: float, limit: int) -> list[uuid.UUID]:
+    """Acquirements older than the max lease, however fresh their heartbeat (unlocked scan).
+
+    Uses `ix_minion_subtask_acquirement_acquired_at` (range scan on `acquired_at`), so cost
+    follows the number of expired rows, not the table size.
+    """
+    rows = await session.execute(over_lease_stmt(max_lease_s, limit))
     return list(rows.scalars())
 
 
