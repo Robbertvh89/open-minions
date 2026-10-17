@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 05:14'
 labels:
   - M5
 dependencies: []
@@ -22,10 +22,16 @@ minion_executor/service.py: pure render_plist() (plistlib, deterministic), exit_
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 render_plist with grace 0/30/300 gives ExitTimeOut 15/45/315
-- [ ] #2 No secret in the plist even with MINION_EXECUTOR_TOKEN and HF_TOKEN set
-- [ ] #3 plutil -lint passes (macos marker)
-- [ ] #4 install refuses DEV=1 and env-only token; run exits 2 on inconsistent launchd exit timeout
-- [ ] #5 Live on this Mac: install a test label, uninstall during a subtask; exits within grace + 10 s, subtask RELEASED, no SIGKILL; nothing left installed afterwards
-- [ ] #6 Worker sandbox self-test passes when installed via uv tool install (or documented venv fallback)
+- [x] #1 render_plist with grace 0/30/300 gives ExitTimeOut 15/45/315
+- [x] #2 No secret in the plist even with MINION_EXECUTOR_TOKEN and HF_TOKEN set
+- [x] #3 plutil -lint passes (macos marker)
+- [x] #4 install refuses DEV=1 and env-only token; run exits 2 on inconsistent launchd exit timeout
+- [x] #5 Live on this Mac: install a test label, uninstall during a subtask; exits within grace + 10 s, subtask RELEASED, no SIGKILL; nothing left installed afterwards
+- [x] #6 Worker sandbox self-test passes when installed via uv tool install (or documented venv fallback)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Live on this Mac (M3 Pro, macOS 27): installed com.test.minions from a non-editable venv outside protected folders (bge-small-en, real mlx); uninstall mid-subtask -> subtask RELEASED, stopped in 6.1 s (grace 5), no SIGKILL, plist removed after the stop. Revoked token while running -> exit 0 credential_rejected, no relaunch, service status shows the failure. Found and fixed: TCC hang when the install references ~/Documents (install now refuses), bootout rc 0 while still stopping (uninstall polls), service mode lost after env scrub. Everything removed afterwards (agent, Keychain item, logs).
+<!-- SECTION:NOTES:END -->

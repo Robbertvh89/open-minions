@@ -24,6 +24,10 @@ class ExecutorSettings(BaseSettings):
     # is killed and the subtask released. 0 = stop at once. A second signal stops immediately.
     stop_grace_s: float = Field(default=30.0, ge=0, le=300, allow_inf_nan=False)
 
+    # The ExitTimeOut launchd gives this process (set by `service install` in the plist). When set,
+    # `run` exits 2 if it is below stop_grace_s + 15 (launchd would SIGKILL mid-release).
+    launchd_exit_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
     # Model cache (D6). Ollama models live in Ollama's own store and are not counted.
     model_cache_dir: Path = Field(default_factory=default_cache_dir)
     model_cache_gb: float = Field(default=50.0, gt=0, allow_inf_nan=False)
@@ -72,7 +76,7 @@ class ExecutorSettings(BaseSettings):
             raise ValueError("MINION_EXECUTOR_STATE_DIR must be an absolute path")
         return v
 
-    @field_validator("config_path", "fake_signals", mode="before")
+    @field_validator("config_path", "fake_signals", "launchd_exit_timeout_s", mode="before")
     @classmethod
     def _empty_config_path_is_unset(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v

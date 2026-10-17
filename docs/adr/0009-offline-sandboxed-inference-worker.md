@@ -193,7 +193,7 @@ together with `MINION_EXECUTOR_DEV=1`.
 ## Alternatives considered
 
 - **Separate macOS user for the worker.** Strongest isolation, but needs admin/root at install time and
-  a privileged helper; belongs to M5 packaging.
+  a privileged helper. Still deferred after M5 packaging: ADR-0011 ships a per-user LaunchAgent, so the executor and its sandboxed worker run as the logged-in user.
 - **`sandbox-exec` wrapper.** Deprecated CLI as well; needs a custom `multiprocessing` executable and an
   on-disk profile script, and gives the child no way to report profile errors over the pipe.
 - **App Sandbox entitlements.** Requires a signed app bundle; not applicable to a `uv tool` CLI.

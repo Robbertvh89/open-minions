@@ -76,6 +76,7 @@ UPLOAD_URL_MARGIN_S = 60.0
 # window, release, fail, worker kill and close all draw from it, so a slow server or wedged worker
 # cannot hold the exit past grace + SHUTDOWN_BUDGET_S (+ MIN_CALL_S per call as reaping slack).
 SHUTDOWN_BUDGET_S = 10.0
+MAX_RETRY_AFTER_S = 300.0
 MIN_CALL_S = 0.5
 _TMP_RE = re.compile(r"^minion-exec-(\d+)-")
 # Connectivity trouble on this Mac: released (no retry budget burned). Everything else from S3
@@ -359,6 +360,13 @@ class ExecutorLoop:
         lo, hi = self._backoff
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
+    def _rate_limit_delay(self, exc: Exception, n: int) -> float:
+        """Backoff for attempt `n`; a 429 waits at least its numeric `Retry-After` (cap 300 s)."""
+        delay = self._delay(n)
+        if isinstance(exc, ApiError) and exc.status_code == 429 and exc.retry_after is not None:
+            delay = max(delay, min(exc.retry_after, MAX_RETRY_AFTER_S))
+        return delay
+
     async def _pause(self, delay: float, *, until: asyncio.Event | None = None) -> None:
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
@@ -366,11 +374,12 @@ class ExecutorLoop:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for((until or self._stop).wait(), timeout=delay)
 
-    async def _sleep(self, version: int | None = None) -> None:
+    async def _sleep(self, version: int | None = None, *, delay: float | None = None) -> None:
         """Idle back-off. `version` is the governor version read *before* the acquire call, so a
-        change that arrived during it is not missed."""
-        delay = self._delay(self._idle)
-        self._idle += 1
+        change that arrived during it is not missed. `delay` overrides the idle back-off (429)."""
+        if delay is None:
+            delay = self._delay(self._idle)
+            self._idle += 1
         if self._sleep_fn is not None:
             await self._sleep_fn(delay)
             return
@@ -463,15 +472,17 @@ class ExecutorLoop:
                 log.warning("register_abandoned_at_stop")
                 return
             except (httpx.HTTPError, ApiError) as exc:
-                if isinstance(exc, ApiError) and exc.status_code < 500:
+                limited = isinstance(exc, ApiError) and exc.status_code == 429
+                if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     raise
                 log.warning("register_failed", error=type(exc).__name__)
-                await self._pause(self._delay(attempt))
+                await self._pause(self._rate_limit_delay(exc, attempt))
                 attempt += 1
 
     async def run(self, max_subtasks: int | None = None) -> int:
         """Run until stopped (or `max_subtasks` handled). Returns subtasks completed."""
         done = 0
+        limited_n = 0
         await asyncio.to_thread(cleanup_stale_tmp, self._tmp_root)
         pid_prefix = f"{TMP_PREFIX}{os.getpid()}-"
         tmp = Path(tempfile.mkdtemp(prefix=pid_prefix, dir=self._tmp_root))  # mode 0700
@@ -514,13 +525,19 @@ class ExecutorLoop:
                     log.warning("acquire_abandoned_at_stop")
                     break
                 except (httpx.HTTPError, ApiError, ValueError) as exc:
-                    if isinstance(exc, ApiError) and exc.status_code < 500:
+                    limited = isinstance(exc, ApiError) and exc.status_code == 429
+                    if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                         raise
                     log.warning("acquire_failed", error=type(exc).__name__)
                     await self._maybe_unload()  # a warm model must not outlive a server outage
                     await self._enforce_idle_budget()
-                    await self._sleep(version)
+                    if limited:  # 429: back off at least Retry-After (TASK-6.2 extends this)
+                        limited_n += 1
+                        await self._sleep(version, delay=self._rate_limit_delay(exc, limited_n - 1))
+                    else:
+                        await self._sleep(version)
                     continue
+                limited_n = 0
                 if assignment is None:
                     await self._maybe_unload()
                     await self._enforce_idle_budget()

@@ -3034,3 +3034,42 @@ async def test_watcher_does_not_busy_spin_while_a_model_is_fetched(tmp_path: Pat
     assert count <= 10
     cache.release.set()
     assert await asyncio.wait_for(task, 10) == 1
+
+
+async def test_register_429_backs_off_honouring_retry_after(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([]), list[float]()
+    client.register_excs = [ApiError(429, "RATE_LIMITED", "slow", retry_after=120.0)]
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    loop._register = object()  # type: ignore[assignment]
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.kinds().count("register") == 2
+    assert sleeps[0] == 120.0
+
+
+async def test_acquire_429_backs_off_and_does_not_escape(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(429, "RATE_LIMITED", "slow", retry_after=9999.0)])
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert sleeps[0] == 300.0  # Retry-After is capped
+
+
+async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_path: Path) -> None:
+    gib = 1024**3
+    gov = FixedGovernor(BUDGET)  # 8 GB
+    first = assignment()
+    first = first.model_copy(update={"model": first.model.model_copy(update={"memory_gb": 8})})
+    client = FakeClient([first, ApiError(429, "RATE_LIMITED", "slow", retry_after=250.0)])
+    worker = FakeWorker()
+    worker.footprints = [7 * gib]  # warm model: over a 4 GB budget's guard
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=gov, sleep=None)
+    task = asyncio.create_task(loop.run())
+    await until(lambda: client.kinds().count("acquire") >= 2)
+    await asyncio.sleep(0.05)  # now inside the 429 back-off (>= 250 s)
+    assert worker.unloads == 0
+    gov.update(dec(small(4.0)))
+    await until(lambda: worker.unloads >= 1)
+    loop.stop()
+    await asyncio.wait_for(task, 10)

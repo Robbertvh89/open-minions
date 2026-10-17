@@ -50,3 +50,12 @@ def test_security_binary_missing_raises(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(subprocess, "run", boom)
     with pytest.raises(RuntimeError, match="no executor token"):
         secrets.load_token()
+
+
+@pytest.mark.parametrize(("rc", "transient"), [(44, False), (51, True), (36, True)])
+def test_token_unavailable_flag(monkeypatch: pytest.MonkeyPatch, rc: int, transient: bool) -> None:
+    monkeypatch.delenv(secrets.ENV_VAR, raising=False)
+    monkeypatch.setattr(subprocess, "run", _fake_run(rc, "", []))
+    with pytest.raises(secrets.TokenUnavailableError) as ei:
+        secrets.load_token()
+    assert ei.value.transient is transient

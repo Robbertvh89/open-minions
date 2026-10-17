@@ -15,14 +15,15 @@ import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 from urllib.parse import urlsplit
 
 import httpx
 import structlog
 import typer
-from minion_common.client import LOCAL_HOSTS, ExecutorClient, require_secure_url
+from minion_common.client import LOCAL_HOSTS, ApiError, ExecutorClient, require_secure_url
 from minion_common.enums import CapacityProfile, Engine
 from minion_common.schemas import Budget, RegisterRequest
 from pydantic import SecretStr
@@ -33,7 +34,7 @@ from minion_executor.capacity.config import ExecutorConfig, load_config, resolve
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
 from minion_executor.capacity.gpu_meter import GpuMeterError
-from minion_executor.capacity.instance import acquire_instance_lock
+from minion_executor.capacity.instance import AlreadyRunningError, acquire_instance_lock
 from minion_executor.capacity.profiles import (
     ProfileSpec,
     budget_for,
@@ -50,12 +51,23 @@ from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop, GovernorStoppedError
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
-from minion_executor.secrets import ENV_VAR, load_token
+from minion_executor.secrets import ENV_VAR, TokenUnavailableError, load_token
+from minion_executor.service import (
+    SERVER_AUTH_CODES,
+    check_launchd_timeout,
+    check_server_url,
+    clear_failure,
+    record_failure,
+    sanitize,
+    service_app,
+    service_mode,
+)
 from minion_executor.settings import ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
-from minion_executor.worker.sandbox import SandboxPolicy
+from minion_executor.worker.sandbox import SANDBOX_FAILED, SandboxPolicy
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
+app.add_typer(service_app, name="service")
 
 
 def _chip() -> str:
@@ -92,7 +104,15 @@ NO_ENGINE_MSG = (
 
 
 class StartupError(Exception):
-    """Startup failed (no engine, probe failure); the CLI maps it to exit 2."""
+    """Startup failed (no engine, probe failure); the CLI maps it to exit 2.
+
+    `permanent` is False for a probe crash / timeout (a restart may work); a missing engine or a
+    failed sandbox self-test is permanent.
+    """
+
+    def __init__(self, message: str, *, permanent: bool = True) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 def _is_loopback(url: str) -> bool:
@@ -270,7 +290,8 @@ async def _run(
         except (RunnerError, WorkerCrashed) as exc:
             if second_signal:
                 return  # stopped by the user during startup: clean exit
-            raise StartupError(str(exc)) from exc
+            permanent = isinstance(exc, RunnerError) and exc.code == SANDBOX_FAILED
+            raise StartupError(str(exc), permanent=permanent) from exc
         if second_signal:
             return
         if not available:
@@ -369,9 +390,11 @@ def run(
     """Poll the server and run subtasks. Token: $MINION_EXECUTOR_TOKEN or Keychain."""
     try:
         require_secure_url(server)
+        check_server_url(server)
         requested = _requested_engines(engines, runner)
         _validate_heartbeat(heartbeat_interval_s)
         settings = ExecutorSettings()  # fail fast on bad MINION_EXECUTOR_* values
+        check_launchd_timeout(settings)
         config = load_config(settings.config_path)  # before restrict_environ(); exit 2 if unsafe
         specs = resolve_profiles(config)
         pinned = parse_profile(profile, specs) if profile is not None else None
@@ -382,25 +405,92 @@ def run(
         source = default_source(settings.fake_signals)  # SignalError (a RuntimeError): exit 2
         plan = CapacityPlan(config, specs, pinned, source, settings)
         token = load_token()  # fail fast, before starting anything
+    except TokenUnavailableError as exc:
+        # A locked Keychain / timeout is transient (exit 1: launchd retries); a missing item is not.
+        _failure("token_unavailable", str(exc), permanent=not exc.transient)
     except (ValueError, RuntimeError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _failure("config_invalid", str(exc), permanent=True)
     try:  # one executor per state dir: held until this function returns (or the process dies)
         lock_fd = acquire_instance_lock(settings.state_dir)
+    except AlreadyRunningError as exc:  # the other instance may stop: retry, do not give up
+        _failure("instance_lock_held", str(exc), permanent=False)
     except SafeFileError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _failure("instance_lock", str(exc), permanent=True)
+    if service_mode():
+        clear_failure(settings.state_dir)
     os.environ.pop(ENV_VAR, None)  # keep the token out of every child process' environment
+    # restrict_environ() (inside _run) scrubs the service env vars: decide once, before it.
+    in_service = service_mode()
+    state_dir = settings.state_dir
     try:
         asyncio.run(_run(server, prof, requested, token, budget, heartbeat_interval_s, plan))
     except StartupError as exc:  # no engine / probe failure; runtime errors surface
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from None
+        _failure(
+            "startup_failed",
+            str(exc),
+            permanent=exc.permanent,
+            in_service=in_service,
+            state_dir=state_dir,
+        )
+    except ApiError as exc:
+        # Permanent only when the server itself refused us: 401/403 carrying its own error code
+        # (a proxy/WAF 403 has none), 400 with a server code, or 422.
+        # 429/5xx and the rest are retried.
+        if exc.status_code == 429 or not 400 <= exc.status_code < 500:
+            raise
+        auth = exc.status_code in (401, 403) and exc.code in SERVER_AUTH_CODES
+        detail = f"server answered {exc.status_code} {sanitize(exc.code, 64)}"
+        rejected = exc.status_code == 422 or (exc.status_code == 400 and exc.code != "HTTP_ERROR")
+        reason = "credential_rejected" if auth else "request_rejected" if rejected else None
+        _failure(
+            reason or "request_refused",
+            detail,
+            permanent=reason is not None,
+            code=1,
+            in_service=in_service,
+            state_dir=state_dir,
+        )
     except GovernorStoppedError as exc:  # nothing steers the budget: exit non-zero, never run on
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from None
     finally:
         os.close(lock_fd)
+
+
+def _failure(
+    reason: str,
+    detail: str,
+    *,
+    permanent: bool,
+    code: int = 2,
+    in_service: bool | None = None,
+    state_dir: Path | None = None,
+) -> NoReturn:
+    """End `run` after a failure.
+
+    Under launchd (KeepAlive SuccessfulExit=false) a *permanent* one (a restart cannot fix it) exits
+    0 with one log line `permanent_failure ts=<UTC> reason=...` and is recorded in the state dir
+    for `service status`, so the service is not relaunched every ThrottleInterval. A transient one
+    exits 1 there (relaunched after the throttle). Outside the service both exit `code`.
+    """
+    detail = sanitize(detail, 500)
+    typer.echo(f"error: {detail}", err=True)
+    if service_mode() if in_service is None else in_service:
+        ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not permanent:
+            typer.echo(
+                f"transient_failure ts={ts} reason={reason}: exiting 1 for a relaunch", err=True
+            )
+            raise typer.Exit(code=1)
+        with contextlib.suppress(Exception):
+            record_failure(state_dir or ExecutorSettings().state_dir, reason, detail, ts)
+        typer.echo(
+            f"permanent_failure ts={ts} reason={reason}: exiting 0 so launchd does not relaunch; "
+            "fix the cause, then `launchctl kickstart` (or reinstall) the service",
+            err=True,
+        )
+        raise typer.Exit(code=0)
+    raise typer.Exit(code=code)
 
 
 def _warn(message: str) -> None:

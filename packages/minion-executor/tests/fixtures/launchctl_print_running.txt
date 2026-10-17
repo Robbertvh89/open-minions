@@ -1,0 +1,55 @@
+gui/501/com.apple.progressd = {
+	active count = 2
+	path = /System/Library/LaunchAgents/com.apple.progressd.plist
+	type = LaunchAgent
+	state = running
+
+	program = /System/Library/Frameworks/ClassKit.framework/Versions/A/progressd
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.PqwbwoZozj/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		MallocSpaceEfficient => 1
+		XPC_SERVICE_NAME => com.apple.progressd
+	}
+
+	domain = gui/501 [100017]
+	asid = 100017
+	minimum runtime = 10
+	base minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 2098
+	immediate reason = ipc (mach)
+	forks = 0
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	endpoints = {
+		"com.apple.progressd.aps" = {
+			port = 0xf1def
+			active = 0
+			managed = 1
+			state = active
+		}
+	}
+
+	services = {
+		"x" = {
+			state = active
+		}
+	}
+}

@@ -4,6 +4,7 @@ title: M5.2 Executor endpoint rate limits (TASK-9) and minion-executor prefer (G
 status: To Do
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 05:14'
 labels:
   - M5
 dependencies: []
@@ -25,3 +26,9 @@ minion_server/ratelimit.py: in-memory min interval per (executor_id, op), monoto
 - [ ] #4 prefer sets and clears the preference; integration: next acquire prefers that team
 - [ ] #5 The limiter never replaces the ON CONFLICT acquisition (invariant 2)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+From TASK-6.8 review: a 429 acquire back-off cut short by a pause is forgotten; after resume the loop acquires at once even if Retry-After has not elapsed. Keep a _rate_limited_until monotonic deadline and wait out the rest before the first acquire after resume. Also test_loop.py test_governor_downgrade_during_429_backoff_unloads_warm_worker uses asyncio.sleep(0.05) to wait for the back-off; replace with an observable signal.
+<!-- SECTION:NOTES:END -->
