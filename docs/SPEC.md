@@ -534,7 +534,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   `inputs/` to make an overwrite of another submitter's input recoverable. Executors never hold these
   credentials (S-2); they keep using presigned URLs. The CLI's API key comes from `MINION_API_KEY` or
   the Keychain item `open-minions-api-key` and is never printed. Only `https` server and S3 endpoints
-  are accepted (as for the executor), including an endpoint taken from the boto3 environment/config.
+  (or `http` to loopback) are accepted (as for the executor), including an endpoint taken from the boto3 environment/config.
   `minion fetch` claims its output directory with a `manifest.json` naming the task (team, project,
   name, output URI, creation time) and refuses another task's directory; a part is reused only if its
   content matches the remote object (md5 of a plain ETag, else ETag + sha256 recorded in the manifest).

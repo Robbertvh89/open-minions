@@ -77,8 +77,18 @@ def test_imports_and_contents(image: str) -> None:
         assert _run(image, "test", "!", "-e", path).returncode == 0, path
     assert _run(image, "test", "-f", "/app/alembic.ini").returncode == 0
     assert _run(image, "test", "-f", "/app/deploy/models.yaml").returncode == 0
+    # The dev-only fake models must never ship in the image.
+    assert _run(image, "test", "!", "-e", "/app/deploy/models.dev.yaml").returncode == 0
 
 
 def test_compose_config_with_app_profile_is_valid() -> None:
     out = _docker("compose", "-f", "deploy/compose.yml", "--profile", "app", "config", "-q")
+    assert out.returncode == 0, out.stderr
+
+
+def test_compose_config_with_dev_override_is_valid() -> None:
+    out = _docker(
+        "compose", "-f", "deploy/compose.yml", "-f", "deploy/compose.dev.yml",
+        "--profile", "app", "config", "-q",
+    )  # fmt: skip
     assert out.returncode == 0, out.stderr

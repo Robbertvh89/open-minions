@@ -534,7 +534,7 @@ Local dev uses SeaweedFS instead of MinIO (MinIO community images are no longer 
 
 | Env | Topology |
 |---|---|
-| Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana; with `--profile app` also migrate, server, watchdog (one image, `deploy/Dockerfile`); executor runs natively on the Mac (needs Metal — not in Docker) |
+| Local dev | `deploy/compose.yml`: postgres, s3 (SeaweedFS), grafana; with `--profile app` also migrate, server, watchdog (one image, `deploy/Dockerfile`); executor runs natively on the Mac (needs Metal — not in Docker); `-f deploy/compose.dev.yml` adds the fake models for the quick start (dev only) |
 | Prod | Managed Postgres (separate dev/prod DBs **[paper]**), S3, ≥2 server replicas, 1–2 watchdogs, Grafana. One deployment per team/org for isolation **[paper]** |
 
 Container hardening (`deploy/Dockerfile`, `x-minion-app` in `compose.yml`): one image for migrate, server and watchdog, built from the lockfile with `uv sync --locked --no-dev`; base images pinned by digest; the executor and pyobjc are not installed. Runs as uid/gid 10001 (non-root), `read_only` rootfs with `tmpfs` `/tmp`, `cap_drop: [ALL]`, `no-new-privileges`, setuid/setgid bits stripped, `/tmp` tmpfs capped at 64 MB. `server` and `watchdog` use `restart: unless-stopped` (`migrate` is one-shot). Third-party images in `compose.yml` are pinned by digest. No `.env` or secrets in any layer (`.dockerignore` is an allow-list). The watchdog liveness file lives in the `/tmp` tmpfs (`MINION_WATCHDOG_HEALTH_FILE`, touched at start and after each successful tick, so it goes stale while DB errors back off).
