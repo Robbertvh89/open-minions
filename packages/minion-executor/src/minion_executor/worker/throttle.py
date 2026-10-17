@@ -116,6 +116,7 @@ class DutyCyclePacer:
             self._acc = 0.0
             self._force = False
             self._credit = 0.0
+            self._asked = self._due = False  # a latched answer never outlives its step
             self._last = self._clock()
             return 0.0
         ends = self._due if self._asked else (self._force or self._acc >= self._quantum)

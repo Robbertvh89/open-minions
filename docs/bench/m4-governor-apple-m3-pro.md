@@ -9,7 +9,7 @@ TASK-5.6. Raw data: [`m4-governor-apple-m3-pro.json`](m4-governor-apple-m3-pro.j
 - Mac on AC, 100 % battery, no heavy apps; mlx 0.32.4, mlx-lm 0.32.0, Python 3.12.7.
 - `minion-executor bench --budget-check --models deploy/bench-models.yaml --model qwen2.5-0.5b-mlx --model minilm-mlx --profiles light,balanced,full --duration 60 --baseline-s 20 --repeats 3`
   at commit 615685a (quantum pacing). 1fc03d5 only changes the pacer's quantum latch for edge cases
-  (one step per occurrence) and does not affect these numbers.
+  (one step per occurrence); it can only lower the measured share (fewer undrained sleeps) and was not re-measured.
 - **Measured share** = the worker process's own GPU time (summed `accumulatedGPUTime` of its
   `AGXDeviceUserClient`s, ns) / wall time. Device utilization is shown for information only: it is
   device-wide and was 31–39 % on an idle desktop (WindowServer and other apps), so it cannot judge a
@@ -77,4 +77,4 @@ swap. The opt-in procedure is in `governor-measurements.md`.
 | idle | 0.080 | 0.134 % |
 | paused | 0.097 | 0.162 % |
 
-Both < 1 %. Covers the control process only; see the procedure doc for the full process tree.
+Both < 1 %. This covers the control process only; the whole `run` process tree (control + worker, `ps` procedure in governor-measurements.md) was not recorded here and stays open.

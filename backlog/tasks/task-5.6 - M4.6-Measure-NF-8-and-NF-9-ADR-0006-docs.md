@@ -14,7 +14,7 @@ ordinal: 29000
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [x] #1 bench --budget-check: GPU share (ioreg, baseline-subtracted) and worker peak footprint vs budget; M3 Pro results committed
+- [x] #1 bench --budget-check: per-process GPU share (AGX accumulatedGPUTime; device utilization info only) and worker peak footprint vs budget; M3 Pro results committed
 - [x] #2 NF-9: CI 20-trial reaction test max < 5 s; Mac opt-in measurements (memory_pressure, user return, FileSignals thermal/power) documented
 - [x] #3 NF-4 idle/paused CPU < 1 % recorded
 - [x] #4 ADR-0006 final; SPEC/ARCH/CLAUDE.md/.env.example synced

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import sys
 import time
@@ -62,9 +63,10 @@ def test_pacer_sleep_length_follows_duty_and_credit_is_capped() -> None:
     q = DutyCyclePacer(0.5, over, late, quantum_s=0.05)
     over.now += 0.1
     q.step_done()
-    over.now += 0.6  # owes 0.6 s; the credit is capped at 0.5 s, so ~0.1 s is slept
+    assert q._credit == pytest.approx(-0.5)  # 5 s overslept, credit capped at 0.5 s
+    over.now += 0.6  # owes 0.6 s; minus the capped credit, ~0.1 s is slept
     slept = q.step_done()
-    assert slept == pytest.approx(5.0 + 0.1) and over.now > 0  # late wake-up of 5 s on top
+    assert slept == pytest.approx(5.0 + 0.1)  # the requested 0.1 s plus the 5 s late wake-up
 
 
 def test_pacer_full_duty_never_due_or_sleeping() -> None:
@@ -124,6 +126,17 @@ def test_latched_answer_duty_drop_at_checkpoint_syncs_next_step() -> None:
     assert p.step_done() == pytest.approx(0.002)
 
 
+def test_latch_answered_at_full_duty_does_not_outlive_its_step() -> None:
+    c = _Clock()
+    p = _pacer(1.0, c)
+    assert not p.quantum_due()  # latched "no" at duty 1.0
+    c.now += 0.01
+    p.step_done()
+    p.set_duty(0.5)  # duty drop: the next (unasked) step must drain and sleep
+    c.now += 0.01
+    assert p.step_done() > 0.0
+
+
 def test_unasked_step_done_falls_back_to_the_quantum() -> None:
     c = _Clock()
     p = _pacer(0.5, c)
@@ -139,6 +152,11 @@ def test_finish_returns_from_the_flush_when_paused() -> None:
     t0 = time.monotonic()
     ctl.finish()
     assert time.monotonic() - t0 < 1.0
+    msgs = []
+    while parent.poll(0.2):
+        msgs.append(json.loads(parent.recv_bytes()))
+    acks = [m for m in msgs if "ack" in m]
+    assert acks and acks[0]["ack"] == 1 and acks[0]["paused"] is True  # the pause was acked
 
 
 def test_quantum_default_constant() -> None:
