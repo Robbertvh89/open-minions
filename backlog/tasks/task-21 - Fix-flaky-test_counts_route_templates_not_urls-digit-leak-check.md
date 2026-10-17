@@ -20,6 +20,6 @@ The metrics leak check asserts the substring '123' is absent, but prometheus_cli
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Leak check uses the full unique path segment, not a short digit string
-- [ ] #2 Test passes repeatedly
+- [x] #1 Leak check uses the full unique path segment, not a short digit string
+- [x] #2 Test passes repeatedly
 <!-- AC:END -->
