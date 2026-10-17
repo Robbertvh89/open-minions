@@ -3,9 +3,10 @@ id: TASK-6.10
 title: >-
   M5.10 Call-aware governor: camera or microphone in use -> light or pause
   (FR-53 optional)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
+updated_date: '2026-10-17 14:33'
 labels:
   - M5
 dependencies: []
