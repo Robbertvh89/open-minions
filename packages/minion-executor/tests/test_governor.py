@@ -735,3 +735,28 @@ def test_unknown_call_state_is_not_a_call() -> None:
     g = _full_gov(ExecutorConfig(on_call="pause"))
     d = g.step(snap(hid_idle_s=IDLE, call_active=None), 2)
     assert d.paused_reason is None and d.budget.gpu_duty_cycle == 1.0
+
+
+def test_call_capped_flag_is_set_only_when_the_cap_applies() -> None:
+    g = _full_gov()
+    assert g.step(snap(hid_idle_s=IDLE, call_active=True), 2).call_capped is True
+    assert g.step(snap(hid_idle_s=IDLE, call_active=False), 1).call_capped is False
+    p = Gov(pinned=P.FULL)  # auto does not cap a pinned profile
+    assert p.step(snap(call_active=True)).call_capped is False
+
+
+def test_explicit_choice_follows_both_ways_mid_call_capped_at_light() -> None:
+    cfg = ExecutorConfig(on_call="light")
+    g = Gov(cfg, start=True)
+    g.step(snap(call_active=True), 1, owner=OwnerControl(profile=P.FULL))
+    d = g.step(snap(call_active=True), 1, owner=OwnerControl(profile=P.BALANCED))
+    light = budget_for(P.LIGHT, TOTAL, g.specs)
+    balanced = budget_for(P.BALANCED, TOTAL, g.specs)
+    assert d.profile is P.LIGHT
+    assert d.budget.gpu_duty_cycle == min(light.gpu_duty_cycle, balanced.gpu_duty_cycle)
+    d = g.step(snap(call_active=True), 1, owner=OwnerControl(profile=P.FULL))
+    assert d.budget.gpu_duty_cycle == light.gpu_duty_cycle  # raised at once, capped at light
+    d = g.step(snap(call_active=True), 1, owner=OwnerControl(profile=P.LIGHT))
+    assert d.budget == light
+    d = g.step(snap(call_active=True), 1, owner=OwnerControl(profile=P.FULL))
+    assert d.budget.gpu_duty_cycle == light.gpu_duty_cycle

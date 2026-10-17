@@ -26,7 +26,7 @@ import structlog
 from minion_common.enums import CapacityProfile, PausedReason
 from minion_common.schemas import Budget
 
-from minion_executor.capacity.config import ExecutorConfig
+from minion_executor.capacity.config import ExecutorConfig, OnCall
 from minion_executor.capacity.control import ControlUnusable, OwnerControl, read_control
 from minion_executor.capacity.governor import (
     Decision,
@@ -97,6 +97,7 @@ def decision_key(d: Decision) -> tuple[object, ...]:
         d.trim,
         d.profile_source,
         d.candidate,
+        d.call_capped,
     )
 
 
@@ -350,6 +351,9 @@ class GovernorRuntime:
 
     async def poll_once(self) -> Decision:
         """One governor step: read, decide, publish. Never raises on a bad read or file."""
+        want = getattr(self._source, "set_want_call_state", None)
+        if want is not None:  # the source skips the call probe unless the config wants it
+            want(self._cfg.on_call is not OnCall.IGNORE)
         snap = await self._read_signals()
         owner = await self._read_owner()
         decision, self._state = decide(

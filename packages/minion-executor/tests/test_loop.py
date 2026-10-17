@@ -3356,3 +3356,42 @@ def test_acquire_pace_setting_rejects_values_below_server_interval() -> None:
         with pytest.raises(ValueError):
             ExecutorSettings(acquire_pace_s=bad)
     assert ExecutorSettings(acquire_pace_s=0).acquire_pace_s == 0
+
+
+async def test_status_marks_call_cap_from_a_real_decision_and_keeps_it_off_the_wire(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
+    from minion_executor.capacity.governor import decide, initial_state
+    from minion_executor.capacity.profiles import budget_for
+    from minion_executor.capacity.signals import MemPressure, SignalSnapshot, Thermal
+    from minion_executor.capacity.status import render
+
+    cfg = ExecutorConfig()  # default specs, on_call=auto
+    specs = resolve_profiles(cfg)
+    now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+    sig = SignalSnapshot(
+        hid_idle_s=3600.0,
+        on_ac=True,
+        battery_percent=None,
+        low_power_mode=False,
+        thermal=Thermal.NOMINAL,
+        memory_pressure=MemPressure.NORMAL,
+        taken_at=now,
+        call_active=True,
+    )
+    state = initial_state(cfg, None, specs=specs, total_gb=32.0)
+    d, _ = decide(sig, cfg, specs, None, now, now, state, total_gb=32.0)
+    assert d.call_capped
+    gov = FixedGovernor(budget_for(d.profile, 32.0, specs))
+    gov.update(d)
+    loop = make_loop(FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], governor=gov)
+    st = loop._status_snapshot()
+    assert st.call_capped is True
+    assert "[light: in call]" in render(st, st.updated_at)
+    from minion_common.schemas import PresenceRequest
+
+    req = PresenceRequest(budget=d.budget, paused_reason=None)
+    assert "call_capped" not in req.model_dump_json()

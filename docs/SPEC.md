@@ -502,7 +502,9 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   profile (`run --profile` or `minion-executor profile <name>`). Keyboard idle time itself is never sent.
   Likewise a drop to `light` that coincides with a meeting reveals that the owner is probably in a call
   (under the default `on_call = "auto"` it looks like any other drop to light; pinning a profile hides
-  it). `on_call = "pause"` reveals it outright (`paused_reason = in_call`); `"light"` caps pinned
+  it; this cover holds only while light is otherwise reachable, which is the default: if the owner sets
+  `active_profile` and `idle_profile` both above light, light appears only in calls, so pin a profile or
+  use `ignore`). `on_call = "light"` on a pinned executor reveals calls the same way. `on_call = "pause"` reveals it outright (`paused_reason = in_call`); `"light"` caps pinned
   profiles too. Set `on_call = "ignore"` in `executor.toml` to avoid it. The microphone/camera state
   itself is never sent (the local status file only).
 - S-12. Read-endpoint cost **[ours]**. `GET /tasks` aggregates subtask counts per page and `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter. Per-status counters on `minion_task` are tracked in the backlog.

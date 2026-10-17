@@ -255,16 +255,22 @@ true when a process runs audio input or a camera is running. Microphone: input-o
 CoreAudio process objects (`kAudioHardwarePropertyProcessObjectList` + `kAudioProcessPropertyIsRunningInput`,
 macOS 14+, through ctypes), falling back to the default input device's
 `kAudioDevicePropertyDeviceIsRunningSomewhere` when the process list is unavailable. The fallback has
-false positives (output on a combined headset/USB device, an always-open microphone app). Cameras:
+false positives (output on a combined headset/USB device, an always-open microphone app). An
+always-open microphone app (dictation, noise suppression) sets `IsRunningInput` on the process-object
+path too, so under `auto` it keeps an adaptive executor at light for as long as it runs; use
+`on_call = "ignore"` in that case. Cameras:
 CoreMediaIO `IsRunningSomewhere` per device. These are public property reads; they open no device, so
 there is no TCC prompt and no indicator. Device names/UIDs are never read. Residual risk: loading
 CoreMediaIO may load admin-installed third-party DAL plug-ins into the control process.
 The probe runs on its own daemon thread (`AsyncCallProbe`), apart from the safety read: one read in
 flight, a 0.5 s hang limit, the latest finished value cached (15 s max age). `MacSignals.read` takes
 the cached value without blocking; pending, hung, failed or stale gives `None` (unknown), treated as
-not in a call, and can never cause `signals_unavailable`. The first read only starts the probe, as does
-the startup probe (which has the same 1.5 s timeout as `read_with_timeout`). `call_probe_unavailable`
-is logged once when the probe yields `None`.
+not in a call, and can never cause `signals_unavailable`. `value()` starts a read and waits up to the 0.5 s limit for its
+completion event, so a new call state is seen on the very next poll (NF-9); a read already hung is not
+waited for. The probe is built lazily and skipped (no thread, no CoreMediaIO load, `call_active`
+`None`) when `on_call = "ignore"`: `GovernorRuntime` tells the source each poll
+(`set_want_call_state`). `call_probe_unavailable` is logged once when the probe yields `None`,
+including a first read that never settles.
 `on_call` in `executor.toml`: `auto` (default) caps to light only while the profile is adaptive (not
 pinned by `run --profile`, not owner-chosen with `minion-executor profile`); `light` caps always;
 `pause` pauses with `in_call`, the lowest-priority reason, with the usual 10 s resume hysteresis;
@@ -273,10 +279,15 @@ per-dimension minimum of light, the target and the budget in force, so a lower d
 so on the wire it is an ordinary drop to light, not a "full with light numbers" fingerprint. The cap
 applies at once and clears the escalation candidate; afterwards the budget rises after the 60 s hold
 (owner/pinned choices return at once). The dev signal file accepts an optional `call_active`.
-`status.json` (local, 0600) carries `call_active` and renders `[light: in call]`; it is never sent to
-the server.
+An explicit owner/`--profile` choice under `on_call = "light"` is capped against light and its
+target only, so it follows the owner at once in both directions. `status.json` (local, 0600) carries
+`call_active` and `call_capped` (set by the governor when the cap applied) and renders
+`[light: in call]`; neither is sent to the server.
 Privacy: the drop to light is visible to the server (SPEC S-11). Pinning a profile hides calls under
-`auto`; `pause` mode reveals `paused_reason = in_call`, which operators and owners choose knowingly.
+`auto`, but `on_call = "light"` on a pinned executor reveals them the same way. The light "cover" only
+hides calls if light is otherwise reachable (true by default); if the owner sets active and idle
+profiles both above light, light appears only in calls: pin a profile or use `on_call = "ignore"`.
+ `pause` mode reveals `paused_reason = in_call`, which operators and owners choose knowingly.
 Not verified here: real microphone/camera activation (we deliberately do not start them).
 
 ### Gap 1: how NF-8 is measured

@@ -34,7 +34,7 @@ from minion_executor.capacity.config import ExecutorConfig, resolve_profiles
 from minion_executor.capacity.governor import GovernorTiming
 from minion_executor.capacity.profiles import budget_for
 from minion_executor.capacity.runtime import GovernorRuntime
-from minion_executor.capacity.signals import FileSignals
+from minion_executor.capacity.signals import AsyncCallProbe, FileSignals, SignalSnapshot
 from minion_executor.loop import ExecutorLoop, _Verdict
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 
@@ -137,6 +137,27 @@ def write_signals(path: Path, fields: dict[str, Any]) -> None:
     tmp.replace(path)  # atomic: the reader never sees half a file
 
 
+class ProbedFileSignals(FileSignals):
+    """FileSignals whose `call_active` comes through an `AsyncCallProbe` reading the same file, so
+    the production async call path is under the NF-9 bound."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self._probe = AsyncCallProbe(_FileCall(path))
+
+    def read(self) -> SignalSnapshot:
+        snap = super().read()
+        return snap.__class__(**{**snap.__dict__, "call_active": self._probe.value()})
+
+
+class _FileCall:
+    def __init__(self, path: Path) -> None:
+        self._inner = FileSignals(path)
+
+    def call_active(self) -> bool | None:
+        return self._inner.read().call_active
+
+
 def budget_of(profile: CapacityProfile) -> Budget:
     return budget_for(profile, TOTAL_GB)
 
@@ -152,7 +173,7 @@ async def one_trial(tmp: Path, ev: Event, rng: random.Random) -> float:
     write_signals(sig, ev.before)
     cfg = ExecutorConfig()
     gov = GovernorRuntime(
-        FileSignals(sig),
+        ProbedFileSignals(sig),
         cfg,
         resolve_profiles(cfg),
         state_dir=state,

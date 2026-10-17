@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -322,17 +322,18 @@ class CallReader(Protocol):
 
 class AsyncCallProbe:
     """Runs a (possibly slow or wedged) call reader on its own daemon thread, apart from the safety
-    read. At most one read is in flight; `value()` never blocks: it starts a read when none is
-    running and returns the latest finished value. Pending-too-long (hung), failed or stale
-    reads give None (unknown, which the governor treats as not in a call) and can never make the
-    safety signals unavailable."""
+    read. At most one read is in flight. `value()` starts a read when none is running and waits up
+    to `timeout_s` for it, so a change is seen on the very next call; a read that is already hung
+    is not waited for (cached value, or None). Hung, failed or stale reads give None (unknown,
+    which the governor treats as not in a call) and can never make the safety signals unavailable.
+    """
 
     def __init__(
         self,
         reader: CallReader,
         timeout_s: float = CALL_PROBE_TIMEOUT_S,
         max_age_s: float = CALL_PROBE_MAX_AGE_S,
-        clock: Any = time.monotonic,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._reader = reader
         self._timeout_s = timeout_s
@@ -340,36 +341,54 @@ class AsyncCallProbe:
         self._clock = clock
         self._lock = threading.Lock()
         self._started: float | None = None  # start of the read in flight
+        self._done: threading.Event | None = None  # completion of the read in flight
         self._value: bool | None = None
         self._finished: float | None = None
 
-    def _run(self) -> None:
+    def _run(self, done: threading.Event) -> None:
         try:
             val = self._reader.call_active()
         except Exception:  # an optional signal never raises
             val = None
         with self._lock:
             self._value, self._finished, self._started = val, self._clock(), None
+        done.set()
 
     def settled(self) -> bool:
         """True once a read has finished at least once."""
         with self._lock:
             return self._finished is not None
 
-    def value(self) -> bool | None:
+    def read(self) -> tuple[bool | None, bool]:
+        """(value, settled), taken under one lock after the wait."""
         now = self._clock()
+        wait_for: threading.Event | None = None
         with self._lock:
             if self._started is None:
-                self._started = now
+                done = threading.Event()
+                self._started, self._done = now, done
                 try:
-                    threading.Thread(target=self._run, name="call-probe", daemon=True).start()
+                    threading.Thread(
+                        target=self._run, args=(done,), name="call-probe", daemon=True
+                    ).start()
+                    wait_for = done
                 except RuntimeError:  # cannot start a thread: unknown
                     self._started = None
             elif now - self._started > self._timeout_s:
-                return None  # hung: the read stays in flight, nothing new is started
+                return None, self._finished is not None  # hung: nothing new is started
+        if wait_for is not None:
+            wait_for.wait(self._timeout_s)
+        now = self._clock()
+        with self._lock:
+            settled = self._finished is not None
+            if self._started is not None and now - self._started > self._timeout_s:
+                return None, settled  # the read we started hung
             if self._finished is None or now - self._finished > self._max_age_s:
-                return None
-            return self._value
+                return None, settled
+            return self._value, settled
+
+    def value(self) -> bool | None:
+        return self.read()[0]
 
 
 _CF_RETAINED: dict[str, Any] = {"retval": {"already_cfretained": True}}
@@ -383,8 +402,9 @@ class MacSignals:
     _foundation: Any
     _iokit: dict[str, Any]
     _libc: Any
-    _call: AsyncCallProbe
+    _call: AsyncCallProbe | None
     _call_warned: bool
+    _want_call: bool
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
@@ -420,8 +440,13 @@ class MacSignals:
         self._quartz = Quartz
         self._foundation = Foundation
         self._iokit = iokit
-        self._call = AsyncCallProbe(_CallProbe())
+        self._call = None  # built lazily: no CoreMediaIO load or thread unless call state is wanted
         self._call_warned = False
+        self._want_call = True
+
+    def set_want_call_state(self, want: bool) -> None:
+        """Whether the governor uses call state (`on_call` != ignore); set from config each poll."""
+        self._want_call = want
 
     def _hid_idle_s(self) -> float:
         q = self._quartz
@@ -467,18 +492,23 @@ class MacSignals:
             raise SignalError("memory pressure unreadable")
         return pressure_from_sysctl(val.value)
 
-    def _call_seen(self) -> bool:
-        """True once a probe read has finished (so None then means unreadable, not just new)."""
-        return self._call.settled()
+    def _call_state(self) -> bool | None:
+        if not self._want_call:
+            return None
+        if self._call is None:
+            self._call = AsyncCallProbe(_CallProbe())
+        call, _settled = self._call.read()
+        # the read waits for a fresh value, so None is unreadable: failed, or hung (never settled)
+        if call is None and not self._call_warned:
+            self._call_warned = True
+            log.info("call_probe_unavailable")
+        return call
 
     def read(self) -> SignalSnapshot:
         try:
             # reads run on a bare worker thread with no ambient pool: drain autoreleased objects
             with self._objc.autorelease_pool():
-                call = self._call.value()
-                if call is None and not self._call_warned and self._call_seen():
-                    self._call_warned = True
-                    log.info("call_probe_unavailable")
+                call = self._call_state()
                 info = self._foundation.NSProcessInfo.processInfo()
                 on_ac, percent = self._power()
                 return SignalSnapshot(

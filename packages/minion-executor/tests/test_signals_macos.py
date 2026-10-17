@@ -66,15 +66,19 @@ def test_mac_signals_call_active_is_a_bool() -> None:
 
     Real microphone/camera activation is NOT exercised here (not verifiable without starting them).
     """
-    import time
-
     m = MacSignals()
-    assert m.read().call_active is None  # the first read only starts the probe (never blocks)
-    for _ in range(50):
-        if m._call.settled():
-            break
-        time.sleep(0.1)
+    assert isinstance(m.read().call_active, bool)  # waits for the fresh read (<= 0.5 s)
+    assert m._call is not None and m._call.settled()
+
+
+def test_mac_signals_skips_the_call_probe_when_not_wanted() -> None:
+    m = MacSignals()
+    m.set_want_call_state(False)
+    assert m.read().call_active is None
+    assert m._call is None  # no thread, no CoreMediaIO load
+    m.set_want_call_state(True)
     assert isinstance(m.read().call_active, bool)
+    assert m._call is not None
 
 
 def test_mac_signals_hung_call_probe_does_not_block_safety_read() -> None:

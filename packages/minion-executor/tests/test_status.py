@@ -250,5 +250,6 @@ def test_render_in_call_label() -> None:
         taken_at=NOW,
         call_active=True,
     )
-    out = render(status(held_below_nominal=True, signals=sig), NOW)
+    out = render(status(call_capped=True, signals=sig), NOW)  # independent of held_below_nominal
     assert "[light: in call]" in out and "held below nominal" not in out
+    assert "[light: in call]" not in render(status(held_below_nominal=True, signals=sig), NOW)

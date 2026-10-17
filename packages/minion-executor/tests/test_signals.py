@@ -315,20 +315,30 @@ def test_async_call_probe_hung_reader_never_blocks_and_starts_one_thread() -> No
         gate.set()
 
 
-def test_async_call_probe_caches_latest_finished_value() -> None:
+def test_async_call_probe_change_is_visible_on_the_very_next_call() -> None:
+    from minion_executor.capacity.signals import AsyncCallProbe
+
+    r = _Reader(value=False)
+    p = AsyncCallProbe(r)
+    assert p.value() is False  # waits for the fresh read, not "the previous value"
+    r.value = True
+    assert p.value() is True
+    r.value = False
+    assert p.value() is False
+    assert p.read() == (False, True)
+
+
+def test_async_call_probe_stale_value_is_unknown() -> None:
     from minion_executor.capacity.signals import AsyncCallProbe
 
     r = _Reader(value=True)
     t = [0.0]
-    p = AsyncCallProbe(r, clock=lambda: t[0])
-    assert p.value() is None  # first call only starts the read
-    for _ in range(100):
-        if p.settled():
-            break
-        threading.Event().wait(0.02)
+    p = AsyncCallProbe(r, timeout_s=0.05, clock=lambda: t[0])
     assert p.value() is True
-    t[0] += 100.0  # stale
-    assert p.value() is None
+    r.gate = threading.Event()  # the next read hangs
+    t[0] += 100.0
+    assert p.value() is None  # never the stale True
+    r.gate.set()
 
 
 def test_async_call_probe_failing_reader_is_unknown() -> None:
@@ -339,12 +349,8 @@ def test_async_call_probe_failing_reader_is_unknown() -> None:
             raise OSError("x")
 
     p = AsyncCallProbe(Boom())
-    p.value()
-    for _ in range(100):
-        if p.settled():
-            break
-        threading.Event().wait(0.02)
     assert p.value() is None
+    assert p.settled() is True
 
 
 def test_call_probe_none_when_frameworks_fail_to_load(monkeypatch: pytest.MonkeyPatch) -> None:

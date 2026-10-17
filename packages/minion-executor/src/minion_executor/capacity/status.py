@@ -78,6 +78,7 @@ class StatusFile(_Model):
     profile_source: ProfileSource
     budget: Budget
     held_below_nominal: bool
+    call_capped: bool = False  # local file only: the in-call cap to light applied
     candidate: CapacityProfile | None = None
     candidate_since: AwareDatetime | None = None
     paused_reason: PausedReason | None = None
@@ -236,9 +237,10 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
     now = now or datetime.now(UTC)
     b = st.budget
     lines = [f"profile:   {st.profile.value} (source: {st.profile_source.value})"]
-    if st.held_below_nominal:
-        in_call = st.signals is not None and st.signals.call_active is True
-        lines[0] += "  [light: in call]" if in_call else "  [held below nominal]"
+    if st.call_capped:
+        lines[0] += "  [light: in call]"
+    elif st.held_below_nominal:
+        lines[0] += "  [held below nominal]"
     if st.candidate is not None and st.candidate != st.profile:
         since = st.candidate_since
         wait = f" for {_dur((now - since).total_seconds())}" if since is not None else ""

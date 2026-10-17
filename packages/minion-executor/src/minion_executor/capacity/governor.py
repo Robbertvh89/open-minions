@@ -104,6 +104,7 @@ class Decision:
     # May equal `profile` when the budget in force is below that profile's nominal budget.
     candidate: CapacityProfile | None
     candidate_since: datetime | None
+    call_capped: bool = False  # the in-call cap to light applied (local status only, never wire)
 
     @property
     def paused(self) -> bool:
@@ -304,7 +305,8 @@ def decide(
         # is already lower stays lower. Applies at once; the candidate is cleared, so after the
         # call the usual hold restarts from this capped budget.
         capped = _min_budget(budget_for(CapacityProfile.LIGHT, total_gb, specs), target_b)
-        if in_force is not None:
+        if in_force is not None and source not in _EXPLICIT:
+            # an explicit choice (owner / --profile) moves at once, capped at light
             capped = _min_budget(capped, in_force)
         applied, cand, cand_since = CapacityProfile.LIGHT, None, None
         applied_b = capped.model_copy(update={"profile": CapacityProfile.LIGHT})
@@ -330,6 +332,7 @@ def decide(
         profile_source=source,
         candidate=cand,
         candidate_since=cand_since,
+        call_capped=call_cap,
     )
     new_state = replace(
         state,

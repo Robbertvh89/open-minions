@@ -1051,6 +1051,7 @@ class ExecutorLoop:
             profile_source=d.profile_source,
             budget=d.budget,
             held_below_nominal=d.budget != self._gov.nominal,
+            call_capped=d.call_capped,
             candidate=d.candidate,
             candidate_since=d.candidate_since,
             paused_reason=d.paused_reason,
