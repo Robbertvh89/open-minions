@@ -5,6 +5,7 @@ attempt's output stays at its attempt-scoped key, unpromoted. Ownership is only 
 the acquire INSERT; reclaim just deletes the row under a row lock.
 """
 
+import time
 import uuid
 from collections import Counter
 from enum import StrEnum
@@ -81,9 +82,14 @@ async def reclaim_stale(
         ids = await repo.stale_ids(s, timeout_s, batch_size)
         if max_lease_s is not None:
             seen = set(ids)
-            ids += [
-                i for i in await repo.over_lease_ids(s, max_lease_s, batch_size) if i not in seen
-            ]
+            scan_started = time.monotonic()
+            over = await repo.over_lease_ids(s, max_lease_s, batch_size)
+            log.debug(
+                "over_lease_scan",
+                scan_ms=round((time.monotonic() - scan_started) * 1000),
+                hits=len(over),
+            )
+            ids += [i for i in over if i not in seen]
     results: Counter[ReclaimResult] = Counter()
     for aid in ids:
         try:

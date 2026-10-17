@@ -27,6 +27,7 @@ _EXPIRED = frozenset(
         ReclaimResult.EXPIRED_CANCELLED,
     }
 )
+SLOW_TICK_MS = 1000  # a tick slower than this is logged at info, else at debug
 MAX_ROUNDS_PER_TICK = 100  # bound one tick when a mass outage leaves more than a batch stale
 
 
@@ -40,7 +41,9 @@ async def tick(
 ) -> None:
     """One pass: reclaim (repeated while batches come back full), then sweep cancelled tasks."""
     started = time.monotonic()
+    rounds = 0
     for _ in range(MAX_ROUNDS_PER_TICK):
+        rounds += 1
         results = await reclaim_stale(
             sm,
             timeout_s=cfg.heartbeat_timeout_s,
@@ -48,11 +51,7 @@ async def tick(
             max_lease_s=cfg.max_lease_s,
         )
         if results:
-            log.info(
-                "watchdog_reclaim",
-                **{k.value: v for k, v in results.items()},
-                duration_ms=round((time.monotonic() - started) * 1000),
-            )
+            log.info("watchdog_reclaim", **{k.value: v for k, v in results.items()})
         expired = sum(n for r, n in results.items() if r in _EXPIRED)
         if expired < cfg.watchdog_batch_size or stop.is_set():
             break
@@ -61,6 +60,9 @@ async def tick(
         await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)
     except Exception as exc:
         log.error("watchdog_sweep_failed", error_class=type(exc).__name__)
+    duration_ms = round((time.monotonic() - started) * 1000)
+    emit = log.info if duration_ms > SLOW_TICK_MS else log.debug
+    emit("watchdog_tick", duration_ms=duration_ms, rounds=rounds)
 
 
 async def _sleep(stop: asyncio.Event, seconds: float) -> None:

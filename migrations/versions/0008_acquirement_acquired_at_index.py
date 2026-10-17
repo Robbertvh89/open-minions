@@ -17,6 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     # The table only holds running work (small); a plain CREATE INDEX is a brief lock.
+    op.execute("SET LOCAL lock_timeout = '5s'")  # fail fast rather than queue behind acquires
     op.create_index(
         "ix_minion_subtask_acquirement_acquired_at",
         "minion_subtask_acquirement",
