@@ -17,11 +17,12 @@ import contextlib
 import enum
 import hashlib
 import multiprocessing as mp
+import queue
 import random
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import httpx
 from minion_common.client import ApiError, ExecutorClient, StaleAcquirementError
@@ -46,6 +47,8 @@ T = TypeVar("T")
 EXECUTOR_BACKOFF: tuple[float, float] = (10.0, 30.0)  # loop.py `backoff` default
 MAX_RETRY_AFTER_S = 300.0  # loop.py MAX_RETRY_AFTER_S
 ACQUIRE_PACE_S = 0.4  # ExecutorSettings.acquire_pace_s default
+MAX_CONSECUTIVE_FAILURES = 5  # ExecutorLoop max_consecutive_failures default
+FAILURE_PAUSE_S = 300.0  # ExecutorLoop failure_pause_s default
 FAULT_CODE = "SCALE_FAULT"
 
 
@@ -120,6 +123,8 @@ class SimConfig:
     # How long a `late` sim stays silent: must exceed the watchdog's timeout + a tick.
     late_wait_s: float = 30.0
     timeout_s: float = 30.0
+    max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES
+    failure_pause_s: float = FAILURE_PAUSE_S
     seed: int = 0
 
 
@@ -166,11 +171,18 @@ class SimExecutor:
         self._idle = 0
         self._fails = 0
         self._limited = 0
+        self._cancelled = asyncio.Event()  # the server asked this sim to stop (task cancelled)
 
     async def _call(
-        self, op: str, aw: Awaitable[T], *, ok_op: Callable[[T], str] | None = None
+        self,
+        op: str,
+        aw: Awaitable[T],
+        *,
+        ok_op: Callable[[T], str] | None = None,
+        ok_status: Callable[[T], int] | None = None,
     ) -> T:
-        """Await one API call, recording latency under `op` (or `ok_op(result)` on success)."""
+        """Await one API call, recording latency under `op` (or `ok_op(result)` on success, with
+        `ok_status(result)` instead of 200, e.g. 204 for an empty acquire)."""
         t0 = time.perf_counter()
         try:
             result = await aw
@@ -180,7 +192,11 @@ class SimExecutor:
         except httpx.HTTPError:
             self.rec.record(op, time.perf_counter() - t0, TRANSPORT)
             raise
-        self.rec.record(ok_op(result) if ok_op else op, time.perf_counter() - t0, 200)
+        self.rec.record(
+            ok_op(result) if ok_op else op,
+            time.perf_counter() - t0,
+            ok_status(result) if ok_status else 200,
+        )
         return result
 
     async def _sleep(self, seconds: float) -> None:
@@ -207,8 +223,9 @@ class SimExecutor:
                             AcquireRequest(engines=[Engine.FAKE], budget=sim_budget())
                         ),
                         ok_op=lambda a: "acquire_empty" if a is None else "acquire_assigned",
+                        ok_status=lambda a: 204 if a is None else 200,
                     )
-                except (ApiError, httpx.HTTPError) as exc:
+                except (ApiError, httpx.HTTPError, ValueError) as exc:  # as loop.py acquire
                     if not await self._after_acquire_error(exc):
                         return
                     continue
@@ -223,13 +240,24 @@ class SimExecutor:
                 if ok:
                     self._fails = 0
                 else:
-                    await self._sleep(backoff_delay(self._fails, self.cfg.backoff, self._rng))
-                    self._fails += 1
+                    await self._back_off_after_failure()
         finally:
             await self._client.aclose()
 
+    async def _back_off_after_failure(self) -> None:
+        """Executor `_back_off_after_failure`: exponential, and a long pause after
+        `max_consecutive_failures` failures in a row."""
+        self._fails += 1
+        if self._fails >= self.cfg.max_consecutive_failures:
+            self.rec.count("failure_pause")
+            self._fails = 0
+            await self._sleep(self.cfg.failure_pause_s)
+        else:
+            await self._sleep(backoff_delay(self._fails - 1, self.cfg.backoff, self._rng))
+
     async def _register(self) -> bool:
         attempt = 0
+        limited_n = 0
         while not self.stop.is_set():
             try:
                 await self._call("register", self._client.register(register_request(self.index)))
@@ -240,9 +268,15 @@ class SimExecutor:
                     return False
                 retry_after = exc.retry_after if isinstance(exc, ApiError) else None
                 limited = isinstance(exc, ApiError) and exc.status_code == 429
+                if limited:  # 429s are counted separately, like the executor's register loop
+                    limited_n += 1
                 await self._sleep(
                     rate_limit_delay(
-                        retry_after if limited else None, attempt, self.cfg.backoff, self._rng
+                        retry_after if limited else None,
+                        attempt,
+                        self.cfg.backoff,
+                        self._rng,
+                        repeated=limited and limited_n > 1,
                     )
                 )
                 attempt += 1
@@ -278,6 +312,7 @@ class SimExecutor:
         if fault is Fault.VANISH:
             return True  # walk away: no beat, no complete; the watchdog reclaims it
         stale = asyncio.Event()
+        self._cancelled.clear()
         beat: asyncio.Task[None] | None = None
         if fault is not Fault.LATE:
             beat = asyncio.create_task(self._heartbeats(a, stale))
@@ -285,6 +320,10 @@ class SimExecutor:
             await self._wait(
                 self.cfg.late_wait_s if fault is Fault.LATE else self.cfg.work_s, stale
             )
+            if self._cancelled.is_set():  # executor: release with CANCELLED, no failure back-off
+                self.rec.count("cancelled")
+                await self._release(a, "CANCELLED")
+                return True
             if stale.is_set():
                 self.rec.count("discarded_stale")
                 return True
@@ -326,6 +365,7 @@ class SimExecutor:
             except (ApiError, httpx.HTTPError):
                 continue  # a missed beat is retried at the next interval
             if resp.cancel:
+                self._cancelled.set()
                 stale.set()
                 return
 
@@ -429,17 +469,29 @@ def _proc_main(
                 await asyncio.sleep(0.1)
 
         watcher = asyncio.create_task(watch())
-        rec = await run_sims(cfg, [SecretStr(t) for t in tokens], stop, first_index=first_index)
-        watcher.cancel()
+        try:
+            rec = await run_sims(cfg, [SecretStr(t) for t in tokens], stop, first_index=first_index)
+        finally:
+            watcher.cancel()
         return rec.to_dict()
 
     try:
         result = asyncio.run(main())
-    except Exception:
+    except Exception as exc:
         crashed = Recorder()
         crashed.count("proc_crashed")
+        crashed.count(f"proc_crashed_{type(exc).__name__}")  # the type only, never the message
         result = crashed.to_dict()
     out.put(result)
+
+
+class FleetResult(NamedTuple):
+    rec: Recorder
+    duration_s: float
+    drained: bool  # `until()` became true (False: time ran out, every sim ended, or a crash)
+
+
+JOIN_TIMEOUT_S = 30.0  # how long to wait for the sim processes to report after the stop flag
 
 
 async def run_fleet(
@@ -450,10 +502,12 @@ async def run_fleet(
     until: Callable[[], Awaitable[bool]],
     poll_s: float = 1.0,
     max_duration_s: float | None = None,
-) -> tuple[Recorder, float]:
+) -> FleetResult:
     """Run the sims (spread over `procs` processes) until `until()` is true or time runs out.
 
-    Returns the merged recorder and the wall-clock duration in seconds.
+    Fails fast instead of hanging: when every sim has ended (all aborted) or a sim process died,
+    the run stops with `drained=False`. An exception of the in-process runner (e.g. an insecure
+    server URL) is re-raised. Returns the merged recorder, the duration and whether it drained.
     """
     started = time.monotonic()
 
@@ -468,12 +522,16 @@ async def run_fleet(
     if procs <= 1:
         stop = asyncio.Event()
         runner = asyncio.create_task(run_sims(cfg, tokens, stop))
+        watch = asyncio.create_task(drained())
         try:
-            await drained()
+            await asyncio.wait({runner, watch}, return_when=asyncio.FIRST_COMPLETED)
+            ok = watch.done() and not watch.cancelled() and watch.result()
         finally:
             stop.set()
-        rec = await runner
-        return rec, time.monotonic() - started
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+        rec = await runner  # re-raises what the runner died of
+        return FleetResult(rec, time.monotonic() - started, ok)
 
     ctx = mp.get_context("spawn")
     stop_flag = ctx.Event()
@@ -490,11 +548,43 @@ async def run_fleet(
     ]
     for w in workers:
         w.start()
+    ok = False
+    watch = asyncio.create_task(drained())
     try:
-        await drained()
+        while not watch.done():
+            await asyncio.wait({watch}, timeout=min(poll_s, 0.5))
+            if not watch.done() and (
+                any(not w.is_alive() and w.exitcode not in (0, None) for w in workers)
+                or all(not w.is_alive() for w in workers)
+            ):
+                break  # a process died, or every sim process ended: nothing left to wait for
+        ok = watch.done() and not watch.cancelled() and watch.result()
     finally:
         stop_flag.set()
-    parts = [await asyncio.to_thread(out.get) for _ in workers]
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
+    parts: list[dict[str, Any]] = []
+    deadline = time.monotonic() + JOIN_TIMEOUT_S
+    while len(parts) < len(workers) and time.monotonic() < deadline:
+        try:
+            parts.append(await asyncio.to_thread(out.get, True, 0.5))
+        except queue.Empty:
+            if not any(w.is_alive() for w in workers):
+                try:  # a result may still be in the pipe after the process exited
+                    parts.append(await asyncio.to_thread(out.get, True, 1.0))
+                except queue.Empty:
+                    break
+    missing = len(workers) - len(parts)
     for w in workers:
+        if w.is_alive():
+            await asyncio.to_thread(w.join, 1.0)
+        if w.is_alive():
+            w.terminate()
         await asyncio.to_thread(w.join)
-    return merge_dicts(parts), time.monotonic() - started
+    rec = merge_dicts(parts)
+    if missing:  # a process that never reported (killed, segfault): count it, fail the run
+        rec.count("proc_crashed", missing)
+        ok = False
+    if rec.events.get("proc_crashed"):
+        ok = False
+    return FleetResult(rec, time.monotonic() - started, ok)

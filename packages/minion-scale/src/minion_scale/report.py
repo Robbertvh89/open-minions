@@ -23,13 +23,16 @@ def server_label(url: str) -> str:
     return f"{parts.hostname or ''}:{parts.port}" if parts.port else (parts.hostname or "")
 
 
-def run_section(rec: Recorder, *, duration_s: float, sims: int, procs: int) -> dict[str, Any]:
+def run_section(
+    rec: Recorder, *, duration_s: float, sims: int, procs: int, drained: bool
+) -> dict[str, Any]:
     d = rec.to_dict()
     completed = int(d["events"].get("completed", 0))
     return {
         "duration_s": round(duration_s, 3),
         "sims": sims,
         "procs": procs,
+        "drained": drained,
         "completed": completed,
         "throughput_per_s": round(completed / duration_s, 3) if duration_s > 0 else 0.0,
         "assigned": int(d["events"].get("assigned", 0)),
@@ -83,6 +86,7 @@ def summary_lines(doc: dict[str, Any]) -> list[str]:
         lines.append(
             f"run: {run['completed']} completed in {run['duration_s']} s "
             f"({run['throughput_per_s']}/s) with {run['sims']} sims over {run['procs']} proc(s)"
+            + ("" if run.get("drained", True) else "; NOT DRAINED")
         )
         lines.append(
             f"     409={run['conflicts_409']} 429={run['rate_limited_429']} "

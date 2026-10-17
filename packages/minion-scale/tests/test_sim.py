@@ -63,6 +63,9 @@ def test_constants_match_the_executor() -> None:
     assert default == sim.EXECUTOR_BACKOFF
     assert sim.MAX_RETRY_AFTER_S == executor_loop.MAX_RETRY_AFTER_S
     assert ExecutorSettings.model_fields["acquire_pace_s"].default == sim.ACQUIRE_PACE_S
+    params = inspect.signature(executor_loop.ExecutorLoop.__init__).parameters
+    assert params["max_consecutive_failures"].default == sim.MAX_CONSECUTIVE_FAILURES
+    assert params["failure_pause_s"].default == sim.FAILURE_PAUSE_S
 
 
 def _executor_stub(backoff: tuple[float, float]) -> Any:
@@ -174,6 +177,7 @@ async def test_sims_drain_a_queue_over_rest_only(lv: Live) -> None:
         rec.latency
     ) - {"register"}
     assert rec.lag.n > 0
+    assert set(rec.statuses["acquire_empty"]) == {204}  # an empty acquire is a 204, not a 200
     assert await _outcomes(lv) == {"SUCCEEDED": 12}
     assert (await lv.rows("SELECT status FROM minion_task"))[0][0] == "SUCCEEDED"
 
@@ -237,7 +241,7 @@ async def test_two_procs_split_the_sims(lv: Live) -> None:
         rows = await lv.rows("SELECT count(*) FROM minion_subtask WHERE status='SUCCEEDED'")
         return bool(rows[0][0] >= 6)
 
-    rec, secs = await sim.run_fleet(
+    rec, secs, drained_ok = await sim.run_fleet(
         conf, tokens, procs=2, until=drained, poll_s=0.2, max_duration_s=60
     )
-    assert rec.events["completed"] == 6 and secs < 60
+    assert rec.events["completed"] == 6 and secs < 60 and drained_ok

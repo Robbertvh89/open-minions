@@ -3,8 +3,10 @@
 import asyncio
 import contextlib
 import hashlib
+import http.server
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -463,3 +465,29 @@ async def _started(server: uvicorn.Server) -> bool:
 async def live(fresh_url: str, s3: S3Env, tmp_path: Path) -> AsyncIterator[Live]:
     async with _serve(fresh_url, s3, tmp_path, {}) as lv:
         yield lv
+
+
+class _StatusStub(http.server.BaseHTTPRequestHandler):
+    status = 401
+
+    def do_POST(self) -> None:
+        self.send_response(self.status)
+        self.send_header("Content-Length", "2")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def serve_status(status: int) -> Iterator[str]:
+    """Loopback HTTP server answering every POST with `status` (`yield from` it in a fixture)."""
+    handler = type("H", (_StatusStub,), {"status": status})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()

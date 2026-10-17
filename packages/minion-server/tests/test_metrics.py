@@ -114,12 +114,12 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
 async def test_acquire_error_outcome_is_timed(
     fresh_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from minion_server.api import executor as executor_api
+    from minion_server.services import acquisition
 
     async def boom(*_a: Any, **_k: Any) -> None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(executor_api.acquisition, "acquire", boom)
+    monkeypatch.setattr(acquisition, "acquire", boom)
     cfg = _settings(fresh_url).model_copy(update={"metrics_enabled": True})
     app = create_app(cfg)
     async with (

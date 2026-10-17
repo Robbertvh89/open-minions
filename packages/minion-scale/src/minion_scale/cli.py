@@ -1,7 +1,10 @@
-"""`minion-scale`: seed / run / explain / verify / report (DEV ONLY).
+"""`minion-scale`: seed / run / explain / verify / cleanup / report (DEV ONLY).
 
-Database and S3 settings come from the same `MINION_*` variables as the server (`.env` works).
-Tokens live in a 0600 file written by `seed --tokens-file`; nothing here prints them.
+Database and S3 settings come from the `MINION_*` environment variables only (no `.env` file is
+read, so a developer's regular settings are never picked up by accident); the S3 endpoint has no
+default. Commands that write refuse a non-loopback database, or one holding tasks that this
+harness did not create, unless `--yes-this-is-a-scale-db` is given. Tokens live in a 0600 file
+written by `seed --tokens-file`; nothing here prints them.
 """
 
 import asyncio
@@ -11,16 +14,21 @@ from typing import Annotated, Any
 import boto3
 import typer
 from botocore.config import Config as BotoConfig
+from minion_common.client import require_secure_url
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.models_registry import load_models
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 
 from minion_scale import dbstats, report
 from minion_scale.explain import explain_all, hot_statements
 from minion_scale.seed import (
+    CREATED_BY,
     DEFAULT_MODEL,
+    DEFAULT_POOL,
     DEFAULT_PREFIX,
     DEFAULT_PROJECT,
     DEFAULT_TEAM,
@@ -29,6 +37,7 @@ from minion_scale.seed import (
     SeedSpec,
     count_remaining,
     read_tokens_file,
+    revoke_executors,
     seed_executors,
     seed_queue,
     upload_input,
@@ -49,18 +58,26 @@ DEFAULT_MODELS_FILE = Path("deploy/scale/models.scale.yaml")
 
 
 class ScaleSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MINION_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="MINION_", env_file=None, extra="ignore")
 
     database_url: SecretStr
-    s3_endpoint_url: str = "http://localhost:9000"
+    s3_endpoint_url: str | None = None  # no default: never guess which object store to write to
     s3_access_key: SecretStr | None = None
     s3_secret_key: SecretStr | None = None
     s3_bucket: str = "minion"
     s3_region: str = "us-east-1"
 
 
+def _settings() -> ScaleSettings:
+    try:
+        return ScaleSettings()
+    except ValidationError as exc:
+        missing = ", ".join(f"MINION_{str(e['loc'][0]).upper()}" for e in exc.errors())
+        raise _fail(f"invalid or missing settings: {missing}") from None
+
+
 def _s3(cfg: ScaleSettings) -> Any:
-    if cfg.s3_access_key is None or cfg.s3_secret_key is None:
+    if cfg.s3_endpoint_url is None or cfg.s3_access_key is None or cfg.s3_secret_key is None:
         return None
     return boto3.client(
         "s3",
@@ -82,6 +99,50 @@ def _fail(msg: str) -> typer.Exit:
     return typer.Exit(2)
 
 
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+YesScaleDb = Annotated[
+    bool,
+    typer.Option(
+        "--yes-this-is-a-scale-db",
+        help="Allow a non-loopback database or one that holds tasks not created by minion-scale",
+    ),
+]
+
+
+def check_scale_host(database_url: str, yes: bool) -> None:
+    """Refuse a database that is not on this machine unless the operator said it is a scale DB.
+    The message names the host only, never the credentials."""
+    host = make_url(database_url).host
+    if host is not None and host.lower() not in LOOPBACK_HOSTS and not yes:
+        raise _fail(
+            f"refusing database host {host!r}: not loopback; pass --yes-this-is-a-scale-db "
+            "if it is a throwaway scale-test database"
+        )
+
+
+async def check_scale_db(sm: Any, yes: bool) -> None:
+    """Refuse a database that holds tasks this harness did not create (a real queue)."""
+    if yes:
+        return
+    try:
+        async with sm() as s:
+            foreign = int(
+                (
+                    await s.execute(
+                        text("SELECT count(*) FROM minion_task WHERE created_by <> :me"),
+                        {"me": CREATED_BY},
+                    )
+                ).scalar_one()
+            )
+    except DBAPIError:
+        return  # not migrated: the command itself fails with its own error
+    if foreign:
+        raise _fail(
+            f"refusing: the database holds {foreign} task(s) not created by {CREATED_BY}; "
+            "pass --yes-this-is-a-scale-db if this really is a scale-test database"
+        )
+
+
 @app.command("seed")
 def seed_cmd(
     tasks: Annotated[int, typer.Option(min=1, help="Tasks to create")] = 10,
@@ -97,14 +158,19 @@ def seed_cmd(
     prefix: Annotated[str, typer.Option(help="Task name prefix")] = DEFAULT_PREFIX,
     records: int = RECORDS_PER_SUBTASK,
     max_attempts: int = 5,
+    yes_scale_db: YesScaleDb = False,
 ) -> None:
     """Bulk-insert tasks x PENDING subtasks and (optionally) executor tokens."""
     if executors and tokens_file is None:
         raise _fail("--tokens-file is required with --executors (tokens are never printed)")
-    cfg = ScaleSettings()
+    cfg = _settings()
+    check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
     s3 = _s3(cfg)
     if s3 is None:
-        raise _fail("MINION_S3_ACCESS_KEY / MINION_S3_SECRET_KEY are required to upload the input")
+        raise _fail(
+            "MINION_S3_ENDPOINT_URL, MINION_S3_ACCESS_KEY and MINION_S3_SECRET_KEY are required "
+            "to upload the input"
+        )
     spec = SeedSpec(
         tasks=tasks,
         subtasks=subtasks,
@@ -121,11 +187,12 @@ def seed_cmd(
     async def go() -> None:
         engine, sm = _sessionmaker(cfg)
         try:
+            await check_scale_db(sm, yes_scale_db)
             size = await asyncio.to_thread(upload_input, s3, spec)
             res = await seed_queue(sm, spec, input_bytes=size)
             typer.echo(f"seeded {res.tasks} tasks, {res.subtasks} PENDING subtasks")
             if executors:
-                creds = await seed_executors(sm, executors)
+                creds = await seed_executors(sm, executors, pool=DEFAULT_POOL)
                 assert tokens_file is not None  # noqa: S101 - checked above
                 write_tokens_file(tokens_file, creds)
                 typer.echo(f"issued {len(creds)} executor tokens -> {tokens_file}")
@@ -168,10 +235,17 @@ def run_cmd(
         str, typer.Option(help="Compose project to read `docker stats` from (default: none)")
     ] = "",
     out: Annotated[Path | None, typer.Option(help="Write the JSON report here")] = None,
+    yes_scale_db: YesScaleDb = False,
 ) -> None:
-    """Run simulated executors until the queue is drained (or --max-duration-s)."""
-    cfg = ScaleSettings()
+    """Run simulated executors until the queue is drained (or --max-duration-s).
+
+    Exit 1 when the queue did not drain (time ran out, every sim ended, a sim process crashed)
+    or the server answered 5xx; exit 2 on bad input.
+    """
+    cfg = _settings()
+    check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
     try:
+        require_secure_url(server)
         creds = read_tokens_file(tokens_file)
         faults = FaultRates(vanish=vanish, release=release, fail=fail, late=late)
     except (SeedError, ValueError, OSError) as exc:
@@ -191,13 +265,14 @@ def run_cmd(
     async def go() -> dict[str, Any]:
         engine, sm = _sessionmaker(cfg)
         try:
+            await check_scale_db(sm, yes_scale_db)
             await dbstats.ensure_extension(sm)
             before = await dbstats.snapshot(sm)
 
             async def drained() -> bool:
                 return await count_remaining(sm, team=team) == 0
 
-            rec, secs = await run_fleet(
+            rec, secs, did_drain = await run_fleet(
                 sim_cfg,
                 tokens,
                 procs=procs,
@@ -223,14 +298,21 @@ def run_cmd(
                 "seed": seed,
                 "team": team,
             },
-            run=report.run_section(rec, duration_s=secs, sims=len(tokens), procs=procs),
+            run=report.run_section(
+                rec, duration_s=secs, sims=len(tokens), procs=procs, drained=did_drain
+            ),
             db=dbstats.db_report(before, after),
             docker=docker,
         )
 
-    doc = asyncio.run(go())
+    try:
+        doc = asyncio.run(go())
+    except ValueError as exc:  # e.g. an insecure server URL the sims refused
+        raise _fail(f"run failed: {type(exc).__name__}: {exc}") from exc
     _emit(doc, out)
-    if doc["run"]["server_errors_5xx"]:
+    if not doc["run"]["drained"]:
+        typer.echo("the queue did not drain (see run.events: sim_aborted / proc_crashed)", err=True)
+    if doc["run"]["server_errors_5xx"] or not doc["run"]["drained"]:
         raise typer.Exit(1)
 
 
@@ -241,19 +323,23 @@ def explain_cmd(
     heartbeat_timeout_s: Annotated[float, typer.Option(help="Watchdog timeout in use")] = 900.0,
     max_lease_s: float = 6 * 3600.0,
     out: Annotated[Path | None, typer.Option(help="Write the JSON report here")] = None,
+    yes_scale_db: YesScaleDb = False,
 ) -> None:
     """EXPLAIN (ANALYZE, BUFFERS) the candidate, stale-heartbeat and over-lease queries."""
-    cfg = ScaleSettings()
+    cfg = _settings()
+    check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
     stmts = hot_statements(
         model_ids=list(load_models(models_file)),
         team=team,
         heartbeat_timeout_s=heartbeat_timeout_s,
         max_lease_s=max_lease_s,
+        pool=DEFAULT_POOL,
     )
 
     async def go() -> list[dict[str, Any]]:
         engine, sm = _sessionmaker(cfg)
         try:
+            await check_scale_db(sm, yes_scale_db)
             async with sm() as s:
                 await s.execute(text("ANALYZE"))
                 await s.commit()
@@ -270,7 +356,7 @@ def verify_cmd(
     out: Annotated[Path | None, typer.Option(help="Write the JSON report here")] = None,
 ) -> None:
     """Check NF-2 / NF-3 and the task counters after a drained run; exit 1 on a violation."""
-    cfg = ScaleSettings()
+    cfg = _settings()
 
     async def go() -> dict[str, Any]:
         engine, sm = _sessionmaker(cfg)
@@ -284,6 +370,32 @@ def verify_cmd(
     _emit(report.new_report(verify=result), out)
     if not result["ok"]:
         raise typer.Exit(1)
+
+
+@app.command("cleanup")
+def cleanup_cmd(
+    tokens_file: Annotated[Path, typer.Option(help="File written by `seed`")],
+    yes_scale_db: YesScaleDb = False,
+) -> None:
+    """Revoke the executor tokens `seed` issued and delete the tokens file."""
+    cfg = _settings()
+    check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
+    try:
+        creds = read_tokens_file(tokens_file)
+    except (SeedError, ValueError, OSError) as exc:
+        raise _fail(f"cannot clean up: {type(exc).__name__}: {exc}") from exc
+
+    async def go() -> int:
+        engine, sm = _sessionmaker(cfg)
+        try:
+            await check_scale_db(sm, yes_scale_db)
+            return await revoke_executors(sm, [c.executor_id for c in creds])
+        finally:
+            await engine.dispose()
+
+    revoked = asyncio.run(go())
+    tokens_file.unlink()
+    typer.echo(f"revoked {revoked} executor token(s), deleted {tokens_file}")
 
 
 @app.command("report")
