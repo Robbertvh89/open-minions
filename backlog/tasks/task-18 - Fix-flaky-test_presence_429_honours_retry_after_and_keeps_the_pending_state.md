@@ -1,10 +1,10 @@
 ---
 id: TASK-18
 title: Fix flaky test_presence_429_honours_retry_after_and_keeps_the_pending_state
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 12:47'
-updated_date: '2026-10-17 12:48'
+updated_date: '2026-10-17 12:57'
 labels:
   - executor
   - test
