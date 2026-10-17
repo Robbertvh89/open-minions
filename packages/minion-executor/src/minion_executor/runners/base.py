@@ -66,6 +66,14 @@ class StepControl(Protocol):
         ...
 
 
+def is_paced(ctl: StepControl) -> bool:
+    """True if the duty cycle is below 1, i.e. the pacer will sleep at checkpoints. Runners then
+    drain queued GPU work first (pacing measures busy time as wall time between checkpoints, so
+    in-flight async work would run during the sleep and exceed the duty, invariant 6). Unknown
+    controls count as paced (the safe side)."""
+    return bool(getattr(ctl, "paced", True))
+
+
 class Runner(Protocol):
     def load(
         self, model: ModelEntry, model_path: Path | None, budget: Budget, cfg: EngineConfig

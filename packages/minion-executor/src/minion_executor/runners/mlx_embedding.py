@@ -22,6 +22,7 @@ from minion_executor.runners.base import (
     Record,
     RunnerError,
     StepControl,
+    is_paced,
 )
 from minion_executor.runners.pooling import read_json
 from minion_executor.runners.prompts import embedding_text
@@ -225,6 +226,8 @@ class MlxEmbeddingRunner:
                 vecs, counts = self._embed(chunk, params.normalize)
                 for rec, vec, n in zip(batch[start : start + CHUNK], vecs, counts, strict=True):
                     out.append({"id": rec.get("id"), "embedding": vec, "tokens": n})
+                if is_paced(ctl):
+                    common.sync_gpu()
                 ctl.checkpoint(len(out))
         except RuntimeError as exc:
             if common.is_oom(exc):

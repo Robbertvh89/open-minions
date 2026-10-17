@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
+from typing import Any
 
 from minion_common.schemas import Budget
 
@@ -47,6 +48,17 @@ def apply_memory_limits(budget: Budget) -> None:
     mx.set_memory_limit(budget_bytes(budget))
     mx.set_cache_limit(min(_CACHE_LIMIT_BYTES, budget_bytes(budget) // 8))
     mx.reset_peak_memory()
+
+
+def sync_gpu(stream: Any = None) -> None:
+    """Block until queued GPU work has finished. Called before a pacer checkpoint when duty < 1:
+    mlx-lm pipelines the next token with `mx.async_eval`, so without this the GPU keeps computing
+    through the pacer's sleep and the measured share overshoots the duty (invariant 6)."""
+    import mlx.core as mx
+
+    mx.synchronize()
+    if stream is not None:
+        mx.synchronize(stream)
 
 
 def trim_cache() -> None:

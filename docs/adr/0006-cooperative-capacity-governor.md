@@ -57,6 +57,15 @@ call between replies, so the latest decision is never lost. In-flight Ollama req
 suspended: a pause stops *new* requests (the runner submits lazily, at most `max_batch_size`
 outstanding, with a checkpoint before each) and the requests already sent finish during the pause.
 
+*Pacing requires synchronous GPU completion (TASK-5.6 NF-8 finding).* The pacer measures busy time as
+wall time between checkpoints. mlx-lm pipelines the next token with `mx.async_eval`, so at a
+checkpoint the GPU still holds queued work that runs through the pacer's sleep (measured: balanced
+duty 0.5 gave 74-76 % GPU share on qwen2.5-0.5b, larger batches worse). Runners therefore drain the
+GPU before each checkpoint when duty < 1 (`mx.synchronize` incl. mlx-lm's generation stream; HF:
+`torch.mps.synchronize()`), signalled by `StepControl.paced`. At duty 1.0 nothing is synced and async
+pipelining stays on. Ollama is not controllable: the daemon owns the GPU queue, so its duty is
+best-effort (request-level pacing only).
+
 **D4 Budget per batch.** Every `run` carries the current `Budget`. `Runner.set_budget` re-applies
 memory/wired limits and batch caps; `Runner.trim` frees allocator caches. The loop re-slices records
 with the current `max_batch_size` before each batch (FR-54 "next batch").

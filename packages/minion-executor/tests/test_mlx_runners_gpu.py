@@ -524,3 +524,41 @@ def test_worker_applies_the_run_budget_to_mlx_in_the_subprocess(qwen_path: Path)
         assert h.stats()["active_bytes"] > 0
     finally:
         h.close()
+
+
+class _PacedCtl:
+    """A real `DutyCyclePacer` behind `StepControl`, as the worker wires it."""
+
+    def __init__(self, duty: float) -> None:
+        from minion_executor.worker.throttle import DutyCyclePacer
+
+        self.paced = duty < 1.0
+        self._pacer = DutyCyclePacer(duty, time.monotonic, lambda s: time.sleep(s))
+
+    def checkpoint(self, records_done: int | None = None) -> None:
+        self._pacer.step_done()
+
+
+def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionRunner) -> None:
+    """Regression: mlx-lm pipelines tokens with `mx.async_eval`, so without a sync at the
+    checkpoint the GPU kept running through the pacer's sleep (50 % duty measured ~75 %)."""
+    from minion_executor.capacity.gpu_meter import make_sampler, process_gpu_share
+
+    duty = 0.5
+    completion.set_budget(_budget_gb(2, batch=16))
+    recs = _recs([f"Count upward from {i}, one number per line, never stop." for i in range(16)])
+    params = CompletionParams(max_tokens=300, temperature=0.0)
+    completion.run(recs[:2], CompletionParams(max_tokens=4), Ctl())  # warm up kernels
+    sampler = make_sampler(os.getpid)
+    sampler.start()
+    time.sleep(1.0)
+    start = time.monotonic()
+    out = completion.run(recs, params, _PacedCtl(duty))
+    end = time.monotonic()
+    time.sleep(1.0)
+    samples = sampler.stop()
+    assert len(out) == 16
+    assert end - start > 5, "run too short to measure"
+    share = process_gpu_share(samples, start, end)
+    print(f"gpu share {share:.3f} over {end - start:.1f}s")
+    assert share <= duty + 0.10, f"worker GPU share {share:.2f} exceeds duty {duty}"

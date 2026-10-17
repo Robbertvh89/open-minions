@@ -123,3 +123,30 @@ def test_context_window_from_config() -> None:
     assert _context_window({"max_position_embeddings": "x"}) == 0
     assert _context_window({"max_position_embeddings": True}) == 0
     assert _context_window({}) == 0
+
+
+def test_is_paced_follows_the_control_and_defaults_to_the_safe_side() -> None:
+    from minion_executor.runners.base import is_paced
+
+    class Paced(_Ctl):
+        paced = False
+
+    assert is_paced(_Ctl())  # unknown control: drain GPU work
+    assert not is_paced(Paced())
+
+
+def test_sync_gpu_synchronizes_default_and_given_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    from minion_executor.runners.mlx_common import sync_gpu
+
+    calls: list[object] = []
+    core = types.ModuleType("mlx.core")
+    core.synchronize = lambda s=None: calls.append(s)  # type: ignore[attr-defined]
+    pkg = types.ModuleType("mlx")
+    pkg.core = core  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx", pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    sync_gpu("gen-stream")
+    assert calls == [None, "gen-stream"]

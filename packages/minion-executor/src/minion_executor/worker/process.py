@@ -169,6 +169,11 @@ class _Ctl:
         self.ctl = ctl
         self._pacer = DutyCyclePacer(min(ctl.duty, duty_cap), time.monotonic, self._wait)
 
+    @property
+    def paced(self) -> bool:
+        """The pacer will sleep at checkpoints: runners must drain async GPU work first."""
+        return self._pacer.duty < 1.0
+
     def start(self) -> None:
         """Ack the starting state; a run that begins paused does no work until resumed."""
         self._pacer.reset()
