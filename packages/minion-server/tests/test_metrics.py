@@ -50,7 +50,7 @@ async def test_counts_route_templates_not_urls(on: AsyncClient) -> None:
     secret = uuid.uuid4()
     await on.post(f"/api/v1/executor/subtasks/{secret}/release")  # no auth -> 401
     await on.get("/api/v1/tasks/secret-team/secret-proj/secret-task")  # 401, templated
-    await on.get("/no/such/path/with-an-id-123")
+    await on.get("/no/such/path/with-an-id-7f3e9a")
     await on.request("BREW", "/healthz")
     r = await on.get("/metrics")
     assert r.status_code == 200
@@ -60,7 +60,14 @@ async def test_counts_route_templates_not_urls(on: AsyncClient) -> None:
     assert 'route="/api/v1/executor/subtasks/{acquirement_id}/release"' in body
     assert 'route="/api/v1/tasks/{team}/{project}/{task_name}"' in body
     assert 'route="unmatched"' in body and 'method="OTHER"' in body
-    for leak in (str(secret), "secret-team", "secret-proj", "secret-task", "123", "Bearer"):
+    for leak in (
+        str(secret),
+        "secret-team",
+        "secret-proj",
+        "secret-task",
+        "with-an-id-7f3e9a",
+        "Bearer",
+    ):
         assert leak not in body, leak
 
 
