@@ -1,10 +1,10 @@
 ---
 id: TASK-6.9
 title: 'M5.9 NF-7: synthetic foreground-load benchmark and usability-test protocol'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 15:48'
+updated_date: '2026-10-17 17:49'
 labels:
   - M5
 dependencies: []
@@ -20,10 +20,10 @@ runners/fg_probe.py (MLX): deadline probe in its own spawn subprocess runs a fix
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 nf7_proxy_verdict unit-tested; CI path runs with a fake probe and fake engine
-- [ ] #2 Mac results for light and balanced on qwen2.5-0.5b-mlx and minilm-mlx committed (derived figures only)
-- [ ] #3 If the proxy fails at light or balanced, a follow-up is opened and TASK-15/Q5 flagged; thresholds not loosened
-- [ ] #4 Protocol doc exists; human study marked NOT VERIFIABLE HERE
+- [x] #1 nf7_proxy_verdict unit-tested; CI path runs with a fake probe and fake engine
+- [x] #2 Mac results for light and balanced on qwen2.5-0.5b-mlx and minilm-mlx committed (derived figures only)
+- [x] #3 If the proxy fails at light or balanced, a follow-up is opened and TASK-15/Q5 flagged; thresholds not loosened
+- [x] #4 Protocol doc exists; human study marked NOT VERIFIABLE HERE
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -74,3 +74,9 @@ Estimated ~70 min (2 models x 3 profiles x 3 repeats x ~3.8 min). Commit the .js
 
 **Risks / open questions.** (1) An MLX probe and an MLX worker share one GPU but run separate command queues. The proxy is a scheduling-latency stand-in for the compositor; say so in docs. (2) osascript `launch` may trigger a TCC Automation prompt on first use; the orchestrator approves it once, otherwise launch is "unavailable" and only frames are judged (partial; record it). (3) The call-aware governor from 6.10 does not engage, since no mic/camera is in use. (4) Thermal drift over 70 min: the baseline is paired per row, which mitigates it. No new dependencies (mlx is already an extra). No invariant is weakened. Invariant 6 is what is being measured. Invariants 1-5 are untouched.
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #36: bench --foreground-check (30 fps MLX probe + Calculator relaunch proxy, paired medians, fail-closed exits) and NF-7 video-call protocol (human study NOT VERIFIABLE HERE). M3 Pro: qwen passes light/balanced, minilm fails miss-rate at light (+1.11 pp) and balanced (+1.56 pp); DVFS confounds latency ratios. Thresholds kept; follow-up TASK-24; TASK-15 and SPEC Q5 noted. CI run 39054681404: 1606 passed.
+<!-- SECTION:FINAL_SUMMARY:END -->
