@@ -50,6 +50,7 @@ from minion_executor.capacity.status import STATUS_FILE, read_status, running
 from minion_executor.capacity.status import render as render_status
 from minion_executor.heartbeat import check_interval
 from minion_executor.loop import ExecutorLoop, GovernorStoppedError
+from minion_executor.menubar_agent import menubar_app
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, RunnerError
 from minion_executor.runners.fg_probe import MlxFrameProbe, ProbeError
@@ -70,6 +71,7 @@ from minion_executor.worker.sandbox import SANDBOX_FAILED, SandboxPolicy
 
 app = typer.Typer(help="open-minions executor: donate idle Apple Silicon GPU capacity.")
 app.add_typer(service_app, name="service")
+app.add_typer(menubar_app, name="menubar")
 
 
 def _chip() -> str:
@@ -646,12 +648,15 @@ def status() -> None:
         raise typer.Exit(code=1)
 
 
-@app.command()
-def menubar() -> None:
+@menubar_app.callback()
+def menubar(ctx: typer.Context) -> None:
     """Show a menu-bar item to pause/resume and pick the profile (macOS, as your own user).
 
-    Talks only to the local status.json / control.json: no server, no token.
+    Talks only to the local status.json / control.json: no server, no token. The subcommands
+    install/uninstall/status manage the launch-at-login agent.
     """
+    if ctx.invoked_subcommand is not None:
+        return
     if sys.platform != "darwin":
         typer.echo("error: the menu-bar app needs macOS", err=True)
         raise typer.Exit(code=2)
