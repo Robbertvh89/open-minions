@@ -8,10 +8,14 @@ CSP = (
     "default-src 'self'; script-src 'self'; frame-ancestors 'none'; "
     "form-action 'self'; base-uri 'none'"
 )
+# Sent only when the server itself sees https; behind a TLS-terminating proxy the proxy adds it.
+HSTS = "max-age=31536000"
+# `same-origin`, not `no-referrer`: with no-referrer browsers send `Origin: null` on same-origin
+# form POSTs, which the CSRF check (rightly) rejects.
 SECURITY_HEADERS = {
     "Content-Security-Policy": CSP,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
 
@@ -31,6 +35,8 @@ class UiHeadersMiddleware:
                 headers = MutableHeaders(scope=message)
                 for name, value in SECURITY_HEADERS.items():
                     headers[name] = value
+                if scope.get("scheme") == "https":
+                    headers["Strict-Transport-Security"] = HSTS
             await send(message)
 
         await self.app(scope, receive, send_with_headers)

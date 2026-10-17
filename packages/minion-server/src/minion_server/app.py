@@ -1,5 +1,4 @@
 import asyncio
-import ipaddress
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -15,18 +14,12 @@ from minion_server.limits import BodyLimitMiddleware
 from minion_server.metrics import Metrics, MetricsMiddleware
 from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
+from minion_server.netutil import is_loopback
 from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 from minion_server.ui.headers import UiHeadersMiddleware
 from minion_server.ui.routes import router as ui_router
-
-
-def is_loopback(host: str) -> bool:
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return host == "localhost"
 
 
 def create_app(settings: ServerSettings | None = None) -> FastAPI:

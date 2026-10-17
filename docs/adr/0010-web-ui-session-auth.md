@@ -16,10 +16,10 @@ surface (flows, discovery, JWKS caching) for a tool that is deployed per team or
    an API request (SHA-256, `hmac.compare_digest` over all stored hashes, `expires_at`). Wrong,
    expired and removed keys get the same 401 page. The key is never logged, echoed or stored.
 2. **Stateless session cookie** `minion_session`:
-   `v1.<key sha256>.<issued_at>.<expires_at>.<HMAC-SHA256>`, keyed by `MINION_UI_SESSION_SECRET`
+   `v2.<kid>.<issued_at>.<expires_at>.<HMAC-SHA256>`, where `kid` = HMAC(secret, "kid", key sha256) so the cookie never carries the key hash, keyed by `MINION_UI_SESSION_SECRET`
    (at least 32 bytes). It holds no secret (the key hash cannot be inverted into the key). Flags:
    `HttpOnly`, `SameSite=Strict`, `Path=/ui`, `Secure` unless the request addressed a loopback host.
-   Lifetime `MINION_UI_SESSION_TTL_S` (default 8 h); a later, lower TTL also shortens old cookies.
+   Lifetime `MINION_UI_SESSION_TTL_S` (default 8 h, max 7 days). Validity is age-based: valid while `now < min(expires, issued + TTL)`, so a lowered TTL shortens old cookies and a raised one never revives them.
 3. **Re-resolved on every request** against the live KeyStore snapshot: removing or expiring the
    key in the file, or a file that turns invalid (fail closed), ends the session within
    `MINION_API_KEYS_RELOAD_S`. Team scoping is the same code path as the REST API (shared helpers
@@ -30,10 +30,15 @@ surface (flows, discovery, JWKS caching) for a tool that is deployed per team or
    the `Host` header, and (b) a CSRF token. The token is an HMAC of the signed session payload
    (per session). The login form, which has no session yet, uses an HMAC of a random nonce held in
    a short-lived `HttpOnly` `minion_login` cookie. Both checks fail with `403`. The reverse proxy
-   must pass `Host` through unchanged.
+   must forward `Host` including the port (nginx `$http_host`, not `$host`). A non-loopback UI
+   requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` restricts `Host` (else `400`).
 5. **Headers** on every `/ui` response: `Content-Security-Policy: default-src 'self'; script-src
    'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'`, `X-Content-Type-Options:
-   nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`.
+   nosniff`, `Referrer-Policy: same-origin`, `Cache-Control: no-store`, plus `Strict-Transport-Security:
+   max-age=31536000` when the server itself sees https (behind a TLS proxy the proxy adds it).
+   `no-referrer` was rejected: browsers then send `Origin: null` on same-origin form POSTs and every
+   login would fail the CSRF check, which deliberately rejects `Origin: null`. htmx runs with
+   `historyCacheSize: 0`.
 6. **Rendering**: Jinja2 with autoescape on for every template and no `|safe`; owner, hostname,
    error text and other executor-supplied strings are untrusted. No inline script or handler (CSP).
    htmx 2.0.4 is vendored (`ui/static/htmx.min.js`, sha256 pinned in a test), configured by a

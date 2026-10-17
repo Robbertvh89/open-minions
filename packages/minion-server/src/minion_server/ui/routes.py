@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from minion_server.api import tasks as tasks_api
 from minion_server.auth import KeysConfig, User, lookup_user, sha256_hex
 from minion_server.db.session import get_session
+from minion_server.netutil import host_header_is_loopback
 from minion_server.settings import ServerSettings
 from minion_server.ui import session as sess
 
@@ -59,6 +60,10 @@ def error_page(status: int, message: str, user: User | None = None) -> HTMLRespo
 async def require_enabled(request: Request) -> None:
     if getattr(request.app.state, "ui_secret", None) is None:
         raise HTTPException(404)  # same body as an unknown route
+    settings = getattr(request.app.state, "settings", None)
+    allowed = settings.ui_allowed_host_set if settings is not None else frozenset()
+    if allowed and (request.headers.get("host") or "").lower() not in allowed:
+        raise HTTPException(400, "host not allowed")
 
 
 router = APIRouter(prefix="/ui", dependencies=[Depends(require_enabled)], include_in_schema=False)
@@ -82,7 +87,7 @@ def _set_cookie(request: Request, response: Response, name: str, value: str, max
         path=sess.COOKIE_PATH,
         httponly=True,
         samesite="strict",
-        secure=not sess.host_is_loopback(request.headers.get("host")),
+        secure=not host_header_is_loopback(request.headers.get("host")),
     )
 
 
@@ -91,10 +96,18 @@ def _clear_cookie(response: Response, name: str) -> None:
 
 
 class UiSession:
-    def __init__(self, user: User, csrf: str, keys: KeysConfig) -> None:
+    def __init__(self, user: User, csrf: str) -> None:
         self.user = user
         self.csrf = csrf
-        self.keys = keys
+
+
+def _user_for_kid(secret: bytes, cfg: KeysConfig, kid: str) -> User | None:
+    """Resolve the cookie's key id: full constant-time scan, as `lookup_user` does."""
+    found: User | None = None
+    for stored, user in cfg.keys.items():
+        if sess.tokens_equal(sess.key_id(secret, stored), kid):
+            found = user
+    return found
 
 
 def _login_redirect(request: Request) -> HTTPException:
@@ -122,10 +135,10 @@ async def ui_session(request: Request) -> UiSession:
         raise _login_redirect(request)
     store = getattr(request.app.state, "api_keys", None)
     cfg: KeysConfig | None = store.config if store is not None else None
-    user = cfg.keys.get(claims.key_sha256) if cfg else None
+    user = _user_for_kid(secret, cfg, claims.kid) if cfg else None
     if cfg is None or user is None or (user.expires_at is not None and user.expires_at <= now):
         raise _login_redirect(request)  # key removed/expired or keys file invalid: fail closed
-    return UiSession(user, sess.csrf_token(secret, claims), cfg)
+    return UiSession(user, sess.csrf_token(secret, claims))
 
 
 Current = Annotated[UiSession, Depends(ui_session)]
@@ -184,6 +197,10 @@ async def login(
 ) -> Response:
     secret = _secret(request)
     nonce = request.cookies.get(sess.LOGIN_COOKIE, "")
+    if not nonce:
+        log.info(
+            "ui_login_nonce_missing", hint="cookies blocked, form expired or Secure/Path mismatch"
+        )
     if (
         not _post_allowed(request)
         or not nonce
@@ -198,7 +215,7 @@ async def login(
     now = datetime.now(UTC)
     if user is None or (user.expires_at is not None and user.expires_at <= now):
         # one message for wrong, expired and removed keys; the key itself is never logged/echoed
-        log.info("ui_login_failed")
+        log.info("ui_login_failed", client=request.client.host if request.client else None)
         return _login_form(request, 401, "Invalid or expired API key.")
     ttl = _settings(request).ui_session_ttl_s
     response = RedirectResponse("/ui/tasks", status_code=303)
@@ -338,4 +355,4 @@ async def task_detail(
         "terminal": task.status
         in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.PARTIAL, TaskStatus.CANCELLED),
     }
-    return render("_task_live.html" if partial else "task.html", **ctx)
+    return render("_task_live.html" if partial == "1" else "task.html", **ctx)

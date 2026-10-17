@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 from minion_server.app import create_app
+from minion_server.netutil import host_header_is_loopback
 from minion_server.settings import ServerSettings
 from minion_server.ui import session as sess
 from minion_server.ui.headers import CSP
@@ -20,7 +21,7 @@ from sqlalchemy import text
 from conftest import _settings, seed_task
 
 ALICE, BOB, EXPIRED, GONE = "k-alice", "k-bob", "k-expired", "k-gone"
-SECRET = "s" * 40
+SECRET = "s3cret-" * 6
 BASE = "https://ui.example"
 ORIGIN = {"Origin": BASE}
 HTMX_VERSION = "2.0.4"
@@ -60,7 +61,8 @@ def test_session_roundtrip_and_rejections() -> None:
     now = datetime(2026, 1, 1, 12, tzinfo=UTC)
     value = sess.issue_session(secret, _h(ALICE), now, 3600)
     claims = sess.verify_session(secret, value, now + timedelta(seconds=10), 3600)
-    assert claims is not None and claims.key_sha256 == _h(ALICE)
+    assert claims is not None and claims.kid == sess.key_id(secret, _h(ALICE))
+    assert _h(ALICE) not in value and claims.kid != _h(ALICE)  # cookie never carries the key hash
     # expired, wrong secret, tampered field, truncated, junk, TTL lowered after issue
     assert sess.verify_session(secret, value, now + timedelta(hours=1), 3600) is None
     assert sess.verify_session(b"j" * 32, value, now, 3600) is None
@@ -72,13 +74,42 @@ def test_session_roundtrip_and_rejections() -> None:
     assert sess.verify_session(secret, ".".join(parts), now, 3600) is None
     for bad in ["", "v1", value[:-4], value + "x", "é" * 10, "a.b.c.d.e", "x" * 1000]:
         assert sess.verify_session(secret, bad, now, 3600) is None
-    assert sess.verify_session(secret, value, now, 60) is None
+    assert sess.verify_session(secret, value, now + timedelta(minutes=2), 60) is None
     # csrf token is per session and not valid for another one
     other = sess.issue_session(secret, _h(BOB), now, 3600)
     c1 = sess.verify_session(secret, value, now, 3600)
     c2 = sess.verify_session(secret, other, now, 3600)
     assert c1 and c2
     assert sess.csrf_token(secret, c1) != sess.csrf_token(secret, c2)
+
+
+def test_session_ttl_is_age_based_without_revival() -> None:
+    secret = b"k" * 32
+    t0 = datetime(2026, 1, 1, 12, tzinfo=UTC)
+    value = sess.issue_session(secret, _h(ALICE), t0, 8 * 3600)  # issued under an 8 h TTL
+
+    def ok(dt: timedelta, ttl: int) -> bool:
+        return sess.verify_session(secret, value, t0 + dt, ttl) is not None
+
+    # TTL later lowered to 1 h
+    assert ok(timedelta(hours=0.5), 3600)
+    assert not ok(timedelta(hours=2), 3600)
+    assert not ok(timedelta(hours=7.5), 3600)  # no revival
+    # a later raise never extends beyond the signed expiry
+    assert not ok(timedelta(hours=9), 24 * 3600)
+    # issued in the future beyond skew is rejected
+    assert sess.verify_session(secret, value, t0 - timedelta(minutes=5), 8 * 3600) is None
+    assert sess.verify_session(secret, value, t0 - timedelta(seconds=30), 8 * 3600) is not None
+
+
+def test_referrer_policy_header_and_meta_are_same_origin() -> None:
+    import minion_server.ui as ui
+    from minion_server.ui.headers import SECURITY_HEADERS
+
+    assert SECURITY_HEADERS["Referrer-Policy"] == "same-origin"
+    html = (Path(ui.__file__).parent / "templates" / "base.html").read_text()
+    assert '<meta name="referrer" content="same-origin">' in html
+    assert '"historyCacheSize": 0' in html
 
 
 def test_origin_check() -> None:
@@ -88,6 +119,8 @@ def test_origin_check() -> None:
     assert ok(None, "https://h.example/ui/login", "h.example")
     assert not ok(None, None, "h.example")
     assert not ok("null", None, "h.example")
+    assert not ok("null", "https://h.example/ui/login", "h.example")
+    assert not ok(None, None, "h.example")
     assert not ok("https://evil.example", None, "h.example")
     assert not ok("https://h.example.evil.example", None, "h.example")
     assert not ok("https://evil@h.example", None, "h.example")
@@ -98,12 +131,31 @@ def test_origin_check() -> None:
 
 
 def test_loopback_detection() -> None:
-    assert sess.host_is_loopback("localhost:8080")
-    assert sess.host_is_loopback("127.0.0.1")
-    assert sess.host_is_loopback("[::1]:8080")
-    assert not sess.host_is_loopback("ui.example")
-    assert not sess.host_is_loopback("10.0.0.5:8080")
-    assert not sess.host_is_loopback(None)
+    assert host_header_is_loopback("localhost:8080")
+    assert host_header_is_loopback("127.0.0.1")
+    assert host_header_is_loopback("[::1]:8080")
+    assert not host_header_is_loopback("ui.example")
+    assert not host_header_is_loopback("10.0.0.5:8080")
+    assert not host_header_is_loopback(None)
+
+
+def test_settings_ttl_cap_and_allowed_hosts_and_secret_charset() -> None:
+    base: dict[str, Any] = {"database_url": "x", "s3_access_key": "a", "s3_secret_key": "b"}
+    with pytest.raises(ValidationError):
+        ServerSettings.model_validate({**base, "ui_session_ttl_s": 7 * 24 * 3600 + 1})
+    with pytest.raises(ValidationError):
+        ServerSettings.model_validate({**base, "ui_session_secret": "a" * 40})
+    cfg = ServerSettings.model_validate({**base, "ui_allowed_hosts": " A.example:8443, b.example "})
+    assert cfg.ui_allowed_host_set == {"a.example:8443", "b.example"}
+
+
+def test_generate_ui_secret_command() -> None:
+    from minion_server.admin import app as admin_app
+    from typer.testing import CliRunner
+
+    out = CliRunner().invoke(admin_app, ["generate-ui-secret"]).output.strip()
+    assert out.startswith("MINION_UI_SESSION_SECRET=")
+    assert len(out.split("=", 1)[1]) >= 48
 
 
 def test_settings_secret_validation() -> None:
@@ -119,8 +171,8 @@ def test_settings_secret_validation() -> None:
 
     assert make(None).ui_session_secret is None
     assert make("  ").ui_session_secret is None
-    s = make("s" * 32).ui_session_secret
-    assert s is not None and s.get_secret_value() == "s" * 32
+    s = make("ab" * 16).ui_session_secret
+    assert s is not None and s.get_secret_value() == "ab" * 16
     with pytest.raises(ValidationError):
         make("short")
 
@@ -273,7 +325,9 @@ async def test_team_scoping_and_csrf(ui: tuple[AsyncClient, Any, Path]) -> None:
     # Referer is an acceptable stand-in for a missing Origin
     r = await c.post("/ui/logout", data=form, headers={"Referer": BASE + "/ui/tasks"})
     assert r.status_code == 303 and r.headers["location"] == "/ui/login"
-    assert (await c.get("/ui/tasks")).status_code == 303 or "minion_session" not in c.cookies
+    cleared = [v for v in r.headers.get_list("set-cookie") if v.startswith("minion_session=")]
+    assert cleared and "Max-Age=0" in cleared[0]
+    assert (await c.get("/ui/tasks")).status_code == 303
 
     # login itself: foreign origin, missing/forged csrf, csrf of another browser's nonce
     token = await _csrf(c)
@@ -313,7 +367,8 @@ async def test_security_headers_and_escaping(ui: tuple[AsyncClient, Any, Path]) 
         r = await c.get(path)
         assert r.headers["content-security-policy"] == CSP, path
         assert r.headers["x-content-type-options"] == "nosniff", path
-        assert r.headers["referrer-policy"] == "no-referrer", path
+        assert r.headers["referrer-policy"] == "same-origin", path
+        assert r.headers["strict-transport-security"] == "max-age=31536000", path  # https client
         assert r.headers["cache-control"] == "no-store", path
     assert "default-src 'self'" in CSP and "frame-ancestors 'none'" in CSP
     # the API is not affected
@@ -328,6 +383,22 @@ async def test_security_headers_and_escaping(ui: tuple[AsyncClient, Any, Path]) 
         scripts = re.findall(r"<script\b[^>]*>", (await c.get(path)).text)
         assert scripts == ['<script src="/ui/static/htmx.min.js">'], path
         assert not re.search(r"\son\w+\s*=|javascript:", (await c.get(path)).text)
+
+
+@pytest.mark.integration
+async def test_hsts_only_on_https_and_allowed_hosts(ui: tuple[AsyncClient, Any, Path]) -> None:
+    _c, app, _ = ui
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as lb:
+        r = await lb.get("/ui/login")
+        assert r.status_code == 200 and "strict-transport-security" not in r.headers
+    app.state.settings = app.state.settings.model_copy(update={"ui_allowed_hosts": "ui.example"})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=BASE) as ok:
+        assert (await ok.get("/ui/login")).status_code == 200
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="https://evil.example"
+    ) as bad:
+        assert (await bad.get("/ui/login")).status_code == 400
+        assert (await bad.get("/ui/tasks")).status_code == 400
 
 
 @pytest.mark.integration

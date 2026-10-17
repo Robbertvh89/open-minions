@@ -1,14 +1,13 @@
 """Stateless UI session cookie and CSRF tokens (ADR-0010).
 
-The cookie carries `v1.<key sha256>.<issued_at>.<expires_at>.<mac>` where the MAC is
-HMAC-SHA256 over the first four fields with the server's `MINION_UI_SESSION_SECRET`. It holds no
-secret (the key hash cannot be turned into the key). Whether the key still exists is decided on
-every request against the KeyStore, so removing a key from the keys file ends its sessions.
+The cookie carries `v2.<kid>.<issued_at>.<expires_at>.<mac>`. `kid` is HMAC(secret, "kid", key
+sha256), so the cookie never carries the key hash (which is what the keys file stores); the mac is
+HMAC-SHA256 over the first four fields. Whether the key still exists is decided on every request
+against the KeyStore (kid is recomputed per configured key), so removing a key ends its sessions.
 """
 
 import hashlib
 import hmac
-import ipaddress
 import re
 import secrets
 from dataclasses import dataclass
@@ -19,14 +18,14 @@ SESSION_COOKIE = "minion_session"
 LOGIN_COOKIE = "minion_login"  # anonymous nonce binding the login form to this browser
 LOGIN_NONCE_TTL_S = 600
 COOKIE_PATH = "/ui"
-_VERSION = "v1"
+_VERSION = "v2"
 _MAX_COOKIE_LEN = 512
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
 class SessionClaims:
-    key_sha256: str
+    kid: str
     issued_at: int
     expires_at: int
     payload: str
@@ -36,6 +35,10 @@ def _mac(secret: bytes, purpose: str, message: str) -> str:
     return hmac.new(secret, f"{purpose}\0{message}".encode(), hashlib.sha256).hexdigest()
 
 
+def key_id(secret: bytes, key_sha256: str) -> str:
+    return _mac(secret, "kid", key_sha256)
+
+
 def tokens_equal(a: str, b: str) -> bool:
     """Constant-time comparison that tolerates non-ASCII input (compare_digest on str does not)."""
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
@@ -43,7 +46,7 @@ def tokens_equal(a: str, b: str) -> bool:
 
 def issue_session(secret: bytes, key_sha256: str, now: datetime, ttl_s: int) -> str:
     issued = int(now.timestamp())
-    payload = f"{_VERSION}.{key_sha256}.{issued}.{issued + ttl_s}"
+    payload = f"{_VERSION}.{key_id(secret, key_sha256)}.{issued}.{issued + ttl_s}"
     return f"{payload}.{_mac(secret, 'session', payload)}"
 
 
@@ -61,8 +64,9 @@ def verify_session(secret: bytes, value: str, now: datetime, ttl_s: int) -> Sess
         return None
     issued, expires = int(parts[2]), int(parts[3])
     now_ts = int(now.timestamp())
-    # A TTL lowered after issue shortens existing sessions too (expires may not exceed now + ttl).
-    if expires <= now_ts or issued > now_ts + 60 or expires > now_ts + ttl_s:
+    # Age-based: a TTL lowered after issue shortens existing sessions (no revival if raised again
+    # later, since the age check uses the current TTL only to cut, never to extend `expires`).
+    if now_ts >= min(expires, issued + ttl_s) or issued > now_ts + 60:
         return None
     return SessionClaims(parts[1], issued, expires, payload)
 
@@ -97,21 +101,3 @@ def origin_ok(origin: str | None, referer: str | None, host: str | None) -> bool
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return False
     return tokens_equal(parts.netloc.lower(), host.lower())
-
-
-def host_is_loopback(host_header: str | None) -> bool:
-    """True when the request addressed a loopback host (then the cookie may omit `Secure`)."""
-    if not host_header:
-        return False
-    try:
-        name = urlsplit(f"//{host_header}").hostname
-    except ValueError:
-        return False
-    if name is None:
-        return False
-    if name == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(name).is_loopback
-    except ValueError:
-        return False

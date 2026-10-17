@@ -60,6 +60,7 @@ uv run minion-watchdog                    # reclaim + cancel sweep; DB only, no 
 uv run minion-server-admin --help          # operator CLI (typer); subcommands below
 uv run minion-server-admin generate-api-key --name <who> --teams a,b [--operator] [--expires-days N]  # prints key once + keys-file entry (file is live-reloaded, MINION_API_KEYS_RELOAD_S)
 uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]  # prints token once
+uv run minion-server-admin generate-ui-secret   # prints MINION_UI_SESSION_SECRET=... for the web UI
 uv run minion-server-admin revoke-executor-token --executor-id <uuid>
 uv run minion-server-admin list-executors   # never prints token hashes
 uv run minion-server-admin rotate-executor-token --executor-id <uuid> [--ttl-days N]  # same id, new token printed once

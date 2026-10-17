@@ -479,13 +479,13 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   key is never logged or echoed) sets `minion_session`, a stateless cookie HMAC-SHA256-signed over the key
   hash, issue and expiry time (`MINION_UI_SESSION_TTL_S`, default 8 h): `HttpOnly`, `SameSite=Strict`,
   `Path=/ui`, `Secure` unless the request host is loopback. Each request re-resolves the key in the live
-  keys file, so a removed or expired key ends the session within `MINION_API_KEYS_RELOAD_S`; team scoping is
+  keys file (the cookie carries an HMAC key id, never the key hash; validity is age-based: `min(expiry, issued + TTL)`, TTL max 7 days), so a removed or expired key ends the session within `MINION_API_KEYS_RELOAD_S`; team scoping is
   the REST API's (`403` for another team's task). Every `POST` (login included) needs a matching `Origin`
   (else `Referer`) and a per-session HMAC CSRF token, else `403`. All `/ui` responses carry `Content-Security-Policy:
   default-src 'self'; script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'`,
-  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. Templates are
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (with `no-referrer` browsers send `Origin: null` on same-origin form POSTs, which are rejected), `Strict-Transport-Security` when the server sees https, `Cache-Control: no-store`. Templates are
   autoescaped: executor-supplied strings (owner, hostname, task `error`) are rendered inert. Rate-limit
-  `POST /ui/login` at the reverse proxy; the proxy must keep the `Host` header. OIDC/SSO: put a proxy in front.
+  `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`. `minion-server-admin generate-ui-secret` prints a secret; single-character secrets are rejected. OIDC/SSO: put a proxy in front.
 
 ## 9. Non-functional requirements
 

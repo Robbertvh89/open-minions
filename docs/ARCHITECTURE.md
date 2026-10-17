@@ -51,7 +51,7 @@ minion_server/
   ui/                  # server-rendered web UI (ADR-0010)
     routes.py          # /ui: login, logout, task list, task detail (+ ?partial=1 htmx fragment)
     session.py         # stateless HMAC session cookie, CSRF tokens, Origin check
-    headers.py         # CSP / nosniff / no-referrer / no-store middleware for /ui
+    headers.py         # CSP / nosniff / same-origin / no-store middleware for /ui
     templates/         # Jinja2, autoescape on, no inline scripts
     static/            # htmx.min.js (vendored 2.0.4, sha256 pinned in a test), ui.css
   settings.py          # ServerSettings: MINION_* env vars (pydantic-settings)
