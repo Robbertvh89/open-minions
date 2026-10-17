@@ -10,10 +10,8 @@ from minion_common.schemas import ModelEntry, TaskCreate
 from sqlalchemy import (
     ColumnElement,
     Select,
-    String,
     and_,
     func,
-    literal,
     or_,
     select,
     tuple_,
@@ -387,22 +385,63 @@ async def sweep_cancelled(
     return int(result.rowcount)  # type: ignore[attr-defined]
 
 
-def _after_predicate(
-    team: str, after: tuple[datetime, str, str, str], team_below_cursor: bool
-) -> ColumnElement[bool]:
+def _after_predicate(team: str, after: tuple[datetime, str, str, str]) -> ColumnElement[bool]:
     """`(created_at, team, project, task_name) < after` specialised to one fixed `team`.
 
     Written so each per-team branch is a plain range on the (created_at, project, task_name)
-    suffix of ix_minion_task_team_created instead of a mixed-column row comparison.
+    suffix of ix_minion_task_team_created instead of a mixed-column row comparison. For other
+    teams the team ordering is decided by the database itself (`Task.team < cursor_team` uses
+    the column's collation, the same as ORDER BY), never by Python string comparison.
     """
     created, a_team, a_project, a_name = after
     if team == a_team:
         return tuple_(Task.created_at, Task.project, Task.task_name) < tuple_(
             created, a_project, a_name
         )
-    if team_below_cursor:  # any row at the same instant sorts below the cursor
-        return Task.created_at <= created
-    return Task.created_at < created
+    return and_(Task.created_at <= created, or_(Task.created_at < created, Task.team < a_team))
+
+
+def _list_tasks_stmt(
+    teams: Sequence[str],
+    project: str | None,
+    status: TaskStatus | None,
+    after: tuple[datetime, str, str, str] | None,
+    limit: int,
+) -> Select[Task]:
+    """The page statement: one index-served capped branch per team, merged and re-sorted."""
+    # One branch per team (ix_minion_task_team_created), each capped at limit + 1: cost is
+    # O(teams * limit), not O(all tasks of the caller's teams).
+    uniq = list(dict.fromkeys(teams))
+    branches = []
+    for team in uniq:
+        q = select(Task.team, Task.project, Task.task_name, Task.created_at).where(
+            Task.team == team
+        )
+        if project is not None:
+            q = q.where(Task.project == project)
+        if status is not None:
+            q = q.where(Task.status == status.value)
+        if after is not None:
+            q = q.where(_after_predicate(team, after))
+        q = q.order_by(Task.created_at.desc(), Task.project.desc(), Task.task_name.desc())
+        branches.append(select(q.limit(limit + 1).subquery()))
+    keys = branches[0] if len(branches) == 1 else union_all(*branches)
+    keys_sq = keys.subquery("keys")
+    return (
+        select(Task)
+        .join(
+            keys_sq,
+            and_(
+                Task.team == keys_sq.c.team,
+                Task.project == keys_sq.c.project,
+                Task.task_name == keys_sq.c.task_name,
+            ),
+        )
+        .order_by(
+            Task.created_at.desc(), Task.team.desc(), Task.project.desc(), Task.task_name.desc()
+        )
+        .limit(limit + 1)
+    )
 
 
 async def list_tasks(
@@ -421,48 +460,7 @@ async def list_tasks(
     """
     if not teams:
         return [], False
-    # One index-served branch per team (ix_minion_task_team_created), each capped at limit + 1,
-    # merged and re-sorted: cost is O(teams * limit), not O(all tasks of the caller's teams).
-    uniq = list(dict.fromkeys(teams))
-    below: dict[str, bool] = {}
-    if after is not None:
-        # Team order is the database's collation order (same as ORDER BY), not Python's.
-        row = (
-            await session.execute(
-                select(*[literal(t, String) < literal(after[1], String) for t in uniq])
-            )
-        ).one()
-        below = {t: bool(v) for t, v in zip(uniq, row, strict=True)}
-    branches = []
-    for team in uniq:
-        q = select(Task.team, Task.project, Task.task_name, Task.created_at).where(
-            Task.team == team
-        )
-        if project is not None:
-            q = q.where(Task.project == project)
-        if status is not None:
-            q = q.where(Task.status == status.value)
-        if after is not None:
-            q = q.where(_after_predicate(team, after, below[team]))
-        q = q.order_by(Task.created_at.desc(), Task.project.desc(), Task.task_name.desc())
-        branches.append(select(q.limit(limit + 1).subquery()))
-    keys = branches[0] if len(branches) == 1 else union_all(*branches)
-    keys_sq = keys.subquery("keys")
-    stmt = (
-        select(Task)
-        .join(
-            keys_sq,
-            and_(
-                Task.team == keys_sq.c.team,
-                Task.project == keys_sq.c.project,
-                Task.task_name == keys_sq.c.task_name,
-            ),
-        )
-        .order_by(
-            Task.created_at.desc(), Task.team.desc(), Task.project.desc(), Task.task_name.desc()
-        )
-        .limit(limit + 1)
-    )
+    stmt = _list_tasks_stmt(teams, project, status, after, limit)
     rows = list((await session.execute(stmt)).scalars())
     has_more = len(rows) > limit
     page = rows[:limit]

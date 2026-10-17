@@ -35,10 +35,11 @@ async def list_executors(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 200,
 ) -> ExecutorPage:
     settings: ServerSettings = request.app.state.settings
-    after_id = None
+    after = None
     if cursor is not None:
         try:
-            after_id = decode_executor_cursor(cursor).executor_id
+            ec = decode_executor_cursor(cursor)
+            after = (ec.registered_at, ec.executor_id)
         except InvalidCursorError as exc:
             raise api_error(422, "INVALID_CURSOR", "invalid cursor") from exc
     async with session.begin():
@@ -48,7 +49,7 @@ async def list_executors(
             busy_online_s=settings.executor_online_busy_s,
             status=status,
             pool=pool,
-            after_id=after_id,
+            after=after,
             limit=limit,
         )
     items = [
@@ -74,5 +75,14 @@ async def list_executors(
         )
         for r in rows
     ]
-    nxt = encode_cursor(ExecutorCursor(executor_id=rows[-1].executor.executor_id)) if more else None
+    nxt = (
+        encode_cursor(
+            ExecutorCursor(
+                registered_at=rows[-1].executor.registered_at,
+                executor_id=rows[-1].executor.executor_id,
+            )
+        )
+        if more
+        else None
+    )
     return ExecutorPage(items=items, next_cursor=nxt)

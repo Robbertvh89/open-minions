@@ -36,3 +36,16 @@ def test_printable_escapes_control_chars() -> None:
     assert all(c.isprintable() for c in out)
     assert "\x1b" not in out and "\\x1b" in out and "\\t" in out and "\\n" in out
     assert printable("alice@x.io") == "alice@x.io"
+
+
+@pytest.mark.parametrize("pool", ["Bad Pool", "a\nb", "", "x" * 65, "-a"])
+def test_issue_executor_token_rejects_bad_pool(pool: str) -> None:
+    result = CliRunner().invoke(app, ["issue-executor-token", "--owner", "o", "--pool", pool])
+    assert result.exit_code == 2
+    assert "invalid --pool" in result.output
+
+
+def test_generate_api_key_caps_teams() -> None:
+    teams = ",".join(f"t{i}" for i in range(65))
+    result = CliRunner().invoke(app, ["generate-api-key", "--name", "a", "--teams", teams])
+    assert result.exit_code == 2

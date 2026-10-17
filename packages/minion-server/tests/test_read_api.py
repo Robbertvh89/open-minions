@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -59,10 +60,15 @@ def test_cursor_roundtrip_and_rejects_garbage() -> None:
         decode_subtask_cursor(encode_cursor(c))
     import base64
 
-    e = ExecutorCursor(executor_id=uuid.uuid4())
+    e = ExecutorCursor(registered_at=datetime(2026, 1, 2, tzinfo=UTC), executor_id=uuid.uuid4())
     assert decode_executor_cursor(encode_cursor(e)) == e
     with pytest.raises(InvalidCursorError):
         decode_executor_cursor(encode_cursor(s))
+    legacy = base64.urlsafe_b64encode(
+        b'{"k":"executor","executor_id":"%s"}' % str(e.executor_id).encode()
+    )
+    with pytest.raises(InvalidCursorError):
+        decode_executor_cursor(legacy.decode())
     forged = base64.urlsafe_b64encode(b'{"k":"subtask","subtask_id":-1}').decode()
     with pytest.raises(InvalidCursorError):
         decode_subtask_cursor(forged)
@@ -383,41 +389,32 @@ async def test_multi_team_tie_across_page_boundary(http: tuple[AsyncClient, Any]
 
 
 @pytest.mark.integration
-async def test_multi_team_branches_use_team_created_index(http: tuple[AsyncClient, Any]) -> None:
+@pytest.mark.parametrize("with_cursor", [False, True])
+@pytest.mark.parametrize("cursor_team", ["aa", "rb", "zz"])  # below, equal to, above branch teams
+async def test_multi_team_branches_use_team_created_index(
+    http: tuple[AsyncClient, Any], with_cursor: bool, cursor_team: str
+) -> None:
     from minion_server.repositories import tasks as repo
+    from sqlalchemy.dialects import postgresql
 
+    if not with_cursor and cursor_team != "rb":
+        pytest.skip("cursor team is irrelevant without a cursor")
     _, app = http
     sm: async_sessionmaker[AsyncSession] = app.state.sessionmaker
     await seed_task(sm, "e1", 1, team="ra")
     await seed_task(sm, "e2", 1, team="rb")
-    after = (datetime(2030, 1, 1, tzinfo=UTC), "rb", "p", "zzz")
-    async with sm() as s, s.begin():
-        rows, _ = await repo.list_tasks(
-            s, teams=["ra", "rb"], project=None, status=None, after=after, limit=10
-        )
-    assert {t.task_name for t, _ in rows} == {"e1", "e2"}
-    # Same statement shape as each UNION ALL branch (both predicate forms); with seqscan off
-    # on this tiny table every branch must be served by the team/created index.
+    after = (datetime(2030, 1, 1, tzinfo=UTC), cursor_team, "p", "zzz") if with_cursor else None
+    stmt = repo._list_tasks_stmt(["ra", "rb"], None, None, after, 10)
+    dialect = postgresql.dialect()  # type: ignore[no-untyped-call]
+    sql = str(stmt.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
     async with sm() as s, s.begin():
         await s.execute(text("SET LOCAL enable_seqscan = off"))
-        plan = "\n".join(
-            r[0]
-            for r in (
-                await s.execute(
-                    text(
-                        "EXPLAIN SELECT team, project, task_name FROM ("
-                        " (SELECT team, project, task_name FROM minion_task WHERE team = 'ra'"
-                        "  AND created_at <= now() ORDER BY created_at DESC, project DESC,"
-                        "  task_name DESC LIMIT 11)"
-                        " UNION ALL (SELECT team, project, task_name FROM minion_task"
-                        "  WHERE team = 'rb' AND (created_at, project, task_name) <"
-                        "  (now(), 'p', 'z') ORDER BY created_at DESC, project DESC,"
-                        "  task_name DESC LIMIT 11)) u"
-                    )
-                )
-            ).all()
-        )
-    assert plan.count("ix_minion_task_team_created") == 2, plan
+        plan = "\n".join(r[0] for r in (await s.execute(text("EXPLAIN " + sql))).all())
+    # One scan per team branch, plus the final join lookup of the page rows.
+    scan_re = r"Index (?:Only )?Scan(?: Backward)? using ix_minion_task_team_created"
+    scans = re.findall(scan_re, plan)
+    assert len(scans) == 3 and "Seq Scan" not in plan, plan
+    assert plan.count("(team = 'ra'") == 1 and plan.count("(team = 'rb'") == 1, plan
 
 
 @pytest.mark.integration
@@ -434,6 +431,25 @@ async def test_executors_pagination_and_filters(http: tuple[AsyncClient, Any]) -
             text("UPDATE minion_executor SET pool='gpu' WHERE executor_id = :i"),
             {"i": made[1][0].executor_id},
         )
+        # Heavy registered_at ties: the executor_id tiebreak must carry the paging.
+        await s.execute(
+            text(
+                "UPDATE minion_executor SET registered_at = TIMESTAMPTZ '2026-01-01 00:00:00+00'"
+                " WHERE executor_id <> :i"
+            ),
+            {"i": made[4][0].executor_id},
+        )
+        expected = [
+            str(r[0])
+            for r in (
+                await s.execute(
+                    text(
+                        "SELECT executor_id FROM minion_executor"
+                        " ORDER BY registered_at, executor_id"
+                    )
+                )
+            ).all()
+        ]
     seen: list[str] = []
     cursor: str | None = None
     while True:
@@ -446,7 +462,7 @@ async def test_executors_pagination_and_filters(http: tuple[AsyncClient, Any]) -
         cursor = r.json()["next_cursor"]
         if not cursor:
             break
-    assert seen == sorted(seen) and len(set(seen)) == 5
+    assert seen == expected and len(set(seen)) == 5
     r = await c.get("/api/v1/executors?status=REVOKED", headers=_a(OP))
     assert [e["executor_id"] for e in r.json()["items"]] == [str(made[0][0].executor_id)]
     r = await c.get("/api/v1/executors?pool=gpu", headers=_a(OP))

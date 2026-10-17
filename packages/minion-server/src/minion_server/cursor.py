@@ -23,9 +23,11 @@ class InvalidCursorError(ValueError):
     """The cursor is malformed, tampered with, or of the wrong kind."""
 
 
-class TaskCursor(BaseModel):
+class _Cursor(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+
+class TaskCursor(_Cursor):
     k: Literal["task"] = "task"
     created_at: AwareDatetime
     team: _Slug
@@ -33,21 +35,18 @@ class TaskCursor(BaseModel):
     task_name: _Slug
 
 
-class SubtaskCursor(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
+class SubtaskCursor(_Cursor):
     k: Literal["subtask"] = "subtask"
     subtask_id: int = Field(ge=0, le=2**31 - 1)
 
 
-class ExecutorCursor(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
+class ExecutorCursor(_Cursor):
     k: Literal["executor"] = "executor"
+    registered_at: AwareDatetime
     executor_id: uuid.UUID
 
 
-def encode_cursor(cursor: TaskCursor | SubtaskCursor | ExecutorCursor) -> str:
+def encode_cursor(cursor: _Cursor) -> str:
     raw = cursor.model_dump_json().encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
@@ -64,9 +63,9 @@ def _decode_json(token: str) -> bytes:
     return raw
 
 
-def decode_task_cursor(token: str) -> TaskCursor:
+def _decode[M: _Cursor](token: str, model_cls: type[M]) -> M:
     try:
-        cur = TaskCursor.model_validate_json(_decode_json(token))
+        cur = model_cls.model_validate_json(_decode_json(token))
     except ValidationError as exc:
         raise InvalidCursorError("invalid cursor") from exc
     # Strict JSON mode accepts ISO strings for datetime; re-encoding must round-trip exactly.
@@ -75,24 +74,16 @@ def decode_task_cursor(token: str) -> TaskCursor:
     return cur
 
 
+def decode_task_cursor(token: str) -> TaskCursor:
+    return _decode(token, TaskCursor)
+
+
 def decode_subtask_cursor(token: str) -> SubtaskCursor:
-    try:
-        cur = SubtaskCursor.model_validate_json(_decode_json(token))
-    except ValidationError as exc:
-        raise InvalidCursorError("invalid cursor") from exc
-    if encode_cursor(cur) != token.rstrip("="):
-        raise InvalidCursorError("invalid cursor")
-    return cur
+    return _decode(token, SubtaskCursor)
 
 
 def decode_executor_cursor(token: str) -> ExecutorCursor:
-    try:
-        cur = ExecutorCursor.model_validate_json(_decode_json(token))
-    except ValidationError as exc:
-        raise InvalidCursorError("invalid cursor") from exc
-    if encode_cursor(cur) != token.rstrip("="):
-        raise InvalidCursorError("invalid cursor")
-    return cur
+    return _decode(token, ExecutorCursor)
 
 
 def task_cursor_from(created_at: datetime, team: str, project: str, task_name: str) -> str:
