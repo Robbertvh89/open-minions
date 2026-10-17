@@ -251,7 +251,7 @@ Invariants: read-only SQL in repositories/ only.
 
 ### 6.5 Observability: read-only views, release reason, Grafana dashboards, /metrics
 Files:
-- Migration 0006 creates schema `minion_ro` with views over the 7 tables:
+- Migration 0007 creates schema `minion_ro` with views over the 7 tables:
   - minion_executor without token_hash;
   - minion_task without params (the `system` prompt is payload, S-5);
   - minion_subtask without input keys;

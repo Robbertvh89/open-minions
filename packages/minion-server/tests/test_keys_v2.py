@@ -609,3 +609,13 @@ def test_symlink_not_owned_by_root_or_server_rejected(
     monkeypatch.setattr(os, "lstat", foreign_link)
     with pytest.raises(KeysFileUnsafeError):
         KeyStore(link)
+
+
+def test_teams_per_key_capped() -> None:
+    def body(n: int) -> str:
+        teams = ", ".join(f"t{i}" for i in range(n))
+        return f"keys:\n  - {{name: a, sha256: {_h(K1)}, teams: [{teams}]}}\n"
+
+    assert len(parse_keys_config(body(64)).keys[_h(K1)].teams) == 64
+    with pytest.raises(ValidationError):
+        parse_keys_config(body(65))

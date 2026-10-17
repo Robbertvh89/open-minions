@@ -6,11 +6,16 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import ExecutorStatus
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, case, func, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from minion_server.db.models import Executor, ExecutorPreference
+from minion_server.db.models import (
+    Executor,
+    ExecutorHeartbeat,
+    ExecutorPreference,
+    SubtaskAcquirement,
+)
 
 
 @dataclass(frozen=True)
@@ -242,3 +247,72 @@ async def rotate_token(
         .values(token_hash=token_hash, token_expires_at=token_expires_at)
     )
     return bool(result.rowcount)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class FleetRow:
+    executor: Executor
+    busy: bool
+    last_heartbeat_at: datetime | None
+    online: bool
+
+
+async def list_fleet(
+    session: AsyncSession,
+    *,
+    idle_online_s: float,
+    busy_online_s: float,
+    status: ExecutorStatus | None = None,
+    pool: str | None = None,
+    after: tuple[datetime, uuid.UUID] | None = None,
+    limit: int = 200,
+) -> tuple[list[FleetRow], bool]:
+    """Keyset page (`(registered_at, executor_id)`, `limit + 1` probe) of executors, flags derived.
+
+    See ARCHITECTURE §7.
+
+    busy: the executor owns an acquirement that still has a heartbeat row (the row exists exactly
+    while the subtask is RUNNING under it). online: ACTIVE and heard from within `busy_online_s`
+    (heartbeat) when busy, else within `idle_online_s` (acquire poll / presence ping). One query;
+    time is evaluated in the database (`now()`), so it cannot skew against `last_seen_at`.
+    """
+    hb = (
+        select(
+            SubtaskAcquirement.executor_id.label("executor_id"),
+            func.max(ExecutorHeartbeat.last_seen_at).label("last_hb"),
+        )
+        .join(
+            ExecutorHeartbeat,
+            ExecutorHeartbeat.acquirement_id == SubtaskAcquirement.acquirement_id,
+        )
+        .group_by(SubtaskAcquirement.executor_id)
+        .subquery()
+    )
+    busy = hb.c.last_hb.is_not(None)
+    seen = func.greatest(Executor.last_seen_at, hb.c.last_hb)
+    online = and_(
+        Executor.status == ExecutorStatus.ACTIVE.value,
+        seen.is_not(None),
+        seen
+        >= func.now()
+        - case(
+            (busy, func.make_interval(0, 0, 0, 0, 0, 0, busy_online_s)),
+            else_=func.make_interval(0, 0, 0, 0, 0, 0, idle_online_s),
+        ),
+    )
+    stmt = select(Executor, busy, hb.c.last_hb, online).outerjoin(
+        hb, hb.c.executor_id == Executor.executor_id
+    )
+    if status is not None:
+        stmt = stmt.where(Executor.status == status.value)
+    if pool is not None:
+        stmt = stmt.where(Executor.pool == pool)
+    if after is not None:
+        stmt = stmt.where(tuple_(Executor.registered_at, Executor.executor_id) > tuple_(*after))
+    rows = (
+        await session.execute(
+            stmt.order_by(Executor.registered_at, Executor.executor_id).limit(limit + 1)
+        )
+    ).all()
+    out = [FleetRow(r[0], bool(r[1]), r[2], bool(r[3])) for r in rows]
+    return out[:limit], len(out) > limit

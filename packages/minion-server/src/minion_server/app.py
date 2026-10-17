@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from minion_server.api import executor as executor_api
+from minion_server.api import fleet as fleet_api
 from minion_server.api import tasks as tasks_api
 from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
@@ -52,6 +53,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.add_middleware(BodyLimitMiddleware)
     app.include_router(tasks_api.router)
     app.include_router(executor_api.router)
+    app.include_router(fleet_api.router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

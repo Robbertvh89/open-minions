@@ -52,6 +52,9 @@ class ServerSettings(BaseSettings):
     # amplification: a rogue executor cannot hammer the heartbeat row). 0 disables. Executors
     # beat every ~30 s, so 1 s leaves ample headroom.
     heartbeat_min_interval_s: float = Field(default=1.0, ge=0)
+    # Fleet view (ARCHITECTURE §7): online = heard from within this window.
+    executor_online_idle_s: float = Field(default=120.0, gt=0)  # acquire poll / presence ping
+    executor_online_busy_s: float = Field(default=600.0, gt=0)  # running: heartbeat
 
     # Splitter bounds (memory/DoS protection) and retry policy.
     split_max_line_bytes: int = Field(default=16 << 20, gt=0)  # LINE_TOO_LONG above this

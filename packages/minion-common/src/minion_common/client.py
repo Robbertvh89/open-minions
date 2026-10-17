@@ -8,12 +8,13 @@ from __future__ import annotations
 import re
 import uuid
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, SecretStr
 
+from minion_common.enums import ExecutorStatus, SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     SLUG_PATTERN,
     AcquireRequest,
@@ -21,6 +22,7 @@ from minion_common.schemas import (
     Budget,
     CompleteRequest,
     ErrorBody,
+    ExecutorPage,
     FailRequest,
     HeartbeatRequest,
     HeartbeatResponse,
@@ -28,8 +30,10 @@ from minion_common.schemas import (
     PresenceRequest,
     RegisterRequest,
     RegisterResponse,
+    SubtaskPage,
     TaskCreate,
     TaskOut,
+    TaskPage,
 )
 
 API_PREFIX = "/api/v1"
@@ -116,13 +120,21 @@ class _BaseClient:
     ) -> None:
         await self.aclose()
 
-    async def _send(self, method: str, path: str, body: BaseModel | None = None) -> httpx.Response:
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        body: BaseModel | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        query = {k: v for k, v in (params or {}).items() if v is not None}
         if body is None:
-            resp = await self._http.request(method, path)
+            resp = await self._http.request(method, path, params=query)
         else:
             resp = await self._http.request(
                 method,
                 path,
+                params=query,
                 content=body.model_dump_json(),
                 headers={"Content-Type": "application/json"},
             )
@@ -185,6 +197,65 @@ class UserClient(_BaseClient):
     async def cancel_task(self, team: str, project: str, task_name: str) -> TaskOut:
         resp = await self._send("POST", self._task_path(team, project, task_name) + "/cancel")
         return TaskOut.model_validate_json(resp.content)
+
+    async def list_tasks(
+        self,
+        *,
+        team: str | None = None,
+        project: str | None = None,
+        status: TaskStatus | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> TaskPage:
+        resp = await self._send(
+            "GET",
+            "/tasks",
+            params={
+                "team": team,
+                "project": project,
+                "status": status.value if status else None,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
+        return TaskPage.model_validate_json(resp.content)
+
+    async def list_subtasks(
+        self,
+        team: str,
+        project: str,
+        task_name: str,
+        *,
+        status: SubtaskStatus | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> SubtaskPage:
+        resp = await self._send(
+            "GET",
+            self._task_path(team, project, task_name) + "/subtasks",
+            params={"status": status.value if status else None, "cursor": cursor, "limit": limit},
+        )
+        return SubtaskPage.model_validate_json(resp.content)
+
+    async def list_executors(
+        self,
+        *,
+        status: ExecutorStatus | None = None,
+        pool: str | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> ExecutorPage:
+        resp = await self._send(
+            "GET",
+            "/executors",
+            params={
+                "status": status.value if status else None,
+                "pool": pool,
+                "cursor": cursor,
+                "limit": limit,
+            },
+        )
+        return ExecutorPage.model_validate_json(resp.content)
 
 
 __all__ = [

@@ -9,7 +9,15 @@ from typing import Any, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from minion_common.enums import CapacityProfile, CpuPriority, Engine, TaskStatus, TaskType
+from minion_common.enums import (
+    CapacityProfile,
+    CpuPriority,
+    Engine,
+    ExecutorStatus,
+    SubtaskStatus,
+    TaskStatus,
+    TaskType,
+)
 
 SLUG_PATTERN = r"^[a-z0-9]([a-z0-9_-]{0,62}[a-z0-9])?$"
 
@@ -165,6 +173,58 @@ class TaskOut(_Model):
     counts: TaskCounts = Field(default_factory=TaskCounts)
 
 
+class TaskPage(_Model):
+    """One page of `GET /tasks`; `next_cursor` is opaque (None = last page)."""
+
+    items: list[TaskOut]
+    next_cursor: str | None = None
+
+
+class SubtaskOut(_Model):
+    """Subtask progress row. No input/output keys, URLs or executor identity (SPEC S-11)."""
+
+    subtask_id: int = Field(ge=0)
+    status: SubtaskStatus
+    attempt: int = Field(ge=0)
+    max_attempts: int = Field(ge=1)
+    record_count: int = Field(ge=1)
+    error_code: str | None = Field(default=None, pattern=r"^[A-Z0-9_]{1,64}$")
+    updated_at: AwareDatetime
+
+
+class SubtaskPage(_Model):
+    items: list[SubtaskOut]
+    next_cursor: str | None = None
+
+
+class ExecutorOut(_Model):
+    """Fleet row for operators (SPEC §6.1). Never carries the token hash."""
+
+    executor_id: uuid.UUID
+    owner: str
+    pool: str
+    hostname: str
+    chip: str | None = None
+    total_memory_gb: float | None = None
+    os_version: str | None = None
+    engines: list[str] = Field(default_factory=list)
+    status: ExecutorStatus
+    profile: CapacityProfile | None = None
+    paused_reason: str | None = None
+    registered_at: AwareDatetime
+    last_seen_at: AwareDatetime | None = None
+    last_heartbeat_at: AwareDatetime | None = None
+    online: bool
+    busy: bool
+
+
+class ExecutorPage(_Model):
+    """One page of `GET /executors`; `next_cursor` is opaque (None = last page)."""
+
+    items: list[ExecutorOut]
+    next_cursor: str | None = None
+
+
 class RegisterRequest(_Model):
     hostname: str = Field(min_length=1, max_length=255)
     chip: str = Field(min_length=1, max_length=100)
@@ -280,6 +340,8 @@ __all__ = [
     "CompletionParams",
     "EmbeddingParams",
     "ErrorBody",
+    "ExecutorOut",
+    "ExecutorPage",
     "FailRequest",
     "HeartbeatRequest",
     "HeartbeatResponse",
@@ -289,9 +351,12 @@ __all__ = [
     "Progress",
     "RegisterRequest",
     "RegisterResponse",
+    "SubtaskOut",
+    "SubtaskPage",
     "TaskCounts",
     "TaskCreate",
     "TaskOut",
+    "TaskPage",
     "TaskParams",
     "parse_params",
 ]

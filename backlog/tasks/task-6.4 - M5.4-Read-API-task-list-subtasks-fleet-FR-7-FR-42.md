@@ -4,7 +4,7 @@ title: 'M5.4 Read API: task list, subtasks, fleet (FR-7, FR-42)'
 status: In Progress
 assignee: []
 created_date: '2026-10-17 03:33'
-updated_date: '2026-10-17 06:51'
+updated_date: '2026-10-17 07:20'
 labels:
   - M5
 dependencies:
@@ -21,8 +21,8 @@ minion-common: TaskPage, SubtaskOut, SubtaskPage, ExecutorOut (no token_hash; on
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 GET /tasks returns only the caller's teams; filtering another team gives 403
-- [ ] #2 Pagination stable under concurrent inserts; tampered cursor gives 422
-- [ ] #3 /subtasks paginates and filters by status with the same 403/404 rules as get_task
-- [ ] #4 /executors 403 for non-operators, never returns token_hash, busy/online correct in integration
+- [x] #1 GET /tasks returns only the caller's teams; filtering another team gives 403
+- [x] #2 Pagination stable under concurrent inserts; tampered cursor gives 422
+- [x] #3 /subtasks paginates and filters by status with the same 403/404 rules as get_task
+- [x] #4 /executors 403 for non-operators, never returns token_hash, busy/online correct in integration
 <!-- AC:END -->

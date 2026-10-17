@@ -79,3 +79,7 @@ authorized by team.
 - A non-atomic in-place rewrite can be observed half-written; a truncated file that still parses may
   briefly drop team pool policies (fail open for one interval). This is why atomic replace
   (temp + rename) is required, not just recommended.
+- A key may list at most 64 teams (`MAX_TEAMS_PER_KEY`); more is a parse error (fail closed under the
+  rules above). This bounds the per-request fan-out of the team-scoped task list (one index branch per
+  team). `generate-api-key` refuses more than 64 teams too. `issue-executor-token --pool` must match
+  the slug pattern (exit 2).

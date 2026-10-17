@@ -17,7 +17,7 @@ ordinal: 36000
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Migration 0006: schema minion_ro with views (executor w/o token_hash, task w/o params, subtask w/o input keys, attempt, heartbeat); role minion_readonly NOLOGIN in a DO block (NOTICE+skip without CREATEROLE), USAGE+SELECT on minion_ro only. deploy/postgres initdb creates minion_grafana LOGIN IN ROLE minion_readonly, statement_timeout 10s; datasource switches to it. Dashboards (tasks + fleet) per ARCHITECTURE 7. Optional ReleaseRequest{code} stored in attempt.error; executor passes a code at each _release call site. /metrics via prometheus-client (route template, method, status, acquire outcome; no ids/teams); MINION_METRICS_ENABLED. Docs: SPEC 7, ARCHITECTURE 7.
+Migration 0007: schema minion_ro with views (executor w/o token_hash, task w/o params, subtask w/o input keys, attempt, heartbeat); role minion_readonly NOLOGIN in a DO block (NOTICE+skip without CREATEROLE), USAGE+SELECT on minion_ro only. deploy/postgres initdb creates minion_grafana LOGIN IN ROLE minion_readonly, statement_timeout 10s; datasource switches to it. Dashboards (tasks + fleet) per ARCHITECTURE 7. Optional ReleaseRequest{code} stored in attempt.error; executor passes a code at each _release call site. /metrics via prometheus-client (route template, method, status, acquire outcome; no ids/teams); MINION_METRICS_ENABLED. Docs: SPEC 7, ARCHITECTURE 7.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria

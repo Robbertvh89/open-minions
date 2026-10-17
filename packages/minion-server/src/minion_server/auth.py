@@ -76,12 +76,15 @@ _Slug = Annotated[str, StringConstraints(pattern=SLUG_PATTERN)]
 _Pool = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 
 
+MAX_TEAMS_PER_KEY = 64  # bounds per-request team-scoped query fan-out (UNION ALL branches)
+
+
 class _KeyEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=100)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    teams: list[_Slug]
+    teams: list[_Slug] = Field(max_length=MAX_TEAMS_PER_KEY)
     operator: StrictBool = False
     expires_at: AwareDatetime | None = None
 

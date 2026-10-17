@@ -12,7 +12,7 @@ import yaml
 from minion_common.schemas import SLUG_PATTERN
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from minion_server.auth import sha256_hex
+from minion_server.auth import MAX_TEAMS_PER_KEY, sha256_hex
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
@@ -56,6 +56,9 @@ def issue_executor_token_cmd(
         int | None, typer.Option(min=1, max=MAX_TTL_DAYS, help="Token lifetime in days")
     ] = None,
 ) -> None:
+    if not re.fullmatch(SLUG_PATTERN, pool):
+        typer.echo("invalid --pool: lowercase slug required", err=True)
+        raise typer.Exit(2)
     settings = ServerSettings()
     days = min(ttl_days or settings.executor_token_ttl_days, MAX_TTL_DAYS)
 
@@ -199,6 +202,9 @@ def generate_api_key_cmd(
     team_list = [t.strip() for t in teams.split(",") if t.strip()]
     if not team_list or not all(re.fullmatch(SLUG_PATTERN, t) for t in team_list):
         typer.echo("invalid --teams: comma-separated lowercase slugs required", err=True)
+        raise typer.Exit(2)
+    if len(team_list) > MAX_TEAMS_PER_KEY:
+        typer.echo(f"invalid --teams: at most {MAX_TEAMS_PER_KEY} teams per key", err=True)
         raise typer.Exit(2)
     key = secrets.token_urlsafe(32)
     typer.echo(f"api key (shown once): {key}")

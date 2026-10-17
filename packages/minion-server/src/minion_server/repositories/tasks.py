@@ -7,7 +7,17 @@ from typing import Any
 
 from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import ModelEntry, TaskCreate
-from sqlalchemy import Select, func, or_, select, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    and_,
+    func,
+    or_,
+    select,
+    tuple_,
+    union_all,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -373,3 +383,132 @@ async def sweep_cancelled(
         .values(status=SubtaskStatus.CANCELLED.value)
     )
     return int(result.rowcount)  # type: ignore[attr-defined]
+
+
+def _after_predicate(team: str, after: tuple[datetime, str, str, str]) -> ColumnElement[bool]:
+    """`(created_at, team, project, task_name) < after` specialised to one fixed `team`.
+
+    Written so each per-team branch is a plain range on the (created_at, project, task_name)
+    suffix of ix_minion_task_team_created instead of a mixed-column row comparison. For other
+    teams the team ordering is decided by the database itself (`Task.team < cursor_team` uses
+    the column's collation, the same as ORDER BY), never by Python string comparison.
+    """
+    created, a_team, a_project, a_name = after
+    if team == a_team:
+        return tuple_(Task.created_at, Task.project, Task.task_name) < tuple_(
+            created, a_project, a_name
+        )
+    return and_(Task.created_at <= created, or_(Task.created_at < created, Task.team < a_team))
+
+
+def _list_tasks_stmt(
+    teams: Sequence[str],
+    project: str | None,
+    status: TaskStatus | None,
+    after: tuple[datetime, str, str, str] | None,
+    limit: int,
+) -> Select[Task]:
+    """The page statement: one index-served capped branch per team, merged and re-sorted."""
+    # One branch per team (ix_minion_task_team_created), each capped at limit + 1: cost is
+    # O(teams * limit), not O(all tasks of the caller's teams).
+    uniq = list(dict.fromkeys(teams))
+    branches = []
+    for team in uniq:
+        q = select(Task.team, Task.project, Task.task_name, Task.created_at).where(
+            Task.team == team
+        )
+        if project is not None:
+            q = q.where(Task.project == project)
+        if status is not None:
+            q = q.where(Task.status == status.value)
+        if after is not None:
+            q = q.where(_after_predicate(team, after))
+        q = q.order_by(Task.created_at.desc(), Task.project.desc(), Task.task_name.desc())
+        branches.append(select(q.limit(limit + 1).subquery()))
+    keys = branches[0] if len(branches) == 1 else union_all(*branches)
+    keys_sq = keys.subquery("keys")
+    return (
+        select(Task)
+        .join(
+            keys_sq,
+            and_(
+                Task.team == keys_sq.c.team,
+                Task.project == keys_sq.c.project,
+                Task.task_name == keys_sq.c.task_name,
+            ),
+        )
+        .order_by(
+            Task.created_at.desc(), Task.team.desc(), Task.project.desc(), Task.task_name.desc()
+        )
+        .limit(limit + 1)
+    )
+
+
+async def list_tasks(
+    session: AsyncSession,
+    *,
+    teams: Sequence[str],
+    project: str | None,
+    status: TaskStatus | None,
+    after: tuple[datetime, str, str, str] | None,
+    limit: int,
+) -> tuple[list[tuple[Task, dict[SubtaskStatus, int]]], bool]:
+    """Keyset page of tasks in `teams`, newest first: `(created_at, team, project, task_name)` DESC.
+
+    Fetches `limit + 1` rows to learn whether another page exists, then one grouped counts
+    query for the whole page (no per-task queries). Returns `(items, has_more)`.
+    """
+    if not teams:
+        return [], False
+    stmt = _list_tasks_stmt(teams, project, status, after, limit)
+    rows = list((await session.execute(stmt)).scalars())
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    counts: dict[tuple[str, str, str], dict[SubtaskStatus, int]] = {}
+    if page:
+        grouped = await session.execute(
+            select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status, func.count())
+            .where(
+                tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
+                    [(t.team, t.project, t.task_name) for t in page]
+                )
+            )
+            .group_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status)
+        )
+        for team, proj, name, st, n in grouped.all():
+            counts.setdefault((team, proj, name), {})[SubtaskStatus(st)] = int(n)
+    return [(t, counts.get((t.team, t.project, t.task_name), {})) for t in page], has_more
+
+
+async def task_exists(session: AsyncSession, team: str, project: str, task_name: str) -> bool:
+    return (
+        await session.execute(
+            select(Task.task_name).where(
+                Task.team == team, Task.project == project, Task.task_name == task_name
+            )
+        )
+    ).first() is not None
+
+
+async def list_subtasks(
+    session: AsyncSession,
+    team: str,
+    project: str,
+    task_name: str,
+    *,
+    status: SubtaskStatus | None,
+    after_id: int | None,
+    limit: int,
+) -> tuple[list[Subtask], bool]:
+    """Keyset page of one task's subtasks ordered by `subtask_id` (primary key suffix)."""
+    stmt = select(Subtask).where(
+        Subtask.team == team, Subtask.project == project, Subtask.task_name == task_name
+    )
+    if status is not None:
+        stmt = stmt.where(Subtask.status == status.value)
+    if after_id is not None:
+        stmt = stmt.where(Subtask.subtask_id > after_id)
+    rows = list(
+        (await session.execute(stmt.order_by(Subtask.subtask_id).limit(limit + 1))).scalars()
+    )
+    return rows[:limit], len(rows) > limit
