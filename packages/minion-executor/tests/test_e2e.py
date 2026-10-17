@@ -22,7 +22,6 @@ from minion_common.enums import Engine, PausedReason
 from minion_common.schemas import (
     AcquireRequest,
     Budget,
-    CompleteRequest,
     PreferenceRequest,
     PresenceRequest,
     TaskCreate,
@@ -578,7 +577,7 @@ async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live
 
 
 class RecordingClient(ExecutorClient):
-    """Records every 429; each subtask lasts like a real one (>= the 0.5 s acquire limit)."""
+    """Records every 429."""
 
     def __init__(self, *a: Any, **kw: Any) -> None:
         super().__init__(*a, **kw)
@@ -600,15 +599,15 @@ class RecordingClient(ExecutorClient):
                 self.limited.append("presence")
             raise
 
-    async def complete(self, subtask_id: Any, req: CompleteRequest) -> None:
-        await asyncio.sleep(0.6)  # a real subtask takes seconds; the fake runner is instant
-        await super().complete(subtask_id, req)
-
 
 async def test_default_rate_limits_never_trip_a_healthy_loop(
     live_default_limits: Live, tmp_path: Path
 ) -> None:
-    """TASK-6.2: several subtasks and a pause/resume at the production intervals: no 429."""
+    """TASK-6.2: several subtasks and a pause/resume at the production intervals: no 429.
+
+    The fake subtasks are instant, so only the executor's acquire pacing (>= 0.25 s between
+    acquires, above the server's 0.2 s interval) keeps the back-to-back acquires from tripping the
+    limit; the loop below uses the production pace and asserts zero 429s."""
     live = live_default_limits
     live.put_input("rl", "a.jsonl", _records("a", 60))
     await live.submit("rl", rps=10)  # 6 subtasks
@@ -625,6 +624,7 @@ async def test_default_rate_limits_never_trip_a_healthy_loop(
         allow_http_loopback=True,
         governor=gov,
         backoff=(1.0, 2.0),
+        acquire_pace_s=0.25,  # the production default
     )
     paused = dataclasses.replace(gov.decision, paused_reason=PausedReason.THERMAL)
     resumed = gov.decision

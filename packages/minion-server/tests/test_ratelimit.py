@@ -145,6 +145,7 @@ async def limited(fresh_url: str, s3: S3Env) -> AsyncIterator[tuple[AsyncClient,
             "register_min_interval_s": 3600.0,
             "acquire_min_interval_s": 3600.0,
             "presence_min_interval_s": 3600.0,
+            "preference_min_interval_s": 3600.0,
         }
     )
     app = create_app(cfg)
@@ -259,7 +260,6 @@ async def test_concurrent_acquires_with_one_token_admit_exactly_one(
 @pytest.mark.integration
 async def test_preference_too_fast_is_429(limited: tuple[AsyncClient, Any]) -> None:
     c, app = limited
-    app.state.limiter._intervals["preference"] = 3600.0
     [(_, token)] = await make_executors(app.state.sessionmaker, 1)
     body = {"team": "t"}
     r = await c.put(f"{BASE}/preference", json=body, headers=_auth(token))

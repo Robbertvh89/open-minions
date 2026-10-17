@@ -3220,15 +3220,81 @@ async def test_repeated_429_escalates_to_max_of_backoff_and_retry_after(tmp_path
     loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
     client.on_empty = loop.stop
     await loop.run()
-    assert 3.0 <= sleeps[0] <= 3.6  # first: Retry-After + jitter
-    assert sleeps[1] >= 3.0  # repeated: at least Retry-After
+    assert 3.0 <= sleeps[0] <= 3.6 + 1e-9  # first: Retry-After + jitter, no escalation
+    assert sleeps[1] >= 10.0 * 0.5  # repeated: escalated to the backoff base (10 s x 0.5..1)
 
 
 def test_rate_limit_delay_first_vs_repeated(tmp_path: Path) -> None:
     loop = make_loop(FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [])
     exc = ApiError(429, "RATE_LIMITED", "x", retry_after=2.0)
     for _ in range(50):
-        assert 2.0 <= loop._rate_limit_delay(exc, 0) <= 2.4
-        assert loop._rate_limit_delay(exc, 0, repeated=True) >= 2.0
+        assert 2.0 <= loop._rate_limit_delay(exc, 0) <= 2.4 + 1e-9
+        assert loop._rate_limit_delay(exc, 0, repeated=True) >= 10.0 * 0.5  # backoff[0] wins
     other = ApiError(503, "X", "x")
     assert loop._rate_limit_delay(other, 0) <= loop._delay(0) * 2
+
+
+class _PacedClient(FakeClient):
+    """Stamps each acquire with a fake clock that advances `work_s` per subtask."""
+
+    def __init__(self, items: list[Assignment | Exception | None], now: list[float], work_s: float):
+        super().__init__(items)
+        self.now, self.work_s = now, work_s
+        self.at: list[float] = []
+
+    async def acquire(self, req: AcquireRequest) -> Assignment | None:
+        self.at.append(self.now[0])
+        got = await super().acquire(req)
+        self.now[0] += self.work_s  # the subtask that follows takes this long
+        return got
+
+
+async def _run_paced(tmp_path: Path, work_s: float) -> tuple[_PacedClient, list[float]]:
+    now = [100.0]
+    sleeps: list[float] = []
+
+    async def sleep(d: float) -> None:
+        sleeps.append(d)
+        now[0] += d
+
+    client = _PacedClient([assignment(), assignment(), assignment()], now, work_s)
+    loop = make_loop(
+        client,
+        FakeWorker(),
+        FakeS3(),
+        tmp_path,
+        sleeps,
+        sleep=sleep,
+        clock=lambda: now[0],
+        acquire_pace_s=0.25,
+    )
+    await loop.run(max_subtasks=3)
+    return client, sleeps
+
+
+async def test_acquire_pacing_keeps_min_gap_for_instant_subtasks(tmp_path: Path) -> None:
+    client, sleeps = await _run_paced(tmp_path, work_s=0.0)
+    gaps = [b - a for a, b in zip(client.at, client.at[1:], strict=False)]
+    assert len(gaps) == 2 and all(g >= 0.25 - 1e-9 for g in gaps)
+    assert sleeps == [0.25, 0.25]  # exactly the remainder
+
+
+async def test_acquire_pacing_adds_no_delay_when_subtasks_are_slower(tmp_path: Path) -> None:
+    client, sleeps = await _run_paced(tmp_path, work_s=1.0)
+    assert sleeps == []
+    assert client.at == [100.0, 101.0, 102.0]
+
+
+async def test_acquire_pacing_sleeps_only_the_remaining_fraction(tmp_path: Path) -> None:
+    _, sleeps = await _run_paced(tmp_path, work_s=0.1)
+    assert sleeps == [pytest.approx(0.15)] * 2
+
+
+def test_acquire_pace_setting_rejects_values_below_server_interval() -> None:
+    from minion_executor.settings import ExecutorSettings
+
+    assert ExecutorSettings.model_fields["acquire_pace_s"].default == 0.25
+    for bad in (0.1, -1.0):
+        with pytest.raises(ValueError):
+            ExecutorSettings(acquire_pace_s=bad)
+    assert ExecutorSettings(acquire_pace_s=0).acquire_pace_s == 0

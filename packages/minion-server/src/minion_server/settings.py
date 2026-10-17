@@ -68,13 +68,13 @@ class ServerSettings(BaseSettings):
     # Minimum seconds between calls of one executor to register / acquire / presence; faster calls
     # get 429 TOO_MANY_REQUESTS + Retry-After before any DB work (NF-5). In-memory, per replica
     # (soft state, plan D4); 0 disables. Healthy executors acquire >= ~5 s apart when idle, so
-    # the defaults leave headroom; a very fast busy loop (sub-0.5 s subtasks) just backs off.
+    # the defaults leave headroom; the executor paces busy-loop acquires >= 0.25 s apart.
     register_min_interval_s: float = Field(default=5.0, ge=0)
-    acquire_min_interval_s: float = Field(default=0.5, ge=0)
+    acquire_min_interval_s: float = Field(default=0.2, ge=0)
     presence_min_interval_s: float = Field(default=5.0, ge=0)
     preference_min_interval_s: float = Field(default=1.0, ge=0)
-    # Limiter LRU bound: 10k executors x 3 ops; eviction only admits one extra call.
-    rate_limit_max_entries: int = Field(default=30_000, gt=0)
+    # Limiter LRU bound: 10k executors x 4 limited ops; eviction only admits one extra call.
+    rate_limit_max_entries: int = Field(default=40_000, gt=0)
     # Fleet view (ARCHITECTURE §7): online = heard from within this window.
     executor_online_idle_s: float = Field(default=120.0, gt=0)  # acquire poll / presence ping
     executor_online_busy_s: float = Field(default=600.0, gt=0)  # running: heartbeat

@@ -248,8 +248,11 @@ class ExecutorLoop:
         priority_grace_s: float = 60.0,
         status_dir: Path | None = None,
         status_interval_s: float = STATUS_INTERVAL_S,
+        acquire_pace_s: float = 0.0,
     ) -> None:
         self._cache = model_cache
+        self._acquire_pace_s = acquire_pace_s  # min gap between acquire calls; 0 disables
+        self._last_acquire: float | None = None
         self._client = client
         self._worker = worker
         # `budget` seeds a FixedGovernor when no governor is given; with one, the governor's live
@@ -389,7 +392,7 @@ class ExecutorLoop:
         if isinstance(exc, ApiError) and exc.status_code == 429 and exc.retry_after is not None:
             ra = min(exc.retry_after, MAX_RETRY_AFTER_S)
             if repeated:
-                return max(self._delay(n), ra)
+                return max(self._delay(n), ra * random.uniform(1.0, 1.2))  # noqa: S311
             return float(ra * random.uniform(1.0, 1.2))  # noqa: S311
         return self._delay(n)
 
@@ -495,6 +498,7 @@ class ExecutorLoop:
 
     async def _register_with_retry(self, req: RegisterRequest) -> None:
         attempt = 0
+        limited_n = 0
         while not self.stopping:
             try:
                 await self._guarded(
@@ -510,7 +514,11 @@ class ExecutorLoop:
                 if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     raise
                 log.warning("register_failed", error=type(exc).__name__)
-                await self._pause(self._rate_limit_delay(exc, attempt, repeated=attempt > 0))
+                if limited:  # 429s are counted separately, like the acquire loop's limited_n
+                    limited_n += 1
+                await self._pause(
+                    self._rate_limit_delay(exc, attempt, repeated=limited and limited_n > 1)
+                )
                 attempt += 1
 
     async def run(self, max_subtasks: int | None = None) -> int:
@@ -552,7 +560,16 @@ class ExecutorLoop:
                             self._rate_limited_until = None
                         continue
                     self._rate_limited_until = None
+                if self._acquire_pace_s > 0 and self._last_acquire is not None:
+                    # Keep >= pace between acquires (instant subtasks would trip the server's
+                    # limit): sleep only the remainder, none after a subtask that took longer.
+                    gap = self._last_acquire + self._acquire_pace_s - self._clock()
+                    if gap > 0:
+                        await self._pause(gap)
+                        if self.stopping:
+                            break
                 version = self._gov.version
+                self._last_acquire = self._clock()
                 try:
                     assignment = await self._guarded(
                         self._client.acquire(

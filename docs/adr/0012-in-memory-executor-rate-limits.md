@@ -11,11 +11,13 @@ candidate scan. Heartbeats already have a DB-backed minimum interval. NF-5 wants
 ## Decision
 
 - `minion_server/ratelimit.py`: a minimum interval per `(executor_id, op)`, monotonic clock, bounded
-  LRU (30 000 keys by default), kept in process memory. Intervals: `MINION_REGISTER_MIN_INTERVAL_S` 5,
-  `MINION_ACQUIRE_MIN_INTERVAL_S` 0.5, `MINION_PRESENCE_MIN_INTERVAL_S` 5,
+  LRU (40 000 keys by default), kept in process memory. Intervals: `MINION_REGISTER_MIN_INTERVAL_S` 5,
+  `MINION_ACQUIRE_MIN_INTERVAL_S` 0.2, `MINION_PRESENCE_MIN_INTERVAL_S` 5,
   `MINION_PREFERENCE_MIN_INTERVAL_S` 1; `0` disables. LRU bound `MINION_RATE_LIMIT_MAX_ENTRIES`
-  (default 30 000). `check` is guarded by a lock and the dependency is `async` (runs on the event
+  (default 40 000). `check` is guarded by a lock and the dependency is `async` (runs on the event
   loop, not the threadpool), so admission is atomic.
+- Executor-side pacing: the loop keeps `MINION_EXECUTOR_ACQUIRE_PACE_S` (0.25, 0 or >= 0.2) between
+  acquire calls, sleeping only the remainder, so back-to-back instant subtasks never earn a 429.
 - Applied as a route dependency after authentication and before any DB work: `429
   TOO_MANY_REQUESTS` + `Retry-After`. Only admitted calls are recorded.
 - The counters are soft state, not coordination state: N replicas admit up to N calls per interval,
