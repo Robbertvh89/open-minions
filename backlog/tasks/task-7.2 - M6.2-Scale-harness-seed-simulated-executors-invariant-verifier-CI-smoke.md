@@ -1,9 +1,10 @@
 ---
 id: TASK-7.2
 title: 'M6.2 Scale harness: seed, simulated executors, invariant verifier, CI smoke'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-17 21:10'
 labels:
   - scale
 dependencies: []
