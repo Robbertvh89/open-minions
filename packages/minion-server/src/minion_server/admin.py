@@ -216,3 +216,9 @@ def generate_api_key_cmd(
 
 if __name__ == "__main__":
     app()
+
+
+@app.command("generate-ui-secret")
+def generate_ui_secret_cmd() -> None:
+    """Print a random MINION_UI_SESSION_SECRET (UI cookie key); rotating it logs everyone out."""
+    typer.echo(f"MINION_UI_SESSION_SECRET={secrets.token_urlsafe(48)}")

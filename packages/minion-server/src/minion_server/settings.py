@@ -44,6 +44,13 @@ class ServerSettings(BaseSettings):
     metrics_enabled: bool = False
     metrics_token: SecretStr | None = None
 
+    # Web UI (ADR-0010): off (every /ui route is 404) until a session secret is set. The secret
+    # signs the stateless `minion_session` cookie; rotating it logs everyone out.
+    ui_session_secret: SecretStr | None = None
+    ui_session_ttl_s: int = Field(default=8 * 3600, ge=60, le=7 * 24 * 3600)
+    # Optional comma list of host[:port] the UI may be served under; others get 400 (ADR-0010).
+    ui_allowed_hosts: str = ""
+
     # Config files and background work.
     models_file: str = "deploy/models.yaml"
     api_keys_file: str | None = None
@@ -85,6 +92,42 @@ class ServerSettings(BaseSettings):
         if isinstance(raw, str) and len(raw) < 32:
             raise ValueError("metrics_token must be at least 32 characters (or unset)")
         return raw
+
+    @field_validator("ui_session_secret", mode="before")
+    @classmethod
+    def _ui_session_secret(cls, v: object) -> object:
+        """Empty means unset (blank env line); a set secret must be >= 32 bytes."""
+        raw = v.get_secret_value() if isinstance(v, SecretStr) else v
+        if isinstance(raw, str):
+            raw = raw.strip()
+        if raw is None or raw == "":
+            return None
+        if isinstance(raw, str) and len(raw.encode("utf-8")) < 32:
+            raise ValueError("ui_session_secret must be at least 32 bytes (or unset)")
+        if isinstance(raw, str) and len(set(raw)) < 2:
+            raise ValueError("ui_session_secret must not be a single repeated character")
+        return raw
+
+    @field_validator("ui_allowed_hosts")
+    @classmethod
+    def _ui_allowed_hosts(cls, v: str) -> str:
+        """Bare `host[:port]` items only: no scheme, path, userinfo, whitespace, empty items."""
+        if not v.strip():
+            return ""
+        for item in v.split(","):
+            entry = item.strip()
+            if not entry:
+                raise ValueError("ui_allowed_hosts has an empty item (stray comma)")
+            if "://" in entry or any(c in entry for c in "/@") or any(c.isspace() for c in entry):
+                raise ValueError(
+                    f"ui_allowed_hosts entry {entry!r} must be a bare host[:port] "
+                    "(no scheme, '/', '@' or whitespace)"
+                )
+        return v
+
+    @property
+    def ui_allowed_host_set(self) -> frozenset[str]:
+        return frozenset(h.strip().lower() for h in self.ui_allowed_hosts.split(",") if h.strip())
 
     @field_validator("s3_input_prefixes", "s3_output_prefixes")
     @classmethod

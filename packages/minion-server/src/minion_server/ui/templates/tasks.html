@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Tasks - open-minions{% endblock %}
+{% block content %}
+<h1>Tasks</h1>
+<form method="get" action="/ui/tasks" class="filters">
+  <label>Team
+    <select name="team">
+      <option value="">all my teams</option>
+      {% for t in teams %}<option value="{{ t }}"{% if t == f_team %} selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Project <input type="text" name="project" value="{{ f_project }}" maxlength="64"></label>
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for s in statuses %}<option value="{{ s }}"{% if s == f_status %} selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+  </label>
+  <button type="submit">Filter</button>
+</form>
+<table>
+  <thead><tr><th>Team</th><th>Project</th><th>Task</th><th>Status</th><th>Progress</th><th>Model</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for t in page.items %}
+  <tr>
+    <td>{{ t.team }}</td>
+    <td>{{ t.project }}</td>
+    <td><a href="/ui/tasks/{{ t.team|urlencode }}/{{ t.project|urlencode }}/{{ t.task_name|urlencode }}">{{ t.task_name }}</a></td>
+    <td><span class="st st-{{ t.status.value }}">{{ t.status.value }}</span></td>
+    <td>{{ t.counts.succeeded }} / {{ t.counts.total }}{% if t.counts.failed %} ({{ t.counts.failed }} failed){% endif %}</td>
+    <td>{{ t.model }}</td>
+    <td>{{ t.created_at|ts }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7">No tasks.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="pager">
+  {% if next_query %}<a href="/ui/tasks?{{ next_query }}">Next page</a>{% endif %}
+  {% if next_query or f_team or f_project or f_status %}<a href="/ui/tasks">First page</a>{% endif %}
+</p>
+{% endblock %}

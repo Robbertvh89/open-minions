@@ -204,6 +204,19 @@ async def list_tasks(
     limit: _Limit = 50,
 ) -> TaskPage:
     """Tasks of the caller's teams, newest first (keyset pagination)."""
+    return await list_tasks_page(session, user, team, project, status, cursor, limit)
+
+
+async def list_tasks_page(
+    session: AsyncSession,
+    user: User,
+    team: str | None,
+    project: str | None,
+    status: TaskStatus | None,
+    cursor: str | None,
+    limit: int,
+) -> TaskPage:
+    """Shared by the REST endpoint and the web UI (raises `HTTPException` like a handler)."""
     if team is not None and team not in user.teams:
         raise api_error(403, "FORBIDDEN", "not a member of this team")
     after = None
@@ -236,6 +249,13 @@ async def get_task(
     user: Annotated[User, Depends(current_user)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> TaskOut:
+    return await get_task_for(session, user, team, project, task_name)
+
+
+async def get_task_for(
+    session: AsyncSession, user: User, team: str, project: str, task_name: str
+) -> TaskOut:
+    """Shared by the REST endpoint and the web UI (raises `HTTPException` like a handler)."""
     for part in (team, project, task_name):
         if not _slug_ok(part):
             raise api_error(404, "NOT_FOUND", "task not found")
@@ -255,6 +275,20 @@ async def list_subtasks(
     cursor: str | None = None,
     limit: _Limit = 100,
 ) -> SubtaskPage:
+    return await list_subtasks_page(session, user, team, project, task_name, status, cursor, limit)
+
+
+async def list_subtasks_page(
+    session: AsyncSession,
+    user: User,
+    team: str,
+    project: str,
+    task_name: str,
+    status: SubtaskStatus | None,
+    cursor: str | None,
+    limit: int,
+) -> SubtaskPage:
+    """Shared by the REST endpoint and the web UI (raises `HTTPException` like a handler)."""
     for part in (team, project, task_name):
         if not _slug_ok(part):
             raise api_error(404, "NOT_FOUND", "task not found")
