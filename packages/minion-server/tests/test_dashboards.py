@@ -278,6 +278,10 @@ async def test_initdb_role_is_hardened(grafana_engine: tuple[AsyncEngine, AsyncE
         "SET temp_file_limit = '100GB'",
         "SELECT lo_from_bytea(0, 'abc'::bytea)",
         "SELECT lo_creat(-1)",
+        "SELECT pg_advisory_lock(42)",
+        "SELECT pg_try_advisory_lock(1, 2)",
+        "SELECT pg_advisory_xact_lock_shared(42)",
+        "SELECT pg_logical_emit_message(false, 'p', 'x')",
         "SELECT * FROM public.minion_task",
         "SELECT * FROM public.minion_executor",
     ]
