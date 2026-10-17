@@ -18,14 +18,19 @@ def _cutoff(timeout_s: float) -> Any:
     return func.now() - func.make_interval(0, 0, 0, 0, 0, 0, timeout_s)
 
 
-async def stale_ids(session: AsyncSession, timeout_s: float, limit: int) -> list[uuid.UUID]:
-    """Unlocked scan (uses the `last_seen_at` index); each hit is re-checked under its lock."""
-    rows = await session.execute(
+def stale_stmt(timeout_s: float, limit: int) -> Select[uuid.UUID]:
+    """The stale-heartbeat scan; served by the `last_seen_at` index."""
+    return (
         select(ExecutorHeartbeat.acquirement_id)
         .where(ExecutorHeartbeat.last_seen_at < _cutoff(timeout_s))
         .order_by(ExecutorHeartbeat.last_seen_at)
         .limit(limit)
     )
+
+
+async def stale_ids(session: AsyncSession, timeout_s: float, limit: int) -> list[uuid.UUID]:
+    """Unlocked scan (uses the `last_seen_at` index); each hit is re-checked under its lock."""
+    rows = await session.execute(stale_stmt(timeout_s, limit))
     return list(rows.scalars())
 
 

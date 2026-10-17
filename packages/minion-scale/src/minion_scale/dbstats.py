@@ -51,6 +51,23 @@ _CONNECTIONS = text(
 _MAX_CONNECTIONS = text("SELECT current_setting('max_connections')::int")
 
 
+async def ensure_extension(sm: Sm) -> bool:
+    """Best-effort `CREATE EXTENSION pg_stat_statements` (needs the preload and a superuser)."""
+    async with sm() as s:
+        try:
+            await s.execute(text("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"))
+            await s.commit()
+        except DBAPIError:
+            await s.rollback()
+            return False
+        try:
+            await s.execute(text("SELECT 1 FROM pg_stat_statements LIMIT 1"))
+        except DBAPIError:
+            await s.rollback()
+            return False  # extension exists but the library is not preloaded
+    return True
+
+
 async def snapshot(sm: Sm) -> dict[str, Any]:
     """One point-in-time reading. `statements` is None when pg_stat_statements is unavailable."""
     async with sm() as s:
