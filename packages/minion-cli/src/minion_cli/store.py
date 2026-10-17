@@ -86,19 +86,25 @@ def _get_pool() -> ThreadPoolExecutor:
         return _pool
 
 
-def _tracked[T](fn: Callable[..., T], *args: object) -> T:
+def _release(_: object) -> None:
+    global _inflight
+    with _lock:
+        _inflight -= 1
+
+
+async def _in_pool[T](fn: Callable[..., T], *args: object) -> T:
+    """Run `fn` in the transfer pool. The in-flight count covers queued work too and is dropped
+    by a done-callback, so it is exact even if the awaiting task is cancelled (Ctrl-C)."""
     global _inflight
     with _lock:
         _inflight += 1
     try:
-        return fn(*args)
-    finally:
-        with _lock:
-            _inflight -= 1
-
-
-async def _in_pool[T](fn: Callable[..., T], *args: object) -> T:
-    return await asyncio.get_running_loop().run_in_executor(_get_pool(), _tracked, fn, *args)
+        fut = _get_pool().submit(fn, *args)
+    except BaseException:
+        _release(None)
+        raise
+    fut.add_done_callback(_release)
+    return await asyncio.wrap_future(fut)
 
 
 def abort_transfers() -> bool:
@@ -234,6 +240,7 @@ class S3Store:
         try:
             self._s3.download_file(self._bucket, key, tmp)
             Path(tmp).replace(dest)
+            dest.chmod(0o600)
         finally:
             Path(tmp).unlink(missing_ok=True)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import httpx
 from minion_common.client import ApiError, UserClient
 from minion_common.enums import SubtaskStatus, TaskStatus, TaskType
 from minion_common.schemas import SubtaskOut, SubtaskPage, TaskCounts, TaskCreate, TaskOut
+from pydantic import ValidationError
 
 from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError, clean
 from minion_cli.settings import CliSettings
@@ -162,20 +164,28 @@ async def submit_task(
             f"task {target.name!r} already exists; use `minion fetch {target.name}` or --name",
             EXIT_USAGE,
         )
+    # Validate the request before uploading anything (the input URI is deterministic).
+    try:
+        req = TaskCreate(
+            team=target.team,
+            project=target.project,
+            task_name=target.name,
+            type=type,
+            model=model,
+            input_uri=f"s3://{settings.s3_bucket}/{target.input_prefix(settings)}",
+            output_uri=f"s3://{settings.s3_bucket}/{target.output_prefix(settings)}",
+            params=params or {},
+            records_per_subtask=records_per_subtask,
+            priority=priority,
+            allowed_pool=allowed_pool,
+        )
+    except ValidationError as exc:
+        # Error text can embed the offending value; report field names only.
+        fields = ", ".join(sorted({str(e["loc"][0]) for e in exc.errors() if e["loc"]}))
+        raise CliError(f"invalid task request ({fields or 'see options'})", EXIT_USAGE) from None
     input_uri = await upload_inputs(store, settings, target, files)
-    req = TaskCreate(
-        team=target.team,
-        project=target.project,
-        task_name=target.name,
-        type=type,
-        model=model,
-        input_uri=input_uri,
-        output_uri=f"s3://{settings.s3_bucket}/{target.output_prefix(settings)}",
-        params=params or {},
-        records_per_subtask=records_per_subtask,
-        priority=priority,
-        allowed_pool=allowed_pool,
-    )
+    if input_uri != req.input_uri:  # pragma: no cover - same expression
+        raise CliError("input URI mismatch", EXIT_USAGE)
     try:
         return await client.create_task(req)
     except (ApiError, httpx.HTTPError) as exc:
@@ -357,33 +367,101 @@ def _identity(target: Target, task: TaskOut) -> dict[str, str]:
     }
 
 
-def _prepare_out_dir(out_dir: Path, identity: dict[str, str]) -> dict[int, dict[str, Any]]:
-    """Create the output dir (0700) and claim it for this task.
+_LOCK_NAME = ".minion.lock"
+_STALE_TMP = ".*.jsonl.*"
 
-    Refuses (exit 2) a dir whose manifest belongs to another task or is unreadable, and a `parts/`
-    without a manifest. Returns the part records of an earlier fetch of the same task.
+
+def _check_claim(out_dir: Path, identity: dict[str, str]) -> dict[int, dict[str, Any]] | None:
+    """Prior part records if `out_dir` already belongs to this task, None if it is free to claim.
+
+    Refuses (exit 2) another task's dir, an unreadable manifest, a `parts/` without manifest and
+    a non-empty dir without manifest (e.g. ~/Desktop).
     """
     manifest = out_dir / "manifest.json"
-    parts_dir = out_dir / "parts"
     if manifest.exists():
         try:
             doc = json.loads(manifest.read_text())
             if not isinstance(doc, dict):
                 raise ValueError
-        except ValueError:
+            if any(doc.get(k) != v for k, v in identity.items()):
+                raise CliError(
+                    f"{out_dir} holds the results of another task; use another -o", EXIT_USAGE
+                )
+            parts = doc.get("parts", [])
+            if not isinstance(parts, list):
+                raise ValueError
+            return {int(p["subtask_id"]): p for p in parts if isinstance(p, dict)}
+        except (ValueError, KeyError, TypeError):
             raise CliError(
                 f"{out_dir} has an unreadable manifest.json; use another -o", EXIT_USAGE
             ) from None
-        if any(doc.get(k) != v for k, v in identity.items()):
-            raise CliError(
-                f"{out_dir} holds the results of another task; use another -o", EXIT_USAGE
-            )
-        return {int(p["subtask_id"]): p for p in doc.get("parts", []) if isinstance(p, dict)}
-    if parts_dir.exists():
+    if (out_dir / "parts").exists():
         raise CliError(f"{out_dir} has parts/ but no manifest.json; use another -o", EXIT_USAGE)
-    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_manifest(manifest, {**identity, "parts": []})
-    return {}
+    if any(e.name != _LOCK_NAME for e in out_dir.iterdir()):
+        raise CliError(f"{out_dir} is not empty and not a results dir; use another -o", EXIT_USAGE)
+    return None
+
+
+def _lock_out_dir(out_dir: Path) -> int:
+    fd = os.open(out_dir / _LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise CliError(
+            f"another `minion fetch` is writing to {out_dir}; wait for it or use another -o",
+            EXIT_USAGE,
+        ) from None
+    return fd
+
+
+def _create_manifest(path: Path, doc: dict[str, Any]) -> None:
+    """Create `path` only if it does not exist (temp file + hard link, never overwrites)."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write((json.dumps(doc, indent=2, sort_keys=True) + "\n").encode())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise CliError(f"{path.parent} was claimed concurrently; use another -o") from None
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _prepare_out_dir(
+    out_dir: Path, identity: dict[str, str]
+) -> tuple[dict[int, dict[str, Any]], int]:
+    """Create/claim the output dir for this task and lock it; returns (prior parts, lock fd).
+
+    The caller closes the fd (releasing the flock) when the fetch is done.
+    """
+    if out_dir.exists() and not out_dir.is_dir():
+        raise CliError(f"{out_dir} is not a directory; use another -o", EXIT_USAGE)
+    created = not out_dir.exists()
+    if created:
+        out_dir.mkdir(mode=0o700, parents=True)
+    else:
+        _check_claim(out_dir, identity)  # refuse before we drop a lock file into a foreign dir
+    fd = _lock_out_dir(out_dir)
+    try:
+        prior = _check_claim(out_dir, identity)  # again, now that nobody else can claim
+        manifest = out_dir / "manifest.json"
+        if prior is None:
+            out_dir.chmod(0o700)  # empty (or ours): tighten whatever mode it had
+            _create_manifest(manifest, {**identity, "parts": []})
+            prior = {}
+        parts_dir = out_dir / "parts"
+        parts_dir.mkdir(mode=0o700, exist_ok=True)
+        parts_dir.chmod(0o700)
+        for stale in (*out_dir.glob(".*.jsonl.*"), *parts_dir.glob(_STALE_TMP)):
+            stale.unlink(missing_ok=True)  # temp files of an interrupted run
+        for stale in out_dir.glob(".manifest.json.*"):
+            stale.unlink(missing_ok=True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return prior, fd
 
 
 def _part_is_current(dest: Path, remote: ObjectInfo, prior: dict[str, Any] | None) -> bool:
@@ -435,63 +513,66 @@ async def fetch_results(
     prefix = target.output_prefix(settings)
     remote = _remote_parts(await store.list_objects(prefix, recursive=False), prefix)
     identity = _identity(target, task)
-    prior = await asyncio.to_thread(_prepare_out_dir, out_dir, identity)
-    parts_dir = out_dir / "parts"
-    await asyncio.to_thread(lambda: parts_dir.mkdir(mode=0o700, exist_ok=True))
-    downloaded = 0
-    ids = sorted(records)
-    for sid in ids:
-        if sid not in remote:
-            raise CliError(f"result object for subtask {sid} is missing", EXIT_USAGE)
-        dest = parts_dir / f"{sid:06d}.jsonl"
-        if await asyncio.to_thread(_part_is_current, dest, remote[sid], prior.get(sid)):
-            continue
-        await store.download_file(remote[sid].key, dest)
-        downloaded += 1
+    prior, lock_fd = await asyncio.to_thread(_prepare_out_dir, out_dir, identity)
+    try:
+        parts_dir = out_dir / "parts"
+        downloaded = 0
+        ids = sorted(records)
+        for sid in ids:
+            if sid not in remote:
+                raise CliError(f"result object for subtask {sid} is missing", EXIT_USAGE)
+            dest = parts_dir / f"{sid:06d}.jsonl"
+            if await asyncio.to_thread(_part_is_current, dest, remote[sid], prior.get(sid)):
+                continue
+            await store.download_file(remote[sid].key, dest)
+            downloaded += 1
 
-    part_paths = [parts_dir / f"{sid:06d}.jsonl" for sid in ids]
-    results = out_dir / "results.jsonl"
-    await asyncio.to_thread(_merge, part_paths, results)
-    manifest = out_dir / "manifest.json"
-    manifest_parts = [
-        {
-            "subtask_id": sid,
-            "file": f"parts/{sid:06d}.jsonl",
-            "records": records[sid],
-            "bytes": remote[sid].size,
-            "etag": remote[sid].etag,
-            "sha256": await asyncio.to_thread(sha256_file, parts_dir / f"{sid:06d}.jsonl"),
-        }
-        for sid in ids
-    ]
-    counts: TaskCounts = task.counts
-    await asyncio.to_thread(
-        _write_manifest,
-        manifest,
-        {
-            **identity,
-            "status": task.status.value,
-            "counts": counts.model_dump(),
-            "records": sum(records.values()),
-            "not_succeeded_subtasks": len(failed),
-            "not_succeeded": [
-                {
-                    "subtask_id": st.subtask_id,
-                    "status": st.status.value,
-                    "record_count": st.record_count,
-                    "attempt": st.attempt,
-                    "error_code": st.error_code,
-                }
-                for st in failed
-            ],
-            "parts": manifest_parts,
-        },
-    )
-    return FetchResult(
-        parts=len(ids),
-        downloaded=downloaded,
-        records=sum(records.values()),
-        not_succeeded=len(failed),
-        results_path=results,
-        manifest_path=manifest,
-    )
+        part_paths = [parts_dir / f"{sid:06d}.jsonl" for sid in ids]
+        results = out_dir / "results.jsonl"
+        await asyncio.to_thread(_merge, part_paths, results)
+        manifest = out_dir / "manifest.json"
+        manifest_parts = [
+            {
+                "subtask_id": sid,
+                "file": f"parts/{sid:06d}.jsonl",
+                "records": records[sid],
+                "bytes": remote[sid].size,
+                "etag": remote[sid].etag,
+                "sha256": await asyncio.to_thread(sha256_file, parts_dir / f"{sid:06d}.jsonl"),
+            }
+            for sid in ids
+        ]
+        counts: TaskCounts = task.counts
+        await asyncio.to_thread(
+            _write_manifest,
+            manifest,
+            {
+                **identity,
+                "status": task.status.value,
+                "counts": counts.model_dump(),
+                "records": sum(records.values()),
+                "not_succeeded_subtasks": len(failed),
+                "not_succeeded": [
+                    {
+                        "subtask_id": st.subtask_id,
+                        "status": st.status.value,
+                        "record_count": st.record_count,
+                        "attempt": st.attempt,
+                        "error_code": st.error_code,
+                    }
+                    for st in failed
+                ],
+                "parts": manifest_parts,
+            },
+        )
+        return FetchResult(
+            parts=len(ids),
+            downloaded=downloaded,
+            records=sum(records.values()),
+            not_succeeded=len(failed),
+            results_path=results,
+            manifest_path=manifest,
+        )
+
+    finally:
+        os.close(lock_fd)

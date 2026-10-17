@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 import os
+import signal
 import stat
 import sys
 import threading
@@ -19,6 +22,7 @@ from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError, clean
 from minion_cli.flows import Target
 from minion_cli.settings import CliSettings
 from minion_common.client import UserClient
+from minion_common.enums import TaskType
 from minion_common.schemas import TaskOut
 from pydantic import SecretStr
 from typer.testing import CliRunner
@@ -116,7 +120,8 @@ async def test_fetch_lists_non_recursively_and_dir_is_private(tmp_path: Path) ->
     assert stat.S_IMODE((tmp_path / "out").stat().st_mode) == 0o700
     for name in ("manifest.json", "results.jsonl", "parts/000000.jsonl"):
         assert stat.S_IMODE((tmp_path / "out" / name).stat().st_mode) == 0o600
-    assert not [p for p in (tmp_path / "out").iterdir() if p.name.startswith(".")]
+    hidden = [p.name for p in (tmp_path / "out").iterdir() if p.name.startswith(".")]
+    assert hidden == [".minion.lock"]
 
 
 async def test_fetch_refuses_other_tasks_dir(tmp_path: Path) -> None:
@@ -346,6 +351,7 @@ def test_clean_strips_control_chars() -> None:
 
 def test_run_interrupt_hint_only_after_submit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main, "abort_transfers", lambda: False)
+    monkeypatch.setattr(signal, "signal", lambda *a: None)
 
     async def boom() -> int:
         raise KeyboardInterrupt
@@ -364,6 +370,7 @@ def test_run_interrupt_hint_only_after_submit(monkeypatch: pytest.MonkeyPatch) -
 
 def test_run_interrupt_with_inflight_transfer_exits_hard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main, "abort_transfers", lambda: True)
+    monkeypatch.setattr(signal, "signal", lambda *a: None)
     codes: list[int] = []
 
     def fake_exit(code: int) -> None:
@@ -388,11 +395,15 @@ def test_abort_transfers_reports_running_thread() -> None:
         started.set()
         release.wait(5)
 
-    fut = store._get_pool().submit(store._tracked, work)
+    async def go() -> None:
+        await store._in_pool(work)
+
+    t = threading.Thread(target=lambda: asyncio.run(go()))
+    t.start()
     assert started.wait(5)
     assert store.abort_transfers() is True
     release.set()
-    fut.result(5)
+    t.join(5)
     assert store.abort_transfers() is False
 
 
@@ -448,3 +459,143 @@ def test_endpoint_from_environment_must_be_secure(monkeypatch: pytest.MonkeyPatc
     assert ei.value.exit_code == EXIT_USAGE
     monkeypatch.setenv("AWS_ENDPOINT_URL", "https://s3.example.com")
     store.S3Store(CliSettings())
+
+
+# ---- round 3: out-dir claim/lock, validation order, sanitising --------------------------------
+
+
+async def test_fetch_refuses_foreign_nonempty_dir_but_takes_empty_one(tmp_path: Path) -> None:
+    s = FakeStore()
+    seed(s, [0, 1])
+    foreign = tmp_path / "Desktop"
+    foreign.mkdir()
+    (foreign / "results.jsonl").write_text("mine")
+    with pytest.raises(CliError) as ei:
+        await fetch(s, foreign)
+    assert ei.value.exit_code == EXIT_USAGE and "not empty" in str(ei.value)
+    assert (foreign / "results.jsonl").read_text() == "mine"
+    assert not (foreign / ".minion.lock").exists() and s.downloads == []
+    empty = tmp_path / "empty"
+    empty.mkdir(mode=0o755)
+    empty.chmod(0o755)
+    await fetch(s, empty)
+    assert stat.S_IMODE(empty.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"parts": [{}]},
+        {"parts": [{"subtask_id": "x"}]},
+        {"parts": [{"subtask_id": None}]},
+        {"parts": "no"},
+    ],
+)
+async def test_fetch_malformed_manifest_parts_exit_2(tmp_path: Path, doc: dict[str, Any]) -> None:
+    s = FakeStore()
+    seed(s, [0, 1])
+    out = tmp_path / "out"
+    await fetch(s, out)
+    good = json.loads((out / "manifest.json").read_text())
+    (out / "manifest.json").write_text(json.dumps({**good, **doc}))
+    with pytest.raises(CliError) as ei:
+        await fetch(s, out)
+    assert ei.value.exit_code == EXIT_USAGE and "unreadable" in str(ei.value)
+
+
+async def test_fetch_concurrent_second_fetch_exit_2(tmp_path: Path) -> None:
+    s = FakeStore()
+    seed(s, [0, 1])
+    out = tmp_path / "out"
+    await fetch(s, out)
+    fd = os.open(out / ".minion.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(CliError) as ei:
+            await fetch(s, out)
+        assert ei.value.exit_code == EXIT_USAGE and "another" in str(ei.value)
+    finally:
+        os.close(fd)
+    assert (await fetch(s, out)).downloaded == 0  # lock released with the fd
+
+
+def test_fetch_manifest_is_created_exclusively(tmp_path: Path) -> None:
+    (tmp_path / "m.json").write_text("x")
+    with pytest.raises(CliError):
+        flows._create_manifest(tmp_path / "m.json", {})
+    assert (tmp_path / "m.json").read_text() == "x"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["m.json"]
+
+
+async def test_fetch_removes_stale_temp_files_and_sets_modes(tmp_path: Path) -> None:
+    s = FakeStore()
+    seed(s, [0, 1])
+    out = tmp_path / "out"
+    await fetch(s, out)
+    (out / "parts" / ".000000.jsonl.abc").write_text("junk")
+    (out / ".results.jsonl.abc").write_text("junk")
+    (out / ".manifest.json.abc").write_text("junk")
+    (out / "parts").chmod(0o755)
+    await fetch(s, out)
+    assert not [p for p in (out / "parts").iterdir() if p.name.startswith(".")]
+    assert sorted(p.name for p in out.iterdir() if p.name.startswith(".")) == [".minion.lock"]
+    assert stat.S_IMODE((out / "parts").stat().st_mode) == 0o700
+
+
+async def test_submit_invalid_request_fails_before_upload(tmp_path: Path) -> None:
+    f = tmp_path / "a.jsonl"
+    f.write_text("{}\n")
+    st = FakeStore()
+    async with client(lambda r: httpx.Response(404, json={"detail": "x"})) as c:
+        with pytest.raises(CliError) as ei:
+            await flows.submit_task(
+                c,
+                st,
+                settings(),
+                T,
+                [f],
+                type=TaskType.EMBEDDING,
+                model="m",
+                records_per_subtask=0,
+            )
+    assert ei.value.exit_code == EXIT_USAGE and "records_per_subtask" in str(ei.value)
+    assert st.uploads == []
+
+
+def test_clean_strips_bidi_overrides() -> None:
+    assert clean("a\u202eb\u2066c\u2069d\u202a") == "abcd"
+    t = TaskOut.model_validate(task_json(task_name="x\u202e\x1bevil"))
+    assert main._summary(t).startswith("xevil:")
+
+
+async def test_inflight_counter_survives_cancelled_await() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def work() -> None:
+        started.set()
+        release.wait(5)
+
+    t = asyncio.create_task(store._in_pool(work))
+    assert await asyncio.to_thread(started.wait, 5)
+    t.cancel()
+    assert store.abort_transfers() is True  # still counted although the await is gone
+    release.set()
+    for _ in range(100):
+        if store.abort_transfers() is False:
+            break
+        await asyncio.sleep(0.02)
+    assert store.abort_transfers() is False
+
+
+def test_download_result_is_0600(tmp_path: Path) -> None:
+    class FakeS3:
+        def download_file(self, bucket: str, key: str, dest: str) -> None:
+            Path(dest).write_bytes(b"x")
+            Path(dest).chmod(0o644)  # whatever the transfer manager left behind
+
+    s3 = store.S3Store.__new__(store.S3Store)
+    s3._bucket = "b"
+    s3._s3 = FakeS3()  # type: ignore[assignment]
+    s3._download("k", tmp_path / "parts" / "000000.jsonl")
+    assert stat.S_IMODE((tmp_path / "parts" / "000000.jsonl").stat().st_mode) == 0o600

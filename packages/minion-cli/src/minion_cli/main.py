@@ -164,7 +164,7 @@ def _target(settings: CliSettings, name: str) -> Target:
 def _summary(task: TaskOut) -> str:
     c = task.counts
     return (
-        f"{task.task_name}: {task.status.value} "
+        f"{clean(task.task_name)}: {task.status.value} "
         f"(subtasks {c.succeeded}/{c.total} done, {c.running} running, {c.pending} pending, "
         f"{c.failed} failed, {c.cancelled} cancelled)"
     )
@@ -231,7 +231,7 @@ def submit(
                 allowed_pool=pool,
             )
             submitted = True
-            typer.echo(f"submitted {task.task_name} ({task.status.value})")
+            typer.echo(f"submitted {clean(task.task_name)} ({task.status.value})")
             if no_wait:
                 return EXIT_OK
             return await _wait_and_fetch(client, store, settings, target, out_dir, timeout)

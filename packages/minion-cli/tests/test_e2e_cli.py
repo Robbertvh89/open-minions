@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
@@ -147,3 +148,62 @@ async def test_invalid_jsonl_fails_with_exit_1(live: Live, tmp_path: Path) -> No
     assert res.exit_code == 1, res.output
     assert await live.task_status("cli-bad") == "FAILED"
     assert "not json" not in res.output
+
+
+async def test_upload_inputs_resume_is_content_checked_over_multipart(
+    live: Live, tmp_path: Path
+) -> None:
+    """Interrupt after the upload (before create), resubmit: nothing is uploaded twice."""
+    from minion_cli import flows
+    from minion_cli.settings import CliSettings
+    from minion_cli.store import make_store
+
+    big = tmp_path / "big.jsonl"
+    big.write_bytes(os.urandom(9 * 1024 * 1024) + b"\n")  # > 8 MiB: multipart, non-md5 ETag
+    small = write_jsonl(tmp_path / "s.jsonl", "s", 5)
+    settings = CliSettings()
+    target = flows.Target(TEAM, "p", "cli-resume")
+    store = make_store(settings)
+    uploads: list[str] = []
+    real = store.upload_file
+
+    async def counting(path: Path, key: str, *, sha256: str) -> None:
+        uploads.append(key)
+        await real(path, key, sha256=sha256)
+
+    store.upload_file = counting  # type: ignore[method-assign]
+    uri = await flows.upload_inputs(store, settings, target, [big, small])
+    assert len(uploads) == 2
+    head = await store.head(f"{target.input_prefix(settings)}0000-big.jsonl")
+    assert head is not None and head.sha256 and head.etag and "-" in head.etag
+    assert await flows.upload_inputs(store, settings, target, [big, small]) == uri
+    assert len(uploads) == 2  # sha256 metadata round trip: no re-upload
+    same_size = small.read_text().replace("s0", "z0", 1)
+    small.write_text(same_size)
+    with pytest.raises(Exception, match="differs"):
+        await flows.upload_inputs(store, settings, target, [big, small])
+
+
+async def test_fetch_ignores_planted_attempt_objects(live: Live, tmp_path: Path) -> None:
+    f = write_jsonl(tmp_path / "a.jsonl", "a", 20)
+    async with executors(live, 1, tmp_path / "scratch"):
+        res = await minion(
+            [
+                *("submit", str(f), "--type", "embedding", "--model", "fake-embed"),
+                *("--name", "cli-planted", "--records-per-subtask", "10"),
+                *("-o", str(tmp_path / "first")),
+            ]
+        )
+    assert res.exit_code == 0, res.output
+    base = f"outputs/{TEAM}/p/cli-planted/"
+    live.s3.client.put_object(
+        Bucket=live.s3.bucket, Key=f"{base}_attempts/x/000000.jsonl", Body=b'{"id":"evil"}\n'
+    )
+    live.s3.client.put_object(
+        Bucket=live.s3.bucket, Key=f"{base}_attempts/000000.jsonl", Body=b'{"id":"evil"}\n'
+    )
+    again = await minion(["fetch", "cli-planted", "-o", str(tmp_path / "second")])
+    assert again.exit_code == 0, again.output
+    assert "evil" not in (tmp_path / "second" / "results.jsonl").read_text()
+    assert result_ids(tmp_path / "second") == result_ids(tmp_path / "first")
+    assert len(list((tmp_path / "second" / "parts").glob("*.jsonl"))) == 2

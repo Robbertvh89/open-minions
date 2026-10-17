@@ -523,8 +523,10 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   `POST /ui/login` at the reverse proxy; the proxy must forward `Host` including the port (nginx `$http_host`, not `$host`), and a non-loopback UI requires TLS (cookies are `Secure`). Optional `MINION_UI_ALLOWED_HOSTS` (comma list of `host[:port]`) makes other `Host` values `400`; entries are bare `host[:port]` (a scheme, `/`, `@`, whitespace or an empty item fails at startup). Production should set it (DNS rebinding). Generate the secret with `minion-server-admin generate-ui-secret` (hand-picked phrases are weak; only single-character secrets are rejected). OIDC/SSO: put a proxy in front.
 - S-14. Submitter S3 credentials **[ours]**. The `minion` CLI (`minion-cli`, TASK-25) uploads inputs
   itself, so it holds S3 credentials (`MINION_CLI_S3_ACCESS_KEY`/`MINION_CLI_S3_SECRET_KEY`, or the boto3
-  default chain). These must never be the server's credentials. The policy must grant: `s3:PutObject`
-  and `s3:GetObject` on `inputs/{team}/*`; `s3:GetObject` on `outputs/{team}/*`; `s3:ListBucket`
+  default chain). These must never be the server's credentials. The policy must grant: `s3:PutObject`,
+  `s3:AbortMultipartUpload` and `s3:GetObject` on `inputs/{team}/*` (inputs above 8 MiB upload as
+  multipart; configure a bucket lifecycle rule that aborts incomplete multipart uploads after a few
+  days so interrupted uploads do not accumulate); `s3:GetObject` on `outputs/{team}/*`; `s3:ListBucket`
   conditioned on `s3:prefix` being `inputs/{team}/*` or `outputs/{team}/*`. It must **not** grant
   `s3:DeleteObject` on either prefix and must not grant `s3:PutObject` on `outputs/` (results are
   written only through presigned URLs). Write access to `inputs/{team}/` is team-wide, so submitters

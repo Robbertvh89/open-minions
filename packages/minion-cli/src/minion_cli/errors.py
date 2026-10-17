@@ -20,9 +20,9 @@ class CliError(Exception):
         self.exit_code = exit_code
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
 def clean(text: object) -> str:
-    """Strip C0/C1 control characters (terminal escapes) from server-supplied text."""
+    """Strip C0/C1 control characters and Unicode bidi overrides from server-supplied text."""
     return _CONTROL.sub("", str(text))
