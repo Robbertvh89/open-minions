@@ -1,10 +1,10 @@
 ---
 id: TASK-21
 title: Fix flaky test_counts_route_templates_not_urls (digit leak check)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 13:26'
-updated_date: '2026-10-17 13:26'
+updated_date: '2026-10-17 13:35'
 labels:
   - server
   - test
