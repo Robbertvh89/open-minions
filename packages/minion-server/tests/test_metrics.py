@@ -104,6 +104,9 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
         text: Any = (await c.get("/metrics")).text
     assert 'minion_acquire_total{outcome="empty"} 1.0' in text
     assert 'minion_acquire_total{outcome="assigned"} 1.0' in text
+    assert 'minion_acquire_seconds_count{outcome="empty"} 1.0' in text
+    assert 'minion_acquire_seconds_count{outcome="assigned"} 1.0' in text
+    assert 'minion_acquire_seconds_bucket{le="+Inf",outcome="assigned"} 1.0' in text
     assert str(p.executor_id) not in text and "metrics-pool" not in text
 
 

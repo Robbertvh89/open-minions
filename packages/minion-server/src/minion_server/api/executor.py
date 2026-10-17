@@ -1,5 +1,6 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Annotated
@@ -137,12 +138,15 @@ async def acquire(
     storage: Annotated[S3Storage, Depends(_storage)],
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
 ) -> Response:
+    started = time.perf_counter()
     assignment = await acquisition.acquire(
         session, principal, body, settings=settings, storage=storage, models=models
     )
     metrics = getattr(request.app.state, "metrics", None)
     if metrics is not None:
-        metrics.acquires.labels(outcome="empty" if assignment is None else "assigned").inc()
+        outcome = "empty" if assignment is None else "assigned"
+        metrics.acquires.labels(outcome=outcome).inc()
+        metrics.observe_acquire(outcome, time.perf_counter() - started)
     if assignment is None:
         return Response(status_code=204)
     return Response(content=assignment.model_dump_json(), media_type="application/json")
