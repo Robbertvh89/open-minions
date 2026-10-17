@@ -33,11 +33,9 @@ from minion_server.repositories import tasks as tasks_repo
 from minion_server.services import tasks as tasks_service
 from minion_server.services.tasks import get_task as _get
 from minion_server.services.tasks import slug_ok as _slug_ok
-from minion_server.services.tasks import to_out, validate_uris
+from minion_server.services.tasks import to_out
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
-
-__all__ = ["router", "to_out", "validate_uris"]
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 

@@ -68,4 +68,9 @@ surface (flows, discovery, JWKS caching) for a tool that is deployed per team or
 - Cancel has a server-rendered confirm page (`GET`, no side effect) and a CSRF + Origin checked
   `POST`; there is no JavaScript `confirm()` (CSP).
 - The fleet page is operator-only (S-11) and reuses `list_fleet` through `list_fleet_page`. Its
-  summary pages through the whole fleet (500 per query, at most 20 queries).
+  summary is one `GROUP BY` (profile, paused reason) over the whole fleet with the same `online`
+  expression as the list; budget memory is summed only where `budget->>'memory_gb'` is a JSON
+  number in (0, 1024], other stored values are ignored.
+- Compatibility: `ExecutorOut` gained a nullable `budget` and `_Model` forbids extra fields, so a
+  `minion-common` client older than this server fails to parse `GET /executors`. The workspace
+  ships both together; upgrade clients with the server.

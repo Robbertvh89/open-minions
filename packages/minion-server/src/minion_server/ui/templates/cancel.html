@@ -4,10 +4,15 @@
 <h1>Cancel task?</h1>
 <p>{{ task.team }} / {{ task.project }} / {{ task.task_name }} is {{ task.status.value }}
 ({{ task.counts.succeeded }} / {{ task.counts.total }} subtasks succeeded).</p>
+{% if not cancellable %}
+<p>Task already finished; nothing to cancel.</p>
+<p><a href="{{ back }}">Go back</a></p>
+{% else %}
 <p>Pending subtasks will be cancelled; running ones stop at their next heartbeat. This cannot be undone.</p>
 <form method="post" action="{{ back }}/cancel">
   <input type="hidden" name="csrf" value="{{ csrf }}">
   <button type="submit">Yes, cancel this task</button>
   <a href="{{ back }}">No, go back</a>
 </form>
+{% endif %}
 {% endblock %}

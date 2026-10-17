@@ -1,5 +1,6 @@
 """Operator-only fleet view (SPEC §6.1, S-11: it reveals when owners are active)."""
 
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -110,3 +111,46 @@ async def list_fleet_page(
         else None
     )
     return ExecutorPage(items=items, next_cursor=nxt)
+
+
+@dataclass(frozen=True)
+class FleetSummary:
+    """Online executors only for `profiles`/`paused`; `total` counts every registered one."""
+
+    profiles: list[tuple[str, int, float]]  # (profile, count, sum of budget GB)
+    paused: list[tuple[str, int]]  # (paused_reason, count)
+    online: int
+    total: int
+
+
+def shape_summary(groups: list[executors_repo.FleetGroup]) -> FleetSummary:
+    by_profile: dict[str, tuple[int, float]] = {}
+    paused: dict[str, int] = {}
+    online = total = 0
+    for g in groups:
+        total += g.count
+        if not g.online:
+            continue
+        online += g.count
+        key = g.profile or "unknown"
+        n, gb = by_profile.get(key, (0, 0.0))
+        by_profile[key] = (n + g.count, gb + g.memory_gb)
+        if g.paused_reason:
+            paused[g.paused_reason] = paused.get(g.paused_reason, 0) + g.count
+    return FleetSummary(
+        [(k, n, gb) for k, (n, gb) in sorted(by_profile.items())],
+        sorted(paused.items()),
+        online,
+        total,
+    )
+
+
+async def fleet_summary(session: AsyncSession, settings: ServerSettings) -> FleetSummary:
+    """Operator-only (the caller enforces it): one aggregate query over the whole fleet."""
+    async with session.begin():
+        groups = await executors_repo.fleet_summary(
+            session,
+            idle_online_s=settings.executor_online_idle_s,
+            busy_online_s=settings.executor_online_busy_s,
+        )
+    return shape_summary(groups)

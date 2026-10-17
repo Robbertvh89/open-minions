@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import ExecutorStatus
-from sqlalchemy import and_, case, func, select, tuple_, update
+from sqlalchemy import Numeric, Select, and_, case, func, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -257,25 +257,8 @@ class FleetRow:
     online: bool
 
 
-async def list_fleet(
-    session: AsyncSession,
-    *,
-    idle_online_s: float,
-    busy_online_s: float,
-    status: ExecutorStatus | None = None,
-    pool: str | None = None,
-    after: tuple[datetime, uuid.UUID] | None = None,
-    limit: int = 200,
-) -> tuple[list[FleetRow], bool]:
-    """Keyset page (`(registered_at, executor_id)`, `limit + 1` probe) of executors, flags derived.
-
-    See ARCHITECTURE §7.
-
-    busy: the executor owns an acquirement that still has a heartbeat row (the row exists exactly
-    while the subtask is RUNNING under it). online: ACTIVE and heard from within `busy_online_s`
-    (heartbeat) when busy, else within `idle_online_s` (acquire poll / presence ping). One query;
-    time is evaluated in the database (`now()`), so it cannot skew against `last_seen_at`.
-    """
+def _fleet_exprs(idle_online_s: float, busy_online_s: float) -> tuple[Any, Any, Any]:
+    """`(heartbeat subquery, busy expr, online expr)` shared by the page and the summary."""
     hb = (
         select(
             SubtaskAcquirement.executor_id.label("executor_id"),
@@ -300,6 +283,29 @@ async def list_fleet(
             else_=func.make_interval(0, 0, 0, 0, 0, 0, idle_online_s),
         ),
     )
+    return hb, busy, online
+
+
+async def list_fleet(
+    session: AsyncSession,
+    *,
+    idle_online_s: float,
+    busy_online_s: float,
+    status: ExecutorStatus | None = None,
+    pool: str | None = None,
+    after: tuple[datetime, uuid.UUID] | None = None,
+    limit: int = 200,
+) -> tuple[list[FleetRow], bool]:
+    """Keyset page (`(registered_at, executor_id)`, `limit + 1` probe) of executors, flags derived.
+
+    See ARCHITECTURE §7.
+
+    busy: the executor owns an acquirement that still has a heartbeat row (the row exists exactly
+    while the subtask is RUNNING under it). online: ACTIVE and heard from within `busy_online_s`
+    (heartbeat) when busy, else within `idle_online_s` (acquire poll / presence ping). One query;
+    time is evaluated in the database (`now()`), so it cannot skew against `last_seen_at`.
+    """
+    hb, busy, online = _fleet_exprs(idle_online_s, busy_online_s)
     stmt = select(Executor, busy, hb.c.last_hb, online).outerjoin(
         hb, hb.c.executor_id == Executor.executor_id
     )
@@ -316,3 +322,61 @@ async def list_fleet(
     ).all()
     out = [FleetRow(r[0], bool(r[1]), r[2], bool(r[3])) for r in rows]
     return out[:limit], len(out) > limit
+
+
+@dataclass(frozen=True)
+class FleetGroup:
+    online: bool
+    profile: str | None
+    paused_reason: str | None
+    count: int
+    memory_gb: float
+
+
+def fleet_summary_stmt(idle_online_s: float, busy_online_s: float) -> Select[Any]:
+    """One GROUP BY over the whole fleet, `online` defined exactly as in `list_fleet`.
+
+    `memory_gb` sums `budget->>'memory_gb'` only where it is a JSON number in (0, 1024]; the
+    stored budget is executor-supplied, so anything else is ignored rather than cast.
+    """
+    hb, _busy, online = _fleet_exprs(idle_online_s, busy_online_s)
+    raw = Executor.budget["memory_gb"]
+    num = raw.as_string().cast(Numeric)
+    # Nested CASE: Postgres may evaluate AND operands in any order, a nested THEN only after the
+    # type guard passed, so the cast never sees a non-number.
+    mem = case(
+        (
+            func.jsonb_typeof(raw) == "number",
+            case((and_(num > 0, num <= 1024), num), else_=0),
+        ),
+        else_=0,
+    )
+    on = online.label("online")
+    return (
+        select(
+            on,
+            Executor.profile,
+            Executor.paused_reason,
+            func.count().label("n"),
+            func.coalesce(func.sum(mem), 0).label("gb"),
+        )
+        .select_from(Executor)
+        .outerjoin(hb, hb.c.executor_id == Executor.executor_id)
+        .group_by(on, Executor.profile, Executor.paused_reason)
+    )
+
+
+async def fleet_summary(
+    session: AsyncSession, *, idle_online_s: float, busy_online_s: float
+) -> list[FleetGroup]:
+    rows = (await session.execute(fleet_summary_stmt(idle_online_s, busy_online_s))).all()
+    return [
+        FleetGroup(
+            bool(r[0]),
+            r[1].value if r[1] is not None and hasattr(r[1], "value") else r[1],
+            r[2],
+            int(r[3]),
+            float(r[4]),
+        )
+        for r in rows
+    ]

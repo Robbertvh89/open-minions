@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from minion_common.enums import ExecutorStatus, SubtaskStatus, TaskStatus, TaskType
-from minion_common.schemas import SLUG_PATTERN, ExecutorOut, ModelEntry, TaskCreate
+from minion_common.schemas import SLUG_PATTERN, ModelEntry, TaskCreate
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -416,7 +416,7 @@ def _build_create(values: dict[str, str]) -> TaskCreate:
     params_text = values["params"].strip()
     try:
         params = json.loads(params_text) if params_text else {}
-    except ValueError:
+    except (ValueError, RecursionError):
         raise api_error(422, "INVALID_PARAMS", "params is not valid JSON") from None
     if not isinstance(params, dict):
         raise api_error(422, "INVALID_PARAMS", "params must be a JSON object")
@@ -498,6 +498,7 @@ async def cancel_confirm(
         user=current.user,
         csrf=current.csrf,
         task=task,
+        cancellable=task.status in (TaskStatus.SPLITTING, TaskStatus.PENDING, TaskStatus.RUNNING),
         back=_task_url(team, project, task_name),
     )
 
@@ -524,28 +525,6 @@ async def cancel(
 
 # --- fleet (operator only, S-11) ----------------------------------------------------------------
 
-_SUMMARY_PAGE = 500
-_SUMMARY_MAX_PAGES = 20  # 10 000 executors; beyond that the summary says it is partial
-
-
-def _fleet_summary(
-    rows: list[ExecutorOut],
-) -> tuple[list[tuple[str, int, float]], list[tuple[str, int]]]:
-    """Online executors only: (profile, count, Σ budget GB) and (paused_reason, count)."""
-    by_profile: dict[str, list[float]] = {}
-    paused: dict[str, int] = {}
-    for e in rows:
-        if not e.online:
-            continue
-        key = e.profile.value if e.profile else "unknown"
-        gb = e.budget.memory_gb if e.budget else 0.0
-        count, total = by_profile.setdefault(key, [0, 0.0])
-        by_profile[key] = [count + 1, total + gb]
-        if e.paused_reason:
-            paused[e.paused_reason] = paused.get(e.paused_reason, 0) + 1
-    profiles = [(k, int(v[0]), v[1]) for k, v in sorted(by_profile.items())]
-    return profiles, sorted(paused.items())
-
 
 @router.get("/fleet")
 async def fleet(
@@ -567,19 +546,9 @@ async def fleet(
         size = _parse_limit(limit, 50)
         status_enum = _parse_enum(ExecutorStatus, status, "status")
         page = await fleet_api.list_fleet_page(session, settings, status_enum, pool, cursor, size)
-        everyone: list[ExecutorOut] = []
-        nxt: str | None = None
-        for _ in range(_SUMMARY_MAX_PAGES):
-            chunk = await fleet_api.list_fleet_page(
-                session, settings, None, None, nxt, _SUMMARY_PAGE
-            )
-            everyone.extend(chunk.items)
-            nxt = chunk.next_cursor
-            if nxt is None:
-                break
+        summary = await fleet_api.fleet_summary(session, settings)
     except HTTPException as exc:
         return error_page(exc.status_code, _message(exc), current.user)
-    profiles, paused = _fleet_summary(everyone)
     return render(
         "fleet.html",
         user=current.user,
@@ -588,11 +557,10 @@ async def fleet(
         statuses=[s.value for s in ExecutorStatus],
         f_status=status or "",
         f_pool=pool or "",
-        profiles=profiles,
-        paused=paused,
-        online=sum(1 for e in everyone if e.online),
-        total=len(everyone),
-        partial=nxt is not None,
+        profiles=summary.profiles,
+        paused=summary.paused,
+        online=summary.online,
+        total=summary.total,
         next_query=_query(status=status, pool=pool, limit=limit, cursor=page.next_cursor)
         if page.next_cursor
         else None,

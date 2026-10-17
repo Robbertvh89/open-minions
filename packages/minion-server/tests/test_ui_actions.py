@@ -294,7 +294,7 @@ async def test_ui_fleet_is_operator_only_with_summary_and_paging(
                     "o": f"own{i}",
                     "b": '{"profile":"balanced","memory_gb":8,"gpu_duty_cycle":0.5,'
                     '"max_batch_size":8}',
-                    "r": "THERMAL" if i < 2 else None,
+                    "r": "thermal" if i < 2 else None,
                     "id": p.executor_id,
                 },
             )
@@ -311,7 +311,7 @@ async def test_ui_fleet_is_operator_only_with_summary_and_paging(
     assert "<b>evil</b>" not in r.text and "&lt;b&gt;evil&lt;/b&gt;" in r.text
     assert "3 online of 3" in r.text
     assert re.search(r"<td>balanced</td><td>3</td><td>24\.0</td>", r.text)
-    assert re.search(r"<td>THERMAL</td><td>2</td>", r.text)
+    assert re.search(r"<td>thermal</td><td>2</td>", r.text)
     p1 = await c.get("/ui/fleet?limit=2")
     assert p1.text.count("<td>own") == 2
     nxt = re.search(r'href="(/ui/fleet\?[^"]+)">Next page', p1.text)
