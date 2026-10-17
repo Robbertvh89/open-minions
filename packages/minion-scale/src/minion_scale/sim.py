@@ -16,9 +16,11 @@ import asyncio
 import contextlib
 import enum
 import hashlib
+import math
 import multiprocessing as mp
 import queue
 import random
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -74,6 +76,19 @@ def rate_limit_delay(
     if repeated:
         return max(backoff_delay(n, backoff, rng), ra * rng.uniform(1.0, 1.2))
     return float(ra * rng.uniform(1.0, 1.2))
+
+
+class Outcome(enum.Enum):
+    """What one assignment came to (the executor's `_Outcome`): only DONE resets the failure
+    streak, only FAILED backs off."""
+
+    DONE = enum.auto()
+    FAILED = enum.auto()
+    NEUTRAL = enum.auto()  # discarded, cancelled, vanished, stopped, released: neither
+
+
+def _ok(done: bool) -> Outcome:
+    return Outcome.NEUTRAL if done else Outcome.FAILED
 
 
 class Fault(enum.StrEnum):
@@ -236,10 +251,10 @@ class SimExecutor:
                     continue
                 self._idle = 0
                 self.rec.count("assigned")
-                ok = await self._handle(assignment)
-                if ok:
+                outcome = await self._handle(assignment)
+                if outcome is Outcome.DONE:
                     self._fails = 0
-                else:
+                elif outcome is Outcome.FAILED:
                     await self._back_off_after_failure()
         finally:
             await self._client.aclose()
@@ -304,13 +319,13 @@ class SimExecutor:
         await self._sleep(delay)
         return True
 
-    async def _handle(self, a: Assignment) -> bool:
-        """Run one assignment. True when it completed (or was legitimately discarded)."""
+    async def _handle(self, a: Assignment) -> Outcome:
+        """Run one assignment and say how it ended."""
         fault = self.cfg.faults.pick(self._rng)
         if fault is not Fault.NONE:
             self.rec.count(f"fault_{fault.value}")
         if fault is Fault.VANISH:
-            return True  # walk away: no beat, no complete; the watchdog reclaims it
+            return Outcome.NEUTRAL  # walk away: no beat, no complete; the watchdog reclaims it
         stale = asyncio.Event()
         self._cancelled.clear()
         beat: asyncio.Task[None] | None = None
@@ -323,18 +338,18 @@ class SimExecutor:
             if self._cancelled.is_set():  # executor: release with CANCELLED, no failure back-off
                 self.rec.count("cancelled")
                 await self._release(a, "CANCELLED")
-                return True
+                return Outcome.NEUTRAL
             if stale.is_set():
                 self.rec.count("discarded_stale")
-                return True
+                return Outcome.NEUTRAL
             if self.stop.is_set():
-                return await self._release(a, "STOP")
+                return _ok(await self._release(a, "STOP"))
             if fault is Fault.RELEASE:
-                return await self._release(a, FAULT_CODE)
+                return _ok(await self._release(a, FAULT_CODE))
             if fault is Fault.FAIL:
-                return await self._fail(a)
+                return _ok(await self._fail(a))
             if not await self._upload(a):
-                return await self._fail(a, code="UPLOAD_FAILED")
+                return _ok(await self._fail(a, code="UPLOAD_FAILED"))
             return await self._complete(a, expect_stale=fault is Fault.LATE)
         finally:
             if beat is not None:
@@ -380,7 +395,7 @@ class SimExecutor:
         self.rec.record("output_put", time.perf_counter() - t0, resp.status_code)
         return resp.is_success
 
-    async def _complete(self, a: Assignment, *, expect_stale: bool) -> bool:
+    async def _complete(self, a: Assignment, *, expect_stale: bool) -> Outcome:
         body = output_body(a.record_count)
         req = CompleteRequest(
             record_count=a.record_count,
@@ -391,14 +406,14 @@ class SimExecutor:
             await self._call("complete", self._client.complete(a.acquirement_id, req))
         except StaleAcquirementError:
             self.rec.count("late_complete_409" if expect_stale else "complete_409")
-            return True  # someone else owns it now: nothing to report
+            return Outcome.NEUTRAL  # someone else owns it now: nothing to report
         except (ApiError, httpx.HTTPError):
             self.rec.count("complete_failed")
-            return False
+            return Outcome.FAILED
         self.rec.count("completed")
         if expect_stale:
             self.rec.count("late_complete_accepted")  # the watchdog had not reclaimed it yet
-        return True
+        return Outcome.DONE
 
     async def _release(self, a: Assignment, code: str) -> bool:
         try:
@@ -475,14 +490,18 @@ def _proc_main(
             watcher.cancel()
         return rec.to_dict()
 
+    crashed_exit = False
     try:
         result = asyncio.run(main())
     except Exception as exc:
+        crashed_exit = True
         crashed = Recorder()
         crashed.count("proc_crashed")
         crashed.count(f"proc_crashed_{type(exc).__name__}")  # the type only, never the message
         result = crashed.to_dict()
     out.put(result)
+    if crashed_exit:
+        sys.exit(3)  # non-zero so run_fleet sees the death at once instead of waiting for the rest
 
 
 class FleetResult(NamedTuple):
@@ -491,7 +510,13 @@ class FleetResult(NamedTuple):
     drained: bool  # `until()` became true (False: time ran out, every sim ended, or a crash)
 
 
-JOIN_TIMEOUT_S = 30.0  # how long to wait for the sim processes to report after the stop flag
+DEFAULT_STALL_S = 60.0
+
+
+def join_timeout_s(cfg: SimConfig) -> float:
+    """How long to wait for the sim processes to report after the stop flag: a call in flight may
+    take `timeout_s`, and a sim can be in two (the call, then its release)."""
+    return 2 * cfg.timeout_s + 10
 
 
 async def run_fleet(
@@ -502,21 +527,39 @@ async def run_fleet(
     until: Callable[[], Awaitable[bool]],
     poll_s: float = 1.0,
     max_duration_s: float | None = None,
+    progress: Callable[[], Awaitable[int]] | None = None,
+    stall_s: float | None = DEFAULT_STALL_S,
 ) -> FleetResult:
     """Run the sims (spread over `procs` processes) until `until()` is true or time runs out.
 
     Fails fast instead of hanging: when every sim has ended (all aborted) or a sim process died,
     the run stops with `drained=False`. An exception of the in-process runner (e.g. an insecure
-    server URL) is re-raised. Returns the merged recorder, the duration and whether it drained.
+    server URL) is re-raised. With `progress` (the remaining-work count) the run also stops, with
+    a `stalled` event, when that count has not changed for `stall_s` seconds of polls (e.g. a
+    queue nobody can acquire from); `stall_s` None or 0 disables it. Keep `stall_s` above the
+    longest expected subtask (`work_s`, `late_wait_s`).
+    Returns the merged recorder, the duration and whether it drained.
     """
     started = time.monotonic()
+    stalled = False
+    stall_polls = math.ceil(stall_s / poll_s) if progress is not None and stall_s else 0
 
     async def drained() -> bool:
+        nonlocal stalled
+        last: int | None = None
+        same = 0
         while True:
             if max_duration_s is not None and time.monotonic() - started >= max_duration_s:
                 return False
             if await until():
                 return True
+            if stall_polls and progress is not None:
+                now = await progress()
+                same = same + 1 if now == last else 0
+                last = now
+                if same >= stall_polls:
+                    stalled = True
+                    return False
             await asyncio.sleep(poll_s)
 
     if procs <= 1:
@@ -531,6 +574,8 @@ async def run_fleet(
             watch.cancel()
             await asyncio.gather(watch, return_exceptions=True)
         rec = await runner  # re-raises what the runner died of
+        if stalled:
+            rec.count("stalled")
         return FleetResult(rec, time.monotonic() - started, ok)
 
     ctx = mp.get_context("spawn")
@@ -564,7 +609,7 @@ async def run_fleet(
         watch.cancel()
         await asyncio.gather(watch, return_exceptions=True)
     parts: list[dict[str, Any]] = []
-    deadline = time.monotonic() + JOIN_TIMEOUT_S
+    deadline = time.monotonic() + join_timeout_s(cfg)
     while len(parts) < len(workers) and time.monotonic() < deadline:
         try:
             parts.append(await asyncio.to_thread(out.get, True, 0.5))
@@ -582,6 +627,8 @@ async def run_fleet(
             w.terminate()
         await asyncio.to_thread(w.join)
     rec = merge_dicts(parts)
+    if stalled:
+        rec.count("stalled")
     if missing:  # a process that never reported (killed, segfault): count it, fail the run
         rec.count("proc_crashed", missing)
         ok = False

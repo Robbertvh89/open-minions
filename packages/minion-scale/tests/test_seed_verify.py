@@ -60,7 +60,11 @@ def test_input_object_is_tiny_and_line_delimited() -> None:
 def test_tokens_file_is_owner_only_and_never_shown(tmp_path: Path) -> None:
     from minion_scale.seed import ExecutorCred
 
-    creds = [ExecutorCred(executor_id="e1", token=SecretStr("s3cr3t-token"))]
+    creds = [
+        ExecutorCred(
+            executor_id="6f1c1c9e-0000-4000-8000-000000000001", token=SecretStr("s3cr3t-token")
+        )
+    ]
     assert "s3cr3t-token" not in repr(creds) and "s3cr3t-token" not in str(creds[0])
     path = tmp_path / "tokens.json"
     write_tokens_file(path, creds)
@@ -71,6 +75,16 @@ def test_tokens_file_is_owner_only_and_never_shown(tmp_path: Path) -> None:
     assert back[0].token.get_secret_value() == "s3cr3t-token"
     path.chmod(0o644)
     with pytest.raises(SeedError, match="owner-only"):
+        read_tokens_file(path)
+
+
+def test_tokens_file_with_a_bad_executor_id_is_a_value_error(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(
+        '{"schema": "minion-scale-tokens/1", "executors": [{"executor_id": "x", "token": "t"}]}'
+    )
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match=r"(?i)uuid"):  # pydantic ValidationError is a ValueError
         read_tokens_file(path)
 
 
@@ -106,7 +120,11 @@ async def test_seed_creates_pending_queue_and_hashed_tokens(sm: Sm, s3: S3Env) -
     assert len({c.executor_id for c in creds}) == 4
     assert await _one(sm, "SELECT count(*) FROM minion_executor WHERE pool = 'scale'") == 4
     assert await _one(sm, "SELECT max(first_record) FROM minion_subtask") == 6 * spec.records
-    assert await revoke_executors(sm, [c.executor_id for c in creds]) == 4
+    other = await seed_executors(sm, 1, pool="default", owner_prefix="real")
+    ids = [c.executor_id for c in creds]
+    assert await revoke_executors(sm, [*ids, other[0].executor_id]) == 4  # only pool 'scale'
+    assert await _one(sm, "SELECT count(*) FROM minion_executor WHERE pool = 'default'") == 1
+    assert await _one(sm, "SELECT status FROM minion_executor WHERE pool = 'default'") == "ACTIVE"
     assert await _one(sm, "SELECT count(*) FROM minion_executor WHERE status = 'REVOKED'") == 4
     tokens = [c.token.get_secret_value() for c in creds]
     hashes = {r[0] for r in await _rows(sm, "SELECT token_hash FROM minion_executor")}

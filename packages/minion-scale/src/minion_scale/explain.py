@@ -20,9 +20,9 @@ from sqlalchemy import Select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-Sm = async_sessionmaker[AsyncSession]
+from minion_scale.seed import DEFAULT_POOL
 
-DEFAULT_POOL = "scale"  # the pool `seed` issues tokens into (and allows tasks in)
+Sm = async_sessionmaker[AsyncSession]
 
 EXPLAIN = "EXPLAIN (ANALYZE, BUFFERS) "
 STATEMENT_TIMEOUT_MS = 60_000

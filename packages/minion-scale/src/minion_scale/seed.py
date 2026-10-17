@@ -15,12 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from minion_common.enums import ExecutorStatus
 from minion_common.schemas import SLUG_PATTERN
 from minion_server.admin import issue_executor_token
+from minion_server.db.models import Executor
 from minion_server.models_registry import load_models
-from minion_server.repositories import executors as executors_repo
-from pydantic import BaseModel, SecretStr
-from sqlalchemy import text
+from pydantic import BaseModel, SecretStr, field_validator
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 if TYPE_CHECKING:
@@ -120,7 +121,8 @@ _INSERT_TASKS = text(
            p.engine, :memory_gb, p.input_uri,
            's3://' || p.bucket || '/outputs/' || p.team || '/' || p.prefix || '-'
                || lpad(g::text, 5, '0') || '/',
-           :records, :max_attempts, CAST(:pool AS text), 'PENDING', :subtasks, 'minion-scale'
+           :records, :max_attempts, CAST(:pool AS text), 'PENDING', :subtasks,
+           CAST(:created_by AS text)
     FROM p CROSS JOIN generate_series(1, :tasks) AS g
     """
 )
@@ -137,7 +139,7 @@ _INSERT_SUBTASKS = text(
     CROSS JOIN generate_series(0, :subtasks - 1) AS s
     WHERE t.team = CAST(:team AS text) AND t.project = CAST(:project AS text)
       AND t.task_name LIKE CAST(:prefix AS text) || '-_____'
-      AND t.created_by = 'minion-scale'
+      AND t.created_by = CAST(:created_by AS text)
     """
 )
 
@@ -165,6 +167,7 @@ async def seed_queue(sm: Sm, spec: SeedSpec, *, input_bytes: int) -> SeedResult:
                 "pool": spec.pool,
                 "subtasks": spec.subtasks,
                 "tasks": spec.tasks,
+                "created_by": CREATED_BY,
             },
         )
         await session.execute(
@@ -175,6 +178,7 @@ async def seed_queue(sm: Sm, spec: SeedSpec, *, input_bytes: int) -> SeedResult:
                 "input_bytes": input_bytes,
                 "records": spec.records,
                 "subtasks": spec.subtasks,
+                "created_by": CREATED_BY,
             },
         )
     return SeedResult(spec.tasks, spec.tasks * spec.subtasks, input_bytes)
@@ -183,6 +187,11 @@ async def seed_queue(sm: Sm, spec: SeedSpec, *, input_bytes: int) -> SeedResult:
 class ExecutorCred(BaseModel):
     executor_id: str
     token: SecretStr
+
+    @field_validator("executor_id")
+    @classmethod
+    def _uuid(cls, v: str) -> str:
+        return str(uuid.UUID(v))  # ValueError (-> a clean CLI error) on anything else
 
     def __repr__(self) -> str:  # never show the token, even via a stray print/log of the object
         return f"ExecutorCred(executor_id={self.executor_id!r})"
@@ -203,13 +212,18 @@ async def seed_executors(
     return out
 
 
-async def revoke_executors(sm: Sm, executor_ids: list[str]) -> int:
-    """Revoke the given executors (operator path, like `revoke-executor-token`); returns how many
-    existed."""
+async def revoke_executors(sm: Sm, executor_ids: list[str], *, pool: str = DEFAULT_POOL) -> int:
+    """Revoke the given executors, but only those in `pool` (a tampered tokens file cannot revoke
+    a real executor); returns how many were revoked."""
     n = 0
     async with sm() as session, session.begin():
         for eid in executor_ids:
-            n += int(await executors_repo.revoke(session, uuid.UUID(eid)))
+            result = await session.execute(
+                update(Executor)
+                .where(Executor.executor_id == uuid.UUID(eid), Executor.pool == pool)
+                .values(status=ExecutorStatus.REVOKED.value)
+            )
+            n += int(result.rowcount)  # type: ignore[attr-defined]
     return n
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from minion_common.enums import Engine
-from minion_scale.cli import app, check_scale_db
+from minion_scale.cli import app, check_scale_db, check_scale_host
 from minion_scale.seed import read_tokens_file
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -37,6 +37,26 @@ def test_non_loopback_database_is_refused_without_the_flag(monkeypatch: pytest.M
     # with the flag the host check passes (the next problem is the missing S3 settings)
     res = runner.invoke(app, ["seed", "--yes-this-is-a-scale-db"])
     assert res.exit_code == 2 and "MINION_S3_ENDPOINT_URL" in res.output
+
+
+def test_host_guard_checks_query_hosts_and_loopback_forms() -> None:
+    import typer
+
+    for url in (
+        "postgresql+asyncpg://u:pw@localhost/db?host=remote.example.com",
+        "postgresql+asyncpg://u:pw@127.0.0.1/db?hostaddr=10.0.0.5",
+        "postgresql+asyncpg://u:pw@10.1.2.3/db",
+    ):
+        with pytest.raises(typer.Exit):
+            check_scale_host(url, False)
+    for url in (
+        "postgresql+asyncpg://u:pw@127.0.0.2/db",
+        "postgresql+asyncpg://u:pw@[::1]/db",
+        "postgresql+asyncpg://u:pw@localhost/db",
+        "postgresql+asyncpg://u:pw@/db?host=/var/run/postgresql",
+    ):
+        check_scale_host(url, False)
+    check_scale_host("postgresql+asyncpg://u:pw@remote/db?host=remote", True)
 
 
 def test_settings_come_from_the_environment_only(

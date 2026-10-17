@@ -8,6 +8,7 @@ written by `seed --tokens-file`; nothing here prints them.
 """
 
 import asyncio
+import ipaddress
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -45,6 +46,7 @@ from minion_scale.seed import (
 )
 from minion_scale.sim import (
     ACQUIRE_PACE_S,
+    DEFAULT_STALL_S,
     EXECUTOR_BACKOFF,
     FaultRates,
     SimConfig,
@@ -99,7 +101,19 @@ def _fail(msg: str) -> typer.Exit:
     return typer.Exit(2)
 
 
-LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+def _is_local_host(host: str) -> bool:
+    """Loopback name or address, or a unix-socket directory (libpq: a host starting with `/`)."""
+    h = host.strip().lower()
+    if h.startswith("/"):
+        return True
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 YesScaleDb = Annotated[
     bool,
     typer.Option(
@@ -112,12 +126,20 @@ YesScaleDb = Annotated[
 def check_scale_host(database_url: str, yes: bool) -> None:
     """Refuse a database that is not on this machine unless the operator said it is a scale DB.
     The message names the host only, never the credentials."""
-    host = make_url(database_url).host
-    if host is not None and host.lower() not in LOOPBACK_HOSTS and not yes:
-        raise _fail(
-            f"refusing database host {host!r}: not loopback; pass --yes-this-is-a-scale-db "
-            "if it is a throwaway scale-test database"
-        )
+    url = make_url(database_url)
+    hosts: list[str] = []
+    if url.host:
+        hosts.append(url.host)
+    for key in ("host", "hostaddr"):  # libpq query parameters override the authority host
+        value = url.query.get(key)
+        for item in (value,) if isinstance(value, str) else (value or ()):
+            hosts.extend(h for h in item.split(",") if h)
+    for host in hosts:
+        if not _is_local_host(host) and not yes:
+            raise _fail(
+                f"refusing database host {host!r}: not loopback; pass --yes-this-is-a-scale-db "
+                "if it is a throwaway scale-test database"
+            )
 
 
 async def check_scale_db(sm: Any, yes: bool) -> None:
@@ -229,6 +251,14 @@ def run_cmd(
         str, typer.Option(help="Stop when this team has no PENDING/RUNNING left")
     ] = DEFAULT_TEAM,
     max_duration_s: Annotated[float | None, typer.Option(help="Hard stop")] = None,
+    stall_s: Annotated[
+        float,
+        typer.Option(
+            min=0,
+            help="End the run (event `stalled`) when the remaining-subtask count has not changed "
+            "for this many seconds; 0 disables. Keep it above --work-s and --late-wait-s",
+        ),
+    ] = DEFAULT_STALL_S,
     poll_s: float = 1.0,
     seed: int = 0,
     docker_project: Annotated[
@@ -239,8 +269,8 @@ def run_cmd(
 ) -> None:
     """Run simulated executors until the queue is drained (or --max-duration-s).
 
-    Exit 1 when the queue did not drain (time ran out, every sim ended, a sim process crashed)
-    or the server answered 5xx; exit 2 on bad input.
+    Exit 1 when the queue did not drain (time ran out, no progress for --stall-s, every sim
+    ended, a sim process crashed) or the server answered 5xx; exit 2 on bad input.
     """
     cfg = _settings()
     check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
@@ -269,14 +299,19 @@ def run_cmd(
             await dbstats.ensure_extension(sm)
             before = await dbstats.snapshot(sm)
 
+            async def remaining() -> int:
+                return await count_remaining(sm, team=team)
+
             async def drained() -> bool:
-                return await count_remaining(sm, team=team) == 0
+                return await remaining() == 0
 
             rec, secs, did_drain = await run_fleet(
                 sim_cfg,
                 tokens,
                 procs=procs,
                 until=drained,
+                progress=remaining,
+                stall_s=stall_s,
                 poll_s=poll_s,
                 max_duration_s=max_duration_s,
             )
@@ -311,7 +346,10 @@ def run_cmd(
         raise _fail(f"run failed: {type(exc).__name__}: {exc}") from exc
     _emit(doc, out)
     if not doc["run"]["drained"]:
-        typer.echo("the queue did not drain (see run.events: sim_aborted / proc_crashed)", err=True)
+        typer.echo(
+            "the queue did not drain (see run.events: sim_aborted / proc_crashed / stalled)",
+            err=True,
+        )
     if doc["run"]["server_errors_5xx"] or not doc["run"]["drained"]:
         raise typer.Exit(1)
 

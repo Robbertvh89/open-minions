@@ -182,6 +182,93 @@ async def test_a_cancel_from_the_heartbeat_is_released_as_cancelled() -> None:
         work_s=5.0,
     )
     a = SimpleNamespace(acquirement_id="x", record_count=1, output_url="http://127.0.0.1:1/o")
-    assert await asyncio.wait_for(ex._handle(a), 5) is True  # type: ignore[arg-type]
+    assert await asyncio.wait_for(ex._handle(a), 5) is sim.Outcome.NEUTRAL  # type: ignore[arg-type]
     assert released == ["CANCELLED"] and ex.rec.events["cancelled"] == 1
     assert ex.rec.events["released"] == 1
+
+
+async def test_a_stalled_queue_ends_the_run_with_a_stalled_event(unavailable: str) -> None:
+    async def progress() -> int:
+        return 7  # never changes
+
+    rec, secs, drained = await asyncio.wait_for(
+        run_fleet(
+            _cfg(unavailable),
+            _tokens(1),
+            procs=1,
+            until=_never,
+            poll_s=0.05,
+            progress=progress,
+            stall_s=0.3,
+        ),
+        20,
+    )
+    assert drained is False and rec.events["stalled"] == 1 and secs < 20
+
+
+async def test_a_moving_queue_is_not_a_stall(unavailable: str) -> None:
+    n = {"v": 100}
+
+    async def progress() -> int:
+        n["v"] -= 1
+        return n["v"]
+
+    _rec, secs, _ = await run_fleet(
+        _cfg(unavailable),
+        _tokens(1),
+        procs=1,
+        until=_never,
+        poll_s=0.05,
+        progress=progress,
+        stall_s=0.3,
+        max_duration_s=1.0,
+    )
+    assert secs >= 0.9
+
+
+def test_join_timeout_follows_the_http_timeout() -> None:
+    assert sim.join_timeout_s(SimConfig(base_url="x", timeout_s=30.0)) == 70.0
+    assert sim.join_timeout_s(SimConfig(base_url="x", timeout_s=5.0)) == 20.0
+
+
+def test_a_crashed_sim_process_exits_non_zero_after_reporting() -> None:
+    import queue as q
+
+    out: q.Queue[dict[str, Any]] = q.Queue()
+    with pytest.raises(SystemExit) as ei:
+        sim._proc_main(
+            _cfg("http://example.com"), ["t"], 0, SimpleNamespace(is_set=lambda: False), out
+        )
+    assert ei.value.code == 3
+    assert out.get_nowait()["events"]["proc_crashed"] == 1
+
+
+async def test_only_a_completion_resets_the_failure_streak() -> None:
+    async def register(_req: Any) -> None:
+        return None
+
+    async def acquire(_req: Any) -> Any:
+        return SimpleNamespace(record_count=1)
+
+    async def aclose() -> None:
+        return None
+
+    ex = _sim_with(SimpleNamespace(register=register, acquire=acquire, aclose=aclose))
+    outcomes = iter([sim.Outcome.FAILED, sim.Outcome.NEUTRAL, sim.Outcome.FAILED, sim.Outcome.DONE])
+    seen: list[int] = []
+
+    async def handle(_a: Any) -> sim.Outcome:
+        seen.append(ex._fails)  # the streak before this assignment
+        o = next(outcomes, None)
+        if o is None:
+            ex.stop.set()
+            return sim.Outcome.NEUTRAL
+        return o
+
+    async def no_sleep(_s: float) -> None:
+        return None
+
+    ex._handle = handle  # type: ignore[method-assign,assignment]
+    ex._sleep = no_sleep  # type: ignore[method-assign,assignment]
+    await asyncio.wait_for(ex.run(), 5)
+    assert seen == [0, 1, 1, 2, 0]  # NEUTRAL kept the streak, only DONE reset it
