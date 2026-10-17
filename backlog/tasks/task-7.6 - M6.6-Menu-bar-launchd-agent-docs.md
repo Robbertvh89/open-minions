@@ -1,9 +1,10 @@
 ---
 id: TASK-7.6
 title: M6.6 Menu-bar launchd agent + docs
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-17 23:49'
 labels:
   - executor
 dependencies: []

@@ -3,10 +3,10 @@ id: TASK-7.5
 title: >-
   M6.5 Menu-bar app: profile/pause/resume/status over the local control/status
   files
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 20:36'
-updated_date: '2026-10-17 20:36'
+updated_date: '2026-10-17 23:49'
 labels:
   - executor
 dependencies: []
@@ -22,9 +22,15 @@ minion-executor menubar (darwin only). AppKit via pyobjc (NSStatusItem, accessor
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 model.py unit-tested on Linux (all status states, unknown enums, stale/stopped, control_invalid)
-- [ ] #2 Test: minion_executor.menubar imports no httpx/minion_common.client/secrets/keyring and reads no token env
-- [ ] #3 Concurrent update_control calls never lose a field (unit test)
-- [ ] #4 Idle CPU of the menubar process < 0.5 % measured on this Mac (in PR)
-- [ ] #5 macos-marked smoke test builds the status item/menu without running the loop
+- [x] #1 model.py unit-tested on Linux (all status states, unknown enums, stale/stopped, control_invalid)
+- [x] #2 Test: minion_executor.menubar imports no httpx/minion_common.client/secrets/keyring and reads no token env
+- [x] #3 Concurrent update_control calls never lose a field (unit test)
+- [x] #4 Idle CPU of the menubar process < 0.5 % measured on this Mac (in PR)
+- [x] #5 macos-marked smoke test builds the status item/menu without running the loop
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #41: minion-executor menubar (AppKit status item over local control/status files; no network/token/subprocess/power assertions), control.lock flock with 2 s bound shared with the instance lock, shared state-dir resolution, Custom only when configured. Idle CPU 0.00 s/60 s.
+<!-- SECTION:FINAL_SUMMARY:END -->
