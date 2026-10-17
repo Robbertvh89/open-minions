@@ -6,10 +6,16 @@ latencies into frame statistics and applies the NF-7 thresholds (SPEC NF-7, ADR-
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
+import signal
 import statistics
+import subprocess
+import sys
+import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from minion_common.enums import CapacityProfile
@@ -155,3 +161,89 @@ def failures(
     verdicts: Mapping[tuple[str, CapacityProfile], Nf7Verdict],
 ) -> list[tuple[str, CapacityProfile]]:
     return [k for k, v in verdicts.items() if is_judged(k[1]) and not v.passed]
+
+
+OSASCRIPT = "/usr/bin/osascript"
+PGREP = "/usr/bin/pgrep"
+LAUNCH_TIMEOUT_S = 15.0
+EXIT_WAIT_S = 5.0
+GAP_S = 1.0
+
+
+def _running_pids(
+    proc_name: str, run: Callable[..., subprocess.CompletedProcess[str]]
+) -> list[int] | None:
+    """PIDs of this user's `proc_name` processes; [] if none, None if pgrep itself failed."""
+    try:
+        r = run(
+            [PGREP, "-u", str(os.getuid()), "-x", proc_name],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode == 1:
+        return []
+    if r.returncode != 0:
+        return None
+    try:
+        return [int(x) for x in r.stdout.split()]
+    except ValueError:
+        return None
+
+
+def measure_app_launch(
+    n: int,
+    *,
+    bundle_id: str = "com.apple.calculator",
+    proc_name: str = "Calculator",
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    kill: Callable[[int, int], None] = os.kill,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    platform: str = sys.platform,
+) -> list[float] | None:
+    """Wall time (s) of `n` cold launches of a small app, or None when unavailable.
+
+    One warm-up launch is excluded. If the app is already running it belongs to the owner: it is
+    never touched and the result is None. Only the instance we launched is terminated (SIGTERM),
+    then we wait for it to exit. None on non-darwin and on any osascript/TCC error."""
+    if platform != "darwin" or n < 1:
+        return None
+    if _running_pids(proc_name, run) != []:
+        return None
+    argv = [OSASCRIPT, "-e", f'tell application id "{bundle_id}" to launch']
+    samples: list[float] = []
+
+    def close_ours() -> bool:
+        pids = _running_pids(proc_name, run)
+        if pids is None:
+            return False
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                kill(pid, signal.SIGTERM)
+        deadline = clock() + EXIT_WAIT_S
+        while _running_pids(proc_name, run):
+            if clock() >= deadline:
+                return False
+            sleep(0.1)
+        sleep(GAP_S)
+        return True
+
+    for i in range(n + 1):
+        t0 = clock()
+        try:
+            r = run(argv, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S, check=False)
+        except (OSError, subprocess.SubprocessError):
+            close_ours()
+            return None
+        elapsed = clock() - t0
+        ok = r.returncode == 0
+        closed = close_ours()
+        if not ok or not closed:
+            return None
+        if i > 0:
+            samples.append(elapsed)
+    return samples

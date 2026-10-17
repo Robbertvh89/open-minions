@@ -76,3 +76,94 @@ def test_full_never_judged() -> None:
     v = aggregate(_rows(P.FULL, [50.0, 50.0, 50.0]))
     assert not v[("m", P.FULL)].passed
     assert failures(v) == []
+
+
+# --- app-launch proxy -------------------------------------------------------------------------
+import subprocess  # noqa: E402
+
+from minion_executor.bench_foreground import measure_app_launch  # noqa: E402
+
+
+class FakeSys:
+    """Fake subprocess.run: pgrep reports Calculator running between launch and kill."""
+
+    def __init__(
+        self,
+        *,
+        running_at_start: bool = False,
+        launch_rc: int = 0,
+        launch_exc: Exception | None = None,
+        never_exits: bool = False,
+    ) -> None:
+        self.running = running_at_start
+        self.launch_rc = launch_rc
+        self.launch_exc = launch_exc
+        self.never_exits = never_exits
+        self.argvs: list[list[str]] = []
+        self.kills: list[tuple[int, int]] = []
+        self.t = 0.0
+
+    def clock(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+
+    def run(self, argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        self.argvs.append(argv)
+        assert kw.get("shell") is None
+        if argv[0] == "/usr/bin/pgrep":
+            if self.running:
+                return subprocess.CompletedProcess(argv, 0, "4242\n", "")
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        assert argv[0] == "/usr/bin/osascript"
+        if self.launch_exc:
+            raise self.launch_exc
+        self.t += 0.5
+        if self.launch_rc == 0:
+            self.running = True
+        return subprocess.CompletedProcess(argv, self.launch_rc, "", "")
+
+    def kill(self, pid: int, sig: int) -> None:
+        self.kills.append((pid, sig))
+        if not self.never_exits:
+            self.running = False
+
+
+def _measure(f: FakeSys, n: int = 3, platform: str = "darwin") -> list[float] | None:
+    return measure_app_launch(
+        n, run=f.run, kill=f.kill, clock=f.clock, sleep=f.sleep, platform=platform
+    )
+
+
+def test_launch_returns_n_samples_excluding_warmup() -> None:
+    f = FakeSys()
+    out = _measure(f, 3)
+    assert out == [0.5, 0.5, 0.5]
+    assert len([a for a in f.argvs if a[0] == "/usr/bin/osascript"]) == 4
+    assert [pid for pid, _ in f.kills] == [4242] * 4
+    assert not f.running
+
+
+def test_already_running_is_unavailable_and_never_killed() -> None:
+    f = FakeSys(running_at_start=True)
+    assert _measure(f) is None
+    assert f.kills == []
+    assert all(a[0] != "/usr/bin/osascript" for a in f.argvs)
+
+
+def test_non_darwin_unavailable() -> None:
+    f = FakeSys()
+    assert _measure(f, platform="linux") is None
+    assert f.argvs == []
+
+
+def test_launch_timeout_and_error_unavailable() -> None:
+    f = FakeSys(launch_exc=subprocess.TimeoutExpired("osascript", 15))
+    assert _measure(f) is None
+    assert _measure(FakeSys(launch_rc=1)) is None
+
+
+def test_app_that_does_not_exit_is_unavailable() -> None:
+    f = FakeSys(never_exits=True)
+    assert _measure(f) is None
