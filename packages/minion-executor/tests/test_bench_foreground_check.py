@@ -17,7 +17,7 @@ from minion_executor.capacity.gpu_meter import GpuMeterError, GpuSampler
 from minion_executor.capacity.profiles import budget_for
 from minion_executor.main import app
 from minion_executor.model_cache import ModelCache
-from minion_executor.runners.fg_probe import ProbeResult
+from minion_executor.runners.fg_probe import ProbeError, ProbeResult
 from minion_executor.worker.process import WorkerHandle
 from typer.testing import CliRunner
 
@@ -126,6 +126,40 @@ def test_no_launcher_is_partial(tmp_path: Path) -> None:
     rep = run(tmp_path, FakeProbe(), launcher=None)
     assert all(v.partial for v in rep.verdicts().values())
     assert not rep.failed
+
+
+def test_loaded_launch_failure_is_error_row(tmp_path: Path) -> None:
+    calls = 0
+
+    def flaky(n: int) -> list[float] | None:
+        nonlocal calls
+        calls += 1
+        return [0.5] * n if calls % 2 else None
+
+    rep = run(tmp_path, FakeProbe(), launcher=flaky, profiles=(CapacityProfile.LIGHT,))
+    assert rep.results[0].status == "error" and "one window" in rep.results[0].detail
+    assert rep.failed
+
+
+def test_loaded_probe_failure_is_error_row_not_abort(tmp_path: Path) -> None:
+    class Dying(FakeProbe):
+        def run(self, duration_s: float, size: int) -> ProbeResult:
+            if self.calls == 1:
+                self.calls += 1
+                raise ProbeError("probe timed out")
+            return super().run(duration_s, size)
+
+    rep = run(tmp_path, Dying(), profiles=(CapacityProfile.LIGHT,))
+    assert rep.results[0].status == "error" and rep.failed
+
+
+def test_baseline_probe_failure_aborts(tmp_path: Path) -> None:
+    class Dead(FakeProbe):
+        def run(self, duration_s: float, size: int) -> ProbeResult:
+            raise ProbeError("probe timed out")
+
+    with pytest.raises(ProbeError):
+        run(tmp_path, Dead(), profiles=(CapacityProfile.LIGHT,))
 
 
 def test_missing_meter_aborts(tmp_path: Path) -> None:

@@ -785,15 +785,18 @@ def bench(
         ),
     ] = False,
     profiles: Annotated[
-        str, typer.Option(help="--budget-check: comma-separated profiles")
+        str, typer.Option(help="--budget-check/--foreground-check: comma-separated profiles")
     ] = "light,balanced,full",
     duration: Annotated[
-        float, typer.Option(help="--budget-check: seconds per phase / --cpu-check: window")
+        float,
+        typer.Option(help="--budget-check/--foreground-check: s per phase; --cpu-check: window"),
     ] = budget_mod.DEFAULT_DURATION_S,
     baseline_s: Annotated[
         float, typer.Option(help="--budget-check: idle seconds before the phases (device info)")
     ] = budget_mod.DEFAULT_BASELINE_S,
-    repeats: Annotated[int, typer.Option(help="--budget-check: repetitions per profile")] = 1,
+    repeats: Annotated[
+        int, typer.Option(help="--budget-check/--foreground-check: repetitions")
+    ] = 1,
     cpu_check: Annotated[
         bool,
         typer.Option("--cpu-check", help="NF-4: governor CPU % while idle and while paused"),

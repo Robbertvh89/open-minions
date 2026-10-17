@@ -328,9 +328,12 @@ say plainly what it is: it measures **GPU scheduling latency**, not compositor f
 child process (not an inference worker: no task data, no network) issues a fixed fp16 matmul, sized
 to about 5 ms on the idle GPU, on an absolute 30 fps schedule and records completion minus
 *scheduled* start; a frame misses when that exceeds 33.3 ms, and slots skipped because it fell
-behind count as misses. App-launch time is the wall time of N cold launches of Calculator via
-`osascript` (never done if Calculator is already running; "unavailable" on a TCC/osascript error,
-and then the row is judged on frames only and marked partial).
+behind count as misses. App-launch time is the wall time of N warm relaunches of Calculator via
+`osascript` (includes osascript startup; never done if Calculator is running before any launch, and
+only PIDs started by us are signalled; "unavailable" on a TCC/osascript error, and then the row is
+judged on frames only and marked partial; available in one window only is an error row).
+The probe child runs `mlx` outside the Seatbelt sandbox (it handles no task data, its environment
+is scrubbed, and the bench is run by the Mac's owner only).
 
 Per (model, profile, repeat): a fresh worker, warm-up, a **baseline** window (worker loaded, idle),
 then a **loaded** window with the worker running back-to-back batches at the profile budget. Thresholds

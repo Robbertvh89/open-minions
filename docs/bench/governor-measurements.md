@@ -122,12 +122,24 @@ uv run minion-executor bench --foreground-check --models deploy/bench-models.yam
 ```
 
 Per model x profile x repeat: baseline window (worker loaded, idle) then loaded window (worker runs
-back-to-back batches), each a 60 s frame probe plus 20 Calculator launches. Run on AC power with
-Calculator closed, no call running, nothing else heavy; the first launch may raise a macOS
-Automation prompt for `osascript` (approve once, otherwise launch time is "unavailable" and only
-frames are judged, marked partial). Pass (light, balanced; `full` is informational): frame p95 ratio
-<= 1.10, miss-rate increase <= 1.0 pp, launch p50 ratio <= 1.10, medians over repeats. Exit 1 on a
-failing judged aggregate or a judged error row, 2 if the probe or GPU meter is unavailable.
+back-to-back batches), each a 60 s frame probe plus 20 Calculator relaunches (warm, timed via
+`osascript`, so the figure includes osascript startup). Run on AC power with Calculator closed, no
+call running, nothing else heavy. If Calculator is running before any launch the owner's instance is
+never touched and launch time is "unavailable".
+
+Automation prompt: the first launch may raise a macOS Automation prompt. The grant goes to the
+terminal app you run the bench from (the responsible process), not to `minion-executor`. Revoke it in
+System Settings > Privacy & Security > Automation, or with `tccutil reset AppleEvents <terminal
+bundle id>`. `--launches 0` skips launches entirely (no prompt). While a prompt is pending,
+`osascript` times out after 15 s. If launches are unavailable in both windows of every repeat the
+row is judged on frames only and marked partial; if they work in one window but not the other the
+row is an error (exit 1), because no launch comparison is possible.
+
+Pass (light, balanced; `full` is informational): frame p95 ratio <= 1.10, miss-rate increase <= 1.0
+pp, launch p50 ratio <= 1.10, each the median over repeats of the per-repeat paired figure. Exit 1
+on a failing judged aggregate, a judged error row (including a probe timeout in the loaded window),
+or a requested judged profile with no verdict; 2 if calibration or the baseline probe, or the GPU
+meter, is unavailable.
 
 Caveats: the probe measures GPU scheduling latency for a small kernel on its own command queue, not
 compositor frame drops, and no call app runs; thermal drift over the run is mitigated by pairing a

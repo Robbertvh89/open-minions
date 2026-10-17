@@ -40,10 +40,10 @@ def test_schedule_overrun_skips_and_counts_missed() -> None:
     def step() -> None:
         nonlocal calls
         calls += 1
-        c.t += 0.1 if calls == 3 else 0.005  # one 100 ms stall (~3 slots)
+        c.t += 0.09 if calls == 3 else 0.005  # one 90 ms stall: late once, one slot skipped
 
     r = run_schedule(1.0, step, clock=c.now, sleep=c.sleep)
-    assert r.missed == 2
+    assert r.missed == 1
     assert max(r.latencies_ms) > 33.4
     assert len(r.latencies_ms) + r.missed == 30
 
@@ -67,3 +67,20 @@ def test_decode_reply_validates() -> None:
     for bad in (b"", b"123", struct.pack("<3d", 1, 2, 3)):
         with pytest.raises(ProbeError):
             decode_reply(bad, max_values=2)
+
+
+def test_decode_reply_rejects_non_finite_and_negative() -> None:
+    import struct
+
+    for bad in (float("nan"), float("inf"), -1.0):
+        with pytest.raises(ProbeError):
+            decode_reply(struct.pack("<2d", 1.0, bad))
+
+
+def test_timeout_kills_child() -> None:
+    from minion_executor.runners.fg_probe import MlxFrameProbe, hang_child_for_tests
+
+    probe = MlxFrameProbe(target=hang_child_for_tests)
+    with pytest.raises(ProbeError, match="timed out"):
+        probe._call("run", 1.0, 64, 0.5)
+    assert probe._last_proc is not None and not probe._last_proc.is_alive()

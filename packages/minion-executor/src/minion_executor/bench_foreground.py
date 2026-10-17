@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -43,7 +44,7 @@ from minion_executor.capacity.gpu_meter import (
 )
 from minion_executor.model_cache import ModelCache
 from minion_executor.runners.base import RunnerError
-from minion_executor.runners.fg_probe import FrameProbe, ProbeResult, check_duration
+from minion_executor.runners.fg_probe import FrameProbe, ProbeError, ProbeResult, check_duration
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle
 
 log = structlog.get_logger()
@@ -144,41 +145,49 @@ def nf7_proxy_verdict(baseline: PhaseMeasure, loaded: PhaseMeasure) -> Nf7Verdic
     )
 
 
-def _median_opt(values: list[float | None]) -> float | None:
-    present = [v for v in values if v is not None]
-    return statistics.median(present) if present else None
-
-
-def _median_measure(ms: Sequence[PhaseMeasure]) -> PhaseMeasure:
-    return PhaseMeasure(
-        frames=FrameStats(
-            p50_ms=statistics.median(m.frames.p50_ms for m in ms),
-            p95_ms=statistics.median(m.frames.p95_ms for m in ms),
-            miss_rate=statistics.median(m.frames.miss_rate for m in ms),
-            frames=sum(m.frames.frames for m in ms),
-        ),
-        launch_p50_s=_median_opt([m.launch_p50_s for m in ms]),
-    )
+def _med(values: Sequence[float]) -> float:
+    return statistics.median(values)
 
 
 def aggregate(
     rows: Sequence[tuple[str, CapacityProfile, PhaseMeasure, PhaseMeasure]],
 ) -> dict[tuple[str, CapacityProfile], Nf7Verdict]:
-    """Median of each metric over the repeats of (model, profile), then the thresholds.
+    """Per (model, profile): the median over repeats of the *paired* per-repeat figures (frame
+    p95 ratio, miss-rate delta, launch p50 ratio), then the thresholds. A repeat whose launch time
+    exists in only one window fails launch; launch is partial only when it is missing in both
+    windows of every repeat.
 
     `full` is informational: its verdict is computed but callers must not judge it
     (see `is_judged`)."""
-    groups: dict[tuple[str, CapacityProfile], list[tuple[PhaseMeasure, PhaseMeasure]]] = (
-        defaultdict(list)
-    )
+    groups: dict[tuple[str, CapacityProfile], list[Nf7Verdict]] = defaultdict(list)
+    one_sided: set[tuple[str, CapacityProfile]] = set()
     for model, profile, base, loaded in rows:
-        groups[(model, profile)].append((base, loaded))
-    return {
-        key: nf7_proxy_verdict(
-            _median_measure([b for b, _ in pairs]), _median_measure([ld for _, ld in pairs])
+        groups[(model, profile)].append(nf7_proxy_verdict(base, loaded))
+        if (base.launch_p50_s is None) != (loaded.launch_p50_s is None):
+            one_sided.add((model, profile))
+    out: dict[tuple[str, CapacityProfile], Nf7Verdict] = {}
+    for key, vs in groups.items():
+        frame_ratio = _med([v.frame_p95_ratio for v in vs])
+        delta = _med([v.miss_delta_pp for v in vs])
+        launch_ratios = [v.launch_p50_ratio for v in vs if v.launch_p50_ratio is not None]
+        launch_ratio = _med(launch_ratios) if launch_ratios else None
+        launch_ok: bool | None = (
+            None if launch_ratio is None else launch_ratio <= RATIO_LIMIT + _EPS
         )
-        for key, pairs in groups.items()
-    }
+        if key in one_sided:
+            launch_ok = False
+        frame_ok = frame_ratio <= RATIO_LIMIT + _EPS
+        miss_ok = delta <= MISS_DELTA_PP + _EPS
+        out[key] = Nf7Verdict(
+            frame_p95_ratio=frame_ratio,
+            miss_delta_pp=delta,
+            launch_p50_ratio=launch_ratio,
+            frame_ok=frame_ok,
+            miss_ok=miss_ok,
+            launch_ok=launch_ok,
+            passed=frame_ok and miss_ok and launch_ok is not False,
+        )
+    return out
 
 
 def is_judged(profile: CapacityProfile) -> bool:
@@ -222,6 +231,9 @@ def _running_pids(
         return None
 
 
+_BUNDLE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-]*")
+
+
 def measure_app_launch(
     n: int,
     *,
@@ -233,43 +245,64 @@ def measure_app_launch(
     sleep: Callable[[float], None] = time.sleep,
     platform: str = sys.platform,
 ) -> list[float] | None:
-    """Wall time (s) of `n` cold launches of a small app, or None when unavailable.
+    """Wall time (s) of `n` warm relaunches of a small app, timed via osascript (so it includes
+    osascript startup), or None when unavailable. One warm-up launch is excluded.
 
-    One warm-up launch is excluded. If the app is already running it belongs to the owner: it is
-    never touched and the result is None. Only the instance we launched is terminated (SIGTERM),
-    then we wait for it to exit. None on non-darwin and on any osascript/TCC error."""
+    Before every launch the app must not be running; if it is (the owner started it) the result is
+    None and it is never touched. Only PIDs that appear after our own launch are signalled (SIGTERM,
+    then SIGKILL after `EXIT_WAIT_S`); nothing is ever killed by name at close time. None on
+    non-darwin and on any osascript/TCC error or timeout."""
+    if not _BUNDLE_ID_RE.fullmatch(bundle_id):
+        raise ValueError("invalid bundle id")
     if platform != "darwin" or n < 1:
-        return None
-    if _running_pids(proc_name, run) != []:
         return None
     argv = [OSASCRIPT, "-e", f'tell application id "{bundle_id}" to launch']
     samples: list[float] = []
 
-    def close_ours() -> bool:
+    def alive(ours: set[int]) -> bool | None:
         pids = _running_pids(proc_name, run)
-        if pids is None:
-            return False
-        for pid in pids:
-            with contextlib.suppress(OSError):
-                kill(pid, signal.SIGTERM)
+        return None if pids is None else bool(ours & set(pids))
+
+    def wait_gone(ours: set[int]) -> bool:
         deadline = clock() + EXIT_WAIT_S
-        while _running_pids(proc_name, run):
+        while True:
+            a = alive(ours)
+            if a is None:
+                return False
+            if not a:
+                return True
             if clock() >= deadline:
                 return False
             sleep(0.1)
-        sleep(GAP_S)
-        return True
+
+    def close_ours(ours: set[int]) -> bool:
+        if not ours:
+            return True
+        for pid in ours:
+            with contextlib.suppress(OSError):
+                kill(pid, signal.SIGTERM)
+        gone = wait_gone(ours)
+        if not gone:
+            for pid in ours:
+                with contextlib.suppress(OSError):
+                    kill(pid, signal.SIGKILL)
+            gone = wait_gone(ours)
+        if gone:
+            sleep(GAP_S)
+        return gone
 
     for i in range(n + 1):
+        if _running_pids(proc_name, run) != []:
+            return None  # the owner's instance (or pgrep failed): never touch it
         t0 = clock()
         try:
             r = run(argv, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S, check=False)
         except (OSError, subprocess.SubprocessError):
-            close_ours()
+            close_ours(set(_running_pids(proc_name, run) or []))
             return None
         elapsed = clock() - t0
         ok = r.returncode == 0
-        closed = close_ours()
+        closed = close_ours(set(_running_pids(proc_name, run) or []))
         if not ok or not closed:
             return None
         if i > 0:
@@ -341,11 +374,15 @@ class ForegroundReport:
     @property
     def failed(self) -> bool:
         """Exit-1 condition: a judged (light/balanced) aggregate fails, or a judged row errored
-        (no verdict can come from it). `full` and `unavailable` rows are informational."""
+        (no verdict can come from it), or a requested judged profile ended with no verdict at all
+        (nothing judged is not a pass). `full` and `unavailable` rows are informational."""
         errored = any(
             r.status == "error" and is_judged(CapacityProfile(r.profile)) for r in self.results
         )
-        return errored or bool(failures(self.verdicts()))
+        verdicts = self.verdicts()
+        judged_profiles = {CapacityProfile(p) for p in self.config.get("profiles", [])} & JUDGED
+        missing = any(not any(k[1] == p for k in verdicts) for p in judged_profiles)
+        return errored or missing or bool(failures(verdicts))
 
     def to_json(self) -> dict[str, Any]:
         """Derived figures only: no timestamps, hostnames, paths or payloads."""
@@ -398,6 +435,11 @@ def _phase(
         frames=frame_stats(res.latencies_ms, res.missed),
         launch_p50_s=statistics.median(launches) if launches else None,
     )
+
+
+def _launch_mismatch(base: PhaseMeasure, loaded: PhaseMeasure) -> bool:
+    """Launch time measured in exactly one window: no comparison is possible."""
+    return (base.launch_p50_s is None) != (loaded.launch_p50_s is None)
 
 
 class _LoadThread:
@@ -455,6 +497,7 @@ def _measure_row(
     batch = synthetic_records(entry.type, budget.max_batch_size, cfg.seed)
     sampler = sampler_factory(lambda: worker.pid)
     sampler.start()
+    probe_failed = False
     try:
         worker.ensure_model(entry, budget, path)
         worker.run(batch, params, budget=budget)  # warm-up, excluded
@@ -463,13 +506,26 @@ def _measure_row(
         with _LoadThread(worker, batch, params, budget) as load:
             time.sleep(cfg.settle_s)
             t0 = time.monotonic()
-            row.loaded = _phase(probe, launcher, cfg, size)
+            try:
+                row.loaded = _phase(probe, launcher, cfg, size)
+            except ProbeError:
+                probe_failed = True
             t1 = t0 + cfg.duration_s
         load_error = load.error
     finally:
         samples = sampler.stop()
     if load_error is not None:
         row.status, row.detail = "error", f"background load failed: {type(load_error).__name__}"
+        return row
+    if probe_failed:
+        row.status, row.detail = "error", "frame probe failed in the loaded window"
+        return row
+    if (
+        row.baseline is not None
+        and row.loaded is not None
+        and _launch_mismatch(row.baseline, row.loaded)
+    ):
+        row.status, row.detail = "error", "app launch measured in only one window"
         return row
     if not samples:
         raise GpuMeterError("the GPU sampler produced no samples")

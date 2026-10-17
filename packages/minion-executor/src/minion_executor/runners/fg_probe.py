@@ -9,12 +9,14 @@ no network, and only floats cross the pipe back. MLX is imported lazily inside t
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from typing import Protocol
 
 from minion_executor.worker.process import restrict_environ
@@ -63,7 +65,8 @@ def run_schedule(
     """Run `step` on an absolute schedule t0 + i * period for `duration_s`.
 
     Latency = completion - scheduled start (queueing behind other GPU work counts). When a step
-    overruns later slots, those slots are skipped and counted as missed."""
+    runs past the end of later slots, those slots are skipped and counted as missed; the overrun
+    frame itself is counted once, as late."""
     check_duration(duration_s)
     n_slots = min(int(duration_s / period_s), MAX_FRAMES)
     t0 = clock()
@@ -79,7 +82,7 @@ def run_schedule(
         end = clock()
         latencies.append((end - scheduled) * 1000.0)
         nxt = i + 1
-        while nxt < n_slots and t0 + nxt * period_s <= end:
+        while nxt < n_slots and t0 + (nxt + 1) * period_s <= end:
             nxt += 1
             missed += 1
         i = nxt
@@ -149,19 +152,32 @@ def _child_main(conn: Connection, mode: str, duration_s: float, size: int) -> No
         conn.close()
 
 
+def hang_child_for_tests(conn: Connection, mode: str, duration_s: float, size: int) -> None:
+    """Importable stand-in child that never replies (spawn needs a top-level target)."""
+    time.sleep(120)
+
+
 def decode_reply(raw: bytes, *, max_values: int = MAX_FRAMES + 1) -> list[float]:
     if not raw or len(raw) % _F64.size or len(raw) // _F64.size > max_values:
         raise ProbeError("bad probe reply")
-    return [_F64.unpack_from(raw, o)[0] for o in range(0, len(raw), _F64.size)]
+    vals = [_F64.unpack_from(raw, o)[0] for o in range(0, len(raw), _F64.size)]
+    if not all(math.isfinite(v) and v >= 0.0 for v in vals):
+        raise ProbeError("bad probe reply")
+    return vals
 
 
 class MlxFrameProbe:
     """Spawns a fresh child per call; the parent kills it `KILL_GRACE_S` after the deadline."""
 
+    def __init__(self, target: Callable[[Connection, str, float, int], None] = _child_main) -> None:
+        self._target = target
+        self._last_proc: BaseProcess | None = None
+
     def _call(self, mode: str, duration_s: float, size: int, timeout_s: float) -> list[float]:
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe(duplex=False)
-        proc = ctx.Process(target=_child_main, args=(child, mode, duration_s, size), daemon=True)
+        proc = ctx.Process(target=self._target, args=(child, mode, duration_s, size), daemon=True)
+        self._last_proc = proc
         proc.start()
         child.close()
         try:
