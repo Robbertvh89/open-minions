@@ -176,7 +176,8 @@ def kill_active_probe() -> None:
     _probe_cancelled.set()
     handle = _active_probe
     if handle is not None:
-        handle.kill()
+        # Runs on the event loop from a signal handler; the probe's finally/_reset joins it.
+        handle.kill(reap=False)
 
 
 def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = None) -> list[Engine]:

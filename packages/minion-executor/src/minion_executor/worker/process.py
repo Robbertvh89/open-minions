@@ -54,6 +54,7 @@ from minion_executor.worker.throttle import DutyCyclePacer
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 CTL_SEND_TIMEOUT_S = 1.0  # bounds BOTH the wait for the pipe write lock and the write itself
 UNLOAD_TIMEOUT_S = 5.0  # total wall-clock cap on the graceful unload (> runner keep_alive POST)
+KILL_REAP_TIMEOUT_S = 2.0
 # Allowlist (not a blocklist): only these names ever reach a worker. `__PYVENV_LAUNCHER__` is the
 # macOS framework-launcher variable the interpreter bootstrap may consult for venv detection.
 # Proxy, CA and HF_TOKEN are deliberately not on it: they go only to the model-fetch subprocess
@@ -872,7 +873,8 @@ class WorkerHandle:
         """Memory the OS charges the worker, or None if there is no live worker. Safe to call
         during a run (takes no handle lock). The sample is taken first and the child is checked
         alive after: an unreaped child keeps its pid, so a still-alive child proves the number is
-        the worker's and not a recycled pid's."""
+        the worker's and not a recycled pid's. interrupt()/kill() may reap the child while
+        _proc is still set; a reaped process reports not alive, so the sample is discarded."""
         proc = self._proc
         pid = proc.pid if proc is not None else None
         if proc is None or pid is None:
@@ -955,10 +957,12 @@ class WorkerHandle:
         finally:
             self._reset()
 
-    def kill(self) -> None:
+    def kill(self, *, reap: bool = True) -> None:
         """Stop for good: hard-kill the worker (reclaiming model memory), never respawn.
 
-        Lock-free so it can interrupt a call that holds the lock; safe from any thread.
+        Takes no handle lock, so it can interrupt a call that holds the lock; safe from any
+        thread. With reap (default) it blocks up to KILL_REAP_TIMEOUT_S to reap the child, so
+        call it off the event loop.
         """
         self._closed = True
         ref = self._ollama_ref
@@ -966,6 +970,8 @@ class WorkerHandle:
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+                if reap:  # reap now: no <defunct> child until the next _reset
+                    proc.join(timeout=KILL_REAP_TIMEOUT_S)
             self._release_ollama(ref)
 
     def _release_ollama(self, ref: str | None) -> None:
@@ -982,7 +988,8 @@ class WorkerHandle:
 
         Unlike `kill()` this leaves the handle open. An in-flight call fails with `WorkerCrashed`
         and resets; a dead idle worker is replaced by `ensure_model` (which reloads the model).
-        Lock-free, safe from any thread.
+        Takes no handle lock; safe from any thread. It blocks up to KILL_REAP_TIMEOUT_S to reap
+        the child, so call it off the event loop.
         """
         self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
         ref = self._ollama_ref
@@ -990,6 +997,8 @@ class WorkerHandle:
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
+                # reap now: no <defunct> child until the next _reset
+                proc.join(timeout=KILL_REAP_TIMEOUT_S)
             self._release_ollama(ref)
 
     def _reset(self) -> None:
