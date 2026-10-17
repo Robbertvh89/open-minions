@@ -81,7 +81,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT count(DISTINCT executor_id) AS busy FROM minion_ro.heartbeat"
+          "rawSql": "SELECT count(*) AS busy FROM minion_ro.executor e WHERE e.online AND EXISTS (SELECT 1 FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id)"
         }
       ],
       "fieldConfig": {

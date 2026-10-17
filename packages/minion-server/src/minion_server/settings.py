@@ -78,11 +78,13 @@ class ServerSettings(BaseSettings):
     def _metrics_token(cls, v: object) -> object:
         """Empty means unset (a blank `MINION_METRICS_TOKEN=` line); a set token must be strong."""
         raw = v.get_secret_value() if isinstance(v, SecretStr) else v
+        if isinstance(raw, str):
+            raw = raw.strip()  # a trailing newline/space must neither count nor break the match
         if raw is None or raw == "":
             return None
         if isinstance(raw, str) and len(raw) < 32:
             raise ValueError("metrics_token must be at least 32 characters (or unset)")
-        return v
+        return raw
 
     @field_validator("s3_input_prefixes", "s3_output_prefixes")
     @classmethod

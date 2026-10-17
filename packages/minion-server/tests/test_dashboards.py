@@ -83,6 +83,12 @@ def test_fleet_panels_count_only_online_executors(title: str) -> None:
     assert re.search(r"\bWHERE online\b", sqls[0]), sqls[0]
 
 
+def test_busy_executors_counts_only_online_executors_with_a_heartbeat() -> None:
+    (sql,) = [s for n, s in panels() if n == "fleet/Busy executors"]
+    assert "minion_ro.executor e WHERE e.online" in sql
+    assert "EXISTS (SELECT 1 FROM minion_ro.heartbeat h WHERE h.executor_id = e.executor_id)" in sql
+
+
 def test_static_check_catches_a_raw_table() -> None:
     assert RELATION.findall("SELECT 1 FROM minion_executor e JOIN minion_ro.task t ON true") == [
         "minion_executor",
@@ -183,3 +189,101 @@ async def test_minion_readonly_cannot_read_secrets_or_write(ro_engine: AsyncEngi
             )
         ]
     assert online == [(1, 1)]  # ACTIVE and seen just now
+
+
+INITDB_SQL = REPO_ROOT / "deploy" / "postgres" / "initdb" / "01-grafana-role.sql.in"
+INITDB_PW = "grafana-test-pw"
+
+
+def psql_statements(script: str) -> list[tuple[str, bool]]:
+    """Split a psql script into (statement, is_gexec). Handles only what the initdb SQL uses:
+    `--` comment lines, `;`-terminated statements (with $$ bodies) and `... \\gexec` queries."""
+    out: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    for line in script.splitlines():
+        if not buf and (not line.strip() or line.lstrip().startswith("--")):
+            continue
+        buf.append(line)
+        text_ = "\n".join(buf)
+        if text_.rstrip().endswith("\\gexec"):
+            out.append((text_.rstrip()[: -len("\\gexec")].strip(), True))
+            buf = []
+        elif text_.rstrip().endswith(";") and text_.count("$$") % 2 == 0:
+            out.append((text_.rstrip().rstrip(";"), False))
+            buf = []
+    assert not buf, buf
+    return out
+
+
+@pytest.fixture
+async def grafana_engine(fresh_url: str) -> AsyncIterator[tuple[AsyncEngine, AsyncEngine]]:
+    """Replays the real initdb SQL as the container superuser in a fresh migrated database;
+    yields (minion_grafana engine, superuser engine)."""
+    base = make_url(fresh_url)
+    script = INITDB_SQL.read_text().replace(":'pw'", f"'{INITDB_PW}'")
+    admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
+    gf = create_async_engine(
+        base.set(username="minion_grafana", password=INITDB_PW), isolation_level="AUTOCOMMIT"
+    )
+    try:
+        async with admin.connect() as conn:
+            for stmt, gexec in psql_statements(script):
+                if gexec:
+                    for (generated,) in (await conn.execute(text(stmt))).all():
+                        await conn.execute(text(generated))
+                else:
+                    await conn.execute(text(stmt))
+        yield gf, admin
+    finally:
+        await gf.dispose()
+        await admin.dispose()
+        cleanup = create_async_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        async with cleanup.connect() as conn:
+            await conn.execute(text(f"DROP DATABASE IF EXISTS {base.database} WITH (FORCE)"))
+            await conn.execute(text("DROP ROLE IF EXISTS minion_grafana"))
+            await conn.execute(text("GRANT CONNECT ON DATABASE postgres, template1 TO PUBLIC"))
+        await cleanup.dispose()
+
+
+@pytest.mark.integration
+async def test_initdb_role_is_hardened(grafana_engine: tuple[AsyncEngine, AsyncEngine]) -> None:
+    gf, admin = grafana_engine
+    async with admin.connect() as conn:
+        limit = (
+            await conn.execute(
+                text("SELECT rolconnlimit FROM pg_roles WHERE rolname='minion_grafana'")
+            )
+        ).scalar_one()
+        assert limit == 5
+        assert (
+            await conn.execute(text("SELECT current_setting('is_superuser')"))
+        ).scalar_one() == "on"  # the app role is unaffected: still superuser
+        lo = await conn.execute(text("SELECT lo_from_bytea(0, 'abc'::bytea)"))
+        await conn.execute(text(f"SELECT lo_unlink({lo.scalar_one()})"))
+        priv = await conn.execute(
+            text(
+                "SELECT has_function_privilege('minion_grafana', 'lo_from_bytea(oid, bytea)',"
+                " 'EXECUTE'), has_function_privilege('minion_grafana', 'lo_creat(integer)',"
+                " 'EXECUTE'), has_function_privilege('minion_grafana', 'lo_create(oid)',"
+                " 'EXECUTE'), has_database_privilege('minion_grafana', current_database(),"
+                " 'TEMPORARY'), has_database_privilege('minion_grafana', current_database(),"
+                " 'CONNECT')"
+            )
+        )
+        assert tuple(priv.one()) == (False, False, False, False, True)
+    async with gf.connect() as conn:
+        assert (await conn.execute(text("SELECT count(*) FROM minion_ro.task"))).scalar_one() == 0
+    denied = [
+        "CREATE TEMP TABLE t_x (a int)",
+        "SET temp_file_limit = '100GB'",
+        "SELECT lo_from_bytea(0, 'abc'::bytea)",
+        "SELECT lo_creat(-1)",
+        "SELECT * FROM public.minion_task",
+        "SELECT * FROM public.minion_executor",
+    ]
+    for sql in denied:
+        async with gf.connect() as conn:
+            # the read-only default is only a session default: lift it so the PRIVILEGE is tested
+            await conn.execute(text("SET default_transaction_read_only = off"))
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await conn.execute(text(sql))

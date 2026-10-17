@@ -183,7 +183,10 @@ async def finish_attempt(
             SubtaskAcquirement.acquirement_id == o.acquirement_id
         )
     )
-    values: dict[str, Any] = {"status": subtask_status.value, "error": error}
+    values: dict[str, Any] = {
+        "status": subtask_status.value,
+        "error": error if error is not None else null(),
+    }
     if output_uri is not None:
         values["output_uri"] = output_uri
     await session.execute(

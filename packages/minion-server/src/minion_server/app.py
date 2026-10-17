@@ -41,6 +41,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         app.state.metrics = Metrics() if cfg.metrics_enabled else None
         if cfg.metrics_enabled and cfg.metrics_token is None and not is_loopback(cfg.host):
             structlog.get_logger().warning("metrics_unauthenticated", host=cfg.host)
+        if cfg.executor_online_idle_s != 120.0 or cfg.executor_online_busy_s != 600.0:
+            structlog.get_logger().warning(
+                "executor_online_thresholds_differ_from_dashboards",
+                idle_s=cfg.executor_online_idle_s,
+                busy_s=cfg.executor_online_busy_s,
+                note="minion_ro.executor.online (migration 0007) hardcodes 120/600",
+            )
         app.state.api_keys = api_keys
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)

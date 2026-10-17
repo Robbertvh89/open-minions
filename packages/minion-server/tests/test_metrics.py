@@ -114,6 +114,10 @@ def test_metrics_token_empty_is_unset_and_short_is_rejected() -> None:
     assert _cfg(metrics_token=TOKEN).metrics_token is not None
     with pytest.raises(ValueError, match="at least 32"):
         _cfg(metrics_token="short")
+    padded = _cfg(metrics_token=f"  {TOKEN}\n").metrics_token
+    assert padded is not None
+    assert padded.get_secret_value() == TOKEN
+    assert _cfg(metrics_token="  \n").metrics_token is None
 
 
 async def test_warns_when_metrics_are_open_on_a_non_loopback_host(
@@ -130,3 +134,15 @@ async def test_warns_when_metrics_are_open_on_a_non_loopback_host(
     async for _ in _client(cfg):
         pass
     assert "metrics_unauthenticated" not in capsys.readouterr().out
+
+
+async def test_warns_when_online_thresholds_differ_from_the_dashboards(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async for _ in _client(_settings(DEAD_DB)):
+        pass
+    assert "executor_online_thresholds" not in capsys.readouterr().out
+    cfg = _settings(DEAD_DB).model_copy(update={"executor_online_busy_s": 300.0})
+    async for _ in _client(cfg):
+        pass
+    assert "executor_online_thresholds" in capsys.readouterr().out

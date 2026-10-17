@@ -29,7 +29,7 @@ from minion_common.schemas import (
 )
 from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.runtime import FixedGovernor
-from minion_executor.loop import ExecutorLoop, cleanup_stale_tmp
+from minion_executor.loop import ExecutorLoop, _release_code, cleanup_stale_tmp
 from minion_executor.runners.base import Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
 
@@ -483,7 +483,7 @@ async def test_runner_release_with_invalid_code_uses_fallback_and_loop_survives(
 
     class RelWorker(FakeWorker):
         def run(self, batch: list[Record], *_: Any) -> list[Record]:
-            raise RunnerError("runner_error", "x", release=True)
+            raise RunnerError("runner-error!", "x", release=True)
 
     client = FakeClient([assignment(), assignment()])
     loop = make_loop(client, RelWorker(), FakeS3(), tmp_path, [])
@@ -3126,3 +3126,9 @@ async def test_governor_downgrade_during_429_backoff_unloads_warm_worker(tmp_pat
     await until(lambda: worker.unloads >= 1)
     loop.stop()
     await asyncio.wait_for(task, 10)
+
+
+def test_release_code_is_upper_cased_before_falling_back() -> None:
+    assert _release_code("budget_downgrade") == "BUDGET_DOWNGRADE"
+    assert _release_code("STOP") == "STOP"
+    assert _release_code("free text!") == "EXECUTOR_RELEASE"

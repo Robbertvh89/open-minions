@@ -1,5 +1,6 @@
 """Complete / fail / release (plan D6). Ownership is checked on every call (invariant 3)."""
 
+import re
 import uuid
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
@@ -119,6 +120,16 @@ async def finish_failed(
     return status
 
 
+_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
+_FAIL_FALLBACK = "RUNNER_ERROR"
+
+
+def normalize_fail_code(code: str) -> str:
+    """Upper-case a failure code; anything still not a stable code becomes RUNNER_ERROR."""
+    up = code.upper()
+    return up if _CODE_RE.fullmatch(up) else _FAIL_FALLBACK
+
+
 async def fail(
     session: AsyncSession,
     principal: ExecutorPrincipal,
@@ -133,7 +144,11 @@ async def fail(
             session,
             o,
             outcome=AttemptOutcome.FAILED,
-            error={"code": req.code, "message": req.message, "retryable": req.retryable},
+            error={
+                "code": normalize_fail_code(req.code),
+                "message": req.message,
+                "retryable": req.retryable,
+            },
             retryable=req.retryable,
         )
 

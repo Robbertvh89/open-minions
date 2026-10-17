@@ -196,7 +196,8 @@ FAIL_FALLBACK = "RUNNER_ERROR"
 def _release_code(code: str) -> str:
     """A release reason the server accepts; anything else (e.g. a runner's free-form code)
     becomes the fixed fallback so a bad code can never break the release."""
-    return code if _CODE_RE.fullmatch(code) else RELEASE_FALLBACK
+    up = code.upper()
+    return up if _CODE_RE.fullmatch(up) else RELEASE_FALLBACK
 
 
 def _fail_code(code: str) -> str:

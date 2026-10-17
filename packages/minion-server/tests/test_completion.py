@@ -452,3 +452,33 @@ async def test_task_partial_when_mixed(http: tuple[AsyncClient, Any], s3: S3Env)
         " FROM minion_task WHERE task_name='mix'",
     )
     assert tuple(end) == ("PARTIAL", True, 1, 1)
+
+
+@pytest.mark.integration
+async def test_fail_code_is_normalized_server_side(http: tuple[AsyncClient, Any]) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "normcode", 1, team="cmp6")
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET max_attempts=5 WHERE task_name='normcode'"))
+    ((p, tok),) = await make_executors(sm, 1)
+    for sent, stored in (("oom_killed", "OOM_KILLED"), ("not a code!", "RUNNER_ERROR")):
+        a = await _own(c, sm, "cmp6", tok, p.executor_id)
+        r = await c.post(
+            f"{BASE}/subtasks/{a['acquirement_id']}/fail",
+            json=FAIL | {"code": sent},
+            headers=_auth(tok),
+        )
+        assert r.status_code == 204, sent
+        row = await _one(
+            sm,
+            "SELECT error ->> 'code' FROM minion_subtask WHERE task_name='normcode'",
+        )
+        assert row[0] == stored
+        row = await _one(
+            sm,
+            "SELECT error ->> 'code' FROM minion_subtask_attempt WHERE task_name='normcode'"
+            " AND attempt = :n",
+            n=a["attempt"],
+        )
+        assert row[0] == stored
