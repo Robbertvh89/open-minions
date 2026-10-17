@@ -64,7 +64,7 @@ Files that exist today; the endpoints and services above are built on them in TA
   with `/`. `presign_ttl_s` ≤ 3600. The public S3 endpoint (`s3_public_endpoint_url`, defaults to
   `s3_endpoint_url`) must be https unless it is loopback.
 - **`db/session.py`** — the only place the async engine and sessionmaker are built. The `app.py`
-  lifespan creates the engine, loads the API keys file (if `MINION_API_KEYS_FILE` is set) into
+  lifespan creates the engine, creates the `KeyStore` (live-reloading API keys file, if `MINION_API_KEYS_FILE` is set) in
   `app.state`, and disposes the engine on shutdown. `S3Storage` is not yet constructed in the lifespan;
   wiring it in is part of TASK-2.2.
 - **`storage.py`** — `S3Storage` wraps sync boto3 and runs every call in `asyncio.to_thread` (plan D3).

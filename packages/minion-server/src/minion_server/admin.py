@@ -1,4 +1,4 @@
-"""Operator CLI: `generate-api-key | issue-executor-token | revoke-executor-token`."""
+"""Operator CLI: `generate-api-key | issue/revoke/rotate-executor-token | list-executors`."""
 
 import asyncio
 import re
@@ -84,14 +84,102 @@ def revoke_executor_token_cmd(
     typer.echo(f"revoked: {executor_id}")
 
 
-def api_key_snippet(name: str, key: str, teams: list[str]) -> dict[str, list[dict[str, object]]]:
-    return {"keys": [{"name": name, "sha256": sha256_hex(key), "teams": teams}]}
+@app.command("rotate-executor-token")
+def rotate_executor_token_cmd(
+    executor_id: Annotated[uuid.UUID, typer.Option(help="Executor to re-key")],
+    ttl_days: Annotated[
+        int | None, typer.Option(min=1, max=MAX_TTL_DAYS, help="New token lifetime in days")
+    ] = None,
+) -> None:
+    """Issue a new token for the same executor id; the old token stops working at once."""
+    settings = ServerSettings()
+    days = min(ttl_days or settings.executor_token_ttl_days, MAX_TTL_DAYS)
+
+    async def _run() -> str | None:
+        engine = create_engine(settings.database_url)
+        try:
+            async with create_sessionmaker(engine)() as session, session.begin():
+                return await rotate_executor_token(session, executor_id, ttl_days=days)
+        finally:
+            await engine.dispose()
+
+    token = asyncio.run(_run())
+    if token is None:
+        typer.echo(f"no such (or revoked) executor: {executor_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"executor_id: {executor_id}")
+    typer.echo(f"token (shown once): {token}")
+
+
+async def rotate_executor_token(
+    session: AsyncSession, executor_id: uuid.UUID, *, ttl_days: int
+) -> str | None:
+    token = secrets.token_urlsafe(32)
+    ok = await executors_repo.rotate_token(
+        session,
+        executor_id,
+        token_hash=sha256_hex(token),
+        token_expires_at=datetime.now(UTC) + timedelta(days=ttl_days),
+    )
+    return token if ok else None
+
+
+@app.command("list-executors")
+def list_executors_cmd() -> None:
+    """List executors (id, owner, pool, status, expiry). Never prints token hashes."""
+    settings = ServerSettings()
+
+    async def _run() -> list[executors_repo.ExecutorSummary]:
+        engine = create_engine(settings.database_url)
+        try:
+            async with create_sessionmaker(engine)() as session, session.begin():
+                return await executors_repo.list_all(session)
+        finally:
+            await engine.dispose()
+
+    def ts(v: datetime | None) -> str:
+        return v.isoformat(timespec="seconds") if v else "-"
+
+    for e in asyncio.run(_run()):
+        typer.echo(
+            "\t".join(
+                [
+                    str(e.executor_id),
+                    e.owner,
+                    e.pool,
+                    e.status.value,
+                    e.hostname,
+                    f"last_seen={ts(e.last_seen_at)}",
+                    f"token_expires={ts(e.token_expires_at)}",
+                ]
+            )
+        )
+
+
+def api_key_snippet(
+    name: str,
+    key: str,
+    teams: list[str],
+    *,
+    operator: bool = False,
+    expires_at: datetime | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    entry: dict[str, object] = {"name": name, "sha256": sha256_hex(key), "teams": teams}
+    if operator:
+        entry["operator"] = True
+    if expires_at is not None:
+        entry["expires_at"] = expires_at.isoformat(timespec="seconds")
+    return {"keys": [entry]}
 
 
 @app.command("generate-api-key")
 def generate_api_key_cmd(
     name: Annotated[str, typer.Option(help="Key owner name")],
     teams: Annotated[str, typer.Option(help="Comma-separated team slugs")],
+    operator: Annotated[bool, typer.Option("--operator", help="Grant the operator role")] = False,
+    expires_days: Annotated[
+        int | None, typer.Option(min=1, max=3650, help="Key expires after N days")
+    ] = None,
 ) -> None:
     """Generate a key, print it once, and print the YAML entry (hash only) for the keys file."""
     if not re.fullmatch(NAME_PATTERN, name):
@@ -104,7 +192,9 @@ def generate_api_key_cmd(
     key = secrets.token_urlsafe(32)
     typer.echo(f"api key (shown once): {key}")
     typer.echo("keys file snippet (append the entry under `keys:` if the file exists):")
-    typer.echo(yaml.safe_dump(api_key_snippet(name, key, team_list), sort_keys=False), nl=False)
+    expires = datetime.now(UTC) + timedelta(days=expires_days) if expires_days else None
+    snippet = api_key_snippet(name, key, team_list, operator=operator, expires_at=expires)
+    typer.echo(yaml.safe_dump(snippet, sort_keys=False), nl=False)
 
 
 if __name__ == "__main__":

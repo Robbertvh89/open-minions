@@ -1,6 +1,6 @@
 # ADR-0007: User API keys from a config file, not a database table
 
-- Status: **Accepted** (implemented in TASK-2.1; `auth.lookup_user` full-scan and startup load verified)
+- Status: **Accepted** (implemented in TASK-2.1; amended by TASK-6.1, see the Amendment below)
 - Date: 2026-10-15
 - Deciders: project owner
 - Deviates from paper: **no** — internal design choice; the paper does not specify user authentication.
@@ -28,10 +28,31 @@ authorized by team.
 ## Consequences
 
 - No schema change and no 8th table; the SPEC §7 count holds.
-- **Revoking a user key requires removing it from the file and restarting the server.** Keys are not
-  re-read at runtime. Executor tokens are different: they live in the database and are revoked
+- ~~Revoking a user key requires a restart~~ (superseded by the Amendment: keys are re-read live). Executor tokens are different: they live in the database and are revoked
   immediately (`minion-server-admin revoke-executor-token`).
-- Keys are not individually expirable; rotation means generating a new entry and deleting the old one.
+- Keys can carry `expires_at` (Amendment); rotation means adding a new entry and deleting the old one.
 - `created_by` is not referentially checked and can outlive a removed key; audit by name only.
 - Migrating to a table (or OIDC) in M5 is a migration plus a change to `current_user` only; the
   route-level contract (`Authorization: Bearer`, team scoping) stays the same.
+
+## Amendment (TASK-6.1, M5): keys file v2
+
+- Entries gain `operator: bool` (default false) and `expires_at` (timezone-aware ISO timestamp;
+  an expired key gets `401`). A top-level `teams: {slug: {default_pool, allowed_pools}}` map holds
+  per-team pool policy (SPEC S-1). Parsing stays strict (`extra=forbid`); a v1 file is valid unchanged.
+- **Live reload replaces "loaded once at startup".** `KeyStore` stats the file at most every
+  `MINION_API_KEYS_RELOAD_S` (default 5) on the next request and re-reads it when mtime, size or
+  inode changed. The file is read through one file descriptor (fstat then read), must be a regular
+  file and at most 1 MiB; symlinked files are allowed because secret mounts use them. A removed key
+  is therefore rejected within the reload interval without a restart.
+- **A malformed, unreadable or vanished file after startup fails closed**: every key gets `401` and an
+  error is logged (path and validation error types only, never file content or key material) until a
+  valid file is back. The first load at startup still aborts the server. Fixing the file restores access.
+- `require_operator` is a FastAPI dependency (`403 OPERATOR_REQUIRED`). No existing endpoint uses it yet;
+  the fleet endpoints of M5 will.
+- Task creation applies the team policy: no `allowed_pool` gets `default_pool`; a pool outside
+  `allowed_pools` is `403 POOL_NOT_ALLOWED`; `allowed_pools` without a default and no pool given is
+  `422 POOL_REQUIRED`. A team with only `default_pool` accepts any explicit pool. No policy = as before.
+- `created_by` stays a plain string: the FK is **won't-do** (it would need an 8th table, SPEC section 7).
+- Executor tokens: `rotate-executor-token` replaces the hash on the same row (same `executor_id`);
+  no schema change. Revoked executors are not rotated.

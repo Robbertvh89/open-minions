@@ -407,7 +407,10 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 
 - S-1. Executors run on personal work laptops: data confidentiality is the main risk **[paper]**.
   Mitigation: deploy per team/org with dedicated DB and isolated executor pools **[paper]**; tasks may be
-  restricted to an executor pool via `allowed_pool` **[ours]**.
+  restricted to an executor pool via `allowed_pool` **[ours]**. Per-team policy in the API keys file
+  (`teams: {slug: {default_pool, allowed_pools}}`): a task without `allowed_pool` gets the team default,
+  a pool outside `allowed_pools` is `403 POOL_NOT_ALLOWED`, and a team with `allowed_pools` but no default
+  needs an explicit pool (`422 POOL_REQUIRED`). Teams without a policy are unrestricted.
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
   via heartbeat) **[ours]**.
 - S-3. Executor tokens: random 256-bit (`token_urlsafe(32)`), stored as SHA-256 hash only, revocable,
@@ -421,11 +424,16 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - S-6. TLS required between executor and server outside local dev.
 - S-7. Model ids are allow-listed per deployment (executors must not pull arbitrary remote code;
   `trust_remote_code=False`).
-- S-8. User API keys: `minion-server-admin generate-api-key --name <name> --teams a,b` prints the key
-  once and a YAML entry holding only its SHA-256 hash. Entries live in the file named by
-  `MINION_API_KEYS_FILE`; lookup is by SHA-256 with `hmac.compare_digest`. The file is read at server
-  startup, so revoking a user key requires removing it and restarting the server. No DB table (ADR-0007).
-  `created_by` on a task records the key name; there is no foreign key yet (deferred to M5).
+- S-8. User API keys: `minion-server-admin generate-api-key --name <name> --teams a,b [--operator]
+  [--expires-days N]` prints the key once and a YAML entry holding only its SHA-256 hash. Entries live in
+  the file named by `MINION_API_KEYS_FILE`; lookup is by SHA-256 with `hmac.compare_digest`. The file is
+  re-read when it changes (checked every `MINION_API_KEYS_RELOAD_S`, default 5 s), so removing a key
+  revokes it within that interval without a restart. A file that becomes invalid fails closed (`401` for
+  all keys, error logged) until fixed. Keys may carry `expires_at` (expired = `401`) and `operator: true`
+  (`require_operator`, `403 OPERATOR_REQUIRED` otherwise). No DB table (ADR-0007).
+  `created_by` on a task records the key name; there is no foreign key (won't-do, ADR-0007 amendment).
+  Executor tokens: `list-executors` (never prints hashes) and `rotate-executor-token --executor-id`
+  (same id, new token shown once, old token `401`).
 - S-9. Storage configuration: S3 access and secret keys are required server settings and are never sent
   to executors. `MINION_S3_PUBLIC_ENDPOINT_URL` (the host that presigned URLs point at) must be `https`
   unless it is a loopback host; the server refuses to start otherwise. Presigned URLs use the configured

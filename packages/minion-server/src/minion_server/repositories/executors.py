@@ -195,3 +195,50 @@ async def get_preference(
     if row is None or all(v is None for v in row):
         return None
     return (row[0], row[1], row[2])
+
+
+@dataclass(frozen=True)
+class ExecutorSummary:
+    """Operator listing row. Deliberately has no token hash."""
+
+    executor_id: uuid.UUID
+    owner: str
+    pool: str
+    hostname: str
+    status: ExecutorStatus
+    last_seen_at: datetime | None
+    token_expires_at: datetime | None
+
+
+async def list_all(session: AsyncSession) -> list[ExecutorSummary]:
+    rows = await session.execute(
+        select(
+            Executor.executor_id,
+            Executor.owner,
+            Executor.pool,
+            Executor.hostname,
+            Executor.status,
+            Executor.last_seen_at,
+            Executor.token_expires_at,
+        ).order_by(Executor.registered_at, Executor.executor_id)
+    )
+    return [ExecutorSummary(r[0], r[1], r[2], r[3], ExecutorStatus(r[4]), r[5], r[6]) for r in rows]
+
+
+async def rotate_token(
+    session: AsyncSession,
+    executor_id: uuid.UUID,
+    *,
+    token_hash: str,
+    token_expires_at: datetime,
+) -> bool:
+    """Replace the token hash of a non-revoked executor (same id); False if none matched."""
+    result = await session.execute(
+        update(Executor)
+        .where(
+            Executor.executor_id == executor_id,
+            Executor.status != ExecutorStatus.REVOKED.value,
+        )
+        .values(token_hash=token_hash, token_expires_at=token_expires_at)
+    )
+    return bool(result.rowcount)  # type: ignore[attr-defined]

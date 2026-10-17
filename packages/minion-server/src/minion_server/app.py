@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 from minion_server.api import executor as executor_api
 from minion_server.api import tasks as tasks_api
-from minion_server.auth import load_api_keys
+from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.limits import BodyLimitMiddleware
 from minion_server.models_registry import load_models
@@ -21,7 +21,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or ServerSettings()
-        api_keys = load_api_keys(cfg.api_keys_file) if cfg.api_keys_file else None
+        api_keys = KeyStore(cfg.api_keys_file, cfg.api_keys_reload_s) if cfg.api_keys_file else None
         engine = create_engine(
             cfg.database_url, pool_size=cfg.db_pool_size, max_overflow=cfg.db_max_overflow
         )

@@ -12,6 +12,7 @@ from minion_server.admin import app as admin_app
 from minion_server.admin import issue_executor_token
 from minion_server.auth import (
     ExecutorPrincipal,
+    KeyStore,
     User,
     current_executor,
     current_user,
@@ -43,7 +44,7 @@ def _app(engine: AsyncEngine | None, keys: Path | None) -> FastAPI:
         s3_secret_key=SecretStr("sk"),
         api_keys_file=str(keys) if keys else None,
     )
-    app.state.api_keys = load_api_keys(keys) if keys else None
+    app.state.api_keys = KeyStore(keys) if keys else None
     if engine is not None:
         app.state.sessionmaker = create_sessionmaker(engine)
 
@@ -243,4 +244,96 @@ def test_revoke_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     assert r.exit_code == 0, r.output
     assert asyncio.run(with_sm(status)) == ExecutorStatus.REVOKED.value
     r = CliRunner().invoke(admin_app, ["revoke-executor-token", "--executor-id", str(uuid.uuid4())])
+    assert r.exit_code == 1
+
+
+def test_generate_api_key_operator_expiry(tmp_path: Path) -> None:
+    args = [
+        "generate-api-key",
+        "--name",
+        "ops",
+        "--teams",
+        "ml",
+        "--operator",
+        "--expires-days",
+        "7",
+    ]
+    result = CliRunner().invoke(admin_app, args)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    key = lines[0].split(": ", 1)[1]
+    f = tmp_path / "k.yaml"
+    f.write_text("\n".join(lines[2:]) + "\n")
+    user = load_api_keys(f)[hashlib.sha256(key.encode()).hexdigest()]
+    assert user.operator
+    assert user.expires_at is not None
+    assert timedelta(days=6) < user.expires_at - datetime.now(UTC) <= timedelta(days=7)
+
+
+def _env(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setenv("MINION_DATABASE_URL", url)
+    monkeypatch.setenv("MINION_S3_ACCESS_KEY", "ak")
+    monkeypatch.setenv("MINION_S3_SECRET_KEY", "sk")
+
+
+@pytest.mark.integration
+async def test_rotate_executor_token(engine: AsyncEngine) -> None:
+    from minion_server.admin import rotate_executor_token
+
+    sm = create_sessionmaker(engine)
+    eid, old = await issue_executor_token(sm, owner="r", pool="p", ttl_days=1)
+    app = _app(engine, None)
+
+    async def call(tok: str) -> tuple[int, dict[str, str]]:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.get("/e", headers={"Authorization": f"Bearer {tok}"})
+            return r.status_code, (r.json() if r.status_code == 200 else {})
+
+    assert (await call(old))[0] == 200
+    async with sm() as s, s.begin():
+        new = await rotate_executor_token(s, uuid.UUID(eid), ttl_days=2)
+    assert new is not None and new != old
+    assert (await call(old))[0] == 401
+    code, body = await call(new)
+    assert code == 200 and body["id"] == eid
+    async with sm() as s, s.begin():  # unknown id and revoked executors are not rotated
+        assert await rotate_executor_token(s, uuid.uuid4(), ttl_days=1) is None
+        await s.execute(
+            update(Executor)
+            .where(Executor.executor_id == uuid.UUID(eid))
+            .values(status=ExecutorStatus.REVOKED.value)
+        )
+    async with sm() as s, s.begin():
+        assert await rotate_executor_token(s, uuid.UUID(eid), ttl_days=1) is None
+    assert (await call(new))[0] == 401
+
+
+@pytest.mark.integration
+def test_rotate_and_list_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    async def issue() -> tuple[str, str]:
+        eng = create_async_engine(migrated_url)
+        try:
+            return await issue_executor_token(
+                create_sessionmaker(eng), owner="lister", pool="px", ttl_days=1
+            )
+        finally:
+            await eng.dispose()
+
+    eid, old = asyncio.run(issue())
+    _env(monkeypatch, migrated_url)
+    r = CliRunner().invoke(admin_app, ["list-executors"])
+    assert r.exit_code == 0, r.output
+    assert eid in r.stdout and "lister" in r.stdout
+    assert hashlib.sha256(old.encode()).hexdigest() not in r.stdout and old not in r.stdout
+    r = CliRunner().invoke(admin_app, ["rotate-executor-token", "--executor-id", eid])
+    assert r.exit_code == 0, r.output
+    new = next(ln.split(": ", 1)[1] for ln in r.stdout.splitlines() if ln.startswith("token"))
+    assert new != old and eid in r.stdout
+    r = CliRunner().invoke(admin_app, ["list-executors"])
+    assert hashlib.sha256(new.encode()).hexdigest() not in r.stdout
+    r = CliRunner().invoke(admin_app, ["rotate-executor-token", "--executor-id", str(uuid.uuid4())])
     assert r.exit_code == 1
