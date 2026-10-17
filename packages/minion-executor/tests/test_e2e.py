@@ -572,8 +572,8 @@ async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live
             got = await c.acquire(req)
             assert got is not None and got.team == "bbb"
         await _send_preference(live.url, token, PreferenceRequest())  # --clear
-        rows = await live.rows("SELECT count(*) FROM minion_executor_preference")
-        assert rows[0][0] == 0  # the preference is gone
+        rows = await live.rows("SELECT team, project, task_name FROM minion_executor_preference")
+        assert [tuple(r) for r in rows] == [(None, None, None)]  # cleared: all wildcards
         got = await c.acquire(req)
         assert got is not None  # plain acquisition still serves work
 
