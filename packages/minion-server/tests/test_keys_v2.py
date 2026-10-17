@@ -573,3 +573,39 @@ def test_foreign_owned_directory_rejected(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
     with pytest.raises(KeysFileUnsafeError):
         KeyStore(f)
+
+
+def test_dotdot_after_symlink_in_configured_path_is_physical(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    _good(real)  # real/k.yaml; there is no tmp_path/k.yaml
+    (tmp_path / "link").symlink_to(real / "sub")
+    # the kernel resolves link/.. to real/, not lexically to tmp_path/
+    assert KeyStore(f"{tmp_path}/link/../k.yaml").config is not None
+
+
+def test_symlink_not_owned_by_root_or_server_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from minion_server.auth import KeysFileUnsafeError
+
+    if os.getuid() == 0:
+        pytest.skip("root owns everything")
+    _good(tmp_path)
+    link = tmp_path / "keys.yaml"
+    link.symlink_to("k.yaml")
+    real_lstat = os.lstat
+
+    def foreign_link(p: str | os.PathLike[str]) -> os.stat_result:
+        st = real_lstat(p)
+        if os.fspath(p) == str(link):
+            fields = list(st)
+            fields[4] = os.getuid() + 1  # st_uid of a planted link
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(os, "lstat", foreign_link)
+    with pytest.raises(KeysFileUnsafeError):
+        KeyStore(link)

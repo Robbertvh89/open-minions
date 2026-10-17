@@ -1,4 +1,4 @@
-# ruff: noqa: PTH100, PTH115, PTH116, PTH118, PTH120
+# ruff: noqa: PTH109, PTH115, PTH116, PTH118, PTH120
 """Authentication dependencies: user API keys (file, plan D1) and executor tokens (DB, plan D2).
 
 Secrets are never logged. Lookups hash with SHA-256 and compare with `hmac.compare_digest`.
@@ -167,7 +167,10 @@ def _resolve_checked(path: str | Path) -> str:
     Every directory in which a name is looked up is checked, including the directory holding a
     symlink and every symlinked intermediate directory. Returns the resolved path.
     """
-    queue = os.path.abspath(os.fspath(path)).split("/")[::-1]
+    raw = os.fspath(path)
+    # no normpath: `..` must be resolved physically by the walk below, not lexically
+    full = raw if raw.startswith("/") else os.path.join(os.getcwd(), raw)
+    queue = full.split("/")[::-1]
     current = "/"
     checked: set[str] = set()
     hops = 0
@@ -182,7 +185,13 @@ def _resolve_checked(path: str | Path) -> str:
             current = os.path.dirname(current)
             continue
         candidate = os.path.join(current, name)
-        if stat.S_ISLNK(os.lstat(candidate).st_mode):
+        lst = os.lstat(candidate)
+        if stat.S_ISLNK(lst.st_mode):
+            # manual readlink bypasses fs.protected_symlinks: require a trusted link owner
+            if lst.st_uid not in (0, os.geteuid()):
+                raise KeysFileUnsafeError(
+                    "api keys path symlink is not owned by root or the server user"
+                )
             hops += 1
             if hops > _MAX_SYMLINK_HOPS:
                 raise OSError(errno.ELOOP, "too many symlinks in api keys path")
