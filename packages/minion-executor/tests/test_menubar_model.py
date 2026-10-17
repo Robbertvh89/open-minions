@@ -11,6 +11,7 @@ import pytest
 from minion_common.enums import CapacityProfile as P
 from minion_common.enums import PausedReason
 from minion_common.schemas import Budget
+from minion_executor.capacity.control import OwnerControl
 from minion_executor.capacity.safefile import SafeFileError, ensure_private_dir
 from minion_executor.capacity.status import (
     STATUS_FILE,
@@ -24,10 +25,14 @@ from minion_executor.menubar.model import (
     PAUSE_CHOICES,
     PROFILE_CHOICES,
     RESUME,
+    Action,
+    Kind,
     State,
+    action_error,
+    available_profiles,
     build_view,
     control_kwargs,
-    resolve_state_dir,
+    profile_choices,
 )
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
@@ -143,8 +148,80 @@ def test_actions_map_to_update_control_kwargs() -> None:
     assert set(by_label) == {AUTOMATIC, "Light", "Balanced", "Full", "Custom"}
 
 
-def test_resolve_state_dir() -> None:
-    assert resolve_state_dir({"MINION_EXECUTOR_STATE_DIR": "/var/x"}) == Path("/var/x")
-    assert resolve_state_dir({}).name == "open-minions"
-    with pytest.raises(ValueError, match="absolute"):
-        resolve_state_dir({"MINION_EXECUTOR_STATE_DIR": "rel/dir"})
+@pytest.mark.parametrize("raw", ["", "   ", "/var/x", "~/x", "rel/dir"])
+@pytest.mark.parametrize("name", ["MINION_EXECUTOR_STATE_DIR", "minion_executor_state_dir"])
+def test_state_dir_is_the_same_for_settings_and_menubar(
+    raw: str, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_executor.settings import ExecutorSettings, state_dir_from_env
+
+    monkeypatch.delenv("MINION_EXECUTOR_STATE_DIR", raising=False)
+    monkeypatch.setenv(name, raw)
+    try:
+        expected: Path | str = ExecutorSettings().state_dir
+    except ValueError:
+        expected = "error"
+    try:
+        got: Path | str = state_dir_from_env()
+    except ValueError:
+        got = "error"
+    assert got == expected
+    if raw == "rel/dir":
+        assert got == "error"
+    if raw.strip() == "":
+        assert isinstance(got, Path) and got.name == "open-minions"
+
+
+def test_only_configured_profiles_are_offered(tmp_path: Path) -> None:
+    cfg = tmp_path / "executor.toml"
+    cfg.write_text("")
+    cfg.chmod(0o600)
+    avail = available_profiles(cfg)
+    assert P.CUSTOM not in avail and {P.LIGHT, P.BALANCED, P.FULL} <= avail
+    labels = [label for label, _ in profile_choices(avail)]
+    assert labels == [AUTOMATIC, "Light", "Balanced", "Full"]
+    cfg.write_text(
+        "[profiles.custom]\ngpu_duty_cycle = 0.5\nmax_batch_size = 4\n"
+        'cpu_priority = "background"\nmemory_gb = 4\n'
+    )
+    avail = available_profiles(cfg)
+    assert P.CUSTOM in avail
+    assert "Custom" in [label for label, _ in profile_choices(avail)]
+    # an unloadable config offers the built-ins only
+    cfg.write_text("not toml [")
+    assert P.CUSTOM not in available_profiles(cfg)
+
+
+def test_action_error_rejects_unconfigured_profile() -> None:
+    custom = Action(Kind.PROFILE, profile=P.CUSTOM)
+    assert action_error(custom, {P.LIGHT}) is not None
+    assert action_error(custom, {P.CUSTOM}) is None
+    assert action_error(Action(Kind.PROFILE), set()) is None
+    assert action_error(RESUME, set()) is None
+
+
+def test_age_line_is_not_part_of_view_equality() -> None:
+    a = build_view(status(), now=NOW)
+    b = build_view(status(), now=NOW + timedelta(seconds=30))
+    assert a.updated is not None and b.updated is not None and a.updated != b.updated
+    assert a == b
+    assert all(not line.startswith("updated:") for line in a.lines)
+
+
+def test_owner_pause_and_pin_shown_when_no_executor_runs() -> None:
+    until = NOW + timedelta(hours=1)
+    ctl = OwnerControl(paused=True, paused_until=until, profile=P.FULL)
+    v = build_view(None, now=NOW, control=ctl)
+    assert v.state is State.NO_STATUS
+    assert f"Paused by you until {until.astimezone().strftime('%H:%M')}" in v.lines
+    assert v.profile_checked == "Full" and not v.can_pause and v.can_resume
+    forever = build_view(None, now=NOW, control=OwnerControl(paused=True))
+    assert "Paused by you until you resume" in forever.lines
+    expired = build_view(None, now=until + timedelta(minutes=1), control=ctl)
+    assert len(expired.lines) == 1 and expired.can_pause and not expired.can_resume
+    auto = build_view(None, now=NOW, control=OwnerControl())
+    assert auto.profile_checked == AUTOMATIC
+    running_paused = build_view(
+        status(paused_reason=PausedReason.USER_PAUSED), now=NOW, control=ctl
+    )
+    assert any(line.startswith("Paused by you until") for line in running_paused.lines)

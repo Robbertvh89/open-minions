@@ -76,3 +76,29 @@ def test_other_flock_errors_are_not_reported_as_already_running(
     with pytest.raises(SafeFileError, match="cannot lock") as ei:
         acquire_instance_lock(state_dir)
     assert not isinstance(ei.value, AlreadyRunningError)
+
+
+def test_concurrent_first_runs_on_a_fresh_dir_get_already_running(tmp_path: Path) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    for round_ in range(20):
+        d = tmp_path / f"fresh{round_}"
+        d.mkdir(mode=0o700)
+        barrier = threading.Barrier(8)
+
+        def attempt(d: Path = d, barrier: threading.Barrier = barrier) -> int | Exception:
+            barrier.wait()
+            try:
+                return acquire_instance_lock(d)
+            except Exception as exc:
+                return exc
+
+        with ThreadPoolExecutor(8) as pool:
+            results = [f.result() for f in [pool.submit(attempt) for _ in range(8)]]
+        fds = [r for r in results if isinstance(r, int)]
+        errs = [r for r in results if not isinstance(r, int)]
+        for fd in fds:
+            os.close(fd)
+        assert len(fds) == 1, results
+        assert all(type(e) is AlreadyRunningError for e in errs), errs
