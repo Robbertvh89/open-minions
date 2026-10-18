@@ -66,6 +66,7 @@ def test_constants_match_the_executor() -> None:
     params = inspect.signature(executor_loop.ExecutorLoop.__init__).parameters
     assert params["max_consecutive_failures"].default == sim.MAX_CONSECUTIVE_FAILURES
     assert params["failure_pause_s"].default == sim.FAILURE_PAUSE_S
+    assert params["complete_retries"].default == sim.COMPLETE_RETRIES
 
 
 def _executor_stub(backoff: tuple[float, float]) -> Any:
@@ -245,3 +246,117 @@ async def test_two_procs_split_the_sims(lv: Live) -> None:
         conf, tokens, procs=2, until=drained, poll_s=0.2, max_duration_s=60
     )
     assert rec.events["completed"] == 6 and secs < 60 and drained_ok
+
+
+# --- complete retry, Retry-After, jitter (TASK-7.4.1) ----------------------------------------
+
+
+def _complete_sim(
+    responses: list[Any], delays: list[float], **cfg: Any
+) -> tuple[sim.SimExecutor, list[int]]:
+    """A sim whose `complete` plays `responses` (an exception is raised, else returned)."""
+    calls: list[int] = []
+
+    async def complete(_aid: Any, _req: Any) -> None:
+        calls.append(1)
+        r = responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+
+    ex = sim.SimExecutor(
+        0,
+        SecretStr("t"),
+        SimConfig(base_url="http://127.0.0.1:1", backoff=(1.0, 4.0), **cfg),
+        Recorder(),
+        asyncio.Event(),
+        None,  # type: ignore[arg-type]
+    )
+    ex._client = types.SimpleNamespace(complete=complete)  # type: ignore[assignment]
+
+    async def record(seconds: float) -> None:
+        delays.append(seconds)
+
+    ex._sleep = record  # type: ignore[method-assign]
+    return ex, calls
+
+
+def _assignment() -> Any:
+    return types.SimpleNamespace(acquirement_id="x", record_count=1)
+
+
+async def test_two_503s_then_success_is_one_completion_honouring_retry_after() -> None:
+    from minion_common.client import ApiError
+
+    err = ApiError(503, "UNAVAILABLE", "busy", retry_after=7.0)
+    delays: list[float] = []
+    ex, calls = _complete_sim([err, err, None], delays)
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.DONE
+    assert len(calls) == 3 and ex.rec.events["completed"] == 1
+    assert ex.rec.events["complete_retried"] == 2 and "complete_failed" not in ex.rec.events
+    assert all(7.0 <= d <= 7.0 * 1.2 for d in delays) and len(delays) == 2
+
+
+async def test_transport_error_retry_that_gets_409_counts_complete_409_once() -> None:
+    import httpx
+    from minion_common.client import StaleAcquirementError
+
+    delays: list[float] = []
+    stale = StaleAcquirementError(409, "STALE", "gone")
+    ex, calls = _complete_sim([httpx.ConnectError("x"), stale], delays)
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.NEUTRAL
+    assert len(calls) == 2 and ex.rec.events["complete_409"] == 1
+    assert "completed" not in ex.rec.events and len(delays) == 1
+
+
+async def test_complete_gives_up_after_the_executor_retry_count() -> None:
+    from minion_common.client import ApiError
+
+    delays: list[float] = []
+    ex, calls = _complete_sim([ApiError(500, "E", "x")] * 9, delays)
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert len(calls) == sim.COMPLETE_RETRIES and ex.rec.events["complete_failed"] == 1
+
+
+async def test_a_4xx_complete_is_not_retried() -> None:
+    from minion_common.client import ApiError
+
+    ex, calls = _complete_sim([ApiError(422, "E", "x")], [])
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert len(calls) == 1
+
+
+async def test_acquire_503_with_retry_after_waits_it_out() -> None:
+    from minion_common.client import ApiError
+
+    delays: list[float] = []
+    ex, _ = _complete_sim([], delays)
+    exc = ApiError(503, "UNAVAILABLE", "busy", retry_after=9.0)
+    assert await ex._after_acquire_error(exc) is True
+    assert 9.0 <= delays[0] <= 9.0 * 1.2
+    plain = ApiError(503, "UNAVAILABLE", "busy")  # no header: ordinary back-off
+    assert await ex._after_acquire_error(plain) is True
+    assert delays[1] <= 4.0
+
+
+async def test_first_acquire_jitter_is_applied_once_before_the_first_acquire() -> None:
+    delays: list[float] = []
+    ex, _ = _complete_sim([], delays, first_acquire_jitter_s=3.0, acquire_pace_s=0.0)
+    order: list[str] = []
+
+    async def register() -> bool:
+        order.append("register")
+        return True
+
+    async def acquire(_req: Any) -> None:
+        order.append("acquire")
+        ex.stop.set()
+
+    async def aclose() -> None:
+        return None
+
+    ex._register = register  # type: ignore[method-assign]
+    ex._client = types.SimpleNamespace(acquire=acquire, aclose=aclose)  # type: ignore[assignment]
+    await ex.run()
+    assert order == ["register", "acquire"]
+    # the jitter once, then the idle back-off of the empty acquire
+    assert len(delays) == 2 and 0 <= delays[0] <= 3.0

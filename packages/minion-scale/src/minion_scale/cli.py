@@ -36,11 +36,11 @@ from minion_scale.seed import (
     RECORDS_PER_SUBTASK,
     SeedError,
     SeedSpec,
-    count_remaining,
     read_tokens_file,
     revoke_executors,
     seed_executors,
     seed_queue,
+    sum_remaining,
     upload_input,
     write_tokens_file,
 )
@@ -267,7 +267,13 @@ def run_cmd(
             "for this many seconds; 0 disables. Keep it above --work-s and --late-wait-s",
         ),
     ] = DEFAULT_STALL_S,
-    poll_s: float = 1.0,
+    poll_s: Annotated[
+        float,
+        typer.Option(min=0.05, help="Seconds between remaining-work polls (task counter sum)"),
+    ] = 5.0,
+    first_acquire_jitter_s: Annotated[
+        float, typer.Option(min=0, help="Each sim waits uniform(0, this) before its first acquire")
+    ] = 0.0,
     seed: int = 0,
     docker_project: Annotated[
         str, typer.Option(help="Compose project to read `docker stats` from (default: none)")
@@ -299,6 +305,7 @@ def run_cmd(
         failure_pause_s=failure_pause_s,
         faults=faults,
         late_wait_s=late_wait_s,
+        first_acquire_jitter_s=first_acquire_jitter_s,
         seed=seed,
     )
 
@@ -309,11 +316,14 @@ def run_cmd(
             await dbstats.ensure_extension(sm)
             before = await dbstats.snapshot(sm)
 
-            async def remaining() -> int:
-                return await count_remaining(sm, team=team)
+            latest: list[int] = []
 
             async def drained() -> bool:
-                return await remaining() == 0
+                latest[:] = [await sum_remaining(sm, team=team)]
+                return latest[0] == 0
+
+            async def remaining() -> int:  # `until` ran just before: reuse its answer
+                return latest[0] if latest else await sum_remaining(sm, team=team)
 
             rec, secs, did_drain = await run_fleet(
                 sim_cfg,
@@ -342,6 +352,8 @@ def run_cmd(
                 "failure_pause_s": failure_pause_s,
                 "fault_rates": {"vanish": vanish, "release": release, "fail": fail, "late": late},
                 "late_wait_s": late_wait_s,
+                "poll_s": poll_s,
+                "first_acquire_jitter_s": first_acquire_jitter_s,
                 "seed": seed,
                 "team": team,
             },
