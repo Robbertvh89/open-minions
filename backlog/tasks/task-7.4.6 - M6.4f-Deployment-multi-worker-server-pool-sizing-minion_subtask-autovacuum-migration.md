@@ -3,9 +3,10 @@ id: TASK-7.4.6
 title: >-
   M6.4f Deployment: multi-worker server, pool sizing, minion_subtask autovacuum
   migration
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 08:03'
 labels:
   - scale
 dependencies: []
