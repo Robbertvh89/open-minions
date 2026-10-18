@@ -143,3 +143,47 @@ async def test_any_key_stat_and_conditional_copy(s3: S3Env) -> None:
     assert not await st.any_key("cond/dst2")
     big = await st.list_keys("cond/", max_keys=1)
     assert len(big) > 1  # truncated listing signals "more than max_keys"
+
+
+@pytest.mark.integration
+async def test_presigned_post_enforces_size_cap(s3: S3Env) -> None:
+    import httpx
+
+    cfg = ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+    st = S3Storage(cfg)
+    cap = 1000
+
+    async def post(key: str, data: bytes, mutate: dict[str, str] | None = None) -> httpx.Response:
+        p = await st.presign_post(key, cap)
+        fields = {**p.fields, **(mutate or {})}
+        async with httpx.AsyncClient(timeout=30) as c:
+            return await c.post(p.url, data=fields, files={"file": ("o.jsonl", data)})
+
+    # (a) exactly at the cap is accepted
+    r = await post("post/a", b"x" * cap)
+    assert r.is_success, r.status_code
+    assert await st.head("post/a") == cap
+    # (b) one byte over is refused and nothing is stored
+    r = await post("post/b", b"x" * (cap + 1))
+    assert not r.is_success
+    assert await st.head("post/b") is None
+    # (c) an oversize POST onto an existing key leaves the old object intact
+    s3.client.put_object(Bucket=s3.bucket, Key="post/c", Body=b"old")
+    r = await post("post/c", b"y" * (cap + 1))
+    assert not r.is_success
+    assert s3.client.get_object(Bucket=s3.bucket, Key="post/c")["Body"].read() == b"old"
+    # (d) a tampered key is not accepted (SeaweedFS answers 307, AWS 403) and nothing is stored
+    r = await post("post/d", b"z", {"key": "post/d-evil"})
+    assert not r.is_success
+    assert await st.head("post/d-evil") is None and await st.head("post/d") is None
+    # (e) a bad signature is 403
+    r = await post("post/e", b"z", {"x-amz-signature": "0" * 64})
+    assert r.status_code == 403
+    assert await st.head("post/e") is None

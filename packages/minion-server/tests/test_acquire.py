@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -199,6 +202,13 @@ async def test_http_assignment_shape_and_204(http: tuple[AsyncClient, Any]) -> N
     assert "inputs/acq/shape/a.jsonl" in a["input_url"] and "X-Amz-Signature" in a["input_url"]
     sid = a["subtask_id"]
     assert f"outputs/acq/shape/_attempts/{sid:06d}/1.jsonl" in a["output_url"]
+    post = a["output_post"]
+    assert post["fields"]["key"] == f"outputs/acq/shape/_attempts/{sid:06d}/1.jsonl"
+    policy = json.loads(base64.b64decode(post["fields"]["policy"]))
+    assert ["content-length-range", 0, a["max_output_bytes"]] in policy["conditions"]
+    assert {"key": post["fields"]["key"]} in policy["conditions"]
+    exp = datetime.fromisoformat(policy["expiration"].replace("Z", "+00:00"))
+    assert abs((exp - datetime.now(UTC)).total_seconds() - 3600) < 3700
     assert (a["byte_start"], a["byte_end"]) == (sid * 100, sid * 100 + 100)
     assert (
         await c.post("/api/v1/executor/acquire", json={}, headers=_auth(token))
