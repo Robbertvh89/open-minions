@@ -21,6 +21,7 @@ from minion_server.auth import (
 from minion_server.db.models import Executor
 from minion_server.db.session import create_sessionmaker, get_session
 from minion_server.settings import ServerSettings
+from minion_server.tokencache import ExecutorTokenCache
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -47,6 +48,8 @@ def _app(engine: AsyncEngine | None, keys: Path | None) -> FastAPI:
     app.state.api_keys = KeyStore(keys) if keys else None
     if engine is not None:
         app.state.sessionmaker = create_sessionmaker(engine)
+        app.state.auth_sessionmaker = app.state.sessionmaker
+    app.state.executor_tokens = ExecutorTokenCache(0.0, 100)  # TTL 0: immediate revocation
 
     @app.get("/u")
     async def u(user: User = Depends(current_user)) -> dict[str, object]:  # noqa: B008
