@@ -15,11 +15,13 @@ from minion_common.schemas import (
     FailRequest,
     ModelEntry,
     PreferenceRequest,
+    PresignedPost,
     TaskCreate,
     parse_params,
 )
 from pydantic import ValidationError
 
+POST = {"url": "https://s/o", "fields": {"key": "k", "policy": "p"}}
 BUDGET = Budget(profile=CapacityProfile.BALANCED, memory_gb=8, gpu_duty_cycle=0.5, max_batch_size=8)
 
 
@@ -121,7 +123,7 @@ def test_assignment_roundtrip() -> None:
         byte_start=0,
         byte_end=10,
         record_count=2,
-        output_url="http://y",
+        output_post=PresignedPost(url="http://y", fields={"key": "k", "policy": "p"}),
         expires_at=datetime.now(UTC),
     )
     assert Assignment.model_validate_json(a.model_dump_json()) == a
@@ -349,7 +351,7 @@ def test_assignment_and_responses_ignore_unknown_fields() -> None:
     from minion_common.schemas import Assignment, HeartbeatResponse, RegisterResponse
 
     hb = HeartbeatResponse.model_validate(
-        {"cancel": False, "output_url": "https://s/o", "expires_at": "2030-01-01T00:00:00Z", "x": 1}
+        {"cancel": False, "output_post": POST, "expires_at": "2030-01-01T00:00:00Z", "x": 1}
     )
     assert hb.cancel is False
     eid = str(uuid.uuid4())
@@ -365,7 +367,7 @@ def test_assignment_and_responses_ignore_unknown_fields() -> None:
         {
             "acquirement_id": eid, "attempt": 1, "team": "t", "project": "p", "task_name": "n",
             "subtask_id": 0, "type": "embedding", "model": model, "input_url": "https://s/i",
-            "byte_start": 0, "byte_end": 5, "record_count": 1, "output_url": "https://s/o",
+            "byte_start": 0, "byte_end": 5, "record_count": 1, "output_post": POST,
             "expires_at": "2030-01-01T00:00:00Z", "future_field": {"a": 1},
         }
     )  # fmt: skip

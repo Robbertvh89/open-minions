@@ -86,9 +86,6 @@ class S3Storage:
         """Presigned GET. `byte_range` is `[start, end)` (like the subtask's byte_start/end)."""
         return await asyncio.to_thread(self._presign, "get_object", key, ttl_s, byte_range)
 
-    async def presign_put(self, key: str, ttl_s: int | None = None) -> str:
-        return await asyncio.to_thread(self._presign, "put_object", key, ttl_s)
-
     def _presign_post(self, key: str, max_bytes: int, ttl_s: int | None) -> PresignedPost:
         ttl = min(ttl_s or self._ttl, self._ttl)
         # The signed policy makes S3 itself refuse an object above `max_bytes` (SPEC S-2);

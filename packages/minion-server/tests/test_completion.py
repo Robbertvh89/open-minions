@@ -521,3 +521,46 @@ async def test_fail_code_is_normalized_server_side(http: tuple[AsyncClient, Any]
             n=a["attempt"],
         )
         assert row[0] == stored
+
+
+@pytest.mark.integration
+async def test_evil_executor_cannot_upload_above_the_signed_cap(
+    http: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    """S3 itself refuses an oversize POST (ADR-0017): the attempt object never exists, so
+    `complete` answers OUTPUT_MISSING; an in-cap POST then works and complete succeeds."""
+    import httpx
+
+    c, app = http
+    sm = app.state.sessionmaker
+    app.state.settings = app.state.settings.model_copy(update={"max_output_bytes": 64})
+    await seed_task(sm, "evil", 1, team="cmp10")
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, "cmp10", tok, p.executor_id)
+    post = a["output_post"]
+    key = post["fields"]["key"]
+    done = f"{BASE}/subtasks/{a['acquirement_id']}/complete"
+
+    async def upload(data: bytes) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=30) as raw:
+            return await raw.post(post["url"], data=post["fields"], files={"file": ("o", data)})
+
+    big = b"x" * 64 + b"\n"
+    assert not (await upload(big)).is_success  # 65 bytes
+    assert not _exists(s3, key)
+    body = {
+        "record_count": a["record_count"],
+        "byte_size": len(big),
+        "sha256": hashlib.sha256(big).hexdigest(),
+    }
+    r = await c.post(done, json=body, headers=_auth(tok))
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_MISSING")
+
+    ok = b"x" * 63 + b"\n"  # exactly the cap
+    assert (await upload(ok)).is_success
+    body = {
+        "record_count": a["record_count"],
+        "byte_size": len(ok),
+        "sha256": hashlib.sha256(ok).hexdigest(),
+    }
+    assert (await c.post(done, json=body, headers=_auth(tok))).status_code == 204

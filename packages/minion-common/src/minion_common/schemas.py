@@ -304,8 +304,7 @@ class Assignment(_ResponseModel):
     byte_start: int = Field(ge=0)
     byte_end: int = Field(gt=0, description="Exclusive end offset")
     record_count: int = Field(ge=1)
-    output_url: str | None = None  # legacy PUT URL; removed in the cutover
-    output_post: PresignedPost | None = None
+    output_post: PresignedPost
     expires_at: AwareDatetime
     # The server's output size cap; the executor enforces min(local, this). Absent on old servers.
     max_output_bytes: int | None = Field(default=None, gt=0)
@@ -368,8 +367,7 @@ class PresenceRequest(_Model):
 
 class HeartbeatResponse(_ResponseModel):
     cancel: bool
-    output_url: str | None = None  # legacy PUT URL; removed in the cutover
-    output_post: PresignedPost | None = None
+    output_post: PresignedPost
     expires_at: AwareDatetime
 
 

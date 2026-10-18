@@ -28,6 +28,7 @@ from minion_common.schemas import (
 from pydantic import SecretStr
 
 BUDGET = Budget(profile=CapacityProfile.LIGHT, memory_gb=4, gpu_duty_cycle=0.25, max_batch_size=4)
+POST = {"url": "http://s3/out", "fields": {"key": "k", "policy": "p"}}
 REQ = AcquireRequest(engines=[Engine.MLX], budget=BUDGET)
 AID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 ASSIGNMENT = {
@@ -51,7 +52,7 @@ ASSIGNMENT = {
     "byte_start": 0,
     "byte_end": 10,
     "record_count": 2,
-    "output_url": "http://s3/out",
+    "output_post": POST,
     "expires_at": datetime.now(UTC).isoformat(),
 }
 
@@ -247,7 +248,7 @@ async def test_heartbeat_ok_and_stale() -> None:
                 200,
                 json={
                     "cancel": True,
-                    "output_url": "http://s3/new",
+                    "output_post": {**POST, "url": "http://s3/new"},
                     "expires_at": datetime.now(UTC).isoformat(),
                 },
             )
@@ -259,7 +260,7 @@ async def test_heartbeat_ok_and_stale() -> None:
     async with _client(handler) as c:
         out = await c.heartbeat(AID, req)
         assert out.cancel is True
-        assert out.output_url == "http://s3/new"
+        assert out.output_post.url == "http://s3/new"
         with pytest.raises(StaleAcquirementError):
             await c.heartbeat(AID, HeartbeatRequest())
     assert seen[0].url.path.endswith(f"/subtasks/{AID}/heartbeat")
@@ -328,7 +329,7 @@ async def test_retry_after_parsing_is_strict_ascii_seconds(
 def test_heartbeat_response_requires_aware_expires_at() -> None:
     with pytest.raises(ValueError):
         HeartbeatResponse.model_validate(
-            {"cancel": False, "output_url": "http://s3/out", "expires_at": "2026-01-01T00:00:00"}
+            {"cancel": False, "output_post": POST, "expires_at": "2026-01-01T00:00:00"}
         )
 
 

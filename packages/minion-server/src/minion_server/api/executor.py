@@ -143,6 +143,12 @@ async def acquire(
     storage: Annotated[S3Storage, Depends(_storage)],
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
 ) -> Response:
+    if body.output_upload is None:
+        # Rollout gate (ADR-0017): before any claim, so an old executor never acquires a subtask
+        # whose assignment it cannot parse (it would orphan it until the ack expiry).
+        raise api_error(
+            426, "EXECUTOR_OUTDATED", "upgrade the executor: output uploads use presigned POST"
+        )
     started = time.perf_counter()
     # the deadline runs from the request's arrival (ArrivalStampMiddleware), not from here
     arrival = request.scope.get(ARRIVAL_KEY, time.monotonic())

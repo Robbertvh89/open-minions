@@ -46,6 +46,9 @@ def test_presigned_post_validation() -> None:
             PresignedPost(url="http://s3/b", fields=fields)
 
 
-def test_assignment_ignores_unknown_fields_and_output_post_optional() -> None:
-    assert "output_post" in Assignment.model_fields
-    assert Assignment.model_fields["output_post"].default is None
+def test_output_post_is_required_on_assignment_and_heartbeat() -> None:
+    from minion_common.schemas import HeartbeatResponse
+
+    assert Assignment.model_fields["output_post"].is_required()
+    assert HeartbeatResponse.model_fields["output_post"].is_required()
+    assert "output_url" not in Assignment.model_fields

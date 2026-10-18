@@ -268,7 +268,7 @@ def _budget(mem: float = 8.0) -> Budget:
 
 
 def _req(mem: float = 8.0, engines: tuple[Engine, ...] = (Engine.MLX,)) -> AcquireRequest:
-    return AcquireRequest(engines=list(engines), budget=_budget(mem))
+    return AcquireRequest(engines=list(engines), budget=_budget(mem), output_upload="post")
 
 
 async def seed_task(
