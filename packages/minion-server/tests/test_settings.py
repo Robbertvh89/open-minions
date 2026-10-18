@@ -148,3 +148,10 @@ def test_connection_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     s = ServerSettings(_env_file=None)
     assert s.connection_budget == 50
     assert s.acquire_concurrency_limit == 8  # per process, not divided by workers
+
+
+def test_connection_limit_and_watchdog_pool_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ServerSettings(_env_file=None).connection_limit == 93
+    monkeypatch.setenv("MINION_WATCHDOG_DB_POOL_SIZE", "0")
+    with pytest.raises(ValueError):
+        ServerSettings(_env_file=None)

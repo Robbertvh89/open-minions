@@ -1,8 +1,8 @@
 import asyncio
 import os
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import structlog
 from fastapi import FastAPI, Request
@@ -16,7 +16,13 @@ from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.errors import busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
-from minion_server.metrics import MULTIPROC_ENV, Metrics, MetricsMiddleware
+from minion_server.metrics import (
+    MULTIPROC_ENV,
+    Metrics,
+    MetricsMiddleware,
+    mark_worker_dead,
+    prepare_metrics_dir,
+)
 from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
 from minion_server.netutil import is_loopback
@@ -88,6 +94,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             splitter.cancel()
             await asyncio.gather(splitter, return_exceptions=True)
             await engine.dispose()
+            if cfg.metrics_enabled:
+                mark_worker_dead()
 
     app = FastAPI(title="open-minions server", version="0.1.0", lifespan=lifespan)
 
@@ -121,20 +129,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     return app
 
 
-def prepare_metrics_dir(path: str) -> None:
-    """Create (0700) and empty the multiprocess metrics dir; the parent does this before forking
-    workers so a previous run's samples never leak into this one."""
-    d = Path(path)
-    d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for f in d.glob("*.db"):
-        f.unlink(missing_ok=True)
-
-
 def main() -> None:
     import uvicorn
 
     settings = ServerSettings()
-    if settings.connection_budget > settings.db_max_connections:
+    if settings.connection_budget >= settings.connection_limit:
         structlog.get_logger().warning(
             "db_connection_budget_exceeded",
             workers=settings.server_workers,
@@ -142,17 +141,26 @@ def main() -> None:
             watchdog=settings.watchdog_db_pool_size,
             budget=settings.connection_budget,
             db_max_connections=settings.db_max_connections,
+            reserved=settings.db_reserved_connections,
+            limit=settings.connection_limit,
         )
     if settings.server_workers == 1:
         uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
         return
+    metrics_dir: str | None = None
+    remove_dir = False
     if settings.metrics_enabled:
-        prepare_metrics_dir(settings.metrics_multiproc_dir)
-        os.environ[MULTIPROC_ENV] = settings.metrics_multiproc_dir  # inherited by the workers
-    uvicorn.run(
-        "minion_server.app:create_app",
-        factory=True,
-        workers=settings.server_workers,
-        host=settings.host,
-        port=settings.port,
-    )
+        # Set in the parent before spawning workers (fresh interpreters inherit the env).
+        metrics_dir, remove_dir = prepare_metrics_dir(settings.metrics_multiproc_dir)
+        os.environ[MULTIPROC_ENV] = metrics_dir
+    try:
+        uvicorn.run(
+            "minion_server.app:create_app",
+            factory=True,
+            workers=settings.server_workers,
+            host=settings.host,
+            port=settings.port,
+        )
+    finally:
+        if metrics_dir is not None and remove_dir:
+            shutil.rmtree(metrics_dir, ignore_errors=True)

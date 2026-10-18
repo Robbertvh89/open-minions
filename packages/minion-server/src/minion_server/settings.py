@@ -43,10 +43,17 @@ class ServerSettings(BaseSettings):
     # (startup warning only; PG default 100). The watchdog pool is added to the total.
     server_workers: int = Field(default=1, ge=1, le=32)
     db_max_connections: int = Field(default=100, ge=1)
-    watchdog_db_pool_size: int = Field(default=2, ge=0)  # same MINION_ var the watchdog reads
+    # Connections kept for others: superuser_reserved_connections (3) + Grafana (4).
+    db_reserved_connections: int = Field(default=7, ge=0)
+    # Same MINION_ var the watchdog reads (ge=1 like there); set it on the server service too,
+    # otherwise the budget check counts the default.
+    watchdog_db_pool_size: int = Field(default=2, ge=1)
     # Prometheus multiprocess directory, used only when workers > 1 and metrics are enabled.
-    # Wiped at startup by the parent; must be writable (the /tmp tmpfs in the container).
-    metrics_multiproc_dir: str = "/tmp/minion-metrics"  # noqa: S108
+    # Unset (default): the parent creates a fresh private 0700 dir (mkdtemp) and removes it on
+    # exit. Set: must be an existing real directory (no symlink) owned by the server user with no
+    # group/other access, else the server exits 2; only its counter_/histogram_/gauge_ *.db files
+    # are deleted at startup.
+    metrics_multiproc_dir: str | None = None
 
     # Object storage (S3 API). Executors get presigned URLs built against the public endpoint.
     s3_endpoint_url: str = "http://localhost:9000"
@@ -196,6 +203,11 @@ class ServerSettings(BaseSettings):
         if self.acquire_concurrency is not None:
             return self.acquire_concurrency
         return max(1, self.db_pool_size + self.db_max_overflow - 4)
+
+    @property
+    def connection_limit(self) -> int:
+        """Connections available to this deployment: max_connections minus the reserved ones."""
+        return self.db_max_connections - self.db_reserved_connections
 
     @property
     def connection_budget(self) -> int:
