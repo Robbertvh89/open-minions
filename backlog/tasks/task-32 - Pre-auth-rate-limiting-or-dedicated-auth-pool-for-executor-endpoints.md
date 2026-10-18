@@ -1,9 +1,10 @@
 ---
 id: TASK-32
 title: Pre-auth rate limiting or dedicated auth pool for executor endpoints
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 06:57'
+updated_date: '2026-10-18 18:19'
 labels:
   - security
 dependencies: []
