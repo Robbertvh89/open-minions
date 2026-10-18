@@ -8,6 +8,7 @@ path, no shell and a timeout.
 from __future__ import annotations
 
 import contextlib
+import grp
 import os
 import plistlib
 import re
@@ -91,7 +92,15 @@ def refuse_root() -> None:
         raise ValueError("refusing to run as root; run as the user who owns the agent")
 
 
-ADMIN_GID = 80  # macOS "admin" group
+def _admin_gid() -> int:
+    try:
+        return grp.getgrnam("admin").gr_gid
+    except KeyError:
+        return 80  # macOS "admin" group
+
+
+ADMIN_GID = _admin_gid()
+MAX_SYMLINK_HOPS = 40
 
 
 def _check_owned_not_writable(path: Path) -> None:
@@ -111,16 +120,38 @@ def _check_owned_not_writable(path: Path) -> None:
         raise ValueError(f"{path} is writable by a non-admin group; refusing")
 
 
+def _chain_paths(raw: str) -> set[Path]:
+    """`raw` as written, every symlink hop's target as written (bounded), and the final resolved
+    path: a loose intermediate directory in a link chain must be seen, not just the end."""
+    seen: set[Path] = set()
+    cur = Path(os.path.abspath(raw))  # noqa: PTH100 - normalise ".." only
+    for _ in range(MAX_SYMLINK_HOPS):
+        seen.add(cur)
+        # A symlinked ancestor is a hop too: resolve the parent, then read the leaf.
+        try:
+            if not cur.is_symlink():
+                break
+            target = cur.readlink()
+        except OSError:
+            break
+        cur = Path(os.path.abspath(cur.parent / target))  # noqa: PTH100
+    else:
+        raise ValueError(f"{raw} has more than {MAX_SYMLINK_HOPS} symlink hops; refusing")
+    with contextlib.suppress(OSError, RuntimeError):
+        seen.add(Path(raw).resolve())
+    return seen
+
+
 def check_install_chain(exe: str) -> None:
     """The launchd job runs `exe` with `sys.executable` and `sys.prefix` in your name: every
-    one of them and every ancestor (as written and symlink-resolved) must be owned by you or root
-    and not writable by others or by a group other than admin. Sticky world-writable directories
-    such as /tmp are refused."""
+    one of them, each symlink hop's target and every ancestor (as written and resolved) must be
+    owned by you or root and not writable by others or by a group other than admin. Sticky
+    world-writable directories such as /tmp are refused.
+
+    Scope: the interpreter path and its ancestors. The stdlib and site-packages are descendants of
+    the prefix and normally carry the same permissions; they are not walked separately."""
     for raw in (exe, sys.executable, sys.prefix):
-        candidates = {Path(os.path.abspath(raw))}  # noqa: PTH100 - normalise ".." only
-        with contextlib.suppress(OSError, RuntimeError):
-            candidates.add(Path(raw).resolve())
-        for cand in sorted(candidates):
+        for cand in sorted(_chain_paths(raw)):
             for p in (cand, *cand.parents):
                 _check_owned_not_writable(p)
 
@@ -226,6 +257,11 @@ def uninstall_agent(
     for the job to exit after `bootout` answered.
     """
     plist_path = plist_dir / f"{label}.plist"
+    if plist_path.is_symlink() or plist_path.exists():
+        try:
+            check_plist_file(plist_path)
+        except (OSError, ValueError) as exc:
+            raise fail(f"{exc}; " + manual_removal(label, plist_path)) from None
     doc = read_plist(plist_path)
     if doc is None:
         # Absent or unreadable. Only "not loaded and no file" is a clean nothing-to-do: a loaded

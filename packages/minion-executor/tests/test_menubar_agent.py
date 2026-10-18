@@ -356,12 +356,14 @@ def test_chain_refuses_writable_component(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str, mode: int
 ) -> None:
     exe = _chain(tmp_path, monkeypatch)
+    monkeypatch.setattr(launchd, "ADMIN_GID", -1)
     target = {"exe": exe, "bindir": exe.parent, "root": exe.parent.parent}[which]
     target.chmod(mode)
     with pytest.raises(ValueError, match=r"writable|owned"):
         launchd.check_install_chain(str(exe))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the shared temp dir is sticky elsewhere")
 def test_chain_tolerates_admin_group_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stock Homebrew leaves /opt/homebrew/Cellar admin-group writable; admins can sudo anyway."""
     exe = _chain(tmp_path, monkeypatch)
@@ -392,6 +394,65 @@ def test_chain_vets_resolved_symlink_target(
     link.symlink_to(loose / "real")
     with pytest.raises(ValueError, match="writable"):
         launchd.check_install_chain(str(link))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the shared temp dir is sticky elsewhere")
+def test_chain_vets_intermediate_symlink_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exe = _chain(tmp_path, monkeypatch)
+    real = tmp_path / "tight" / "real"
+    real.parent.mkdir()
+    real.parent.chmod(0o755)
+    real.write_text("x")
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    loose.chmod(0o777)
+    (loose / "hop").symlink_to(real)  # hop 2 lives in a loose dir, the end is tight
+    (exe.parent / "link").symlink_to(loose / "hop")
+    with pytest.raises(ValueError, match="writable"):
+        launchd.check_install_chain(str(exe.parent / "link"))
+
+
+def test_chain_symlink_loop_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    exe = _chain(tmp_path, monkeypatch)
+    (exe.parent / "a").symlink_to(exe.parent / "b")
+    (exe.parent / "b").symlink_to(exe.parent / "a")
+    with pytest.raises(ValueError, match="symlink hops"):
+        launchd.check_install_chain(str(exe.parent / "a"))
+
+
+@pytest.mark.parametrize("kind", ["symlink", "group_writable"])
+def test_uninstall_refuses_unsafe_plist(fake: Fake, tmp_path: Path, kind: str) -> None:
+    plist = installed(tmp_path)
+    if kind == "symlink":
+        other = tmp_path / "other.plist"
+        other.write_bytes(plist.read_bytes())
+        plist.unlink()
+        plist.symlink_to(other)
+    else:
+        plist.chmod(0o664)
+    res = runner.invoke(app, args(tmp_path, "uninstall"))
+    assert res.exit_code == 2 and "launchctl bootout" in res.output
+    assert not any(c[0] == "bootout" for c in fake.calls)
+    assert plist.is_symlink() or plist.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_unsafe_menubar_lock_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    lock = state / "menubar.lock"
+    if kind == "symlink":
+        lock.symlink_to(tmp_path / "elsewhere")
+    else:
+        os.mkfifo(lock)
+    monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(state))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    res = runner.invoke(app, ["menubar"])
+    assert res.exit_code == 2, res.output
 
 
 # --- single instance (R6) --------------------------------------------------------------------

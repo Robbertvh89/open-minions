@@ -48,6 +48,8 @@ governor needs.
   credentials/query/fragment, and an unsafe `~/Library/LaunchAgents` (symlink, not ours, or
   group/other-writable). Uninstall only touches a plist whose `ProgramArguments` are
   `[.../minion-executor, run, ...]`.
+- **Admin-group exception.** The install-chain check tolerates group write for the macOS `admin`
+  group only: admins can sudo anyway, and stock Homebrew's Cellar is admin-group writable.
 - **Logs.** Directory 0700 (an existing directory of ours is tightened), file 0600 (pre-created),
   plist `Umask 077`. Not rotated.
 - **`ExitTimeOut = ceil(grace) + 15`** (FR-17). launchd's default 20 s would SIGKILL a stopping

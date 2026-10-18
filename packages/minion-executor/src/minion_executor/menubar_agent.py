@@ -1,9 +1,9 @@
 """`minion-executor menubar install|uninstall|status`: launch the menu-bar app at login (ADR-0011).
 
-A second, independent per-user LaunchAgent. It reuses the helpers in `service` (TCC check, agents
-dir vetting, safe plist write, launchctl) but has its own label and plist, and refuses to touch
-the executor's. The plist carries no secret and no token: the menu-bar app only reads and writes
-the local status.json / control.json.
+A second, independent per-user LaunchAgent. It reuses the shared helpers in `launchd` (agents
+dir and install-chain vetting, safe plist write, launchctl) but has its own label and plist, and
+refuses to touch the executor's. The plist carries no secret and no token: the menu-bar app only
+reads and writes the local status.json / control.json.
 """
 
 from __future__ import annotations
