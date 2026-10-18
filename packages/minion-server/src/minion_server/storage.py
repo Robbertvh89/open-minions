@@ -207,6 +207,10 @@ class S3Storage:
                     Bucket=self._bucket,
                     Key=dst_key,
                     CopySource={"Bucket": self._bucket, "Key": src_key},
+                    # Executor-supplied form fields (Content-Type, x-amz-meta-*) must not survive
+                    # into the promoted output.
+                    MetadataDirective="REPLACE",
+                    ContentType="application/x-ndjson",
                     **extra,  # type: ignore[arg-type]
                 )
             except self._copy_client.exceptions.ClientError as exc:

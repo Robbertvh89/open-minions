@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import pytest
 from minion_common.client import ApiError
+from minion_common.schemas import PresignedPost
 from minion_scale import sim
 from minion_scale.metrics import Recorder
 from minion_scale.sim import SimConfig, SimExecutor, run_fleet
@@ -183,7 +184,11 @@ async def test_a_cancel_from_the_heartbeat_is_released_as_cancelled() -> None:
         heartbeat_interval_s=0.05,
         work_s=5.0,
     )
-    a = SimpleNamespace(acquirement_id="x", record_count=1, output_post=None)
+    a = SimpleNamespace(
+        acquirement_id="x",
+        record_count=1,
+        output_post=PresignedPost(url="http://127.0.0.1:1/o", fields={"key": "k", "policy": "p"}),
+    )
     assert await asyncio.wait_for(ex._handle(a), 5) is sim.Outcome.NEUTRAL  # type: ignore[arg-type]
     assert released == ["CANCELLED"] and ex.rec.events["cancelled"] == 1
     assert ex.rec.events["released"] == 1

@@ -35,8 +35,7 @@ def test_presigned_post_validation() -> None:
     bad: list[dict[str, str]] = [
         {"key": "a"},
         {"policy": "p"},
-        {**FIELDS, "x": "a\r\nb"},
-        {**FIELDS, "x": 'a"b'},
+        {**FIELDS, "x": "a" * 9000},
         {**FIELDS, "bad name": "v"},
         {**FIELDS, **{f"f{i}": "v" for i in range(20)}},
         {},
@@ -52,3 +51,10 @@ def test_output_post_is_required_on_assignment_and_heartbeat() -> None:
     assert Assignment.model_fields["output_post"].is_required()
     assert HeartbeatResponse.model_fields["output_post"].is_required()
     assert "output_url" not in Assignment.model_fields
+
+
+def test_values_with_quotes_and_crlf_are_allowed_and_roundtrip() -> None:
+    fields = {**FIELDS, "key": 'a/"b"\r\nc'}
+    PresignedPost(url="http://s3/b", fields=fields)
+    parts = encode_post_form(fields)
+    assert b'a/"b"\r\nc' in parts.preamble

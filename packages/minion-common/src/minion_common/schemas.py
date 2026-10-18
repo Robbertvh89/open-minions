@@ -276,7 +276,8 @@ class PresignedPost(_ResponseModel):
         for name, value in self.fields.items():
             if not _POST_FIELD_NAME_RE.fullmatch(name):
                 raise ValueError("invalid form field name")
-            if len(value.encode()) > _POST_MAX_VALUE_BYTES or any(c in value for c in '\r\n"'):
+            # CR/LF/quotes are fine in values: the encoder checks the boundary is absent from them
+            if len(value.encode()) > _POST_MAX_VALUE_BYTES:
                 raise ValueError("invalid form field value")
         if "key" not in self.fields or "policy" not in self.fields:
             raise ValueError("fields must contain 'key' and 'policy'")

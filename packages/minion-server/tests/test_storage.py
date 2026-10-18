@@ -183,3 +183,59 @@ async def test_presigned_post_enforces_size_cap(s3: S3Env) -> None:
     r = await post("post/e", b"z", {"x-amz-signature": "0" * 64})
     assert r.status_code == 403
     assert await st.head("post/e") is None
+
+
+def _cfg(s3: S3Env) -> ServerSettings:
+    return ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+
+
+@pytest.mark.integration
+async def test_presigned_post_policy_expiry_is_enforced(s3: S3Env) -> None:
+    import asyncio
+
+    import httpx
+
+    st = S3Storage(_cfg(s3))
+    p = await st.presign_post("post/expiry", 1000, ttl_s=1)
+    await asyncio.sleep(2.5)
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(p.url, data=p.fields, files={"file": ("o", b"x")})
+    assert not r.is_success
+    assert await st.head("post/expiry") is None
+
+
+@pytest.mark.integration
+async def test_promotion_copy_drops_executor_supplied_metadata_and_acl(s3: S3Env) -> None:
+    import httpx
+
+    st = S3Storage(_cfg(s3))
+    uploaded = 0
+    # extras outside the policy: SeaweedFS accepts Content-Type / x-amz-meta (laxness) but may
+    # answer 307 for some of them; whatever it stores must not survive promotion
+    for extra in (
+        {"Content-Type": "text/html"},
+        {"x-amz-meta-evil": "1"},
+        {"acl": "public-read"},
+        {"Content-Type": "text/html", "acl": "public-read", "x-amz-meta-evil": "1"},
+    ):
+        p = await st.presign_post("post/meta-src", 1000)
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(p.url, data={**p.fields, **extra}, files={"file": ("o", b"x\n")})
+        uploaded += r.is_success
+    assert uploaded >= 1, "no variant uploaded; the test would prove nothing"
+    await st.copy("post/meta-src", "post/meta-dst")
+    head = s3.client.head_object(Bucket=s3.bucket, Key="post/meta-dst")
+    # AWS/MinIO store application/x-ndjson; SeaweedFS 4.05 ignores the copy's ContentType and
+    # falls back to octet-stream. Either way the executor-supplied text/html must be gone.
+    assert head["ContentType"] in ("application/x-ndjson", "application/octet-stream")
+    assert "evil" not in head.get("Metadata", {})
+    url = f"{s3.endpoint_url}/{s3.bucket}/post/meta-dst"
+    async with httpx.AsyncClient(timeout=30) as c:
+        assert not (await c.get(url)).is_success  # not anonymously readable

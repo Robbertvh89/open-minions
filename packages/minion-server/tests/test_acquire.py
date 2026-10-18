@@ -456,3 +456,19 @@ async def test_acquire_without_output_upload_is_426_and_claims_nothing(
     assert r.json()["detail"]["code"] == "EXECUTOR_OUTDATED"
     cnt = await _counts(sm, "outdated")
     assert cnt["rows"] == 0  # the gate runs before the claim
+
+
+@pytest.mark.integration
+async def test_output_prefix_with_double_quote_still_acquires(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    """A stored output URI with `"` (legacy / seeded) must not poison acquire after the claim."""
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "quoted", 1, output_uri='s3://minion/outputs/acq/quo"ted/')
+    ((_, token),) = await make_executors(sm, 1)
+    r = await c.post(
+        "/api/v1/executor/acquire", json=_req().model_dump(mode="json"), headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert '"' in r.json()["output_post"]["fields"]["key"]

@@ -642,6 +642,29 @@ async def test_entity_too_large_is_a_non_retryable_output_too_large(tmp_path: Pa
     assert "release" not in client.kinds()
 
 
+class _StreamBody(httpx.AsyncByteStream):
+    async def __aiter__(self) -> Any:
+        yield b"<Code>X"
+        yield b"</Code>"
+
+
+async def test_streaming_400_is_retryable_upload_failed(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3()
+    orig = s3.handler
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            orig(req)
+            return httpx.Response(400, stream=_StreamBody())
+        return orig(req)
+
+    s3.handler = handler  # type: ignore[method-assign]
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert (_fail_req(client).retryable, _fail_req(client).code) == (True, "UPLOAD_FAILED")
+
+
 async def test_other_400_stays_retryable_upload_failed(tmp_path: Path) -> None:
     client, s3 = FakeClient([assignment()]), FakeS3(put_status=400, put_body=b"<Code>X</Code>")
     loop = make_loop(client, FakeWorker(), s3, tmp_path, [])

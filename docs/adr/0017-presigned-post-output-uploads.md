@@ -27,7 +27,9 @@ policy may contain `["content-length-range", 0, max]`, which the object store en
 
 ## Consequences
 
-- Operator procedure: upgrade executors with the server; old ones get `426` until upgraded. Subtasks in
+- Upgrade order: **server first**. A new executor on an old server gets `422` (the unknown
+  `output_upload` field is rejected) and exits. Old executors on a new server get `426` until upgraded.
+  Operator procedure: Subtasks in
   flight across the server upgrade hold a pre-upgrade PUT URL (valid up to the presign TTL); their
   heartbeat responses no longer parse, so they finish or fail/retry as usual, bounded by `max_attempts`.
 - SeaweedFS 4.05 enforces the range (`400 EntityTooLarge`, nothing stored) but answers a tampered key or
@@ -36,4 +38,17 @@ policy may contain `["content-length-range", 0, max]`, which the object store en
 - Responses grow by about 1 KB (base64 policy). Signing is local HMAC, as before.
 - Whether SeaweedFS buffers a multipart body in memory before rejecting it is unverified; watch memory
   on large caps.
+- The S-2 size guarantee starts one `MINION_PRESIGN_TTL_S` after the cutover: pre-upgrade PUT URLs stay
+  valid up to their TTL (at most 1 h).
+- Verified on SeaweedFS 4.05: an expired policy is refused (`307`, no object). Extra form fields are
+  partly accepted (`Content-Type`, `acl` yes; `x-amz-meta-*` gets `307`), so promotion copies with
+  `MetadataDirective=REPLACE` and `ContentType=application/x-ndjson` to drop executor-supplied
+  metadata (SeaweedFS ignores the ContentType on copy and stores `application/octet-stream`; the
+  executor's `text/html` is gone either way). The promoted object is not anonymously readable.
+- Output URIs containing `"` are rejected at task create (`422 INVALID_URI`); a stored legacy URI with
+  one still acquires (form field values may contain quotes; the encoder checks the boundary).
+  `assignment_build_failed` is logged if building an assignment fails after the claim commit.
+- SeaweedFS likely spools an oversize POST body before checking the range. In production put a
+  body-limit proxy in front of S3 (`max_output_bytes` + 64 KiB) and keep the S3 temp dir on a
+  size-limited volume.
 - Attempts times the cap can still accumulate: quota and lifecycle advice (ARCHITECTURE §3.3) stands.

@@ -102,17 +102,6 @@ async def _file_chunks(path: Path) -> AsyncIterator[bytes]:
         await asyncio.to_thread(fh.close)
 
 
-async def upload_file(http: httpx.AsyncClient, url: str, path: Path) -> None:
-    """Stream `path` to the presigned PUT `url` with an explicit Content-Length."""
-    size = await asyncio.to_thread(lambda: path.stat().st_size)
-    resp = await http.put(
-        url,
-        content=_file_chunks(path),
-        headers={"Content-Length": str(size)},
-    )
-    resp.raise_for_status()
-
-
 async def _post_body(preamble: bytes, path: Path, epilogue: bytes) -> AsyncIterator[bytes]:
     yield preamble
     async for chunk in _file_chunks(path):
@@ -146,5 +135,5 @@ async def upload_post(http: httpx.AsyncClient, post: PresignedPost, path: Path) 
                     break
             if b"<Code>EntityTooLarge</Code>" in head[:4096]:
                 raise OutputTooLargeError
-        await resp.aread()
+        # No re-read: the body may be partly consumed (StreamConsumed). Never logged anyway.
         resp.raise_for_status()

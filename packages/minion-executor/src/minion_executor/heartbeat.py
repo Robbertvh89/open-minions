@@ -154,9 +154,7 @@ class Heartbeater:
         try:
             newer = self.expires_at is None or resp.expires_at > self.expires_at
             new = resp.output_post
-            if new is None:
-                bound.warning("heartbeat_url_ignored", error="MissingOutputPost")
-            elif newer and _same_object(new, self._initial_output):
+            if newer and _same_object(new, self._initial_output):
                 self.expires_at, self.output_post = resp.expires_at, new
             elif newer:  # defence in depth: never redirect the upload to another object
                 bound.warning("heartbeat_url_ignored", error="ObjectMismatch")

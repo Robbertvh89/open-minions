@@ -1,5 +1,6 @@
 """io.upload_post: multipart framing, exact Content-Length, streaming, error mapping."""
 
+from collections.abc import AsyncIterator
 from email.parser import BytesParser
 from email.policy import HTTP
 from pathlib import Path
@@ -63,3 +64,29 @@ async def test_connect_error_propagates(tmp_path: Path) -> None:
 
     with pytest.raises(httpx.ConnectError):
         await _upload(f, boom)
+
+
+class _Chunks(httpx.AsyncByteStream):
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for c in self._chunks:
+            yield c
+
+
+async def test_streaming_other_400_raises_status_error_not_stream_consumed(
+    tmp_path: Path,
+) -> None:
+    f = tmp_path / "o"
+    f.write_bytes(b"{}\n")
+    with pytest.raises(httpx.HTTPStatusError):
+        await _upload(f, lambda req: httpx.Response(400, stream=_Chunks(b"<Code>X", b"</Code>")))
+
+
+async def test_streaming_entity_too_large(tmp_path: Path) -> None:
+    f = tmp_path / "o"
+    f.write_bytes(b"{}\n")
+    stream = _Chunks(b"<Error><Code>Entity", b"TooLarge</Code></Error>")
+    with pytest.raises(io.OutputTooLargeError):
+        await _upload(f, lambda req: httpx.Response(400, stream=stream))

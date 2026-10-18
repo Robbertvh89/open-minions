@@ -63,6 +63,8 @@ def validate_uris(body: TaskCreate, settings: ServerSettings) -> tuple[str, str,
         )
     except InvalidUriError as exc:
         raise api_error(422, "INVALID_URI", str(exc)) from exc
+    if '"' in out.key:  # defence in depth: the key travels in a signed POST form field
+        raise api_error(422, "INVALID_URI", "output uri must not contain a double quote")
     for key in (inp.key, out.key):
         if ATTEMPTS_SEGMENT in key.split("/"):
             raise api_error(422, "INVALID_URI", f"{ATTEMPTS_SEGMENT} is a reserved path segment")

@@ -452,6 +452,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   `OUTPUT_TOO_LARGE` failure (a re-run gives the same output). The assignment carries the server cap
   (`max_output_bytes`) and the executor refuses to upload a larger file (`min` of it and
   `MINION_EXECUTOR_MAX_OUTPUT_BYTES`; both `<= 5 GiB`; fail `OUTPUT_TOO_LARGE`, not retryable).
+  The guarantee starts one presign TTL after the cutover (older PUT URLs live up to 1 h). Run S3 behind a body-limit proxy (`max_output_bytes` + 64 KiB): some stores (SeaweedFS) spool an oversize POST before checking the range. Upgrade the server before the executors.
   Attempts times the cap can still accumulate under `_attempts/`: operators should keep versioning off, set a bucket quota and expire `_attempts/` objects with an S3 lifecycle rule (ARCHITECTURE §3.3).
 - S-3. Executor tokens: random 256-bit (`token_urlsafe(32)`), stored as SHA-256 hash only, revocable,
   scoped to a pool, optional expiry (`token_expires_at`). Tokens are pre-issued by the operator with

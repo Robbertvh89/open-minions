@@ -410,8 +410,6 @@ class SimExecutor:
         body = output_body(a.record_count)
         t0 = time.perf_counter()
         try:
-            if a.output_post is None:
-                raise ValueError("assignment carries no output_post")
             parts = encode_post_form(a.output_post.fields)
             resp = await self._put.post(
                 a.output_post.url,

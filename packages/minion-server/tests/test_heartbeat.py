@@ -129,7 +129,11 @@ async def test_heartbeat_updates_state_and_refreshes_url(
     key = f"outputs/hb1/hb1/_attempts/{a['subtask_id']:06d}/{a['attempt']}.jsonl"
     assert out.output_post is not None and out.output_post.fields["key"] == key
     policy = json.loads(base64.b64decode(out.output_post.fields["policy"]))
-    assert any(c[:2] == ["content-length-range", 0] for c in policy["conditions"] if len(c) == 3)
+    cap = app.state.settings.max_output_bytes
+    assert ["content-length-range", 0, cap] in policy["conditions"]
+    assert {"key": key} in policy["conditions"]
+    exp = datetime.fromisoformat(policy["expiration"].replace("Z", "+00:00"))
+    assert abs((exp - out.expires_at).total_seconds()) < 5
     async with httpx.AsyncClient() as raw:
         put = await raw.post(
             out.output_post.url, data=out.output_post.fields, files={"file": ("o", b"x\n")}

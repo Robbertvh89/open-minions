@@ -40,7 +40,6 @@ from minion_common.schemas import (
     FailRequest,
     ModelEntry,
     PresenceRequest,
-    PresignedPost,
     RegisterRequest,
     ReleaseRequest,
     TaskParams,
@@ -158,12 +157,6 @@ def cleanup_stale_tmp(root: Path | None = None) -> int:
         shutil.rmtree(entry, ignore_errors=True)
         removed += 1
     return removed
-
-
-def _output_post(a: Assignment) -> PresignedPost:
-    if a.output_post is None:
-        raise ValueError("assignment carries no output_post")
-    return a.output_post
 
 
 def _same_model(a: ModelEntry, b: ModelEntry) -> bool:
@@ -785,7 +778,7 @@ class ExecutorLoop:
             budget_fn=lambda: self._gov.decision.budget,
             pause_fn=self._paused_reason,
             total=a.record_count,
-            initial_output=_output_post(a),
+            initial_output=a.output_post,
             initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
@@ -1296,7 +1289,7 @@ class ExecutorLoop:
             except ValidationError:
                 raise _FailureError(False, BAD_PARAMS, "invalid task params") from None
             self._check_url(a.input_url)
-            self._check_url(_output_post(a).url)
+            self._check_url(a.output_post.url)
             try:
                 await io.download_range(self._http, a.input_url, a.byte_start, a.byte_end, in_path)
                 records = await asyncio.to_thread(io.parse_jsonl, in_path, a.record_count)
@@ -1339,7 +1332,7 @@ class ExecutorLoop:
                 raise _FailureError(
                     False, "OUTPUT_TOO_LARGE", "output exceeds the size cap"
                 ) from None
-            except (httpx.HTTPError, OSError) as exc:
+            except (httpx.HTTPError, httpx.StreamError, OSError) as exc:
                 msg = type(exc).__name__
                 local = isinstance(exc, (*LOCAL_TRANSPORT_ERRORS, OSError))
                 raise _FailureError(True, "UPLOAD_FAILED", msg, release=local) from None
