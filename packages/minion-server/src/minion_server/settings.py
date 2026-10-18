@@ -61,6 +61,10 @@ class ServerSettings(BaseSettings):
     splitter_poll_s: float = Field(default=2.0, gt=0)
     executor_token_ttl_days: int = Field(default=90, gt=0)
 
+    # Acquire claim window (ADR-0013, FR-22): the claim picks at random among the top N candidates
+    # of the highest priority present. 1 = strict FR-22 order (head contention returns).
+    acquire_window: int = Field(default=16, ge=1, le=256)
+
     # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
     release_limit: int = Field(default=10, ge=0)
 

@@ -199,17 +199,17 @@ async def test_preference_before_fifo(sm: async_sessionmaker[AsyncSession], fres
     await seed_task(sm, "fifo-old", 2)  # older: global FIFO would serve this first
     await seed_task(sm, "fifo-pref", 2)
     ((p, _),) = await make_executors(sm, 1)
-    first = await _acquire(sm, p, cfg, shuffle_head=1)
+    first = await _acquire(sm, p, cfg, window=1)
     assert first.task_name == "fifo-old" and first.subtask_id == 0  # no preference: FIFO
     async with sm() as s, s.begin():
         await executors_repo.set_preference(
             s, p.executor_id, team=None, project=None, task_name="fifo-pref"
         )
     for expected in (0, 1):
-        got = await _acquire(sm, p, cfg, shuffle_head=1)
+        got = await _acquire(sm, p, cfg, window=1)
         assert (got.task_name, got.subtask_id) == ("fifo-pref", expected)
     # preferred task exhausted -> falls back to global FIFO
-    fallback = await _acquire(sm, p, cfg, shuffle_head=1)
+    fallback = await _acquire(sm, p, cfg, window=1)
     assert (fallback.task_name, fallback.subtask_id) == ("fifo-old", 1)
     # clearing the preference (all None) restores plain FIFO
     async with sm() as s, s.begin():
@@ -227,7 +227,7 @@ async def test_priority_orders_before_age(
     await seed_task(sm, "prio-low", 1)
     await seed_task(sm, "prio-high", 1, priority=5)
     ((p, _),) = await make_executors(sm, 1)
-    got = await _acquire(sm, p, cfg, shuffle_head=1)
+    got = await _acquire(sm, p, cfg, window=1)
     assert got.task_name == "prio-high"
 
 
