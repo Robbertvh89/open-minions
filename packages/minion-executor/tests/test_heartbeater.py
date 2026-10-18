@@ -3,7 +3,12 @@
 import uuid
 
 import pytest
+from minion_common.schemas import PresignedPost
 from minion_executor.heartbeat import Heartbeater
+
+
+def _post(key: str = "k", policy: str = "p") -> PresignedPost:
+    return PresignedPost(url="https://s3.test/out", fields={"key": key, "policy": policy})
 
 
 def _hb(interval: float) -> Heartbeater:
@@ -13,7 +18,7 @@ def _hb(interval: float) -> Heartbeater:
         interval_s=interval,
         budget=None,
         total=1,
-        initial_output_url="https://s3.test/out",
+        initial_output=_post(),
     )
 
 
@@ -51,7 +56,7 @@ async def test_beats_are_serialized_and_429_retry_waits_once() -> None:
             if calls == 1:
                 raise ApiError(429, "RATE_LIMITED", "slow down", retry_after=2.0)
             return HeartbeatResponse(
-                cancel=False, output_url="https://s3.test/out", expires_at=datetime.now(UTC)
+                cancel=False, output_post=_post(), expires_at=datetime.now(UTC)
             )
 
     async def fake_sleep(d: float) -> None:
@@ -63,7 +68,7 @@ async def test_beats_are_serialized_and_429_retry_waits_once() -> None:
         interval_s=10.0,
         budget=None,
         total=1,
-        initial_output_url="https://s3.test/out",
+        initial_output=_post(),
         sleep=fake_sleep,
     )
     first, second = await asyncio.gather(hb.beat(retry_rate_limited=True), hb.beat())
@@ -72,3 +77,40 @@ async def test_beats_are_serialized_and_429_retry_waits_once() -> None:
     assert first == (None, None)  # retried once, then succeeded
     assert second == (None, None)
     assert calls == 3
+
+
+async def test_refresh_accepts_same_key_newer_expiry_and_ignores_other_key() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from minion_common.schemas import HeartbeatResponse
+
+    now = datetime.now(UTC)
+    resp: list[HeartbeatResponse] = []
+
+    class C:
+        async def heartbeat(self, aid: uuid.UUID, req: object) -> HeartbeatResponse:
+            return resp.pop(0)
+
+    hb = Heartbeater(
+        C(),  # type: ignore[arg-type]
+        uuid.uuid4(),
+        interval_s=10.0,
+        budget=None,
+        total=1,
+        initial_output=_post(),
+        initial_expires_at=now,
+    )
+    resp.append(
+        HeartbeatResponse(
+            cancel=False, output_post=_post("evil", "x"), expires_at=now + timedelta(hours=1)
+        )
+    )
+    await hb.beat()
+    assert hb.output_post.fields["key"] == "k" and hb.expires_at == now
+    resp.append(
+        HeartbeatResponse(
+            cancel=False, output_post=_post("k", "new"), expires_at=now + timedelta(hours=1)
+        )
+    )
+    await hb.beat()
+    assert hb.output_post.fields["policy"] == "new"

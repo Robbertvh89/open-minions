@@ -31,6 +31,7 @@ from minion_common.schemas import (
     EmbeddingParams,
     HeartbeatResponse,
     ModelEntry,
+    PresignedPost,
 )
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
@@ -363,7 +364,9 @@ class _Client:
     async def heartbeat(self, aid: uuid.UUID, req: Any) -> HeartbeatResponse:
         return HeartbeatResponse(
             cancel=False,
-            output_url="https://s3.test/out",
+            output_post=PresignedPost(
+                url="https://s3.test/out", fields={"key": "k", "policy": "p"}
+            ),
             expires_at=datetime.now(UTC) + timedelta(minutes=5),
         )
 
@@ -384,7 +387,10 @@ def _assignment(model: ModelEntry, body: bytes, count: int) -> Assignment:
             "byte_start": 0,
             "byte_end": len(body),
             "record_count": count,
-            "output_url": "https://s3.test/out",
+            "output_post": {
+                "url": "https://s3.test/out",
+                "fields": {"key": "k", "policy": "p"},
+            },
             "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         }
     )

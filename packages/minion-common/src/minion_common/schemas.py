@@ -304,7 +304,7 @@ class Assignment(_ResponseModel):
     byte_start: int = Field(ge=0)
     byte_end: int = Field(gt=0, description="Exclusive end offset")
     record_count: int = Field(ge=1)
-    output_url: str
+    output_url: str | None = None  # legacy PUT URL; removed in the cutover
     output_post: PresignedPost | None = None
     expires_at: AwareDatetime
     # The server's output size cap; the executor enforces min(local, this). Absent on old servers.
@@ -368,7 +368,7 @@ class PresenceRequest(_Model):
 
 class HeartbeatResponse(_ResponseModel):
     cancel: bool
-    output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
+    output_url: str | None = None  # legacy PUT URL; removed in the cutover
     output_post: PresignedPost | None = None
     expires_at: AwareDatetime
 

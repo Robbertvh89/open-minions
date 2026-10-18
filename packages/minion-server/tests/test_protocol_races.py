@@ -670,8 +670,13 @@ async def test_e2e_user_and_executor_clients(
                 chunk = got_in.content
                 assert chunk == data[asg.byte_start : asg.byte_end]
                 assert chunk.count(b"\n") == asg.record_count
-                put = await raw.put(asg.output_url, content=chunk)
-                assert put.status_code == 200
+                assert asg.output_post is not None
+                put = await raw.post(
+                    asg.output_post.url,
+                    data=asg.output_post.fields,
+                    files={"file": ("o.jsonl", chunk)},
+                )
+                assert put.is_success
                 await ex.complete(
                     asg.acquirement_id,
                     CompleteRequest(

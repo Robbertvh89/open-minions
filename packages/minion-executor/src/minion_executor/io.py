@@ -9,7 +9,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
-from minion_common.schemas import range_header
+from minion_common.s3post import encode_post_form
+from minion_common.schemas import PresignedPost, range_header
 
 from minion_executor.runners.base import Record
 
@@ -22,6 +23,10 @@ class BadInputError(Exception):
 
 class InputUnavailableError(Exception):
     """The ranged GET did not yield exactly the requested bytes (executor-local/transient)."""
+
+
+class OutputTooLargeError(Exception):
+    """S3 refused the upload because it exceeds the signed size range (deterministic)."""
 
 
 async def download_range(
@@ -106,3 +111,40 @@ async def upload_file(http: httpx.AsyncClient, url: str, path: Path) -> None:
         headers={"Content-Length": str(size)},
     )
     resp.raise_for_status()
+
+
+async def _post_body(preamble: bytes, path: Path, epilogue: bytes) -> AsyncIterator[bytes]:
+    yield preamble
+    async for chunk in _file_chunks(path):
+        yield chunk
+    yield epilogue
+
+
+async def upload_post(http: httpx.AsyncClient, post: PresignedPost, path: Path) -> None:
+    """Stream `path` as the `file` part of a presigned POST with an exact Content-Length.
+
+    Any 2xx is success. A 400 EntityTooLarge raises `OutputTooLargeError`; other non-2xx
+    (including a 3xx, which is not followed) raise `httpx.HTTPStatusError`. The form fields are
+    credentials: never logged.
+    """
+    size = await asyncio.to_thread(lambda: path.stat().st_size)
+    parts = encode_post_form(post.fields)
+    length = len(parts.preamble) + size + len(parts.epilogue)
+    async with http.stream(
+        "POST",
+        post.url,
+        content=_post_body(parts.preamble, path, parts.epilogue),
+        headers={"Content-Type": parts.content_type, "Content-Length": str(length)},
+    ) as resp:
+        if resp.is_success:
+            return
+        if resp.status_code == 400:
+            head = b""
+            async for chunk in resp.aiter_bytes():
+                head += chunk
+                if len(head) >= 4096:
+                    break
+            if b"<Code>EntityTooLarge</Code>" in head[:4096]:
+                raise OutputTooLargeError
+        await resp.aread()
+        resp.raise_for_status()

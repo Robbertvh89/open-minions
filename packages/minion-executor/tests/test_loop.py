@@ -9,6 +9,8 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from email.parser import BytesParser
+from email.policy import HTTP
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from minion_common.schemas import (
     HeartbeatResponse,
     ModelEntry,
     PresenceRequest,
+    PresignedPost,
 )
 from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.runtime import FixedGovernor
@@ -65,17 +68,25 @@ def assignment(
             "byte_start": 0,
             "byte_end": size,
             "record_count": count,
-            "output_url": "https://s3.test/out",
+            "output_post": POST,
             "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         }
     )
 
 
+POST = {"url": "https://s3.test/out", "fields": {"key": "k", "policy": "p"}}
+
+
 def hb_resp(
-    cancel: bool = False, url: str = "https://s3.test/out", minutes: int = 0
+    cancel: bool = False, policy: str = "p", minutes: int = 0, key: str = "k"
 ) -> HeartbeatResponse:
-    return HeartbeatResponse(
-        cancel=cancel, output_url=url, expires_at=datetime.now(UTC) + timedelta(minutes=minutes)
+    post = {"url": "https://s3.test/out", "fields": {"key": key, "policy": policy}}
+    return HeartbeatResponse.model_validate(
+        {
+            "cancel": cancel,
+            "output_post": post,
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat(),
+        }
     )
 
 
@@ -265,18 +276,39 @@ class FakeWorker:
 
 
 class FakeS3:
-    def __init__(self, body: bytes = INPUT, get_status: int = 206, put_status: int = 200) -> None:
+    def __init__(
+        self,
+        body: bytes = INPUT,
+        get_status: int = 206,
+        put_status: int = 200,
+        put_body: bytes = b"",
+    ) -> None:
         self.body = body
-        self.get_status, self.put_status = get_status, put_status
-        self.puts: list[bytes] = []
+        self.get_status, self.put_status, self.put_body = get_status, put_status, put_body
+        self.puts: list[bytes] = []  # file parts of the uploaded POST forms
+        self.forms: list[dict[str, str]] = []
         self.ranges: list[str] = []
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         if req.method == "GET":
             self.ranges.append(req.headers["Range"])
             return httpx.Response(self.get_status, content=self.body)
-        self.puts.append(req.read())
-        return httpx.Response(self.put_status)
+        assert req.method == "POST"
+        raw = req.read()
+        assert int(req.headers["Content-Length"]) == len(raw)
+        msg = BytesParser(policy=HTTP).parsebytes(
+            b"Content-Type: " + req.headers["Content-Type"].encode() + b"\r\n\r\n" + raw
+        )
+        parts = list(msg.iter_parts())
+        assert parts[-1].get_param("name", header="content-disposition") == "file"
+        self.forms.append(
+            {
+                str(p.get_param("name", header="content-disposition")): str(p.get_content())
+                for p in parts[:-1]
+            }
+        )
+        self.puts.append(bytes(parts[-1].get_payload(decode=True)))
+        return httpx.Response(self.put_status, content=self.put_body)
 
 
 def leftover(p: Path) -> list[Path]:
@@ -599,6 +631,25 @@ async def test_runner_fail_code_is_normalized_not_a_validation_error(
     assert [c.code for k, c in client.calls if k == "fail"] == [sent, sent]
 
 
+async def test_entity_too_large_is_a_non_retryable_output_too_large(tmp_path: Path) -> None:
+    body = b"<Error><Code>EntityTooLarge</Code></Error>"
+    client, s3 = FakeClient([assignment()]), FakeS3(put_status=400, put_body=body)
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    req = _fail_req(client)
+    assert (req.retryable, req.code) == (False, "OUTPUT_TOO_LARGE")
+    assert "release" not in client.kinds()
+
+
+async def test_other_400_stays_retryable_upload_failed(tmp_path: Path) -> None:
+    client, s3 = FakeClient([assignment()]), FakeS3(put_status=400, put_body=b"<Code>X</Code>")
+    loop = make_loop(client, FakeWorker(), s3, tmp_path, [])
+    client.on_empty = loop.stop
+    await loop.run()
+    assert (_fail_req(client).retryable, _fail_req(client).code) == (True, "UPLOAD_FAILED")
+
+
 async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None:
     class ShortWorker(FakeWorker):
         def run(self, batch: list[Record], *_: Any) -> list[Record]:
@@ -619,7 +670,8 @@ async def test_output_count_mismatch_fails_before_upload(tmp_path: Path) -> None
         (FakeS3(get_status=500), "INPUT_UNAVAILABLE"),
         (FakeS3(get_status=200), "INPUT_UNAVAILABLE"),  # Range ignored
         (FakeS3(body=INPUT[:-3]), "INPUT_UNAVAILABLE"),  # short read
-        (FakeS3(put_status=403), "UPLOAD_FAILED"),  # e.g. expired presigned PUT
+        (FakeS3(put_status=403), "UPLOAD_FAILED"),  # e.g. expired presigned POST
+        (FakeS3(put_status=307), "UPLOAD_FAILED"),  # SeaweedFS policy violation
     ],
 )
 async def test_s3_verdicts_fail_retryable_not_release(
@@ -740,7 +792,11 @@ async def test_insecure_presigned_url_rejected(tmp_path: Path) -> None:
 
 async def test_loopback_http_allowed_only_when_server_is_loopback(tmp_path: Path) -> None:
     a = assignment(url="http://localhost:9000/in")
-    a = a.model_copy(update={"output_url": "http://localhost:9000/out"})
+    a = a.model_copy(
+        update={
+            "output_post": PresignedPost(url="http://localhost:9000/out", fields=POST["fields"])
+        }
+    )
     client, s3 = FakeClient([a]), FakeS3()
     loop = make_loop(client, FakeWorker(), s3, tmp_path, [], allow_http_loopback=True)
     assert await loop.run(max_subtasks=1) == 1
@@ -968,18 +1024,9 @@ async def test_transport_error_in_heartbeat_does_not_fail_subtask(tmp_path: Path
     assert "fail" not in client.kinds()
 
 
-async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
+async def test_refreshed_output_post_used_for_upload(tmp_path: Path) -> None:
     client, s3 = FakeClient([assignment()]), FakeS3()
-    client.hb_script = [hb_resp(url="https://s3.test/out?sig=new", minutes=10)]
-    urls: list[str] = []
-    orig_handler = s3.handler
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.method == "PUT":
-            urls.append(str(req.url))
-        return orig_handler(req)
-
-    s3.handler = handler  # type: ignore[method-assign]
+    client.hb_script = [hb_resp(policy="new", minutes=10)]
     worker = FakeWorker()
     orig = worker.run
 
@@ -996,7 +1043,7 @@ async def test_refreshed_output_url_used_for_upload(tmp_path: Path) -> None:
     )  # fmt: skip
     client.on_empty = loop.stop
     assert await loop.run() == 1
-    assert urls == ["https://s3.test/out?sig=new"]
+    assert [f["policy"] for f in s3.forms] == ["new"]
 
 
 async def test_stop_during_heartbeat_wait_is_prompt(tmp_path: Path) -> None:
@@ -1060,7 +1107,7 @@ async def test_beat_signal_during_inflight_upload(tmp_path: Path, sig: str) -> N
     orig = s3.handler
 
     async def handler(req: httpx.Request) -> httpx.Response:
-        if req.method == "PUT":
+        if req.method == "POST":
             started.set()
             await asyncio.Event().wait()  # the upload never finishes on its own
         return orig(req)
@@ -1120,16 +1167,7 @@ async def test_upload_refreshes_url_synchronously_when_expiring(tmp_path: Path) 
     a = assignment()
     a.expires_at = datetime.now(UTC) + timedelta(seconds=5)  # inside the 60 s margin
     client, s3 = FakeClient([a]), FakeS3()
-    client.hb_script = [hb_resp(url="https://s3.test/out?sig=2", minutes=10)]
-    urls: list[str] = []
-    orig = s3.handler
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.method == "PUT":
-            urls.append(str(req.url))
-        return orig(req)
-
-    s3.handler = handler  # type: ignore[method-assign]
+    client.hb_script = [hb_resp(policy="p2", minutes=10)]
     loop = make_loop(
         client, FakeWorker(), s3, tmp_path, [],
         heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
@@ -1137,7 +1175,7 @@ async def test_upload_refreshes_url_synchronously_when_expiring(tmp_path: Path) 
     client.on_empty = loop.stop
     assert await loop.run() == 1
     assert client.kinds() == ["acquire", "heartbeat", "complete", "acquire"]
-    assert urls == ["https://s3.test/out?sig=2"]
+    assert [f["policy"] for f in s3.forms] == ["p2"]
 
 
 async def test_oversize_output_fails_non_retryable_without_upload(tmp_path: Path) -> None:
@@ -1239,16 +1277,7 @@ async def test_pre_upload_beat_retries_once_after_429(tmp_path: Path) -> None:
 
 async def test_refreshed_url_for_another_object_is_ignored(tmp_path: Path) -> None:
     client, s3 = FakeClient([assignment()]), FakeS3()
-    client.hb_script = [hb_resp(url="https://evil.test/out", minutes=10)]
-    urls: list[str] = []
-    orig = s3.handler
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.method == "PUT":
-            urls.append(str(req.url))
-        return orig(req)
-
-    s3.handler = handler  # type: ignore[method-assign]
+    client.hb_script = [hb_resp(key="evil", minutes=10)]
     worker = FakeWorker()
     _slow_worker(worker, 0.3)
     loop = make_loop(
@@ -1257,7 +1286,7 @@ async def test_refreshed_url_for_another_object_is_ignored(tmp_path: Path) -> No
     )  # fmt: skip
     client.on_empty = loop.stop
     assert await loop.run() == 1
-    assert urls == ["https://s3.test/out"]
+    assert [(f["key"], f["policy"]) for f in s3.forms] == [("k", "p")]
 
 
 async def test_cancel_during_output_write_leaves_no_files(
@@ -2516,7 +2545,7 @@ async def test_loop_writes_status_on_change_and_at_stop(tmp_path: Path) -> None:
 
 
 class SlowUploadS3(FakeS3):
-    """PUT blocks until `release_put` is set; `put_started` marks the upload in flight."""
+    """POST blocks until `release_put` is set; `put_started` marks the upload in flight."""
 
     def __init__(self) -> None:
         super().__init__()

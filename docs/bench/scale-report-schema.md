@@ -71,7 +71,7 @@ default `[10, 30]`, the executor's), `acquire_pace_s` (default 0.4), `complete_r
 | `event_loop_lag` | histogram of how late a 50 ms sleep woke up, summed over the sim processes (client-side saturation) |
 
 `calls` keys: `register`, `acquire_assigned`, `acquire_empty`, `acquire_error` (failed acquires),
-`heartbeat`, `complete`, `fail`, `release`, `output_put` (the presigned S3 PUT). Each value:
+`heartbeat`, `complete`, `fail`, `release`, `output_put` (output upload, presigned POST). Each value:
 
 ```json
 {"count": 0, "mean_s": 0.0, "p50_s": 0.0, "p90_s": 0.0, "p99_s": 0.0, "max_s": 0.0, "total_s": 0.0,

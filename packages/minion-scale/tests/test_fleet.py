@@ -183,7 +183,7 @@ async def test_a_cancel_from_the_heartbeat_is_released_as_cancelled() -> None:
         heartbeat_interval_s=0.05,
         work_s=5.0,
     )
-    a = SimpleNamespace(acquirement_id="x", record_count=1, output_url="http://127.0.0.1:1/o")
+    a = SimpleNamespace(acquirement_id="x", record_count=1, output_post=None)
     assert await asyncio.wait_for(ex._handle(a), 5) is sim.Outcome.NEUTRAL  # type: ignore[arg-type]
     assert released == ["CANCELLED"] and ex.rec.events["cancelled"] == 1
     assert ex.rec.events["released"] == 1

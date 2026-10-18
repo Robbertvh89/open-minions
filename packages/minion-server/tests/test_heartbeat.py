@@ -127,13 +127,14 @@ async def test_heartbeat_updates_state_and_refreshes_url(
 
     # the refreshed URL is scoped to the attempt key and accepts a PUT
     key = f"outputs/hb1/hb1/_attempts/{a['subtask_id']:06d}/{a['attempt']}.jsonl"
-    assert key in out.output_url
     assert out.output_post is not None and out.output_post.fields["key"] == key
     policy = json.loads(base64.b64decode(out.output_post.fields["policy"]))
     assert any(c[:2] == ["content-length-range", 0] for c in policy["conditions"] if len(c) == 3)
     async with httpx.AsyncClient() as raw:
-        put = await raw.put(out.output_url, content=b"x\n")
-    assert put.status_code == 200
+        put = await raw.post(
+            out.output_post.url, data=out.output_post.fields, files={"file": ("o", b"x\n")}
+        )
+    assert put.is_success
     assert s3.client.get_object(Bucket=s3.bucket, Key=key)["Body"].read() == b"x\n"
 
 

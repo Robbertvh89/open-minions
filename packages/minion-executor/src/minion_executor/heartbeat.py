@@ -19,12 +19,12 @@ from urllib.parse import urlsplit
 import httpx
 import structlog
 from minion_common.client import ApiError, ExecutorClient, StaleAcquirementError
-from minion_common.schemas import Budget, HeartbeatRequest, Progress
+from minion_common.schemas import Budget, HeartbeatRequest, PresignedPost, Progress
 
 log = structlog.get_logger("minion_executor.heartbeat")
 
 MIN_INTERVAL_S = 1.0
-# Upper bound: the refreshed output URL must outlive the gap between beats, so the interval has to
+# Upper bound: the refreshed output POST must outlive the gap between beats, so the interval has to
 # stay well inside the presign TTL (ARCH §2.2; default TTL is 24 h, so 1 h leaves a wide margin).
 MAX_INTERVAL_S = 3600.0
 MAX_ERROR_RETRY_S = 30.0
@@ -41,10 +41,13 @@ def check_interval(interval_s: float) -> None:
         raise ValueError(f"heartbeat interval must be <= {MAX_INTERVAL_S:g}s")
 
 
-def _same_object(a: str, b: str) -> bool:
-    """Same scheme, host and path (the query - the signature - may differ)."""
-    pa, pb = urlsplit(a), urlsplit(b)
-    return (pa.scheme, pa.netloc, pa.path) == (pb.scheme, pb.netloc, pb.path)
+def _same_object(a: PresignedPost, b: PresignedPost) -> bool:
+    """Same scheme, host, path and object key (the signature and policy may differ): a POST URL
+    is the bucket URL, so the key field is what pins the object."""
+    pa, pb = urlsplit(a.url), urlsplit(b.url)
+    return (pa.scheme, pa.netloc, pa.path) == (pb.scheme, pb.netloc, pb.path) and a.fields.get(
+        "key"
+    ) == b.fields.get("key")
 
 
 class HeartbeatSignal(enum.Enum):
@@ -61,7 +64,7 @@ class Heartbeater:
         interval_s: float,
         budget: Budget | None,
         total: int,
-        initial_output_url: str,
+        initial_output: PresignedPost,
         initial_expires_at: datetime | None = None,
         pause_fn: Callable[[], str | None] | None = None,
         budget_fn: Callable[[], Budget | None] | None = None,
@@ -76,10 +79,10 @@ class Heartbeater:
         self._total = total
         self._pause_fn = pause_fn
         self._sleep = sleep
-        self._initial_url = initial_output_url
+        self._initial_output = initial_output
         self.expires_at: datetime | None = initial_expires_at
         self.records_done = 0
-        self.output_url = initial_output_url
+        self.output_post = initial_output
         self._lock = asyncio.Lock()  # one beat in flight: no self-inflicted 429
         self._rate_limit_wait: float | None = None
 
@@ -150,8 +153,11 @@ class Heartbeater:
             return HeartbeatSignal.CANCEL, None
         try:
             newer = self.expires_at is None or resp.expires_at > self.expires_at
-            if newer and _same_object(resp.output_url, self._initial_url):
-                self.expires_at, self.output_url = resp.expires_at, resp.output_url
+            new = resp.output_post
+            if new is None:
+                bound.warning("heartbeat_url_ignored", error="MissingOutputPost")
+            elif newer and _same_object(new, self._initial_output):
+                self.expires_at, self.output_post = resp.expires_at, new
             elif newer:  # defence in depth: never redirect the upload to another object
                 bound.warning("heartbeat_url_ignored", error="ObjectMismatch")
         except Exception as exc:  # e.g. naive vs aware datetimes: keep the old URL
