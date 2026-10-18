@@ -778,6 +778,16 @@ class ExecutorLoop:
             initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
+        # Ack (ADR-0014): one immediate heartbeat before the worker starts, so the server can tell
+        # an owned subtask from a lost acquire response. Failures other than 409 are non-fatal.
+        signal, ack_delay = await hb.beat()
+        if signal is HeartbeatSignal.STALE:
+            bound.info("ack_stale_dropped")
+            return _Outcome.DISCARDED
+        if signal is HeartbeatSignal.CANCEL:
+            # Cancelled before any work: hand it back without a worker or an input download.
+            await self._release(a, bound, "CANCELLED")
+            return _Outcome.CANCELLED
         self._current = (a, hb)
         self._status_kick.set()
         self._batch_budget = None
@@ -786,7 +796,7 @@ class ExecutorLoop:
         self._infer_ok = False
         work = asyncio.create_task(self._execute(a, tmp, hb))
         stopper = asyncio.create_task(self._hard_stop.wait())
-        beat = asyncio.create_task(hb.run())
+        beat = asyncio.create_task(hb.run(ack_delay))
         watch = asyncio.create_task(self._watch(a))
         try:
             pending: set[asyncio.Future[Any]] = {work, stopper, beat, watch}

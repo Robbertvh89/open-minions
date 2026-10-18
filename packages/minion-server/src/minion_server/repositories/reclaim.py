@@ -102,3 +102,24 @@ async def heartbeat_stale(
             )
         ).scalar_one()
     )
+
+
+async def never_acknowledged(session: AsyncSession, acquirement_id: uuid.UUID) -> bool:
+    """True if no heartbeat landed after the claim (ADR-0014).
+
+    The claim transaction writes `acquired_at` and the first `last_seen_at` with the same `now()`;
+    any beat moves `last_seen_at` on. Caller holds the acquirement lock.
+    """
+    return bool(
+        (
+            await session.execute(
+                select(
+                    exists().where(
+                        ExecutorHeartbeat.acquirement_id == acquirement_id,
+                        SubtaskAcquirement.acquirement_id == acquirement_id,
+                        ExecutorHeartbeat.last_seen_at == SubtaskAcquirement.acquired_at,
+                    )
+                )
+            )
+        ).scalar_one()
+    )

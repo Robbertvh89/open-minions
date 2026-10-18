@@ -75,7 +75,8 @@ class ServerSettings(BaseSettings):
     acquire_window: int = Field(default=16, ge=1, le=256)
 
     # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
-    release_limit: int = Field(default=10, ge=0)
+    # Upper bound 100; the watchdog reads the same MINION_RELEASE_LIMIT and must use the same value.
+    release_limit: int = Field(default=10, ge=0, le=100)
 
     # Minimum seconds between heartbeats of one acquirement; faster beats get 429 (guards write
     # amplification: a rogue executor cannot hammer the heartbeat row). 0 disables. Executors

@@ -158,9 +158,10 @@ class Heartbeater:
             bound.warning("heartbeat_url_ignored", error=type(exc).__name__)
         return None, None
 
-    async def run(self) -> HeartbeatSignal:
-        """Beat until a stop signal; cancel the task to end it otherwise."""
-        delay = self._jittered(self._interval)
+    async def run(self, first_delay: float | None = None) -> HeartbeatSignal:
+        """Beat until a stop signal; cancel the task to end it otherwise. `first_delay`
+        replaces the first sleep (e.g. the retry delay a failed ack asked for)."""
+        delay = first_delay if first_delay is not None else self._jittered(self._interval)
         while True:
             await self._sleep(delay)
             signal, override = await self.beat()

@@ -558,3 +558,170 @@ async def test_reclaim_stale_continues_after_failing_id(
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == n - 1
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(1,)]
+
+
+# --- unacknowledged expiry (TASK-7.4.5, ADR-0014) ------------------------------------------------
+
+CAP = 2
+
+
+async def _ghost_age(sm: Sm) -> None:
+    """Age every acquirement and its claim-time heartbeat together: still never beaten."""
+    async with sm() as s, s.begin():
+        await s.execute(
+            text("UPDATE minion_subtask_acquirement SET acquired_at = now() - interval '1 hour'")
+        )
+        await s.execute(
+            text("UPDATE minion_executor_heartbeat SET last_seen_at = now() - interval '1 hour'")
+        )
+
+
+async def _reclaim_cap(sm: Sm, acq_id: str | Any, cap: int = CAP) -> ReclaimResult:
+    import uuid
+
+    async with sm() as s, s.begin():
+        return await reclaim_one(s, uuid.UUID(str(acq_id)), timeout_s=TIMEOUT, unacked_free_cap=cap)
+
+
+async def _max_attempts(sm: Sm, n: int) -> None:
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_subtask SET max_attempts = :n"), {"n": n})
+
+
+async def _ghost_cycle(c: AsyncClient, sm: Sm, tok: str) -> ReclaimResult:
+    a = await _acquire(c, tok)
+    await _ghost_age(sm)
+    return await _reclaim_cap(sm, a["acquirement_id"])
+
+
+@pytest.mark.integration
+async def test_never_beaten_reclaim_is_free(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "ghost", 1, team="ghost")
+    await _max_attempts(sm, 1)
+    ((_, tok),) = await make_executors(sm, 1)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    assert await _rows(sm, "SELECT status, error FROM minion_subtask") == [("PENDING", None)]
+    assert await _rows(sm, "SELECT outcome, error->>'code' FROM minion_subtask_attempt") == [
+        ("EXPIRED", "NOT_ACKNOWLEDGED")
+    ]
+    assert await _rows(sm, "SELECT failed_subtasks FROM minion_task") == [(0,)]
+
+
+@pytest.mark.integration
+async def test_beaten_reclaim_consumes_budget(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "beat", 1, team="beat")
+    await _max_attempts(sm, 1)
+    ((_, tok),) = await make_executors(sm, 1)
+    a = await _acquire(c, tok)
+    assert (await _call(c, a, tok, "heartbeat")).status_code == 200  # the ack
+    await _backdate(sm)  # silent afterwards
+    assert await _reclaim_cap(sm, a["acquirement_id"]) == ReclaimResult.EXPIRED_FAILED
+    assert await _rows(sm, "SELECT outcome, error->>'code' FROM minion_subtask_attempt") == [
+        ("EXPIRED", "HEARTBEAT_TIMEOUT")
+    ]
+
+
+@pytest.mark.integration
+async def test_first_beat_is_not_rate_limited_second_is(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "ackrl", 1, team="ackrl")
+    ((_, tok),) = await make_executors(sm, 1)
+    a = await _acquire(c, tok)
+    assert (await _call(c, a, tok, "heartbeat")).status_code == 200
+    assert (await _call(c, a, tok, "heartbeat")).status_code == 429
+
+
+@pytest.mark.integration
+async def test_free_unacked_expiries_are_capped(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "cap", 1, team="cap")
+    await _max_attempts(sm, 1)
+    ((_, tok),) = await make_executors(sm, 1)
+    for _ in range(CAP):
+        assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    # over the cap it counts like any expiry: max_attempts=1 is spent
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_FAILED
+    assert await _rows(
+        sm, "SELECT error->>'code' FROM minion_subtask_attempt ORDER BY attempt"
+    ) == [("NOT_ACKNOWLEDGED",)] * CAP + [("HEARTBEAT_TIMEOUT",)]
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("FAILED",)]
+
+
+@pytest.mark.integration
+async def test_free_rows_do_not_count_toward_the_budget(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "excl", 1, team="excl")
+    await _max_attempts(sm, 2)
+    ((_, tok),) = await make_executors(sm, 1)
+    for _ in range(CAP):
+        assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    # over the cap: the first counted expiry sees 0 earlier counted attempts (1 of 2 used)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("PENDING",)]
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_FAILED  # 2 of 2
+
+
+@pytest.mark.integration
+async def test_ghost_cycle_then_retryable_fail_requeues(
+    env: tuple[AsyncClient, Any],
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "gfail", 1, team="gfail")
+    await _max_attempts(sm, 2)
+    ((_, tok),) = await make_executors(sm, 1)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    a = await _acquire(c, tok)
+    assert (await _call(c, a, tok, "fail")).status_code == 204
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("PENDING",)]
+
+
+@pytest.mark.integration
+async def test_cap_zero_keeps_paper_semantics(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "cap0", 1, team="cap0")
+    await _max_attempts(sm, 1)
+    ((_, tok),) = await make_executors(sm, 1)
+    a = await _acquire(c, tok)
+    await _ghost_age(sm)
+    assert await _reclaim_cap(sm, a["acquirement_id"], cap=0) == ReclaimResult.EXPIRED_FAILED
+
+
+@pytest.mark.integration
+async def test_max_attempts_one_survives_a_ghost_acquire(
+    env: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "surv", 1, team="surv")
+    await _max_attempts(sm, 1)
+    ((_, tok),) = await make_executors(sm, 1)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    a = await _acquire(c, tok)
+    assert a["attempt"] == 2
+    _put_output(s3, "surv", a)
+    assert (await _call(c, a, tok, "complete")).status_code == 204
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("SUCCEEDED",)]
+
+
+@pytest.mark.integration
+async def test_unacked_reclaim_of_cancelled_task_stays_cancelled(
+    env: tuple[AsyncClient, Any],
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "canc", 1, team="canc")
+    ((_, tok),) = await make_executors(sm, 1)
+    a = await _acquire(c, tok)
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_task SET status = 'CANCELLED'"))
+    await _ghost_age(sm)
+    assert await _reclaim_cap(sm, a["acquirement_id"]) == ReclaimResult.EXPIRED_CANCELLED

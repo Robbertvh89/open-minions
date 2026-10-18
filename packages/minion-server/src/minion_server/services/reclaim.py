@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_server.repositories import reclaim as repo
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.completion import finish_failed
+from minion_server.services.completion import finish_failed, finish_unacknowledged
 
 log = structlog.get_logger()
 
@@ -44,6 +44,7 @@ async def reclaim_one(
     *,
     timeout_s: float,
     max_lease_s: float | None = None,
+    unacked_free_cap: int = 0,
 ) -> ReclaimResult:
     """Reclaim one acquirement inside the caller's open transaction (caller commits).
 
@@ -55,6 +56,9 @@ async def reclaim_one(
     if o is None:
         return ReclaimResult.SKIPPED
     if await repo.heartbeat_stale(session, acquirement_id, timeout_s):
+        if unacked_free_cap > 0 and await repo.never_acknowledged(session, acquirement_id):
+            status = await finish_unacknowledged(session, o, free_cap=unacked_free_cap)
+            return _BY_STATUS[status]
         code, message = "HEARTBEAT_TIMEOUT", "no heartbeat"
     elif max_lease_s is not None and await repo.lease_expired(session, acquirement_id, max_lease_s):
         code, message = "MAX_LEASE_EXCEEDED", "max lease exceeded"
@@ -76,6 +80,7 @@ async def reclaim_stale(
     timeout_s: float,
     batch_size: int,
     max_lease_s: float | None = None,
+    unacked_free_cap: int = 0,
 ) -> Counter[ReclaimResult]:
     """One short transaction per stale acquirement, so a slow owner op never stalls the batch."""
     async with sm() as s:
@@ -94,7 +99,13 @@ async def reclaim_stale(
     for aid in ids:
         try:
             async with sm() as s, s.begin():
-                res = await reclaim_one(s, aid, timeout_s=timeout_s, max_lease_s=max_lease_s)
+                res = await reclaim_one(
+                    s,
+                    aid,
+                    timeout_s=timeout_s,
+                    max_lease_s=max_lease_s,
+                    unacked_free_cap=unacked_free_cap,
+                )
         except Exception as exc:  # one bad row must not block the rest of the batch
             log.error("reclaim_failed", acquirement_id=str(aid), error_type=type(exc).__name__)
             continue

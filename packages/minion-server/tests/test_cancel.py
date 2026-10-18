@@ -475,12 +475,14 @@ async def test_heartbeat_rate_limit(fresh_url: str, s3: S3Env, tmp_path: Path) -
         await seed_task(sm, "rl", 1)
         [(_, tok)] = await make_executors(sm, 1)
         a = await _acquire(c, tok)
+        # The claim's own heartbeat row is no beat: the first heartbeat (the ack) is never limited.
+        assert (await _call(c, a, tok, "heartbeat")).status_code == 200
         before = await _rows(sm, "SELECT last_seen_at, progress FROM minion_executor_heartbeat")
         r = await c.post(
             f"{BASE}/subtasks/{a['acquirement_id']}/heartbeat",
             json={"progress": {"records_done": 1, "records_total": 2}},
             headers=_auth(tok),
-        )  # acquire counts as the first beat
+        )
         assert r.status_code == 429
         assert r.json()["detail"]["code"] == "TOO_MANY_HEARTBEATS"
         assert int(r.headers["retry-after"]) >= 1

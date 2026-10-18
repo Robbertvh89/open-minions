@@ -159,6 +159,36 @@ async def test_run_watchdog_reclaims_sweeps_and_stops(env: tuple[AsyncClient, An
 
 
 @pytest.mark.integration
+async def test_tick_passes_release_limit_to_unacked_reclaim(
+    env: tuple[AsyncClient, Any, str],
+) -> None:
+    c, app, url = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "ghost", 1)
+    [(_, tok)] = await make_executors(sm, 1)
+    await _acquire(c, tok)  # never heartbeated
+    async with sm() as s, s.begin():  # one transaction: same now(), so still never beaten
+        await s.execute(
+            text("UPDATE minion_subtask_acquirement SET acquired_at = now() - interval '1 hour'")
+        )
+        await s.execute(
+            text("UPDATE minion_executor_heartbeat SET last_seen_at = now() - interval '1 hour'")
+        )
+    cfg = _cfg(url, heartbeat_timeout_s=0.5, max_lease_s=3600, release_limit=5)
+    await wd.tick(sm, cfg, asyncio.Event())
+    q = "SELECT outcome || ':' || (error->>'code') FROM minion_subtask_attempt"
+    assert await _scalar(sm, q) == "EXPIRED:NOT_ACKNOWLEDGED"
+    assert await _scalar(sm, "SELECT status FROM minion_subtask") == "PENDING"
+
+
+@pytest.mark.parametrize("n", [-1, 101])
+def test_release_limit_bounds(n: int) -> None:
+    with pytest.raises(ValidationError):
+        _cfg(release_limit=n)
+    assert _cfg(release_limit=100).release_limit == 100
+
+
+@pytest.mark.integration
 async def test_tick_error_does_not_kill_loop(
     env: tuple[AsyncClient, Any, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

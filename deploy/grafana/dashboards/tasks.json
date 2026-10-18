@@ -288,7 +288,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Attempts the watchdog took back (HEARTBEAT_TIMEOUT, MAX_LEASE_EXCEEDED)."
+      "description": "Attempts the watchdog took back (HEARTBEAT_TIMEOUT, MAX_LEASE_EXCEEDED, NOT_ACKNOWLEDGED)."
     },
     {
       "id": 8,

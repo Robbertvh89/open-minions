@@ -121,3 +121,10 @@ def test_pool_timeout_plus_deadline_must_fit_the_executor_http_timeout(
     monkeypatch.setenv("MINION_ACQUIRE_DEADLINE_S", "16")  # 26 s: a client would time out first
     with pytest.raises(ValidationError):
         ServerSettings(_env_file=None)
+
+
+@pytest.mark.parametrize("n", [-1, 101])
+def test_release_limit_bounds(n: int) -> None:
+    with pytest.raises(ValidationError):
+        ServerSettings(_env_file=None, release_limit=n)
+    assert ServerSettings(_env_file=None, release_limit=100).release_limit == 100

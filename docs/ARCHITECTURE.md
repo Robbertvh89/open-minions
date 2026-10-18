@@ -201,8 +201,8 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   running: the bound relies on every worker-lock holder aborting once the handle is `_closed`.
   An `acquire` or `register` still in flight when the first signal arrives is abandoned after
   10 s and the executor exits; an acquirement that had landed server-side is left to the watchdog
-  (no heartbeat ever arrives, so it is reclaimed as EXPIRED, which uses up one of that
-  subtask's attempts). Bounded calls made during grace each get a full budget; the shared
+  (no heartbeat ever arrives, so it is reclaimed as EXPIRED `NOT_ACKNOWLEDGED`, which is free up to
+  `MINION_RELEASE_LIMIT` per subtask, then counts). Bounded calls made during grace each get a full budget; the shared
   deadline is fixed only at the hard stop (or at the final cleanup). When the work finishes
   during the grace period the worker is killed before `complete` so GPU memory is freed
   promptly. launchd `ExitTimeOut` must be at least grace + 15 s (grace + 10 s budget + slack),
@@ -254,6 +254,9 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   a jittered delay (≤30 s); other errors are logged and the beat continues.
   `cancel=true` returns `CANCEL` → interrupt worker, `release` (server records `CANCELLED`).
   `409` (`TASK_FINISHED`, stale acquirement) returns `STALE` → interrupt worker, report nothing.
+  **Ack beat** (ADR-0014): right after a successful acquire, before the worker starts, one heartbeat
+  is sent at once. `429` / `5xx` / transport errors on it are non-fatal; `409` drops the assignment
+  without running it.
   Logs carry ids only. Running with `--heartbeat-interval` such that `MINION_HEARTBEAT_TIMEOUT_S` < 2× the interval is
   rejected only when the operator exports `MINION_HEARTBEAT_TIMEOUT_S`; keep the timeout ≥ 2–3×
   the interval (3× recommended) so one lost beat does not get a live executor reclaimed.
@@ -440,6 +443,7 @@ Never expire the promoted `NNNNNN.jsonl` outputs. Not automated in v1.
 ```
 Executor (every heartbeat interval, 300 s by default, while running): POST /heartbeat {progress, budget, paused_reason}
   Server: owner check under lock (acquirement, else 409); 429 if closer than MINION_HEARTBEAT_MIN_INTERVAL_S
+          (the first beat after a claim, the ack, is exempt: ADR-0014)
           UPDATE minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
           respond {cancel: task.status == CANCELLED, output_url (fresh presigned PUT), expires_at}
 
@@ -453,14 +457,18 @@ SKIP LOCKED + re-check (ADR-0008), not DELETE ... RETURNING:
       SELECT ... FROM minion_subtask_acquirement WHERE acquirement_id = $1 FOR UPDATE SKIP LOCKED
       -- no row (gone) or locked by an owner op / other replica → SKIPPED
       re-check: heartbeat still stale? else max lease exceeded? else → NOT_STALE
-      finish_failed: INSERT minion_subtask_attempt(outcome=EXPIRED, code HEARTBEAT_TIMEOUT | MAX_LEASE_EXCEEDED)
+      -- stale heartbeat with last_seen_at = acquired_at (never acknowledged) and fewer than
+      -- MINION_RELEASE_LIMIT earlier NOT_ACKNOWLEDGED expiries: code NOT_ACKNOWLEDGED, not budget-counted
+      finish_failed: INSERT minion_subtask_attempt(outcome=EXPIRED, code NOT_ACKNOWLEDGED | HEARTBEAT_TIMEOUT | MAX_LEASE_EXCEEDED)
                      DELETE acquirement (cascades heartbeat row)
                      UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
       UPDATE task counters / status
     COMMIT
 ```
 **Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
-(`fail` already counts the attempt being recorded). A voluntary `release` does not consume it, up to
+(`fail` already counts the attempt being recorded). `EXPIRED` with code `NOT_ACKNOWLEDGED` (never-beaten
+acquirement, ADR-0014) is not counted, up to `MINION_RELEASE_LIMIT` per subtask; past the cap it counts.
+A voluntary `release` does not consume it, up to
 `MINION_RELEASE_LIMIT` releases per subtask (then recorded as a retryable `FAILED`).
 `attempt` itself keeps counting every acquisition (it keys the output object), so it is *not* the
 budget; the watchdog (M2) must use the same count, not `attempt >= max_attempts`.
@@ -587,6 +595,8 @@ Container hardening (`deploy/Dockerfile`, `x-minion-app` in `compose.yml`): one 
 Startup order with `docker compose -f deploy/compose.yml --profile app up -d --build`: postgres (healthy via `pg_isready -h 127.0.0.1`, TCP because the socket-only initdb server would report healthy too early) → `migrate` (one-shot `alembic upgrade head`, replaces the manual `uv run alembic upgrade head` in container mode) and `s3-init` → `server` (healthy on `/healthz`) and `watchdog` (healthy while its health file is newer than 3 × interval + 30 s). Only the `app` profile starts these; without it the infra-only flow runs the server natively.
 
 Ports: the server is published on `127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}` only. Secrets: `${MINION_SECRETS_DIR:-./secrets}` (default `deploy/secrets/`, git-ignored) is mounted read-only at `/run/minion-secrets` and holds `api-keys.yaml`; the directory is mounted, not the file, so the atomic temp+rename reload reaches the container. `MINION_UI_SESSION_SECRET` and `MINION_METRICS_TOKEN` come from the environment (compose reads the shell or `deploy/.env`), never from the image. Ownership: `auth.py` refuses a keys file or directory not owned by root or the server uid. On macOS Docker Desktop the bind mount shows the file as owned by the container uid, so it works as is. On Linux hosts, either `chown -R 10001:10001` the secrets directory and file, or leave them `root:root` (file 0644 in a 0755 directory); the keys file must not be group/world-writable. `api-keys.yaml` must exist before `up`, otherwise Docker creates an empty directory at the mount source. The watchdog healthcheck reads `MINION_WATCHDOG_INTERVAL_S`, which compose passes to the watchdog too (default 60) so both use one value.
+
+`MINION_RELEASE_LIMIT` (0..100) is read by both server and watchdog and must have the same value on both (the watchdog applies it to free `NOT_ACKNOWLEDGED` expiries, the server to releases).
 
 Database role: the compose `minion` superuser is dev only. A non-dev deployment runs `migrate` as the schema owner and the server and watchdog as a separate non-superuser, DML-only application role.
 
