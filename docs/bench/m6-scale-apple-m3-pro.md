@@ -28,7 +28,7 @@ bottlenecks show up once that query is cheap: head-of-queue contention (about 19
 | Compose | `deploy/compose.yml` + `deploy/compose.scale.yml`, project `open-minions-scale`, loopback ports 55432 / 59000 / 58080 |
 | PostgreSQL | 16.15 (postgres:16-alpine, aarch64). `shared_buffers=1GB`, `effective_cache_size=3GB`, `max_connections=300`, `work_mem=4MB`, `random_page_cost=4`, `synchronous_commit=on`, `max_wal_size=1GB`, `pg_stat_statements` preloaded (`track=all`), `track_io_timing=on`, `shm_size=1gb`. Alembic head 0008 |
 | Server | 1 container, 1 uvicorn process. Python 3.12.15, FastAPI 0.143.2, SQLAlchemy 2.1.4, asyncpg 0.32.0, uvicorn 0.54.0. DB pool 20 + overflow 20. `acquire_min_interval_s=0.2`, `heartbeat_min_interval_s=1.0`, `CANDIDATE_LIMIT=16`, `/metrics` on |
-| Watchdog | `MINION_HEARTBEAT_TIMEOUT_S=20`, interval 5 s, batch 500 (scale overlay) |
+| Watchdog | `MINION_HEARTBEAT_TIMEOUT_S=20`, interval 5 s, batch 500 (scale overlay). **Production defaults differ:** executor heartbeat 300 s, watchdog `heartbeat_timeout_s` 900 s (`minion_watchdog/settings.py:15`); the sims heartbeat every 5 s. See [Limits](#limits-and-extrapolation) |
 | Load generator | `minion-scale run` on the same Mac (Python 3.12.7, httpx 0.28.1), `--procs 8` for 500 sims, `ulimit -n 65536`. Client timeout 30 s. Event-loop lag stayed at p99 ≤ 2.5 ms (max 100 ms) in every run, so the client was not the bottleneck |
 | Seeding | `minion-scale seed` bulk-inserts PENDING rows (no splitter), then `VACUUM ANALYZE`. 1M rows: 22 s, database 351 MB (`minion_subtask` 337 MB) |
 
@@ -88,16 +88,33 @@ because with 1M pending almost every acquire finds work.
   clients had already given up at 30 s (4,857 transport errors), so they saw only 6 × 5xx.
 - **Knock-on effects:** heartbeats and completes queue for the same pool (heartbeat p50 ≤ 30 s, 322
   heartbeats got 409 after reclaim). 446 completes got 409, and 1,285 completes failed client-side.
-  By the end, **269 subtasks were FAILED** although no fault was injected: overload burned attempts
-  (timeouts, reclaims, retryable fails) until `max_attempts=5` ran out. The exact path was not
-  traced further.
+  By the end, **269 subtasks were FAILED** although no fault was injected. This count is an
+  **unrecorded observation**: it came from a post-run status query that was not saved with the raw
+  data (no query, count or timestamp survives), so it is not in the JSON. The breakdown below is
+  reconstructed from recorded figures (run A1) and is consistent with it, not a trace of those 269:
+  - *Ghost acquires.* The server committed 5,086 assigned acquires (`minion_acquire_seconds`,
+    5,086 acquirement `UPDATE`s) but clients received only 3,148: **1,938 acquirements were never
+    delivered**. The client gave up at 30 s while the server finished the request after the
+    disconnect. These owners never heartbeat, so they expire after the 20 s timeout.
+  - *Abandoned completes.* 1,285 client-side complete failures (1,283 transport, 2 × 500). The sim
+    (`minion_scale/sim.py:410`) gives up after one failed complete, whereas the real executor
+    (`minion_executor/loop.py:1158`) retries transport errors and 5xx. This is a harness artifact
+    and overstates the loss.
+  - *Budget accounting.* An EXPIRED attempt counts against `max_attempts` (`failed_attempt_count`,
+    `repositories/completion.py:114`, via `services/completion.py:124`); the seed uses
+    `max_attempts=5`. FR-22 order puts reclaimed subtasks back at the head, so the same
+    subtasks are re-served first, and each ghost or abandoned attempt burns another try.
+  - *Consistency.* `bump_counters` ran 1,658 times: 1,279 client-confirmed successes + about 110
+    completes committed after the client gave up + 269 failures, if all of them come from A1.
 - The harness polls the remaining count once per second (`SELECT count(*) ... status IN (...)`).
   That cost 748 × 274 ms, about 0.3 core: a few percent of the DB CPU, but not zero.
 
 **Realistic mix (500 sims, 75 s work):** the demand is only about 6.7 acquires/s, but all 500 sims
 acquire at the start. That burst collapses in the same way (PG at 1,183 %, 320 acquire timeouts).
-Heartbeats queued behind the burst for more than 20 s, so the watchdog reclaimed 468 assignments
-from live sims (`discarded_stale` 468, heartbeat 409 × 492). After the burst, acquires settle at
+Heartbeats queued behind the burst for more than 20 s, so the watchdog (at its overlay timeout of
+20 s) reclaimed 468 assignments from live sims (`discarded_stale` 468, heartbeat 409 × 492). With
+the production 900 s timeout these reclaims would not have happened; they are an artifact of the
+20 s overlay (see [Limits](#limits-and-extrapolation)). After the burst, acquires settle at
 about 250 ms (PG median 394 %).
 
 **Load knee:** one executor already costs about 200 ms per acquire, nearly all of it the
@@ -118,7 +135,7 @@ sleep 30; uv run minion-scale verify --out verify.json
 
 **Scaled down from 100k to 20k.** A first attempt with 100k subtasks and 500 sims drained at
 about 22 subtasks/s: 2,672 done in about 150 s, server container at about 98 % CPU, PG at
-350–430 %, and the candidate query 32 ms by EXPLAIN. That projected to about 75 minutes, so I
+350–430 % (`docker stats` samples 01:35–01:37, the only server-CPU samples of Scenario B), and the candidate query 32 ms by EXPLAIN. That projected to about 75 minutes, so I
 stopped it (sims released cleanly, 0 RUNNING left), reset the stack, and re-ran B on 20k.
 
 | Metric | Value |
@@ -132,8 +149,9 @@ stopped it (sims released cleanly, 0 RUNNING left), reset the stack, and re-ran 
 | Acquirement INSERT attempts | **418,083** for 21,518 wins: **19.4 per win**, 0.7 ms each |
 | `verify` | **PASS**: `nf2_one_succeeded_attempt_per_succeeded_subtask` 0 violations; `nf2_final_objects_match_succeeded` 20,000 / 20,000, 0 missing, 0 unexpected; `nf3_all_subtasks_terminal` 0; `nf3_no_orphan_acquirements` 0; `task_counters_match_subtasks` 0 violations; `tasks_terminal` 0 |
 
-In this run the candidate query is cheap, yet the acquire is still seconds long. The server
-process runs at about 98 % of one core: it handles about 19 `INSERT ... ON CONFLICT DO NOTHING` round
+In this run the candidate query is cheap, yet the acquire is still seconds long. In the aborted
+100k attempt (not the 20k run, whose server CPU was not sampled) the server process ran at about
+98 % of one core. It handles about 19 `INSERT ... ON CONFLICT DO NOTHING` round
 trips per acquire, because all 500 sims get the same 16 head candidates and fight over them. Every
 other endpoint queues behind that same event loop (complete p50 ≤ 5 s).
 
@@ -155,10 +173,13 @@ Procedure, on the 1M database after Scenario A:
 | without 0008 | 500 | 6,971 | 2 | 3, 2 (0) |
 
 The tick time is dominated by the per-row reclaim: one short transaction per acquirement, about
-3.9–4.7 ms per row with the index. The without-index tick (14 ms/row) is slower, but its scan took
-the same 2–3 ms, so the gap comes from run-to-run variance in the per-row transactions
-(autovacuum on `minion_subtask` was due: 24k dead tuples). It does not come from the over-lease
-scan. **0008 makes no measurable difference here.** `minion_subtask_acquirement` only holds
+3.9–4.7 ms per row with the index. The without-index tick (14 ms/row) is slower, but with one
+tick per case (n=1) the tick times cannot show an effect either way. The valid argument is
+structural: the over-lease scan costs the same 2–3 ms with and without 0008, and the per-row
+reclaim goes through the primary key, not through 0008. So the gap is most likely run-to-run
+variance in the per-row transactions (autovacuum on `minion_subtask` was due: 24k dead tuples).
+The repeat reclaimed 436 rather than 500 rows; the raw logs do not say why (not explained, and not
+investigated). **0008 makes no measurable difference here.** `minion_subtask_acquirement` only holds
 running work (≤ 500 rows), whatever the size of `minion_subtask`. The planner uses the index only
 when it is selective (no hits: Index Scan, 2 buffers). With 500 hits or no index it picks a Seq
 Scan of 42–63 buffers in < 0.2 ms. 0008 still bounds the scan if the acquirement table ever grows
@@ -178,11 +199,13 @@ uv run minion-scale run ... --sims 20 --procs 2 --work-s 0 --acquire-pace-s 0.4 
 | Check | Result |
 |---|---|
 | Single-executor burst | 50 calls in 0.26 s: **2 × 200, 48 × 429**. Every 429 carried **`Retry-After: 1`** (`ceil(0.2)`). 429 latency p50 3.6 ms |
-| DB work for the burst | pg_stat_statements: candidate SELECT **+2**, acquirement INSERT +2, executor UPDATE on acquire +2, attempt INSERT +2 (the 2 releases), register UPDATE +1. Tuples ins/upd/del +6/+8/+4. **All of it belongs to the 2 admitted acquires and their releases. The 48 throttled calls ran no statement and wrote nothing.** |
+| DB work for the burst | pg_stat_statements: candidate SELECT **+2**, acquirement INSERT +2, executor UPDATE on acquire +2, attempt INSERT +2 (the 2 releases), register UPDATE +1. Tuples ins/upd/del +6/+8/+4. **All of it belongs to the 2 admitted acquires and their releases. The 48 throttled calls ran no candidate scan and no writes.** The indexed auth lookup (`get_by_token_hash`) still runs before `_limited` (`auth.py:437`, `api/executor.py:54-60`) |
 | Harness throttled (pace 0.05 s < 0.2 s) | 1,034 × 429 on acquire, 1,049 admitted. Candidate SELECT 1,053 calls (= admitted + 4 conflict rounds); executor UPDATE 1,049 (= admitted). Writes per completion: ins 2.96 / upd 3.95 / del 1.98 |
 | Harness control (pace 0.4 s) | 0 × 429, 2,980 admitted. Candidate SELECT 3,421; executor UPDATE 2,980. Writes per completion: ins 3.25 / upd 3.96 / del 2.27 |
 
-The limiter rejects before any DB work, as NF-5 / ADR-0012 require. The sims honor `Retry-After`
+The limiter rejects before any candidate scan or write, as NF-5 / ADR-0012 require. It does not
+reject before all DB work: the auth lookup (`get_by_token_hash`, own session) runs first, so load
+shedding still costs one pool connection per call unless the lookup is cached. The sims honor `Retry-After`
 (1–1.2 s), which cuts their own throughput (17.3/s throttled vs 49.1/s control). That is the
 intended back-pressure. The control run at only 20 sims and 10k pending already shows 8.3 INSERT
 attempts per win (24,605 / 2,980), the same head contention as in Scenario B.
@@ -206,30 +229,48 @@ The candidate query has no index path: its `ORDER BY` mixes task columns (`prior
 created_at`) with subtask columns, so PostgreSQL must join every PENDING row before it can take
 the top 16. The cost grows linearly with the pending count: about 0.6 µs per row per process, with 333k rows per process.
 
+Neither existing index helps. `ix_minion_task_queue` leads with `status` and the query filters
+`status IN (PENDING, RUNNING)`, so it cannot return tasks ordered by `(priority DESC,
+created_at)`. `ix_minion_subtask_pending` matches 100 % of the rows (all are PENDING), so it
+brings no selectivity.
+
 ## M6.4 (TASK-7.4) items from this run
 
 1. **Candidate query: index-driven two-step pick (highest impact, needed for NF-1).** Evidence: 187 ms
    with one executor at 1M pending, 2.4 s mean under load. 38 cores of demand in the stress run.
    EXPLAIN shows a parallel seq scan plus a top-N sort of all 1M PENDING rows. Fix as in the TASK-7.4
-   description: walk `minion_task` in queue order (`ix_minion_task_queue` or an index on `(priority
-   DESC, created_at)` for live tasks), then take the per-task top-K from `ix_minion_subtask_pending`
-   (an index range scan, no full sort). Expected cost: O(K + number of tasks), independent of queue
-   length. Target: ≤ 5 ms at 1M.
+   description: walk the live tasks in queue order, then take the per-task top-K from
+   `ix_minion_subtask_pending` (an index range scan, no full sort). Expected cost: O(K + number of
+   tasks), independent of queue length. Target: ≤ 5 ms at 1M. The task walk needs a new partial
+   index on `(priority DESC, created_at) WHERE status IN ('PENDING', 'RUNNING')`, or an
+   application-level two-step walk. `ix_minion_task_queue` is not an option (it leads with
+   `status`; see [EXPLAIN plans](#explain-plans)). Keep the FR-22 tie-breakers.
 2. **Head contention / conflict rounds.** Evidence: 19.4 acquirement INSERT attempts per win
-   (Scenario B), 24–26 per win under load at 1M, 8.3 per win at only 20 sims. 2–3 candidate queries per
-   acquire. The server sat at about 98 % CPU on these round trips while the DB was not saturated.
-   Options that keep invariant 2: randomize or offset the start within the top-K per executor (e.g.
-   hash of executor_id), or a larger K with a random pick. `SKIP LOCKED` deviates from the paper and
-   needs an ADR first.
-3. **Server throughput: one uvicorn process.** Evidence: 98 % of one core in Scenario B, and every
-   endpoint (complete, heartbeat) queues behind acquire. Run several workers or replicas (NF-5 allows
-   it; the rate-limiter caveat is in ADR-0012) and re-measure.
+   (Scenario B), 24–26 per win under load at 1M, 8.3 per win at only 20 sims. About 2 candidate
+   queries per acquire (1.95 / 2.09 / 2.19). The server sat at about 98 % CPU on these round trips
+   in the aborted 100k attempt while the DB was not saturated. Note that `SHUFFLE_HEAD = 4`
+   (`services/acquisition.py:16`, used at `:68`) already exists, and the 19.4 per win were measured
+   with it. The option is therefore to widen or decorrelate it: a larger shuffled head, or an
+   offset per executor (e.g. a hash of executor_id) within the top-K. Both keep invariant 2.
+   `SKIP LOCKED` deviates from the paper and needs an ADR first.
+3. **Server throughput: one uvicorn process.** Evidence: 98 % of one core in the aborted 100k
+   attempt, and every endpoint (complete, heartbeat) queues behind acquire. Run several workers or
+   replicas (NF-5 allows it; the rate-limiter caveat is in ADR-0012) and re-measure.
 4. **Overload must not turn into permanent failures or false reclaims.** Evidence: 269 subtasks FAILED
-   with no injected fault (stress), and 468 live assignments reclaimed because heartbeats waited in the
-   pool for > 20 s (realistic burst). Ideas: answer acquire with 503 / 429 + Retry-After when the DB
-   pool is saturated (load shedding) instead of letting heartbeats and completes time out; give
-   heartbeats and completes priority over acquires (separate pool or semaphore); look at whether
-   EXPIRED attempts caused by server overload should count against `max_attempts`.
+   with no injected fault (stress; unrecorded observation, see the breakdown above) and 468 live
+   assignments reclaimed because heartbeats waited in the pool for > 20 s (realistic burst, an
+   overlay artifact at a 20 s timeout). The main real-executor mechanism is the *acquire committed
+   after the client gave up*: the server finishes the acquirement INSERT after the client has
+   timed out, the executor never learns it owns the subtask, never heartbeats, and the attempt
+   expires and is charged to `max_attempts`. Options:
+   - a server-side acquire deadline below the client timeout, checked before the acquirement
+     INSERT, so that an acquire the client abandoned never commits;
+   - do not charge the retry budget for EXPIRED attempts that never sent a heartbeat (needs a SPEC
+     change);
+   - an executor client timeout above the server pool timeout, so the server answers first;
+   - answer acquire with 503 / 429 + Retry-After when the DB pool is saturated (load shedding), and
+     give heartbeats and completes priority over acquires (separate pool or semaphore). Shedding
+     still costs an auth pool connection unless the token lookup is cached.
 5. **DB pool sizing and timeout.** Evidence: QueuePool 20 + 20 exhausted with a 30 s wait, 3,181 × 500.
    A bigger pool would not help while the candidate query saturates PG. Re-tune after item 1:
    pool ≈ cores × 2–4, and a short pool timeout (≤ 2–5 s) so a request fails fast instead of holding a
@@ -241,9 +282,21 @@ the top 16. The cost grows linearly with the pending count: about 0.6 µs per ro
    during the runs; scale factor 0.2 means 200k dead rows before the first autovacuum at 1M; tune via
    migration as TASK-7.4 (3) suggests). `bump_counters` (`UPDATE minion_task SET succeeded_subtasks`)
    cost 0.98 ms mean in B and is not a hot spot yet. Re-check it after items 1–3.
+8. **Harness: sim complete retry parity.** The sim gives up after one failed complete
+   (`minion_scale/sim.py:410`); the executor retries transport errors and 5xx
+   (`minion_executor/loop.py:1158`). Give the sim the same retry so overload runs do not
+   overcount abandoned completes (1,285 in A1).
 
 ## Limits and extrapolation
 
+- **Overlay timings vs production.** The scale overlay ran the sims' heartbeat at 5 s and the
+  watchdog `heartbeat_timeout_s` at 20 s. Production uses an executor heartbeat of 300 s and a
+  watchdog timeout of 900 s (`minion_watchdog/settings.py:15`). That is about 60x the heartbeat
+  load: A2 sent 43,285 heartbeats in 600 s (about 72/s), where 500 production executors send about
+  1.7/s. A 20 s pool wait is enough to reclaim a live sim, so the 468 false reclaims (and part of
+  the pool pressure, which the heartbeat load adds to) are overlay artifacts. Read "heartbeats
+  starve" and "reclaimed from live sims" as holding *at a 20 s timeout*; the 900 s timeout
+  tolerates a pool wait of that size. The NF-1 failure (candidate query) does not depend on it.
 - **Co-location.** The load generator (8 processes), the server, PostgreSQL, SeaweedFS and the
   watchdog all share one Mac. PG was given all 12 VM CPUs and competed with the sims and the server
   for them. A dedicated DB host would raise the knee somewhat, but the 187 ms single-executor cost does

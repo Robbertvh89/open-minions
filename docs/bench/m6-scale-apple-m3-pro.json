@@ -50,6 +50,15 @@
    "python": "3.12.7",
    "httpx": "0.28.1",
    "host": "same Mac, loopback to Docker Desktop port forward"
+  },
+  "overlay_vs_production": {
+   "sim_heartbeat_s": 5,
+   "overlay_watchdog_heartbeat_timeout_s": 20,
+   "production_executor_heartbeat_s": 300,
+   "production_watchdog_heartbeat_timeout_s": 900,
+   "a2_heartbeats_600s": 43285,
+   "a2_heartbeats_per_s": 72,
+   "production_heartbeats_per_s_500_executors": 1.7
   }
  },
  "scenario_a_nf1": {
@@ -475,6 +484,21 @@
     "server_cpu_pct_median": 44,
     "server_cpu_pct_max": 64,
     "server_log": "3181 x sqlalchemy QueuePool limit of size 20 overflow 20 reached (30 s timeout) -> 500"
+   },
+   "overload_breakdown": {
+    "failed_subtasks_observed": {
+     "count": 269,
+     "recorded": false,
+     "note": "post-run status count; query, time and raw output were not saved"
+    },
+    "ghost_acquires": {
+     "server_assigned_committed": 5086,
+     "client_received": 3148,
+     "never_delivered": 1938
+    },
+    "client_complete_failed": 1285,
+    "bump_counters_calls": 1658,
+    "bump_counters_decomposition": "1279 client successes + ~110 late-committed completes + 269 failures (if all from this run)"
    }
   },
   "realistic_500_sims_work_75s": {
