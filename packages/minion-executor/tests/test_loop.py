@@ -106,6 +106,12 @@ class FakeClient:
         self.on_presence: Any = None
         self.presence_excs: list[Exception] = []
         self.registers: list[Any] = []
+        # the ack (first beat after an acquire, ADR-0014) is recorded apart so scripted
+        # heartbeats and call-order assertions keep their meaning
+        self.acks: list[uuid.UUID] = []
+        self.ack_script: list[HeartbeatResponse | Exception] = []
+        self.on_ack: Any = None
+        self._unacked: set[uuid.UUID] = set()
 
     async def presence(self, req: PresenceRequest) -> None:
         self.calls.append(("presence", req))
@@ -131,6 +137,8 @@ class FakeClient:
         item = self.items.pop(0)
         if isinstance(item, Exception):
             raise item
+        if item is not None:
+            self._unacked.add(item.acquirement_id)
         return item
 
     async def complete(self, aid: uuid.UUID, req: CompleteRequest) -> None:
@@ -148,6 +156,17 @@ class FakeClient:
         self.release_codes.append(req.code if req is not None else None)
 
     async def heartbeat(self, aid: uuid.UUID, req: HeartbeatRequest) -> HeartbeatResponse:
+        if aid in self._unacked:
+            self._unacked.discard(aid)
+            self.acks.append(aid)
+            if self.on_ack:
+                self.on_ack()
+            if self.ack_script:
+                ack = self.ack_script.pop(0)
+                if isinstance(ack, Exception):
+                    raise ack
+                return ack
+            return hb_resp()
         self.calls.append(("heartbeat", req))
         if self.hb_script:
             item = self.hb_script.pop(0)
@@ -1384,7 +1403,8 @@ async def test_progress_ticks_feed_heartbeat_progress(tmp_path: Path) -> None:
         try:
             return await orig(*a, **k)
         finally:
-            worker.release.set()
+            if "heartbeat" in client.kinds():  # not the ack
+                worker.release.set()
 
     client.heartbeat = hb  # type: ignore[method-assign]
     await loop.run()
@@ -3502,3 +3522,53 @@ def test_first_acquire_jitter_setting_bounds() -> None:
         with pytest.raises(ValueError):
             ExecutorSettings(first_acquire_jitter_s=bad)
     assert ExecutorSettings(first_acquire_jitter_s=0).first_acquire_jitter_s == 0
+
+
+# --- ack heartbeat (TASK-7.4.5, ADR-0014) ---
+
+
+async def test_ack_is_sent_before_the_worker_starts(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    seen: list[list[int]] = []
+    client.on_ack = lambda: seen.append(list(worker.batches))
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert len(client.acks) == 1 and seen == [[]]  # acked while no batch had run
+    assert worker.batches  # and the work did run afterwards
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ApiError(429, "TOO_MANY_HEARTBEATS", "slow", retry_after=1.0),
+        ApiError(503, "UNAVAILABLE", "down"),
+        httpx.ConnectError("boom"),
+    ],
+)
+async def test_ack_failure_is_non_fatal(tmp_path: Path, exc: Exception) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    client.ack_script = [exc]
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    assert await loop.run() == 1
+    assert worker.batches and "complete" in client.kinds()
+
+
+async def test_ack_409_drops_the_assignment_without_running(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    client.ack_script = [StaleAcquirementError(409, "STALE_ACQUIREMENT", "gone")]
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await loop.run()
+    assert worker.batches == [] and not worker.ensured
+    assert client.kinds() == ["acquire", "acquire"]  # no complete / fail / release

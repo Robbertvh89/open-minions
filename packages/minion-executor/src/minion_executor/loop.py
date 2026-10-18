@@ -778,6 +778,12 @@ class ExecutorLoop:
             initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
+        # Ack (ADR-0014): one immediate heartbeat before the worker starts, so the server can tell
+        # an owned subtask from a lost acquire response. Failures other than 409 are non-fatal.
+        signal, _ = await hb.beat()
+        if signal is HeartbeatSignal.STALE:
+            bound.info("ack_stale_dropped")
+            return _Outcome.DISCARDED
         self._current = (a, hb)
         self._status_kick.set()
         self._batch_budget = None
