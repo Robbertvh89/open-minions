@@ -242,6 +242,7 @@ def test_revoke_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_S3_SECRET_KEY", "sk")
     r = CliRunner().invoke(admin_app, ["revoke-executor-token", "--executor-id", eid])
     assert r.exit_code == 0, r.output
+    assert "MINION_EXECUTOR_AUTH_CACHE_TTL_S" in r.stdout
     assert asyncio.run(with_sm(status)) == ExecutorStatus.REVOKED.value
     r = CliRunner().invoke(admin_app, ["revoke-executor-token", "--executor-id", str(uuid.uuid4())])
     assert r.exit_code == 1
@@ -333,6 +334,7 @@ def test_rotate_and_list_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch)
     assert r.exit_code == 0, r.output
     new = next(ln.split(": ", 1)[1] for ln in r.stdout.splitlines() if ln.startswith("token"))
     assert new != old and eid in r.stdout
+    assert "MINION_EXECUTOR_AUTH_CACHE_TTL_S" in r.stdout
     r = CliRunner().invoke(admin_app, ["list-executors"])
     assert hashlib.sha256(new.encode()).hexdigest() not in r.stdout
     r = CliRunner().invoke(admin_app, ["rotate-executor-token", "--executor-id", str(uuid.uuid4())])

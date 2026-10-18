@@ -125,6 +125,13 @@ class Metrics:
             buckets=ACQUIRE_BUCKETS_S,
             registry=self.registry,
         )
+        self.executor_auth = Counter(
+            "minion_executor_auth_total",
+            "Executor token authentications by outcome (cache_hit, negative_hit, db_valid, "
+            "db_invalid, busy: auth pool wait timed out -> 503).",
+            ("outcome",),
+            registry=self.registry,
+        )
         self.task_settle_failed = Counter(
             "minion_task_settle_failed_total",
             "Post-commit task settles that raised (the watchdog's settle_stuck finishes the task).",

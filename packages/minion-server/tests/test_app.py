@@ -73,23 +73,23 @@ def test_main_warns_when_the_connection_budget_is_exceeded(
     import uvicorn
 
     _main_env(monkeypatch)
-    monkeypatch.setenv("MINION_SERVER_WORKERS", "8")  # 8 x 20 + 2 > 100
+    monkeypatch.setenv("MINION_SERVER_WORKERS", "8")  # 8 x 22 + 2 > 100
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
     with structlog.testing.capture_logs() as logs:
         app_module.main()
     [w] = [e for e in logs if e["event"] == "db_connection_budget_exceeded"]
-    assert w["budget"] == 162
+    assert w["budget"] == 178
     assert w["db_max_connections"] == 100
     assert w["limit"] == 93
-    monkeypatch.setenv("MINION_SERVER_WORKERS", "4")  # 4 x 20 + 2 = 82 < 93
+    monkeypatch.setenv("MINION_SERVER_WORKERS", "4")  # 4 x (10 + 10 + 2) + 2 = 90 < 93
     with structlog.testing.capture_logs() as logs:
         app_module.main()
     assert not [e for e in logs if e["event"] == "db_connection_budget_exceeded"]
-    monkeypatch.setenv("MINION_DB_MAX_CONNECTIONS", "89")  # budget 82 >= 89 - 7: warns (>=)
+    monkeypatch.setenv("MINION_DB_MAX_CONNECTIONS", "97")  # budget 90 >= 97 - 7: warns (>=)
     with structlog.testing.capture_logs() as logs:
         app_module.main()
     assert [e for e in logs if e["event"] == "db_connection_budget_exceeded"]
-    monkeypatch.setenv("MINION_DB_MAX_CONNECTIONS", "90")  # 82 < 83
+    monkeypatch.setenv("MINION_DB_MAX_CONNECTIONS", "98")  # 90 < 91
     with structlog.testing.capture_logs() as logs:
         app_module.main()
     assert not [e for e in logs if e["event"] == "db_connection_budget_exceeded"]

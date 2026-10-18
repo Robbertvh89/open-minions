@@ -258,6 +258,7 @@ def _settings(url: str) -> ServerSettings:
         acquire_min_interval_s=0,
         presence_min_interval_s=0,
         preference_min_interval_s=0,
+        executor_auth_cache_ttl_s=0,  # tests revoke/expire and expect an immediate 401 (TASK-32)
     )
 
 

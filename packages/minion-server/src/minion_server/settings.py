@@ -35,6 +35,14 @@ class ServerSettings(BaseSettings):
     db_pool_timeout_s: float = Field(default=5.0, ge=0.5, le=30.0)
     acquire_deadline_s: float = Field(default=10.0, ge=1.0, le=20.0)
     acquire_concurrency: int | None = Field(default=None, ge=1)
+    # Executor token cache + auth lane (TASK-32, ADR-0018). A revoked/rotated token keeps working
+    # for at most executor_auth_cache_ttl_s per worker (0 = revalidate every request); expiry is
+    # checked on every hit. Unknown tokens are looked up on a separate pool of db_auth_pool_size
+    # connections (no overflow); no connection within auth_lookup_timeout_s -> 503 SERVER_BUSY.
+    executor_auth_cache_ttl_s: float = Field(default=10.0, ge=0, le=60)
+    executor_auth_cache_max_entries: int = Field(default=50_000, gt=0)
+    db_auth_pool_size: int = Field(default=2, ge=1, le=8)
+    auth_lookup_timeout_s: float = Field(default=1.0, ge=0.1, le=5.0)
     max_request_body_bytes: int = Field(default=1 << 20, gt=0)  # 413 above this
 
     # Multi-worker (TASK-7.4.6): `workers` uvicorn processes, each with its own pool, acquire
@@ -211,8 +219,9 @@ class ServerSettings(BaseSettings):
 
     @property
     def connection_budget(self) -> int:
-        """Worst-case DB connections: every worker's full pool plus the watchdog's pool."""
-        per_worker = self.db_pool_size + self.db_max_overflow
+        """Worst-case DB connections: every worker's full pool plus its auth pool, plus the
+        watchdog's pool."""
+        per_worker = self.db_pool_size + self.db_max_overflow + self.db_auth_pool_size
         return self.server_workers * per_worker + self.watchdog_db_pool_size
 
     @model_validator(mode="after")

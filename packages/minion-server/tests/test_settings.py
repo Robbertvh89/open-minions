@@ -146,7 +146,7 @@ def test_connection_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_DB_MAX_OVERFLOW", "4")
     monkeypatch.setenv("MINION_WATCHDOG_DB_POOL_SIZE", "2")
     s = ServerSettings(_env_file=None)
-    assert s.connection_budget == 50
+    assert s.connection_budget == 4 * (8 + 4 + 2) + 2  # + auth pool per worker
     assert s.acquire_concurrency_limit == 8  # per process, not divided by workers
 
 
@@ -155,3 +155,27 @@ def test_connection_limit_and_watchdog_pool_floor(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("MINION_WATCHDOG_DB_POOL_SIZE", "0")
     with pytest.raises(ValueError):
         ServerSettings(_env_file=None)
+
+
+def test_auth_cache_settings_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = ServerSettings(_env_file=None)
+    assert (s.executor_auth_cache_ttl_s, s.db_auth_pool_size, s.auth_lookup_timeout_s) == (
+        10.0,
+        2,
+        1.0,
+    )
+    for name, bad in (
+        ("MINION_EXECUTOR_AUTH_CACHE_TTL_S", "61"),
+        ("MINION_EXECUTOR_AUTH_CACHE_TTL_S", "-1"),
+        ("MINION_DB_AUTH_POOL_SIZE", "0"),
+        ("MINION_DB_AUTH_POOL_SIZE", "9"),
+        ("MINION_AUTH_LOOKUP_TIMEOUT_S", "0.05"),
+        ("MINION_AUTH_LOOKUP_TIMEOUT_S", "6"),
+        ("MINION_EXECUTOR_AUTH_CACHE_MAX_ENTRIES", "0"),
+    ):
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValidationError):
+            ServerSettings(_env_file=None)
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("MINION_EXECUTOR_AUTH_CACHE_TTL_S", "0")
+    assert ServerSettings(_env_file=None).executor_auth_cache_ttl_s == 0

@@ -30,6 +30,7 @@ from minion_server.ratelimit import MinIntervalLimiter
 from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
+from minion_server.tokencache import ExecutorTokenCache
 from minion_server.ui.headers import UiHeadersMiddleware
 from minion_server.ui.routes import router as ui_router
 
@@ -46,6 +47,19 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             pool_size=cfg.db_pool_size,
             max_overflow=cfg.db_max_overflow,
             pool_timeout=cfg.db_pool_timeout_s,
+        )
+        # Dedicated lane for lookups of tokens never seen (TASK-32): a flood of garbage bearers can
+        # hold at most db_auth_pool_size connections here, never one from the main pool.
+        auth_engine = create_engine(
+            cfg.database_url,
+            pool_size=cfg.db_auth_pool_size,
+            max_overflow=0,
+            pool_timeout=cfg.auth_lookup_timeout_s,
+        )
+        app.state.auth_engine = auth_engine
+        app.state.auth_sessionmaker = create_sessionmaker(auth_engine)
+        app.state.executor_tokens = ExecutorTokenCache(
+            cfg.executor_auth_cache_ttl_s, cfg.executor_auth_cache_max_entries
         )
         app.state.acquire_slots = asyncio.Semaphore(cfg.acquire_concurrency_limit)
         app.state.acquire_inflight = {}  # executor_id -> acquires in flight (cap per executor)
@@ -94,6 +108,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             splitter.cancel()
             await asyncio.gather(splitter, return_exceptions=True)
             await engine.dispose()
+            await auth_engine.dispose()
             if cfg.metrics_enabled:
                 mark_worker_dead()
 
@@ -137,7 +152,9 @@ def main() -> None:
         structlog.get_logger().warning(
             "db_connection_budget_exceeded",
             workers=settings.server_workers,
-            per_worker=settings.db_pool_size + settings.db_max_overflow,
+            per_worker=settings.db_pool_size
+            + settings.db_max_overflow
+            + settings.db_auth_pool_size,
             watchdog=settings.watchdog_db_pool_size,
             budget=settings.connection_budget,
             db_max_connections=settings.db_max_connections,
