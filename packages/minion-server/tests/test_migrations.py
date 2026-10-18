@@ -314,3 +314,14 @@ def test_0011_task_counters_backfill_and_round_trip(fresh_url: str) -> None:
         )
         == 7
     )
+
+
+def test_0012_executor_id_index_round_trip(fresh_url: str) -> None:
+    name = "ix_minion_subtask_acquirement_executor_id"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))
+    command.downgrade(cfg, "0011")
+    assert not asyncio.run(_index_exists(fresh_url, name))
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))

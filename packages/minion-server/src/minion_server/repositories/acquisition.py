@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, cast
 
-from minion_common.enums import Engine, SubtaskStatus, TaskStatus
+from minion_common.enums import Engine, ExecutorStatus, SubtaskStatus, TaskStatus
 from sqlalchemy import (
     ColumnElement,
     Select,
@@ -30,6 +30,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.db.models import (
+    Executor,
     ExecutorHeartbeat,
     Subtask,
     SubtaskAcquirement,
@@ -271,6 +272,40 @@ QUERY_CANCELED = "57014"  # PostgreSQL SQLSTATE: statement_timeout (or a cancel)
 async def set_statement_timeout(session: AsyncSession, ms: int) -> None:
     """`SET LOCAL statement_timeout` for the current transaction (a no-op after commit/rollback)."""
     await session.execute(select(func.set_config("statement_timeout", str(ms), True)))
+
+
+async def lock_executor_for_claim(session: AsyncSession, executor_id: uuid.UUID) -> bool:
+    """`SELECT ... FOR NO KEY UPDATE` on the caller's own executor row (ADR-0019): serialises this
+    executor's claim rounds across workers so the open-acquirement count below cannot be raced.
+    False = the row is missing or REVOKED (the caller answers 401).
+
+    Deadlock-freedom depends on complete / release / reclaim NEVER writing `minion_executor`: the
+    claim takes executor row -> new acquirement -> subtask -> heartbeat, owner ops take
+    acquirement -> heartbeat -> subtask -> counter -> executor row (heartbeat, presence). If an
+    owner op that holds an acquirement/subtask lock ever started to write the executor row, revisit
+    ARCHITECTURE §4 first. NO KEY UPDATE does not conflict with the FK KEY SHARE locks."""
+    status = (
+        await session.execute(
+            select(Executor.status)
+            .where(Executor.executor_id == executor_id)
+            .with_for_update(key_share=True)
+        )
+    ).scalar_one_or_none()
+    return status is not None and status != ExecutorStatus.REVOKED.value
+
+
+async def count_open_acquirements(session: AsyncSession, executor_id: uuid.UUID) -> int:
+    """Acquirements this executor holds. A separate statement after the lock: in READ COMMITTED it
+    gets a fresh snapshot and sees a claim that committed while we waited for the lock."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(SubtaskAcquirement)
+                .where(SubtaskAcquirement.executor_id == executor_id)
+            )
+        ).scalar_one()
+    )
 
 
 def is_query_canceled(exc: BaseException) -> bool:

@@ -100,6 +100,10 @@ class ServerSettings(BaseSettings):
     # of the highest priority present. 1 = strict FR-22 order (head contention returns).
     acquire_window: int = Field(default=16, ge=1, le=256)
 
+    # Open acquirements one executor may hold (TASK-33, ADR-0019); above it acquire answers
+    # 429 TOO_MANY_ACQUIREMENTS. Per executor, enforced in the DB so it holds across workers.
+    max_open_acquirements: int = Field(default=4, ge=1, le=64)
+
     # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
     # Upper bound 100; the watchdog reads the same MINION_RELEASE_LIMIT and must use the same value.
     release_limit: int = Field(default=10, ge=0, le=100)

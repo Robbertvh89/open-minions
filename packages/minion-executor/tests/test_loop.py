@@ -3652,3 +3652,13 @@ async def test_failed_ack_retry_delay_is_the_first_heartbeat_delay(tmp_path: Pat
     client.on_empty = loop.stop
     await loop.run()
     assert delays and 30.0 <= delays[0] <= 33.0  # min(30 s, interval), not the 100 s interval
+
+
+async def test_acquire_cap_429_backs_off_for_the_retry_after(tmp_path: Path) -> None:
+    """TOO_MANY_ACQUIREMENTS (TASK-33): 429 + Retry-After 30 is a back-off, not a crash."""
+    client = FakeClient([ApiError(429, "TOO_MANY_ACQUIREMENTS", "cap", retry_after=30.0)])
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert 30.0 <= sleeps[0] <= 36.0

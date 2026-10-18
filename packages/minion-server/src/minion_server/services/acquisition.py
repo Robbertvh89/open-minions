@@ -9,7 +9,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
-from minion_server.errors import ExecutorRevokedError, busy_error
+from minion_server.errors import ExecutorRevokedError, busy_error, capped_error
 from minion_server.repositories import acquisition as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
@@ -74,6 +74,14 @@ async def acquire(
                         # unique index, a slow plan): the statement is cancelled and nothing commits
                         left_ms = int((deadline - time.monotonic()) * 1000) + 100
                         await repo.set_statement_timeout(session, max(100, left_ms))
+                    # Per-executor cap (ADR-0019): lock own row, then a separate count statement;
+                    # a capped round ends before any candidate read. Admission only: ownership is
+                    # still decided by the claim INSERT ... ON CONFLICT DO NOTHING.
+                    if not await repo.lock_executor_for_claim(session, principal.executor_id):
+                        raise ExecutorRevokedError(principal.token_hash)
+                    open_now = await repo.count_open_acquirements(session, principal.executor_id)
+                    if open_now >= settings.max_open_acquirements:
+                        raise capped_error()
                     result = await repo.claim(
                         session,
                         principal.executor_id,
