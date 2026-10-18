@@ -269,8 +269,12 @@ async def sum_remaining(sm: Sm, *, team: str = DEFAULT_TEAM) -> int:
     async with sm() as session:
         row = await session.execute(
             text(
-                "SELECT coalesce(sum(total_subtasks - succeeded_subtasks - failed_subtasks), 0)"
-                " FROM minion_task WHERE team = :team AND status IN ('PENDING', 'RUNNING')"
+                "SELECT coalesce(sum(t.total_subtasks), 0) - coalesce(sum(k.done), 0)"
+                " FROM minion_task t LEFT JOIN ("
+                "   SELECT team, project, task_name, sum(succeeded + failed) AS done"
+                "   FROM minion_task_counter WHERE team = :team GROUP BY team, project, task_name"
+                " ) k USING (team, project, task_name)"
+                " WHERE t.team = :team AND t.status IN ('PENDING', 'RUNNING')"
             ),
             {"team": team},
         )

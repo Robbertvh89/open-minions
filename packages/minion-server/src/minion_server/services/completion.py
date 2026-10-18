@@ -43,13 +43,36 @@ def stale_error() -> Exception:
     return api_error(409, "STALE_ACQUIREMENT", STALE_MESSAGE)
 
 
-async def _bump_and_derive(
-    session: AsyncSession, o: repo.Owned, *, succeeded: int, failed: int
-) -> None:
-    counts = await repo.bump_counters(session, o, succeeded=succeeded, failed=failed)
+def task_key(o: repo.Owned) -> repo.TaskKey:
+    return repo.TaskKey(o.team, o.project, o.task_name)
+
+
+async def settle_in_tx(session: AsyncSession, key: repo.TaskKey) -> bool:
+    """Move a task to its derived terminal status once every subtask is terminal.
+
+    Runs in the caller's open transaction. True if this call made the transition.
+    """
+    counts = await repo.task_counts(session, key)
+    if counts is None or counts.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
+        return False
     final = derive_task_status(counts.total, counts.succeeded, counts.failed)
-    if final is not None:
-        await repo.set_task_terminal(session, o, final)
+    if final is None:
+        return False
+    return await repo.set_task_terminal(session, key, final)
+
+
+async def settle_task(session: AsyncSession, key: repo.TaskKey) -> None:
+    """Post-commit settle in its own short transaction (ADR-0015).
+
+    The owner op has already committed; a failure here is logged (class only) and swallowed, the
+    watchdog's `settle_stuck` backstop finishes the task. Several concurrent settles are safe:
+    only one UPDATE sees the task live.
+    """
+    try:
+        async with session.begin():
+            await settle_in_tx(session, key)
+    except Exception as exc:
+        log.error("task_settle_failed", error=type(exc).__name__)
 
 
 async def complete(
@@ -95,7 +118,9 @@ async def complete(
             subtask_status=SubtaskStatus.SUCCEEDED,
             output_uri=f"s3://{settings.s3_bucket}/{dst}",
         )
-        await _bump_and_derive(session, o, succeeded=1, failed=0)
+        await repo.bump_counters(session, o, succeeded=1, failed=0)
+    # The retried-complete branch above skips the settle: a lost settle is the watchdog's job.
+    await settle_task(session, task_key(o))
 
 
 def next_status(
@@ -119,7 +144,9 @@ async def finish_failed(
 ) -> SubtaskStatus:
     """Record a budget-consuming attempt (FAILED or EXPIRED); shared by fail, reclaim, release cap.
 
-    Caller holds the acquirement lock. Lock order: acquirement -> heartbeat -> subtask -> task.
+    Caller holds the acquirement lock. Lock order: acquirement -> heartbeat -> subtask ->
+    counter shard.
+    A FAILED result needs `settle_task` after the caller commits.
     """
     used = await repo.failed_attempt_count(session, o) + 1
     status = next_status(
@@ -130,7 +157,7 @@ async def finish_failed(
     )
     await repo.finish_attempt(session, o, outcome=outcome, subtask_status=status, error=error)
     if status == SubtaskStatus.FAILED:
-        await _bump_and_derive(session, o, succeeded=0, failed=1)
+        await repo.bump_counters(session, o, succeeded=0, failed=1)
     return status
 
 
@@ -194,7 +221,7 @@ async def fail(
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
         if o is None:
             raise stale_error()
-        await finish_failed(
+        status = await finish_failed(
             session,
             o,
             outcome=AttemptOutcome.FAILED,
@@ -205,6 +232,8 @@ async def fail(
             },
             retryable=req.retryable,
         )
+    if status == SubtaskStatus.FAILED:
+        await settle_task(session, task_key(o))
 
 
 async def release(
@@ -221,6 +250,7 @@ async def release(
             raise stale_error()
         # Why the executor handed it back (dashboards); history only, not the subtask's error.
         reason = {"code": code} if code is not None else None
+        status = SubtaskStatus.PENDING  # anything but FAILED: no settle needed
         if o.task_status == TaskStatus.CANCELLED:
             await repo.finish_attempt(
                 session,
@@ -231,7 +261,7 @@ async def release(
             )
         elif await repo.released_attempt_count(session, o) >= settings.release_limit:
             # Repeated releases must not livelock a subtask: past the cap they cost budget.
-            await finish_failed(
+            status = await finish_failed(
                 session,
                 o,
                 outcome=AttemptOutcome.FAILED,
@@ -250,3 +280,5 @@ async def release(
                 subtask_status=SubtaskStatus.PENDING,
                 attempt_error=reason,
             )
+    if status == SubtaskStatus.FAILED:
+        await settle_task(session, task_key(o))
