@@ -94,6 +94,14 @@ class _FakeSession:
         return None
 
 
+async def _lock_ok(*a: Any, **kw: Any) -> bool:
+    return True
+
+
+async def _zero(*a: Any, **kw: Any) -> int:
+    return 0
+
+
 async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"claim": 0}
 
@@ -110,6 +118,8 @@ async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(executors_repo, "touch", touch)
     monkeypatch.setattr(executors_repo, "get_preference", pref)
     monkeypatch.setattr(repo, "claim", claim)
+    monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
+    monkeypatch.setattr(repo, "count_open_acquirements", _zero)
     p = ExecutorPrincipal(uuid.uuid4(), "o", "default")
     with structlog.testing.capture_logs() as logs:
         got = await svc.acquire(
@@ -138,6 +148,8 @@ async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.Monkey
     monkeypatch.setattr(executors_repo, "touch", live)
     monkeypatch.setattr(executors_repo, "get_preference", noop)
     monkeypatch.setattr(repo, "claim", claim)
+    monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
+    monkeypatch.setattr(repo, "count_open_acquirements", _zero)
     p = ExecutorPrincipal(uuid.uuid4(), "o", "default")
     with structlog.testing.capture_logs() as logs:
         got = await svc.acquire(

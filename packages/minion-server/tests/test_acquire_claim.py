@@ -113,7 +113,7 @@ async def test_never_lower_priority_while_higher_pending(
 async def test_window_1_is_strict_fr22_order(
     sm: async_sessionmaker[AsyncSession], fresh_url: str
 ) -> None:
-    cfg = _settings(fresh_url)
+    cfg = _settings(fresh_url).model_copy(update={"max_open_acquirements": 64})
     await seed_task(sm, "o-a", 3)
     await seed_task(sm, "o-b", 3, priority=2)
     await seed_task(sm, "o-c", 3)
