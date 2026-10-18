@@ -29,8 +29,7 @@ policy may contain `["content-length-range", 0, max]`, which the object store en
 
 - Upgrade order: **server first**. A new executor on an old server gets `422` (the unknown
   `output_upload` field is rejected) and exits. Old executors on a new server get `426` until upgraded.
-  Operator procedure: Subtasks in
-  flight across the server upgrade hold a pre-upgrade PUT URL (valid up to the presign TTL); their
+  Subtasks in flight across the server upgrade hold a pre-upgrade PUT URL (valid up to the presign TTL); their
   heartbeat responses no longer parse, so they finish or fail/retry as usual, bounded by `max_attempts`.
 - SeaweedFS 4.05 enforces the range (`400 EntityTooLarge`, nothing stored) but answers a tampered key or
   an expired policy with `307`, not `403`, and accepts form fields outside the policy. Tests therefore
