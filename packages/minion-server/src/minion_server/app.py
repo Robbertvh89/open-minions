@@ -1,4 +1,6 @@
 import asyncio
+import os
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -14,7 +16,13 @@ from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.errors import busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
-from minion_server.metrics import Metrics, MetricsMiddleware
+from minion_server.metrics import (
+    MULTIPROC_ENV,
+    Metrics,
+    MetricsMiddleware,
+    mark_worker_dead,
+    prepare_metrics_dir,
+)
 from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
 from minion_server.netutil import is_loopback
@@ -86,6 +94,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             splitter.cancel()
             await asyncio.gather(splitter, return_exceptions=True)
             await engine.dispose()
+            if cfg.metrics_enabled:
+                mark_worker_dead()
 
     app = FastAPI(title="open-minions server", version="0.1.0", lifespan=lifespan)
 
@@ -123,4 +133,39 @@ def main() -> None:
     import uvicorn
 
     settings = ServerSettings()
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    if settings.connection_budget >= settings.connection_limit:
+        structlog.get_logger().warning(
+            "db_connection_budget_exceeded",
+            workers=settings.server_workers,
+            per_worker=settings.db_pool_size + settings.db_max_overflow,
+            watchdog=settings.watchdog_db_pool_size,
+            budget=settings.connection_budget,
+            db_max_connections=settings.db_max_connections,
+            reserved=settings.db_reserved_connections,
+            limit=settings.connection_limit,
+        )
+    if settings.server_workers == 1:
+        # single process: prometheus_client already chose its value class at import, so an
+        # inherited multiprocess dir cannot be dropped here; validate it like an operator dir
+        inherited = os.environ.get(MULTIPROC_ENV)
+        if inherited:
+            os.environ[MULTIPROC_ENV], _ = prepare_metrics_dir(inherited)
+        uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+        return
+    metrics_dir: str | None = None
+    remove_dir = False
+    if settings.metrics_enabled:
+        # Set in the parent before spawning workers (fresh interpreters inherit the env).
+        metrics_dir, remove_dir = prepare_metrics_dir(settings.metrics_multiproc_dir)
+        os.environ[MULTIPROC_ENV] = metrics_dir
+    try:
+        uvicorn.run(
+            "minion_server.app:create_app",
+            factory=True,
+            workers=settings.server_workers,
+            host=settings.host,
+            port=settings.port,
+        )
+    finally:
+        if metrics_dir is not None and remove_dir:
+            shutil.rmtree(metrics_dir, ignore_errors=True)

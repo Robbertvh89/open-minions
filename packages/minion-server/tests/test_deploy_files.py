@@ -197,3 +197,26 @@ def test_compose_dev_override_mounts_the_dev_models_file_read_only() -> None:
     assert dst == target
     assert mode == "ro"
     assert COMPOSE_DEV.read_text().startswith("# DEV ONLY")
+
+
+def test_compose_scale_runs_four_workers_inside_the_connection_budget() -> None:
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    def _override(loader: yaml.SafeLoader, node: yaml.Node) -> Any:
+        assert isinstance(node, yaml.SequenceNode)
+        return loader.construct_sequence(node)
+
+    _Loader.add_constructor("!override", _override)
+    doc = yaml.load((ROOT / "deploy" / "compose.scale.yml").read_text(), _Loader)  # noqa: S506
+    env = doc["services"]["server"]["environment"]
+    assert env["MINION_SERVER_WORKERS"] == "${MINION_SERVER_WORKERS:-4}"
+    assert env["MINION_DB_POOL_SIZE"] == "${MINION_DB_POOL_SIZE:-8}"
+    assert env["MINION_DB_MAX_OVERFLOW"] == "${MINION_DB_MAX_OVERFLOW:-4}"
+    assert env["MINION_ACQUIRE_CONCURRENCY"] == "${MINION_ACQUIRE_CONCURRENCY:-8}"
+    pg = " ".join(doc["services"]["postgres"]["command"])
+    max_conn = int(re.search(r"max_connections=(\d+)", pg).group(1))  # type: ignore[union-attr]
+    assert max_conn > 4 * (8 + 4) + 2
+    assert int(env["MINION_DB_MAX_CONNECTIONS"]) == max_conn
+    # dev compose stays single worker
+    assert "MINION_SERVER_WORKERS" not in _services()["server"]["environment"]

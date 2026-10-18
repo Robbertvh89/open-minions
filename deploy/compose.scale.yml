@@ -47,8 +47,15 @@ services:
       MINION_S3_PUBLIC_ENDPOINT_URL: http://localhost:${MINION_S3_PORT:-59000}
       MINION_MODELS_FILE: /run/minion-models/models.scale.yaml
       MINION_METRICS_ENABLED: "true"
-      MINION_DB_POOL_SIZE: ${MINION_DB_POOL_SIZE:-20}
-      MINION_DB_MAX_OVERFLOW: ${MINION_DB_MAX_OVERFLOW:-20}
+      # 4 worker processes, each its own pool (8+4) and acquire semaphore (8): 48 connections plus
+      # the watchdog's 2, well inside max_connections=300. Rate limits and the per-executor
+      # in-flight cap are per worker (ADR-0012). Override MINION_SERVER_WORKERS=1 for a baseline
+      # (then raise the pool, e.g. 20+20 with MINION_ACQUIRE_CONCURRENCY=36).
+      MINION_SERVER_WORKERS: ${MINION_SERVER_WORKERS:-4}
+      MINION_DB_POOL_SIZE: ${MINION_DB_POOL_SIZE:-8}
+      MINION_DB_MAX_OVERFLOW: ${MINION_DB_MAX_OVERFLOW:-4}
+      MINION_ACQUIRE_CONCURRENCY: ${MINION_ACQUIRE_CONCURRENCY:-8}
+      MINION_DB_MAX_CONNECTIONS: "300"
     volumes:
       - ./scale/models.scale.yaml:/run/minion-models/models.scale.yaml:ro
 

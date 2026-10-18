@@ -192,3 +192,29 @@ def test_0008_acquired_at_index_round_trip(fresh_url: str) -> None:
     assert not asyncio.run(_index_exists(fresh_url, name))
     command.upgrade(cfg, "head")
     assert asyncio.run(_index_exists(fresh_url, name))
+
+
+async def _subtask_reloptions(url: str) -> list[str]:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text("SELECT reloptions FROM pg_class WHERE relname = 'minion_subtask'")
+            )
+            return sorted(res.scalar_one() or [])
+    finally:
+        await eng.dispose()
+
+
+def test_0010_subtask_autovacuum_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_subtask_reloptions(fresh_url)) == [
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_vacuum_scale_factor=0.02",
+        "autovacuum_vacuum_threshold=1000",
+    ]
+    command.downgrade(cfg, "0009")
+    assert asyncio.run(_subtask_reloptions(fresh_url)) == []
+    command.upgrade(cfg, "head")
+    assert len(asyncio.run(_subtask_reloptions(fresh_url))) == 3

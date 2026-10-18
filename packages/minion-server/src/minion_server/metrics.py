@@ -5,7 +5,14 @@ no ids, team or task names), the HTTP method and status, and the acquire outcome
 owner, team, key or payload value ever becomes a label or a sample.
 """
 
+import contextlib
+import os
+import re
 import secrets
+import stat
+import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
@@ -15,6 +22,7 @@ from prometheus_client import (
     Counter,
     Histogram,
     generate_latest,
+    multiprocess,
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -23,8 +31,75 @@ ACQUIRE_BUCKETS_S = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10
 UNMATCHED = "unmatched"  # 404s and other requests that match no route: one bucket, not the URL
 
 
+MULTIPROC_ENV = "PROMETHEUS_MULTIPROC_DIR"
+_METRIC_FILE = re.compile(r"^(counter|histogram|gauge)_.*\.db$")
+
+
+def prepare_metrics_dir(path: str | None) -> tuple[str, bool]:
+    """Return (dir, is_private_temp) for the multiprocess samples, emptied of old metric files.
+
+    None: a fresh private mkdtemp dir (0700). A given path must be a real directory (not a
+    symlink) owned by us with no group/other access, else `SystemExit(2)`: the dir holds mmap files
+    every worker trusts, so a directory another user can write to would let them forge metrics.
+    Only `counter_*.db` / `histogram_*.db` / `gauge_*.db` regular files are unlinked, through a
+    directory fd opened with O_NOFOLLOW, so nothing outside the directory is ever touched.
+    """
+    if path is None:
+        return tempfile.mkdtemp(prefix="minion-metrics-"), True
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        Path(path).mkdir(mode=0o700, parents=True)
+        st = os.lstat(path)
+    problem = None
+    if not stat.S_ISDIR(st.st_mode):
+        problem = "is not a real directory (symlinks are refused)"
+    elif st.st_uid != os.geteuid():
+        problem = f"is not owned by uid {os.geteuid()}"
+    elif st.st_mode & 0o077:
+        problem = f"has mode {stat.S_IMODE(st.st_mode):04o}, expected no group/other access (0700)"
+    if problem:
+        sys.stderr.write(f"MINION_METRICS_MULTIPROC_DIR {path!r} {problem}\n")
+        raise SystemExit(2)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        sys.stderr.write(f"MINION_METRICS_MULTIPROC_DIR {path!r} cannot be opened: {exc}\n")
+        raise SystemExit(2) from exc
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_ino, fst.st_dev) != (st.st_ino, st.st_dev):
+            sys.stderr.write(f"MINION_METRICS_MULTIPROC_DIR {path!r} changed while opening\n")
+            raise SystemExit(2)
+        with os.scandir(fd) as it:
+            names = [
+                e.name
+                for e in it
+                if _METRIC_FILE.match(e.name) and e.is_file(follow_symlinks=False)
+            ]
+        for name in names:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+    return path, False
+
+
+def mark_worker_dead() -> None:
+    """Worker shutdown hook: let prometheus_client drop this pid's live-gauge files. Counter and
+    histogram files stay on purpose (their totals must outlive the worker)."""
+    if os.environ.get(MULTIPROC_ENV):
+        multiprocess.mark_process_dead(os.getpid())  # type: ignore[no-untyped-call]
+
+
 class Metrics:
-    """Counters on a private registry (not the process-global one: apps are built per test)."""
+    """Counters on a private registry (not the process-global one: apps are built per test).
+
+    With `PROMETHEUS_MULTIPROC_DIR` set (`main()` does this in the parent for workers > 1, before
+    the workers start) every sample lives in a per-process mmap file and `render` sums all of them
+    (MultiProcessCollector). Only counters and histograms are used; a Gauge added later needs an
+    explicit `multiprocess_mode`.
+    """
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry()
@@ -62,6 +137,11 @@ class Metrics:
         ).inc()
 
     def render(self) -> bytes:
+        directory = os.environ.get(MULTIPROC_ENV)
+        if directory:
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry, path=directory)  # type: ignore[no-untyped-call]
+            return generate_latest(registry)
         return generate_latest(self.registry)
 
 

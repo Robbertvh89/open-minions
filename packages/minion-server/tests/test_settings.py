@@ -128,3 +128,30 @@ def test_release_limit_bounds(n: int) -> None:
     with pytest.raises(ValidationError):
         ServerSettings(_env_file=None, release_limit=n)
     assert ServerSettings(_env_file=None, release_limit=100).release_limit == 100
+
+
+def test_workers_default_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ServerSettings(_env_file=None).server_workers == 1
+    for bad in ("0", "33"):
+        monkeypatch.setenv("MINION_SERVER_WORKERS", bad)
+        with pytest.raises(ValidationError):
+            ServerSettings(_env_file=None)
+    monkeypatch.setenv("MINION_SERVER_WORKERS", "32")
+    assert ServerSettings(_env_file=None).server_workers == 32
+
+
+def test_connection_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_SERVER_WORKERS", "4")
+    monkeypatch.setenv("MINION_DB_POOL_SIZE", "8")
+    monkeypatch.setenv("MINION_DB_MAX_OVERFLOW", "4")
+    monkeypatch.setenv("MINION_WATCHDOG_DB_POOL_SIZE", "2")
+    s = ServerSettings(_env_file=None)
+    assert s.connection_budget == 50
+    assert s.acquire_concurrency_limit == 8  # per process, not divided by workers
+
+
+def test_connection_limit_and_watchdog_pool_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ServerSettings(_env_file=None).connection_limit == 93
+    monkeypatch.setenv("MINION_WATCHDOG_DB_POOL_SIZE", "0")
+    with pytest.raises(ValueError):
+        ServerSettings(_env_file=None)
