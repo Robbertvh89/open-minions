@@ -67,6 +67,7 @@ def test_constants_match_the_executor() -> None:
     assert params["max_consecutive_failures"].default == sim.MAX_CONSECUTIVE_FAILURES
     assert params["failure_pause_s"].default == sim.FAILURE_PAUSE_S
     assert params["complete_retries"].default == sim.COMPLETE_RETRIES
+    assert params["complete_shed_budget_s"].default == sim.COMPLETE_SHED_BUDGET_S
 
 
 def _executor_stub(backoff: tuple[float, float]) -> Any:
@@ -84,14 +85,17 @@ def test_idle_delay_equals_executor_delay(n: int) -> None:
         assert sim.backoff_delay(n, sim.EXECUTOR_BACKOFF, _rng(seed)) == want
 
 
+@pytest.mark.parametrize("status", [429, 503])
 @pytest.mark.parametrize("repeated", [False, True])
 @pytest.mark.parametrize("retry_after", [None, 1.0, 7.0, 10_000.0])
 @pytest.mark.parametrize("n", [0, 1, 4])
-def test_429_delay_equals_executor_delay(n: int, retry_after: float | None, repeated: bool) -> None:
+def test_429_503_delay_equals_executor_delay(
+    n: int, retry_after: float | None, repeated: bool, status: int
+) -> None:
     from minion_common.client import ApiError
 
     stub = _executor_stub(sim.EXECUTOR_BACKOFF)
-    exc = ApiError(429, "TOO_MANY_REQUESTS", "slow down", retry_after=retry_after)
+    exc = ApiError(status, "SERVER_BUSY", "busy", retry_after=retry_after)
     for seed in range(5):
         random.seed(seed)
         want = executor_loop.ExecutorLoop._rate_limit_delay(stub, exc, n, repeated=repeated)
@@ -303,6 +307,39 @@ async def test_two_503s_then_success_is_one_completion_honouring_retry_after() -
     assert len(calls) == 3 and ex.rec.events["completed"] == 1
     assert ex.rec.events["complete_retried"] == 2 and "complete_failed" not in ex.rec.events
     assert all(7.0 <= d <= 7.0 * 1.2 for d in delays) and len(delays) == 2
+
+
+async def test_many_complete_sheds_do_not_use_up_the_retry_count() -> None:
+    from minion_common.client import ApiError
+
+    n = sim.COMPLETE_RETRIES * 3
+    err = ApiError(503, "SERVER_BUSY", "busy", retry_after=1.0)
+    delays: list[float] = []
+    ex, calls = _complete_sim([err] * n + [None], delays)
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.DONE
+    assert len(calls) == n + 1 and ex.rec.events["completed"] == 1
+    assert ex.reports == []  # type: ignore[attr-defined]  # no fail call
+    assert len(delays) == n
+
+
+async def test_complete_shed_budget_exhausted_releases_server_busy() -> None:
+    from minion_common.client import ApiError
+
+    err = ApiError(503, "SERVER_BUSY", "busy", retry_after=1.0)
+    delays: list[float] = []
+    ex, calls = _complete_sim([err] * 99, delays, complete_shed_budget_s=10.0)
+    now = [0.0]
+    ex._clock = lambda: now[0]
+    real = ex._sleep
+
+    async def tick(seconds: float) -> None:
+        now[0] += 4.0
+        await real(seconds)
+
+    ex._sleep = tick  # type: ignore[method-assign]
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.NEUTRAL
+    assert len(calls) == 4  # t=0, 4, 8, 12 -> over the 10 s budget
+    assert ex.reports == [("release", "SERVER_BUSY", None)]  # type: ignore[attr-defined]  # no fail
 
 
 async def test_transport_error_retry_that_gets_409_counts_complete_409_once() -> None:

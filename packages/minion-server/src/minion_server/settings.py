@@ -1,6 +1,6 @@
 from typing import Self
 
-from minion_common.client import require_secure_url
+from minion_common.client import DEFAULT_TIMEOUT_S, require_secure_url
 from minion_common.schemas import MAX_OUTPUT_BYTES_DEFAULT, MAX_OUTPUT_BYTES_LIMIT
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +26,15 @@ class ServerSettings(BaseSettings):
     # Sizing: pool_size + max_overflow bounds concurrent DB connections per server process.
     db_pool_size: int = Field(default=10, ge=1)
     db_max_overflow: int = Field(default=10, ge=0)
+    # Overload (TASK-7.4.4, ADR-0013): a request waits at most db_pool_timeout_s for a connection
+    # (then 503 SERVER_BUSY, never 500). An acquire that has used up acquire_deadline_s before its
+    # claim INSERT answers 503 ACQUIRE_DEADLINE with nothing committed, so a client that timed out
+    # (executor HTTP timeout 30 s) is not left with a ghost acquirement. At most acquire_concurrency
+    # acquires run per process (default pool + overflow - 4, min 1); the rest get 503 SERVER_BUSY
+    # and the remaining connections stay free for heartbeat / complete / release.
+    db_pool_timeout_s: float = Field(default=5.0, ge=0.5, le=30.0)
+    acquire_deadline_s: float = Field(default=10.0, ge=1.0, le=20.0)
+    acquire_concurrency: int | None = Field(default=None, ge=1)
     max_request_body_bytes: int = Field(default=1 << 20, gt=0)  # 413 above this
 
     # Object storage (S3 API). Executors get presigned URLs built against the public endpoint.
@@ -150,6 +159,31 @@ class ServerSettings(BaseSettings):
     @classmethod
     def _prefixes(cls, v: list[str]) -> list[str]:
         return _check_prefixes(v)
+
+    @model_validator(mode="after")
+    def _overload_limits(self) -> Self:
+        if self.acquire_deadline_s >= DEFAULT_TIMEOUT_S:
+            raise ValueError(
+                f"acquire_deadline_s must be below the executor HTTP timeout ({DEFAULT_TIMEOUT_S} s)"  # noqa: E501
+            )
+        # worst case a request waits db_pool_timeout_s for a connection that arrives right at the
+        # deadline: both must fit in the client's timeout with a margin for the response
+        if self.db_pool_timeout_s + self.acquire_deadline_s > DEFAULT_TIMEOUT_S - 5:
+            raise ValueError(
+                "db_pool_timeout_s + acquire_deadline_s must be at most "
+                f"{DEFAULT_TIMEOUT_S - 5:g} s (executor HTTP timeout {DEFAULT_TIMEOUT_S:g} s - 5 s)"
+            )
+        cap = self.db_pool_size + self.db_max_overflow
+        if self.acquire_concurrency is not None and self.acquire_concurrency > cap:
+            raise ValueError(f"acquire_concurrency must be <= pool_size + max_overflow ({cap})")
+        return self
+
+    @property
+    def acquire_concurrency_limit(self) -> int:
+        """Concurrent acquires per process: leave 4 connections for owner operations."""
+        if self.acquire_concurrency is not None:
+            return self.acquire_concurrency
+        return max(1, self.db_pool_size + self.db_max_overflow - 4)
 
     @model_validator(mode="after")
     def _prefixes_disjoint(self) -> Self:

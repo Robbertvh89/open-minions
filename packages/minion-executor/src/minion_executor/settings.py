@@ -96,6 +96,11 @@ class ExecutorSettings(BaseSettings):
     # does not stampede the queue head (ADR-0013). A stop interrupts the wait. 0 disables.
     first_acquire_jitter_s: float = Field(default=15.0, ge=0, le=300, allow_inf_nan=False)
 
+    # Wall-clock cap on the complete call's retries after 503 + Retry-After (server overload, not a
+    # fault: they do not use up the complete retry count). Heartbeats continue meanwhile; past it
+    # the subtask is released with SERVER_BUSY (TASK-7.4.4).
+    complete_shed_budget_s: float = Field(default=120.0, gt=0, le=300, allow_inf_nan=False)
+
     @field_validator("acquire_pace_s")
     @classmethod
     def _pace_not_below_server_default(cls, v: float) -> float:

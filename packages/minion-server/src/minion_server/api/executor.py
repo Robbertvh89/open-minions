@@ -1,5 +1,6 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,11 +21,13 @@ from minion_common.schemas import (
     RegisterResponse,
     ReleaseRequest,
 )
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal, current_executor
 from minion_server.db.session import get_session
-from minion_server.errors import api_error
+from minion_server.errors import api_error, busy_error
+from minion_server.limits import ARRIVAL_KEY
 from minion_server.ratelimit import retry_after_header
 from minion_server.repositories import executors as executors_repo
 from minion_server.services import acquisition, completion
@@ -32,6 +35,8 @@ from minion_server.services import heartbeat as heartbeat_service
 from minion_server.services import presence as presence_service
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
+
+MAX_ACQUIRES_PER_EXECUTOR = 2  # concurrent acquires per executor_id per process
 
 router = APIRouter(prefix="/api/v1/executor", tags=["executor"])
 
@@ -139,18 +144,64 @@ async def acquire(
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
 ) -> Response:
     started = time.perf_counter()
+    # the deadline runs from the request's arrival (ArrivalStampMiddleware), not from here
+    arrival = request.scope.get(ARRIVAL_KEY, time.monotonic())
+    deadline = arrival + settings.acquire_deadline_s
     metrics = getattr(request.app.state, "metrics", None)
-    outcome = "error"  # one of three fixed values; a raised acquire is timed too
+    slots: asyncio.Semaphore | None = getattr(request.app.state, "acquire_slots", None)
+    inflight: dict[uuid.UUID, int] | None = getattr(request.app.state, "acquire_inflight", None)
+    eid = principal.executor_id
+    if inflight is not None and inflight.get(eid, 0) >= MAX_ACQUIRES_PER_EXECUTOR:
+        # a client ignoring the pace limit (acquire_min_interval_s = 0) cannot fill the slots
+        if metrics is not None:
+            metrics.acquires.labels(outcome="rate_limited").inc()
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "TOO_MANY_REQUESTS", "message": "acquire already in flight"},
+            headers={"Retry-After": "1"},
+        )
+    if slots is not None:
+        # Non-blocking: when full, shed before any candidate work so owner operations
+        # (heartbeat / complete / release) keep their connections.
+        if slots.locked():
+            if metrics is not None:
+                metrics.acquires.labels(outcome="shed").inc()
+            raise busy_error("SERVER_BUSY", "too many acquires in flight, retry later")
+        await slots.acquire()  # not locked: returns without suspending
+    if inflight is not None:
+        inflight[eid] = inflight.get(eid, 0) + 1
+    outcome = "error"  # one of a few fixed values; a raised acquire is timed too
     try:
         assignment = await acquisition.acquire(
-            session, principal, body, settings=settings, storage=storage, models=models
+            session,
+            principal,
+            body,
+            settings=settings,
+            storage=storage,
+            models=models,
+            deadline=deadline,
         )
         outcome = "empty" if assignment is None else "assigned"
+    except PoolTimeoutError:
+        outcome = "shed"  # 503 SERVER_BUSY from the app-level handler
+        raise
+    except HTTPException as exc:
+        if exc.status_code == 503:  # ACQUIRE_DEADLINE
+            outcome = "shed"
+        raise
     finally:
+        if inflight is not None:
+            left = inflight.get(eid, 1) - 1
+            if left > 0:
+                inflight[eid] = left
+            else:
+                inflight.pop(eid, None)
+        if slots is not None:
+            slots.release()
         if metrics is not None:
             metrics.observe_acquire(outcome, time.perf_counter() - started)
-    if metrics is not None:
-        metrics.acquires.labels(outcome=outcome).inc()
+            if outcome != "error":  # a raised acquire is timed, not counted (500s are in requests)
+                metrics.acquires.labels(outcome=outcome).inc()
     if assignment is None:
         return Response(status_code=204)
     return Response(content=assignment.model_dump_json(), media_type="application/json")
