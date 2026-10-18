@@ -125,6 +125,14 @@ MEMORY_GUARD_FACTOR = 1.10  # D7: footprint over budget x 1.10 on two consecutiv
 MEMORY_GUARD_SAMPLES = 2
 
 
+def _is_shed(exc: Exception) -> bool:
+    """429, or a 503 that carries a numeric Retry-After (server overload shedding, TASK-7.4.4):
+    both are "come back later", not a fault."""
+    return isinstance(exc, ApiError) and (
+        exc.status_code == 429 or (exc.status_code == 503 and exc.retry_after is not None)
+    )
+
+
 def cleanup_stale_tmp(root: Path | None = None) -> int:
     """Remove `minion-exec-<pid>-*` dirs owned by this user whose pid is no longer alive."""
     base = root or Path(tempfile.gettempdir())
@@ -392,9 +400,10 @@ class ExecutorLoop:
         return float(min(hi, lo * (2 ** min(n, 16))) * random.uniform(0.5, 1.0))  # noqa: S311
 
     def _rate_limit_delay(self, exc: Exception, n: int, *, repeated: bool = False) -> float:
-        """Backoff for attempt `n`. A first 429 waits its numeric `Retry-After` (cap 300 s) plus
-        0-20 % jitter; when 429s repeat (`repeated`) it escalates to max(backoff, Retry-After)."""
-        if isinstance(exc, ApiError) and exc.status_code == 429 and exc.retry_after is not None:
+        """Backoff for attempt `n`. A first 429 (or a 503 shed, TASK-7.4.4) waits its numeric
+        `Retry-After` (cap 300 s) plus 0-20 % jitter; when they repeat (`repeated`) it escalates to
+        max(backoff, Retry-After)."""
+        if _is_shed(exc) and isinstance(exc, ApiError) and exc.retry_after is not None:
             ra = min(exc.retry_after, MAX_RETRY_AFTER_S)
             if repeated:
                 return max(self._delay(n), ra * random.uniform(1.0, 1.2))  # noqa: S311
@@ -515,7 +524,7 @@ class ExecutorLoop:
                 log.warning("register_abandoned_at_stop")
                 return
             except (httpx.HTTPError, ApiError) as exc:
-                limited = isinstance(exc, ApiError) and exc.status_code == 429
+                limited = _is_shed(exc)
                 if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     raise
                 log.warning("register_failed", error=type(exc).__name__)
@@ -592,7 +601,7 @@ class ExecutorLoop:
                     log.warning("acquire_abandoned_at_stop")
                     break
                 except (httpx.HTTPError, ApiError, ValueError) as exc:
-                    limited = isinstance(exc, ApiError) and exc.status_code == 429
+                    limited = _is_shed(exc)
                     if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                         raise
                     log.warning("acquire_failed", error=type(exc).__name__)
@@ -1166,6 +1175,7 @@ class ExecutorLoop:
         attempt = 0
         saw_5xx = False
         while True:
+            last_exc: Exception | None = None
             try:
                 await self._call_complete(a, result)
                 bound.info("subtask_completed", records=result.record_count)
@@ -1195,6 +1205,7 @@ class ExecutorLoop:
                     await self._report_failure(a, err, bound)
                     return _Outcome.FAILED
                 saw_5xx = True
+                last_exc = exc
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             except httpx.HTTPError as exc:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
@@ -1209,7 +1220,13 @@ class ExecutorLoop:
                     await self._report_failure(a, err, bound)
                 # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
-            await self._pause(self._delay(attempt - 1), until=self._hard_stop)
+            # 503 + Retry-After (server shed load): wait that long, like a 429 (TASK-7.4.4)
+            wait = (
+                self._rate_limit_delay(last_exc, attempt - 1)
+                if last_exc is not None
+                else self._delay(attempt - 1)
+            )
+            await self._pause(wait, until=self._hard_stop)
 
     async def _call_complete(self, a: Assignment, result: CompleteRequest) -> None:
         """`client.complete`, but once a hard stop is set (or arrives mid-call) the call gets only

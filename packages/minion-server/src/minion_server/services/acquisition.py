@@ -1,5 +1,6 @@
 """Acquire service: one-statement claim per round (ADR-0013)."""
 
+import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -7,6 +8,7 @@ from minion_common.schemas import AcquireRequest, Assignment, ModelEntry
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
+from minion_server.errors import busy_error
 from minion_server.repositories import acquisition as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
@@ -35,7 +37,11 @@ async def acquire(
     storage: S3Storage,
     models: dict[str, ModelEntry],
     window: int | None = None,
+    deadline: float | None = None,
 ) -> Assignment | None:
+    """Claim one subtask. `deadline` is an absolute `time.monotonic()` value: a round that gets
+    its connection after it answers 503 ACQUIRE_DEADLINE before the claim INSERT, so nothing is
+    committed for a client that has probably given up (TASK-7.4.4)."""
     window = settings.acquire_window if window is None else window
     if not 1 <= window <= repo.MAX_WINDOW:
         raise ValueError(f"acquire window must be in 1..{repo.MAX_WINDOW}, got {window}")
@@ -56,6 +62,9 @@ async def acquire(
         for _ in range(MAX_ROUNDS):
             try:
                 async with session.begin():
+                    await session.connection()  # the pool wait happens here, not in the claim
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise busy_error("ACQUIRE_DEADLINE", "acquire deadline exceeded")
                     result = await repo.claim(
                         session,
                         principal.executor_id,

@@ -369,6 +369,8 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
+**Overload shedding (TASK-7.4.4).** When the server is saturated it fails fast and safely instead of timing out: (a) a request that waits more than `MINION_DB_POOL_TIMEOUT_S` (5, 0.5..30) for a DB connection, on any endpoint, answers `503 SERVER_BUSY` with a jittered `Retry-After` (never 500); (b) at most `MINION_ACQUIRE_CONCURRENCY` (default pool + overflow - 4, min 1) acquires run per process, the rest answer `503 SERVER_BUSY` + `Retry-After` before any candidate work, which keeps connections free for heartbeat / complete / release; (c) an acquire that has used `MINION_ACQUIRE_DEADLINE_S` (10, 1..20, always below the executor's 30 s HTTP timeout) by the time it holds its connection answers `503 ACQUIRE_DEADLINE` + `Retry-After` before the claim INSERT, so no acquirement is committed for a client that has already given up. Executors treat a 503 with `Retry-After` like a 429: acquire waits at least that long, `complete` waits it between retries.
+
 ### 6.1 User-facing
 | Method | Path | Purpose |
 |---|---|---|

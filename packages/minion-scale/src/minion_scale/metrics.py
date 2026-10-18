@@ -120,7 +120,12 @@ class Recorder:
 
     @property
     def server_errors_5xx(self) -> int:
-        return self._status_total(lambda s: 500 <= s <= 599)
+        """5xx other than 503: a 503 is the server shedding load on purpose (TASK-7.4.4)."""
+        return self._status_total(lambda s: 500 <= s <= 599 and s != 503)
+
+    @property
+    def shed_503(self) -> int:
+        return self._status_total(lambda s: s == 503)
 
     @property
     def transport_errors(self) -> int:
@@ -148,6 +153,7 @@ class Recorder:
             "conflicts_409": self.conflicts_409,
             "rate_limited_429": self.rate_limited_429,
             "server_errors_5xx": self.server_errors_5xx,
+            "shed_503": self.shed_503,
             "transport_errors": self.transport_errors,
             "events": dict(sorted(self.events.items())),
             "event_loop_lag": self.lag.to_dict(),

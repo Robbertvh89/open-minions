@@ -284,11 +284,14 @@ class SimExecutor:
                 await self._call("register", self._client.register(register_request(self.index)))
                 return True
             except (ApiError, httpx.HTTPError) as exc:
-                if isinstance(exc, ApiError) and exc.status_code < 500 and exc.status_code != 429:
+                limited = isinstance(exc, ApiError) and (
+                    exc.status_code == 429
+                    or (exc.status_code == 503 and exc.retry_after is not None)
+                )
+                if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                     self.rec.count("sim_aborted")
                     return False
                 retry_after = exc.retry_after if isinstance(exc, ApiError) else None
-                limited = isinstance(exc, ApiError) and exc.status_code == 429
                 if limited:  # 429s are counted separately, like the executor's register loop
                     limited_n += 1
                 await self._sleep(

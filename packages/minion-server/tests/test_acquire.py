@@ -140,7 +140,10 @@ async def test_service_race_unique_owners(
 
 @pytest.fixture
 async def http(fresh_url: str) -> AsyncIterator[tuple[AsyncClient, Any]]:
-    cfg = _settings(fresh_url)
+    # N simultaneous acquires must all run (the race is the point): pool and slots sized for it
+    cfg = _settings(fresh_url).model_copy(
+        update={"db_pool_size": N + 5, "db_max_overflow": 0, "acquire_concurrency": N}
+    )
     app = create_app(cfg)
     async with (
         app.router.lifespan_context(app),

@@ -39,6 +39,7 @@ def run_section(
         "conflicts_409": d["conflicts_409"],
         "rate_limited_429": d["rate_limited_429"],
         "server_errors_5xx": d["server_errors_5xx"],
+        "shed_503": d.get("shed_503", 0),
         "transport_errors": d["transport_errors"],
         "faults": {
             k.removeprefix("fault_"): v for k, v in d["events"].items() if k.startswith("fault_")
@@ -90,7 +91,8 @@ def summary_lines(doc: dict[str, Any]) -> list[str]:
         )
         lines.append(
             f"     409={run['conflicts_409']} 429={run['rate_limited_429']} "
-            f"5xx={run['server_errors_5xx']} transport={run['transport_errors']} "
+            f"5xx={run['server_errors_5xx']} 503={run.get('shed_503', 0)} "
+            f"transport={run['transport_errors']} "
             f"faults={run['faults']}"
         )
         for op, c in run["calls"].items():

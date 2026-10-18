@@ -3,13 +3,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from starlette.responses import JSONResponse, Response
 
 from minion_server.api import executor as executor_api
 from minion_server.api import fleet as fleet_api
 from minion_server.api import tasks as tasks_api
 from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
+from minion_server.errors import busy_error
 from minion_server.limits import BodyLimitMiddleware
 from minion_server.metrics import Metrics, MetricsMiddleware
 from minion_server.metrics import router as metrics_router
@@ -31,8 +34,12 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         cfg = settings or ServerSettings()
         api_keys = KeyStore(cfg.api_keys_file, cfg.api_keys_reload_s) if cfg.api_keys_file else None
         engine = create_engine(
-            cfg.database_url, pool_size=cfg.db_pool_size, max_overflow=cfg.db_max_overflow
+            cfg.database_url,
+            pool_size=cfg.db_pool_size,
+            max_overflow=cfg.db_max_overflow,
+            pool_timeout=cfg.db_pool_timeout_s,
         )
+        app.state.acquire_slots = asyncio.Semaphore(cfg.acquire_concurrency_limit)
         app.state.settings = cfg
         app.state.metrics = Metrics() if cfg.metrics_enabled else None
         if cfg.metrics_enabled and cfg.metrics_token is None and not is_loopback(cfg.host):
@@ -89,6 +96,19 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.include_router(fleet_api.router)
     app.include_router(metrics_router)
     app.include_router(ui_router)
+
+    @app.exception_handler(PoolTimeoutError)
+    async def pool_timeout_handler(request: Request, exc: PoolTimeoutError) -> Response:
+        """No connection within db_pool_timeout_s: overload, not a bug (TASK-7.4.4). Never a 500;
+        the log carries the route template only (no ids, no payload)."""
+        route = request.scope.get("route")
+        structlog.get_logger().warning(
+            "db_pool_timeout", route=getattr(route, "path", None), method=request.method
+        )
+        err = busy_error("SERVER_BUSY", "server is busy, retry later")
+        return JSONResponse(
+            {"detail": err.detail}, status_code=err.status_code, headers=err.headers
+        )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

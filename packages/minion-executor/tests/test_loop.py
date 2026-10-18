@@ -421,6 +421,37 @@ async def test_complete_retried_on_transport_error_then_succeeds(tmp_path: Path)
     assert "fail" not in client.kinds() and "release" not in client.kinds()
 
 
+async def test_complete_503_waits_retry_after_between_retries(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([assignment()]), list[float]()
+    client.complete_excs = [
+        ApiError(503, "SERVER_BUSY", "busy", retry_after=7.0),
+        ApiError(503, "SERVER_BUSY", "busy", retry_after=2.0),
+    ]
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    assert await loop.run(max_subtasks=1) == 1
+    assert client.kinds().count("complete") == 3
+    assert 7.0 <= sleeps[0] <= 8.4 and 2.0 <= sleeps[1] <= 2.4  # Retry-After + 0-20 % jitter
+    assert "fail" not in client.kinds() and "release" not in client.kinds()
+
+
+async def test_acquire_503_backs_off_honouring_retry_after(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(503, "SERVER_BUSY", "busy", retry_after=30.0)])
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert 30.0 <= sleeps[0] <= 36.0
+
+
+async def test_acquire_503_without_retry_after_uses_the_plain_backoff(tmp_path: Path) -> None:
+    client = FakeClient([ApiError(503, "X", "down")])
+    sleeps: list[float] = []
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps)
+    client.on_empty = loop.stop
+    await loop.run()
+    assert sleeps[0] < 30.0  # the idle back-off, not a Retry-After wait
+
+
 async def test_complete_transport_exhaustion_leaves_to_watchdog(tmp_path: Path) -> None:
     client, sleeps = FakeClient([assignment()]), list[float]()
     client.complete_exc = httpx.ConnectError("x")

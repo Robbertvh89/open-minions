@@ -36,7 +36,8 @@ class Metrics:
         )
         self.acquires = Counter(
             "minion_acquire_total",
-            "Executor acquire calls by outcome (assigned: got a subtask, empty: no work).",
+            "Executor acquire calls by outcome (assigned: got a subtask, empty: no work, "
+            "shed: 503 before any work, error).",
             ("outcome",),
             registry=self.registry,
         )

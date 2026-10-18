@@ -18,6 +18,7 @@ def create_engine(
     *,
     pool_size: int = 20,
     max_overflow: int = 40,
+    pool_timeout: float = 5.0,
     connect_args: dict[str, Any] | None = None,
 ) -> AsyncEngine:
     return create_async_engine(
@@ -25,6 +26,7 @@ def create_engine(
         pool_pre_ping=True,
         pool_size=pool_size,
         max_overflow=max_overflow,
+        pool_timeout=pool_timeout,  # wait for a connection, then TimeoutError -> 503 (TASK-7.4.4)
         connect_args=connect_args or {},
     )
 

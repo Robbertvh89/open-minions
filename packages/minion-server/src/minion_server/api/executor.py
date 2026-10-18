@@ -1,5 +1,6 @@
 """Executor-facing endpoints (SPEC §6.2): register, preference, acquire."""
 
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal, current_executor
 from minion_server.db.session import get_session
-from minion_server.errors import api_error
+from minion_server.errors import api_error, busy_error
 from minion_server.ratelimit import retry_after_header
 from minion_server.repositories import executors as executors_repo
 from minion_server.services import acquisition, completion
@@ -139,14 +140,32 @@ async def acquire(
     models: Annotated[dict[str, ModelEntry], Depends(_models)],
 ) -> Response:
     started = time.perf_counter()
+    deadline = time.monotonic() + settings.acquire_deadline_s
     metrics = getattr(request.app.state, "metrics", None)
-    outcome = "error"  # one of three fixed values; a raised acquire is timed too
+    slots: asyncio.Semaphore | None = getattr(request.app.state, "acquire_slots", None)
+    if slots is not None:
+        # Non-blocking: when full, shed before any candidate work so owner operations
+        # (heartbeat / complete / release) keep their connections.
+        if slots.locked():
+            if metrics is not None:
+                metrics.acquires.labels(outcome="shed").inc()
+            raise busy_error("SERVER_BUSY", "too many acquires in flight, retry later")
+        await slots.acquire()  # not locked: returns without suspending
+    outcome = "error"  # one of a few fixed values; a raised acquire is timed too
     try:
         assignment = await acquisition.acquire(
-            session, principal, body, settings=settings, storage=storage, models=models
+            session,
+            principal,
+            body,
+            settings=settings,
+            storage=storage,
+            models=models,
+            deadline=deadline,
         )
         outcome = "empty" if assignment is None else "assigned"
     finally:
+        if slots is not None:
+            slots.release()
         if metrics is not None:
             metrics.observe_acquire(outcome, time.perf_counter() - started)
     if metrics is not None:

@@ -385,6 +385,15 @@ Notes:
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
   paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).
 
+- Overload (TASK-7.4.4): the acquire handler first tries a per-process slot (`MINION_ACQUIRE_CONCURRENCY`,
+  non-blocking; full = `503 SERVER_BUSY`, no candidate work), then each claim round obtains its connection and
+  checks a monotonic deadline (`MINION_ACQUIRE_DEADLINE_S`, started at handler entry) *before* the claim
+  statement: past it = `503 ACQUIRE_DEADLINE`, rolled back, nothing committed (no ghost acquirement for a
+  client that timed out). A pool wait over `MINION_DB_POOL_TIMEOUT_S` surfaces as SQLAlchemy `TimeoutError`,
+  mapped app-wide to `503 SERVER_BUSY` + `Retry-After`. The pool keeps at least 4 connections that acquires cannot
+  take, for owner operations (heartbeat, complete, release). Residual: the connection used by the auth lookup
+  is still taken before the slot check.
+
 ### 3.3 Execute & report
 ```
 Executor: GET input via presigned URL (Range header for byte slice)

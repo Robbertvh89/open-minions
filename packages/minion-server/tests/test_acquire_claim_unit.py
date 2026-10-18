@@ -90,6 +90,9 @@ class _FakeSession:
     def begin(self) -> _Ctx:
         return _Ctx()
 
+    async def connection(self) -> None:
+        return None
+
 
 async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"claim": 0}

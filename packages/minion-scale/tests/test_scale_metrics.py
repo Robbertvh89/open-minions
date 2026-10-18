@@ -26,16 +26,18 @@ def test_recorder_counts_statuses_and_round_trips_through_dicts() -> None:
     r.record("complete", 0.03, 503)
     r.record("heartbeat", 0.01, TRANSPORT)
     r.count("completed", 3)
+    r.record("complete", 0.03, 500)
     assert (r.conflicts_409, r.rate_limited_429, r.server_errors_5xx, r.transport_errors) == (
         1,
         1,
         1,
         1,
     )
+    assert r.shed_503 == 1  # a 503 is shedding, not a 5xx fault
     merged = merge_dicts([r.to_dict(), r.to_dict()])
     d = merged.to_dict()
-    assert d["calls"]["complete"]["count"] == 4
-    assert d["calls"]["complete"]["statuses"] == {"409": 2, "503": 2}
+    assert d["calls"]["complete"]["count"] == 6
+    assert d["calls"]["complete"]["statuses"] == {"409": 2, "500": 2, "503": 2}
     assert d["conflicts_409"] == 2 and d["events"]["completed"] == 6
 
 

@@ -84,14 +84,17 @@ def test_idle_delay_equals_executor_delay(n: int) -> None:
         assert sim.backoff_delay(n, sim.EXECUTOR_BACKOFF, _rng(seed)) == want
 
 
+@pytest.mark.parametrize("status", [429, 503])
 @pytest.mark.parametrize("repeated", [False, True])
 @pytest.mark.parametrize("retry_after", [None, 1.0, 7.0, 10_000.0])
 @pytest.mark.parametrize("n", [0, 1, 4])
-def test_429_delay_equals_executor_delay(n: int, retry_after: float | None, repeated: bool) -> None:
+def test_429_503_delay_equals_executor_delay(
+    n: int, retry_after: float | None, repeated: bool, status: int
+) -> None:
     from minion_common.client import ApiError
 
     stub = _executor_stub(sim.EXECUTOR_BACKOFF)
-    exc = ApiError(429, "TOO_MANY_REQUESTS", "slow down", retry_after=retry_after)
+    exc = ApiError(status, "SERVER_BUSY", "busy", retry_after=retry_after)
     for seed in range(5):
         random.seed(seed)
         want = executor_loop.ExecutorLoop._rate_limit_delay(stub, exc, n, repeated=repeated)

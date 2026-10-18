@@ -86,3 +86,27 @@ def test_max_output_bytes_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MINION_MAX_OUTPUT_BYTES", bad)
         with pytest.raises(ValidationError):
             ServerSettings(_env_file=None)
+
+
+def test_overload_defaults_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    s = ServerSettings(_env_file=None)
+    assert (s.db_pool_timeout_s, s.acquire_deadline_s) == (5.0, 10.0)
+    assert s.acquire_concurrency_limit == max(1, s.db_pool_size + s.db_max_overflow - 4)
+    for name, bad in [
+        ("DB_POOL_TIMEOUT_S", "0.1"),
+        ("DB_POOL_TIMEOUT_S", "31"),
+        ("ACQUIRE_DEADLINE_S", "0.5"),
+        ("ACQUIRE_DEADLINE_S", "30"),  # not below the executor's 30 s HTTP timeout
+        ("ACQUIRE_CONCURRENCY", "0"),
+        ("ACQUIRE_CONCURRENCY", "999"),  # above pool_size + max_overflow
+    ]:
+        monkeypatch.setenv(f"MINION_{name}", bad)
+        with pytest.raises(ValidationError):
+            ServerSettings(_env_file=None)
+        monkeypatch.delenv(f"MINION_{name}")
+
+
+def test_acquire_concurrency_default_floors_at_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINION_DB_POOL_SIZE", "1")
+    monkeypatch.setenv("MINION_DB_MAX_OVERFLOW", "0")
+    assert ServerSettings(_env_file=None).acquire_concurrency_limit == 1
