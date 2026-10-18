@@ -4,7 +4,7 @@ title: M6.4 Scale fixes (scoped from M6.3 findings)
 status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
-updated_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 11:57'
 labels:
   - scale
 dependencies: []
@@ -20,7 +20,7 @@ Candidates: (1) candidate query: two-step head-task pick in queue order, then pe
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Each fix has a before/after number from minion-scale in the PR
-- [ ] #2 Protocol race and concurrent-acquire tests stay green
-- [ ] #3 M6.3 report re-run shows NF-1 met or gap documented with ADR
+- [x] #1 Each fix has a before/after number from minion-scale in the PR
+- [x] #2 Protocol race and concurrent-acquire tests stay green
+- [x] #3 M6.3 report re-run shows NF-1 met or gap documented with ADR
 <!-- AC:END -->

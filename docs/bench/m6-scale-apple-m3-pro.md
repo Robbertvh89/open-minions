@@ -1,5 +1,7 @@
 # M6 scale test (NF-1, NF-2, NF-3): Apple M3 Pro (36 GB, macOS 27.0.1)
 
+> **Superseded by the [M6.4 re-run](m6.4-scale-apple-m3-pro.md)** (TASK-7.4.7, after the TASK-7.4 fixes). The numbers below are the M6.3 baseline and are kept unchanged.
+
 TASK-7.3. Derived data: [`m6-scale-apple-m3-pro.json`](m6-scale-apple-m3-pro.json). Harness:
 `packages/minion-scale` ([report schema](scale-report-schema.md)). Run on 2026-10-18 at commit
 `3d03959`, on the branch `docs/task-7.3-scale-report`. Total wall time was about 80 minutes. The
