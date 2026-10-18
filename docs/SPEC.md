@@ -545,9 +545,9 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 
 | ID | Requirement |
 |---|---|
-| NF-1 | Acquire endpoint p99 < 200 ms with 500 executors and 1M pending subtasks. |
-| NF-2 | Zero double-completion: a subtask's final output is written by exactly one attempt. |
-| NF-3 | No lost subtasks: every subtask reaches a terminal state given ≥1 live executor. |
+| NF-1 | Acquire endpoint p99 < 200 ms with 500 executors and 1M pending subtasks. **Not met** (M6.3, [report](bench/m6-scale-apple-m3-pro.md)): at 1M pending one executor already pays about 200 ms (the candidate query sorts every PENDING row), and 500 executors saturate PostgreSQL (server p99 > 10 s). Fixes are scoped in TASK-7.4. |
+| NF-2 | Zero double-completion: a subtask's final output is written by exactly one attempt. Verified by `minion-scale verify` after a 20k-subtask, 500-executor drain with vanish/release/fail/late faults ([M6.3 report](bench/m6-scale-apple-m3-pro.md)); 100k and 1M drains not run. |
+| NF-3 | No lost subtasks: every subtask reaches a terminal state given ≥1 live executor. Verified in the same 20k chaos drain: 0 non-terminal subtasks, 0 orphan acquirements ([M6.3 report](bench/m6-scale-apple-m3-pro.md)). |
 | NF-4 | Executor idle CPU < 1 %; no work while user has stopped it. Measured for the idle and the paused executor: `bench --cpu-check` covers the control process only (governor loop, no server round trips); the whole `run` (control plus worker process tree) is measured with `ps` (docs/bench/governor-measurements.md). |
 | NF-5 | Server and watchdog are stateless and horizontally scalable (all state in Postgres). The one exception is soft, per-replica state: the executor-endpoint rate limiter (TASK-6.2, ADR-0012) keeps its counters in memory, so with N replicas an executor may be admitted up to N times per interval. Counters are never coordination state; correctness stays in the database. |
 | NF-6 | Executor runs on macOS 14+ on M1 or newer. |
