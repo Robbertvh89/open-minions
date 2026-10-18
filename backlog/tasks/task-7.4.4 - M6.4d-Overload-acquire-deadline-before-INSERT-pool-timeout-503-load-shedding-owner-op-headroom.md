@@ -3,9 +3,10 @@ id: TASK-7.4.4
 title: >-
   M6.4d Overload: acquire deadline before INSERT, pool timeout, 503 load
   shedding, owner-op headroom
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 05:21'
 labels:
   - scale
 dependencies: []
