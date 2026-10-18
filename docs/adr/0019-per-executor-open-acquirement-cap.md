@@ -70,6 +70,20 @@ its claim (milliseconds), and the wait is bounded by the acquire deadline (57014
 - **Per-executor accounting of free NOT_ACKNOWLEDGED expiries:** already capped per subtask
   (ADR-0014); not added.
 
+## Measurement (NF-1)
+
+Knee scenario of the M6.4 run (`docs/bench/m6.4-scale-apple-m3-pro.md`): `open-minions-scale`
+overlay, 4 workers, 1,000,000 PENDING seeded (100 x 10,000), 50 sims, work 2 s, heartbeat 5 s,
+120 s, same Mac with the load generator; cap 64 (the statements run either way). 2,867
+completions (23.8/s), 0 5xx, 0 429, 22 shed 503 (M6.4: 17). Server `minion_acquire_seconds`
+(assigned, n=2,910): mean 18.7 ms, p50 <= 25 ms, p99 <= 100 ms (99.8 % <= 100 ms), the same
+buckets as M6.4 (p50 <= 25 ms, p99 <= 100 ms); client p99 <= 250 ms, as M6.4. In
+`pg_stat_statements`: the executor-row lock 0.030 ms and the count 0.016 ms per call (3,019
+calls each), against 0.58 ms for the claim statement, so about 0.05 ms of statement time per
+round (+8 % of the claim) plus two local round trips. The regression is far below the 20 %
+threshold, so the count stays a separate statement (folding it into the claim CTE was not needed).
+One run per variant on a shared Mac, no same-day baseline run: read it as "no visible change".
+
 ## Consequences
 
 - Two extra indexed statements per claim round (well under 1 ms); the full-fleet acquire path
