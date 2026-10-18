@@ -637,12 +637,16 @@ token in macOS Keychain.
    downgrade-release. Measure NF-8/NF-9 (TASK-5.6: `bench --budget-check`, reaction tests; numbers in ADR-0006 and docs/bench/).
 6. **M5 – Ops & usability:** Grafana dashboards, web UI, launchd packaging, auth hardening; usability
    test with real participants during video calls (NF-7) to tune default profiles. NF-7 proxy: `bench --foreground-check` (TASK-6.9); human protocol in docs/usability/nf7-video-call-protocol.md.
-7. **M6 – Scale test & menu-bar app:** simulated 500 executors against 1M subtasks (NF-1..NF-3);
+7. **M6 – Scale test & menu-bar app:** simulated 500 executors against 1M subtasks (NF-1..NF-3; results in [docs/bench/m6.4-scale-apple-m3-pro.md](bench/m6.4-scale-apple-m3-pro.md));
    menu-bar UI for profile/pause.
 
 ## 9. ADR index
 - [ADR-0001](adr/0001-python-for-all-components.md): Python for all components — **Accepted**
-- ADR-0013: Single-statement acquisition claim over a random window; unique-constraint acquisition over `SKIP LOCKED`
+- [ADR-0011](adr/0011-launchd-user-agent.md): launchd packaging as a per-user LaunchAgent — **Accepted**
+- [ADR-0013](adr/0013-acquisition-claim-window.md): Single-statement acquisition claim over a random window; unique-constraint acquisition over `SKIP LOCKED` — **Accepted**
+- [ADR-0014](adr/0014-unacknowledged-expiry-budget.md): Unacknowledged EXPIRED attempts do not consume the retry budget (capped) — **Accepted**
+- [ADR-0015](adr/0015-sharded-task-counters.md): Sharded task counters and post-commit task settle — **Accepted**
+- [ADR-0016](adr/0016-nf1-workload-scope.md): NF-1 is defined against a tested numeric workload scope; overload is shed, not queued — **Accepted**
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**

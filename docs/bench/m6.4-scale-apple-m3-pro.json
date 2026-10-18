@@ -4237,19 +4237,23 @@
   "ok": true
  },
  "b_100k_attempts": {
+  "derived": true,
+  "note": "total minus injected faults; no outcome query was saved",
   "total": 105737,
   "succeeded": 100000,
   "failed": 2054,
   "released": 2088,
-  "expired": 1595
+  "expired": 1595,
+  "expired_composition": "1055 vanish + 540 late"
  },
  "b_100k_faults_injected": {
   "fail": 2054,
   "late": 540,
-  "late_409": 528,
-  "late_accepted": 12,
   "release": 2088,
-  "vanish": 1055
+  "vanish": 1055,
+  "late_complete_409": 528,
+  "late_complete_accepted": 0,
+  "late_sims_stopped_at_drain_got_409_on_release": 12
  },
  "server_cpu_percent": {
   "a_stress_rerun_180s": {
@@ -4439,19 +4443,22 @@
    "case": "with 0008",
    "stale": 705,
    "tick_ms": 8759,
-   "rounds": 2
+   "rounds": 2,
+   "n": 1
   },
   {
    "case": "with 0008 repeat",
    "stale": 500,
    "tick_ms": 9313,
-   "rounds": 2
+   "rounds": 2,
+   "n": 1
   },
   {
    "case": "without 0008",
    "stale": 500,
    "tick_ms": 6430,
-   "rounds": 2
+   "rounds": 2,
+   "n": 1
   }
  ],
  "scenario_c_note": "tick time is host round trips through the Docker port forward; DB execution ~0.4 s per 500-row tick; follow-up TASK-35",
@@ -4472,14 +4479,29 @@
   "candidate_mean_ms_stress": 2436,
   "b_20k_s": 671,
   "b_20k_per_s": 29.7,
-  "c_tick_s": [
-   1.7,
-   2.4
-  ]
+  "c_tick_s": {
+   "with_0008": [
+    1.7,
+    2.4
+   ],
+   "without_0008": 6.971
+  }
  },
  "nf1_verdict": {
   "realistic": "met (server p99 <= 50 ms)",
   "knee": "met up to ~50 sims",
   "stress": "not met (server p99 <= 500 ms bucket, interp ~435 ms), ADR-0016"
- }
+ },
+ "pending_at_start": {
+  "a_stress": 1000000,
+  "a_stress_cpu_rerun": 1000000,
+  "a_realistic": 894924,
+  "knee_1": 898389,
+  "knee_10": 898331,
+  "knee_50": 897761,
+  "d_throttled": 891424,
+  "d_control": 890393,
+  "b_100k": 100000
+ },
+ "a_realistic_acquire_rate_per_s": 6.6
 }

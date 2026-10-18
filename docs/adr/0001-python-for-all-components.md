@@ -46,5 +46,8 @@ Use **Python 3.12+** for all components, managed as a `uv` workspace:
 **Revisit when**
 - The M6 scale test misses NF-1 (acquire p99 < 200 ms @ 500 executors) *and* profiling shows Python
   CPU time, not Postgres, as the bottleneck → rewrite the server only (the REST contract is stable).
+  *Status (M6.4):* NF-1 is met for the tested realistic scope and missed under the 2 s-work stress mix,
+  where server CPU is near-saturated; whether Python is the cause is decided by the profile in TASK-36
+  ([ADR-0016](0016-nf1-workload-scope.md)).
 - Executor installation friction becomes the main adoption blocker → consider a Swift menu-bar shell
   around the Python worker, or a full `mlx-swift` executor.
