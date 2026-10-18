@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
+import structlog
 from minion_common.schemas import AcquireRequest, Assignment, ModelEntry
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,7 @@ from minion_server.storage import MAX_PRESIGN_TTL_S, S3Storage
 from minion_server.uris import parse_s3_uri
 
 MAX_ROUNDS = 10
+_log = structlog.get_logger(__name__)
 
 
 class _LostRaceError(Exception):
@@ -35,6 +37,8 @@ async def acquire(
     window: int | None = None,
 ) -> Assignment | None:
     window = settings.acquire_window if window is None else window
+    if not 1 <= window <= repo.MAX_WINDOW:
+        raise ValueError(f"acquire window must be in 1..{repo.MAX_WINDOW}, got {window}")
     async with session.begin():
         await executors_repo.touch(
             session,
@@ -48,6 +52,7 @@ async def acquire(
     passes = [preference, None] if preference is not None else [None]
     for pref in passes:
         # A round whose pick lost the insert race (n > 0, no row) re-reads a fresh window.
+        exhausted = True
         for _ in range(MAX_ROUNDS):
             try:
                 async with session.begin():
@@ -66,11 +71,19 @@ async def acquire(
             except _LostRaceError:
                 continue
             if result.n_candidates == 0:
+                exhausted = False
                 break
             if result.candidate is None or result.won is None:  # unreachable: raised above
                 continue
             model = models[result.candidate.model_id]  # candidates are filtered to registry keys
             return await _assignment(result.candidate, result.won, model, settings, storage)
+        if exhausted:  # every round had work but lost the race: answer "empty", executor re-polls
+            _log.warning(
+                "acquire_rounds_exhausted",
+                rounds=MAX_ROUNDS,
+                window=window,
+                preferred_pass=pref is not None,
+            )
     return None
 
 

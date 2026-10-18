@@ -344,7 +344,7 @@ async def sweep_cancelled(
     """One batch (<= `batch` rows) of PENDING subtasks under tasks cancelled in the last `window_s`.
 
     A requeue that read the task status just before cancel committed can leave one behind. They
-    are never acquired (candidates and `try_acquire` both require a PENDING/RUNNING task); this
+    are never acquired (candidates and `claim` both require a PENDING/RUNNING task); this
     keeps the counts consistent. Locks subtask rows only (SKIP LOCKED, bounded), so it cannot
     deadlock with acquire (subtask -> task). The caller loops, one transaction per call, until
     fewer than `batch` rows come back. Stragglers older than the window are healed only by

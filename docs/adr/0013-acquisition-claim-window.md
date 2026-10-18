@@ -53,5 +53,13 @@ ROLLBACK plus a pool checkout). The server saturated on these round trips while 
   and ~19 transactions. `SHUFFLE_HEAD` and the service `rng` parameter are removed.
 - Under light load executors may take a subtask other than the strict head; ordering across tasks
   of equal priority is only approximate FIFO. Operators who need strict order set the window to 1.
-- Data-modifying CTE: the INSERT sees the statement snapshot like the candidate read, so a
-  candidate taken by a concurrent winner is still skipped via the unique constraint.
+- Data-modifying CTE: the INSERT sees the statement snapshot like the candidate read. A candidate
+  taken by a concurrent winner is skipped via the unique constraint; one whose winner completed or
+  was reclaimed after the snapshot (acquirement deleted, subtask no longer PENDING at the old
+  attempt) can win the INSERT, but is caught by the re-check `UPDATE` (status PENDING and
+  `attempt = won attempt - 1`), which rolls the round back.
+- A round now makes one attempt (the old loop tried several candidates per transaction). Under heavy
+  contention a round can lose, so an acquire may exhaust `MAX_ROUNDS` while work exists and answer
+  `204`; the executor re-polls. This trade-off is accepted (each round is one cheap statement) and is
+  visible as the `acquire_rounds_exhausted` log event (rounds, window, pass; no identities).
+- The claim returns the inserted key next to the picked key and refuses to serve a mismatch.

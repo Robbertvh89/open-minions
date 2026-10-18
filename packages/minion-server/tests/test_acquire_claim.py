@@ -86,11 +86,20 @@ async def test_never_lower_priority_while_higher_pending(
     await seed_task(sm, "high", 20, priority=5)
     execs = await make_executors(sm, 20)  # exactly as many racers as high-priority subtasks
     results = await asyncio.gather(*(_acquire(sm, p, cfg) for p, _ in execs))
-    winners = [r for r in results if r is not None]
-    assert len(winners) >= 10
-    # a low win means a high subtask was still PENDING: with 20 racers one would stay unowned
-    assert {w.task_name for w in winners} == {"high"}
-    assert len({w.subtask_id for w in winners}) == len(winners)
+    # losers (a racer whose every round lost) retry until all 20 high ones are owned: a low win
+    # before that would mean a high subtask was still PENDING
+    owned = [r for r in results if r is not None]
+    for p, _ in execs:
+        if len(owned) == 20:
+            break
+        got = await _acquire(sm, p, cfg)
+        if got is not None:
+            owned.append(got)
+    assert len(owned) == 20
+    assert {w.task_name for w in owned} == {"high"}
+    assert len({w.subtask_id for w in owned}) == 20
+    low = await _acquire(sm, execs[0][0], cfg)  # only now is low-priority work served
+    assert low is not None and low.task_name == "low"
 
 
 @pytest.mark.integration

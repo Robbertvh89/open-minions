@@ -344,23 +344,29 @@ default 3600; exceeding it backs off like any transient error). A claim never ha
 ```
 Executor ─POST /executor/acquire {engines, budget}─▶ Server
   (executor only calls this when governor state ≠ PAUSED)
-  candidates = SELECT pending subtasks
-               WHERE task.engine = ANY(engines)
-                 AND task.model_memory_gb <= budget.memory_gb   -- capacity admission
-                 AND (matches preference)            -- pass 1
-               ORDER BY task.priority DESC, task.created_at, subtask_id
-               LIMIT 16
-  if empty: candidates = same query without preference filter (engine, memory and allowed_pool filters stay) -- pass 2 (global FIFO)
-  one statement per round (ADR-0013): candidates (LIMIT MINION_ACQUIRE_WINDOW=16), pick one at random
-  among the highest priority present, then
-      INSERT INTO minion_subtask_acquirement (...) VALUES (...)
-        ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
-        RETURNING acquirement_id
-      if row returned:
-          UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ...  (same txn)
-          INSERT minion_executor_heartbeat(...)                           (same txn)
-          COMMIT → return assignment + presigned URLs
-  return 204   (a round repeats up to MAX_ROUNDS=10 when the picked candidate lost its insert race; then 204)
+  for pass in [preference, none]:            -- pass 2 (global FIFO) only if there is a preference;
+                                             -- engine, memory and allowed_pool filters stay in both
+    repeat up to MAX_ROUNDS=10 times:        -- one transaction and ONE statement per round (ADR-0013)
+      WITH cand AS (SELECT pending subtasks of live tasks
+                    WHERE task.engine = ANY(engines)
+                      AND task.model_memory_gb <= budget.memory_gb   -- capacity admission
+                      AND (matches pass preference)
+                    ORDER BY task.priority DESC, task.created_at, team, project, task_name, subtask_id
+                    LIMIT window),            -- MINION_ACQUIRE_WINDOW, default 16
+           pick AS (SELECT * FROM cand WHERE priority = max(priority) ORDER BY random() LIMIT 1),
+           ins  AS (INSERT INTO minion_subtask_acquirement (...)
+                      SELECT ... FROM pick JOIN subtask JOIN task
+                      WHERE subtask.status = PENDING AND task.status IN (PENDING, RUNNING)
+                    ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
+                    RETURNING acquirement_id, attempt, key)
+      SELECT count(cand), ins.*, pick.* ...
+      count = 0:  nothing in this pass -> next pass
+      no row:     lost the insert race   -> ROLLBACK, next round (fresh window)
+      row:        UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ... (same txn, re-check)
+                  INSERT minion_executor_heartbeat(...); UPDATE task PENDING -> RUNNING (same txn)
+                  re-check failed -> ROLLBACK, next round; else COMMIT -> return assignment + presigned URLs
+  return 204   (pass 2 starts when pass 1 finds nothing or exhausts MAX_ROUNDS; exhausting every
+                round with work present is logged as `acquire_rounds_exhausted`)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is

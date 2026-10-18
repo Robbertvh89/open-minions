@@ -352,6 +352,44 @@ def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def acquire_after_claim(
+    sm: async_sessionmaker[AsyncSession],
+    principal: ExecutorPrincipal,
+    hook: Callable[[], Awaitable[None]],
+    *,
+    settings: ServerSettings,
+    storage: Any,
+    models: dict[str, ModelEntry],
+    window: int = 1,
+) -> Any:
+    """Run the production `services.acquisition.acquire`; right after the first claim statement
+    (the CTE with `ON CONFLICT`) in the transaction, await `hook` (once). The hook must use its
+    own session: a write in the claim transaction would be rolled back with it."""
+    from minion_server.services.acquisition import acquire
+    from sqlalchemy.dialects import postgresql
+
+    fired = False
+    async with sm() as s:
+        real_execute = s.execute
+
+        async def execute(stmt: Any, *a: Any, **kw: Any) -> Any:
+            nonlocal fired
+            res = await real_execute(stmt, *a, **kw)
+            sql = str(stmt.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+            if not fired and "ON CONFLICT" in sql:
+                fired = True
+                await hook()
+            return res
+
+        s.execute = execute  # type: ignore[method-assign,assignment]
+        out = await acquire(
+            s, principal, _req(), settings=settings, storage=storage, models=models, window=window
+        )
+    if not fired:
+        raise AssertionError("the claim statement never ran")
+    return out
+
+
 @pytest.fixture(autouse=True)
 def _isolated_executor_config(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
