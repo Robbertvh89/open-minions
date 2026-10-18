@@ -268,7 +268,7 @@ def _budget(mem: float = 8.0) -> Budget:
 
 
 def _req(mem: float = 8.0, engines: tuple[Engine, ...] = (Engine.MLX,)) -> AcquireRequest:
-    return AcquireRequest(engines=list(engines), budget=_budget(mem))
+    return AcquireRequest(engines=list(engines), budget=_budget(mem), output_upload="post")
 
 
 async def seed_task(
@@ -284,6 +284,7 @@ async def seed_task(
     team: str = "acq",
     model_id: str = "fake-embed",
     project: str = "p",
+    output_uri: str | None = None,
 ) -> None:
     body = TaskCreate.model_validate(
         {
@@ -293,7 +294,7 @@ async def seed_task(
             "type": "embedding",
             "model": model_id,
             "input_uri": f"s3://minion/inputs/{team}/{name}/",
-            "output_uri": f"s3://minion/outputs/{team}/{name}/",
+            "output_uri": output_uri or f"s3://minion/outputs/{team}/{name}/",
             "priority": priority,
             "allowed_pool": pool,
         }

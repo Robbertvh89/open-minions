@@ -25,7 +25,7 @@ BUDGET: dict[str, Any] = {
     "gpu_duty_cycle": 0.5,
     "max_batch_size": 8,
 }
-ACQ = {"engines": ["mlx"], "budget": BUDGET}
+ACQ = {"engines": ["mlx"], "budget": BUDGET, "output_upload": "post"}
 
 Make = Callable[..., Awaitable[tuple[AsyncClient, Any]]]
 

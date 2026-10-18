@@ -124,7 +124,10 @@ def assignment() -> Assignment:
             "byte_start": 0,
             "byte_end": 1,
             "record_count": 1,
-            "output_url": "https://s3.test/out",
+            "output_post": {
+                "url": "https://s3.test/out",
+                "fields": {"key": "k", "policy": "p"},
+            },
             "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         }
     )

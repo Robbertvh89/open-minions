@@ -120,10 +120,25 @@ async def _assignment(
     settings: ServerSettings,
     storage: S3Storage,
 ) -> Assignment:
+    try:
+        return await _build_assignment(c, won, model, settings, storage)
+    except Exception as exc:  # the claim is already committed: leave a trace of the orphan
+        _log.error("assignment_build_failed", error=type(exc).__name__)
+        raise
+
+
+async def _build_assignment(
+    c: repo.Candidate,
+    won: repo.Won,
+    model: ModelEntry,
+    settings: ServerSettings,
+    storage: S3Storage,
+) -> Assignment:
     out = parse_s3_uri(c.output_uri, bucket=settings.s3_bucket, prefixes=("",))
     ttl = min(settings.presign_ttl_s, MAX_PRESIGN_TTL_S)
     input_url = await storage.presign_get(c.input_object_key, ttl, (c.byte_start, c.byte_end))
-    output_url = await storage.presign_put(attempt_key(out.key, c.subtask_id, won.attempt), ttl)
+    akey = attempt_key(out.key, c.subtask_id, won.attempt)
+    output_post = await storage.presign_post(akey, settings.max_output_bytes, ttl)
     return Assignment(
         acquirement_id=won.acquirement_id,
         attempt=won.attempt,
@@ -138,7 +153,7 @@ async def _assignment(
         byte_start=c.byte_start,
         byte_end=c.byte_end,
         record_count=c.record_count,
-        output_url=output_url,
+        output_post=output_post,
         expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
         max_output_bytes=settings.max_output_bytes,
     )

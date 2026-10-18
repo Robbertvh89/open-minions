@@ -595,7 +595,11 @@ class ExecutorLoop:
                 try:
                     assignment = await self._guarded(
                         self._client.acquire(
-                            AcquireRequest(engines=self._engines, budget=self._gov.decision.budget)
+                            AcquireRequest(
+                                engines=self._engines,
+                                budget=self._gov.decision.budget,
+                                output_upload="post",
+                            )
                         ),
                         self._stop,
                         lambda: SHUTDOWN_BUDGET_S,
@@ -774,7 +778,7 @@ class ExecutorLoop:
             budget_fn=lambda: self._gov.decision.budget,
             pause_fn=self._paused_reason,
             total=a.record_count,
-            initial_output_url=a.output_url,
+            initial_output=a.output_post,
             initial_expires_at=a.expires_at,
             sleep=self._hb_sleep,
         )
@@ -1285,7 +1289,7 @@ class ExecutorLoop:
             except ValidationError:
                 raise _FailureError(False, BAD_PARAMS, "invalid task params") from None
             self._check_url(a.input_url)
-            self._check_url(a.output_url)
+            self._check_url(a.output_post.url)
             try:
                 await io.download_range(self._http, a.input_url, a.byte_start, a.byte_end, in_path)
                 records = await asyncio.to_thread(io.parse_jsonl, in_path, a.record_count)
@@ -1320,11 +1324,15 @@ class ExecutorLoop:
                 signal, _ = await hb.beat(retry_rate_limited=True)
                 if signal is not None:
                     raise _SignalledError(signal)
-            output_url = hb.output_url  # refreshed by heartbeats; same attempt-scoped key
-            self._check_url(output_url)
+            post = hb.output_post  # refreshed by heartbeats; same attempt-scoped key
+            self._check_url(post.url)
             try:
-                await io.upload_file(self._http, output_url, out_path)
-            except (httpx.HTTPError, OSError) as exc:
+                await io.upload_post(self._http, post, out_path)
+            except io.OutputTooLargeError:  # S3 refused it: deterministic, do not retry
+                raise _FailureError(
+                    False, "OUTPUT_TOO_LARGE", "output exceeds the size cap"
+                ) from None
+            except (httpx.HTTPError, httpx.StreamError, OSError) as exc:
                 msg = type(exc).__name__
                 local = isinstance(exc, (*LOCAL_TRANSPORT_ERRORS, OSError))
                 raise _FailureError(True, "UPLOAD_FAILED", msg, release=local) from None

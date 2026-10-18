@@ -829,3 +829,13 @@ async def test_insert_readback_detects_mismatch(
     assert await split_one(sm, storage, batch_size=2)
     status, error, _, _ = await _task_row(fresh_engine, "rb")
     assert status == "FAILED" and error.startswith("INPUT_CHANGED")
+
+
+@pytest.mark.integration
+async def test_output_uri_with_double_quote_is_rejected(
+    app_client: tuple[AsyncClient, FastAPI],
+) -> None:
+    c, _ = app_client
+    body = _payload("api1", "quo1", output_uri='s3://minion/outputs/api1/q"x')
+    r = await c.post("/api/v1/tasks", json=body)
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "INVALID_URI"

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
-from minion_common.schemas import range_header
+from minion_common.schemas import PresignedPost, range_header
 
 from minion_server.settings import ServerSettings
 
@@ -86,8 +86,23 @@ class S3Storage:
         """Presigned GET. `byte_range` is `[start, end)` (like the subtask's byte_start/end)."""
         return await asyncio.to_thread(self._presign, "get_object", key, ttl_s, byte_range)
 
-    async def presign_put(self, key: str, ttl_s: int | None = None) -> str:
-        return await asyncio.to_thread(self._presign, "put_object", key, ttl_s)
+    def _presign_post(self, key: str, max_bytes: int, ttl_s: int | None) -> PresignedPost:
+        ttl = min(ttl_s or self._ttl, self._ttl)
+        # The signed policy makes S3 itself refuse an object above `max_bytes` (SPEC S-2);
+        # boto adds the exact bucket and key conditions.
+        post = self._signer.generate_presigned_post(
+            Bucket=self._bucket,
+            Key=key,
+            Conditions=[["content-length-range", 0, max_bytes]],
+            ExpiresIn=ttl,
+        )
+        return PresignedPost(url=post["url"], fields=post["fields"])
+
+    async def presign_post(
+        self, key: str, max_bytes: int, ttl_s: int | None = None
+    ) -> PresignedPost:
+        """Presigned POST for one object key, size-capped by the signed policy."""
+        return await asyncio.to_thread(self._presign_post, key, max_bytes, ttl_s)
 
     def _list_keys(self, prefix: str, max_keys: int | None) -> list[tuple[str, int, str]]:
         out: list[tuple[str, int, str]] = []
@@ -192,6 +207,10 @@ class S3Storage:
                     Bucket=self._bucket,
                     Key=dst_key,
                     CopySource={"Bucket": self._bucket, "Key": src_key},
+                    # Executor-supplied form fields (Content-Type, x-amz-meta-*) must not survive
+                    # into the promoted output.
+                    MetadataDirective="REPLACE",
+                    ContentType="application/x-ndjson",
                     **extra,  # type: ignore[arg-type]
                 )
             except self._copy_client.exceptions.ClientError as exc:

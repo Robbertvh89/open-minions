@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import json
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -198,7 +201,13 @@ async def test_http_assignment_shape_and_204(http: tuple[AsyncClient, Any]) -> N
     assert a["model"]["revision"] == "a" * 40
     assert "inputs/acq/shape/a.jsonl" in a["input_url"] and "X-Amz-Signature" in a["input_url"]
     sid = a["subtask_id"]
-    assert f"outputs/acq/shape/_attempts/{sid:06d}/1.jsonl" in a["output_url"]
+    post = a["output_post"]
+    assert post["fields"]["key"] == f"outputs/acq/shape/_attempts/{sid:06d}/1.jsonl"
+    policy = json.loads(base64.b64decode(post["fields"]["policy"]))
+    assert ["content-length-range", 0, a["max_output_bytes"]] in policy["conditions"]
+    assert {"key": post["fields"]["key"]} in policy["conditions"]
+    exp = datetime.fromisoformat(policy["expiration"].replace("Z", "+00:00"))
+    assert abs((exp - datetime.fromisoformat(a["expires_at"])).total_seconds()) < 5
     assert (a["byte_start"], a["byte_end"]) == (sid * 100, sid * 100 + 100)
     assert (
         await c.post("/api/v1/executor/acquire", json={}, headers=_auth(token))
@@ -431,3 +440,35 @@ async def test_default_window_drains_preferred_before_other_work(
     assert len({g.subtask_id for g in got}) == 3
     rest = await _acquire(sm, p, cfg)  # preferred work gone: pass 2 serves the rest
     assert rest is not None and rest.task_name != "pf-y"
+
+
+@pytest.mark.integration
+async def test_acquire_without_output_upload_is_426_and_claims_nothing(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "outdated", 2)
+    ((_, token),) = await make_executors(sm, 1)
+    body = _req().model_dump(mode="json", exclude={"output_upload"})
+    r = await c.post("/api/v1/executor/acquire", json=body, headers=_auth(token))
+    assert r.status_code == 426
+    assert r.json()["detail"]["code"] == "EXECUTOR_OUTDATED"
+    cnt = await _counts(sm, "outdated")
+    assert cnt["rows"] == 0  # the gate runs before the claim
+
+
+@pytest.mark.integration
+async def test_output_prefix_with_double_quote_still_acquires(
+    http: tuple[AsyncClient, Any],
+) -> None:
+    """A stored output URI with `"` (legacy / seeded) must not poison acquire after the claim."""
+    c, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "quoted", 1, output_uri='s3://minion/outputs/acq/quo"ted/')
+    ((_, token),) = await make_executors(sm, 1)
+    r = await c.post(
+        "/api/v1/executor/acquire", json=_req().model_dump(mode="json"), headers=_auth(token)
+    )
+    assert r.status_code == 200, r.text
+    assert '"' in r.json()["output_post"]["fields"]["key"]

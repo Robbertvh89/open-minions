@@ -124,7 +124,9 @@ async def test_acquire_clears_paused_reason_and_stores_cpu_priority(
     assert r.status_code == 204
     assert (await _row(sm, p.executor_id)).paused_reason == "thermal"
     await seed_task(sm, "presence-clear", 1, team="presence")
-    req = AcquireRequest(engines=["mlx"], budget=Budget.model_validate(BUDGET))
+    req = AcquireRequest(
+        engines=["mlx"], budget=Budget.model_validate(BUDGET), output_upload="post"
+    )
     r = await c.post(f"{BASE}/acquire", json=req.model_dump(mode="json"), headers=_auth(token))
     assert r.status_code in (200, 204), r.text
     row = await _row(sm, p.executor_id)
@@ -138,7 +140,9 @@ async def test_acquire_without_cpu_priority_still_accepted(http: tuple[AsyncClie
     [(_, token)] = await make_executors(app.state.sessionmaker, 1)
     old = {k: v for k, v in BUDGET.items() if k != "cpu_priority"}
     r = await c.post(
-        f"{BASE}/acquire", json={"engines": ["mlx"], "budget": old}, headers=_auth(token)
+        f"{BASE}/acquire",
+        json={"engines": ["mlx"], "budget": old, "output_upload": "post"},
+        headers=_auth(token),
     )
     assert r.status_code in (200, 204), r.text
 

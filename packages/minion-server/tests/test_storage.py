@@ -28,14 +28,10 @@ async def test_presigned_roundtrip(s3: S3Env) -> None:
         s3_region=s3.region,
     )
     st = S3Storage(cfg)
-    put = await st.presign_put("outputs/t/x.jsonl")
-    _http("PUT", put, b'{"a":1}\n')
+    s3.client.put_object(Bucket=s3.bucket, Key="outputs/t/x.jsonl", Body=b'{"a":1}\n')
     assert await st.head("outputs/t/x.jsonl") == 8
     assert await st.head("outputs/t/missing") is None
     assert _http("GET", await st.presign_get("outputs/t/x.jsonl")) == b'{"a":1}\n'
-    # presigned PUT is scoped to one object
-    with pytest.raises(urllib.error.HTTPError):
-        _http("PUT", put.replace("x.jsonl", "y.jsonl"), b"z")
     await st.copy("outputs/t/x.jsonl", "outputs/t/z.jsonl")
     assert await st.list_keys("outputs/t/") == [("outputs/t/x.jsonl", 8), ("outputs/t/z.jsonl", 8)]
     assert b"".join(st.iter_object("outputs/t/z.jsonl")) == b'{"a":1}\n'
@@ -143,3 +139,103 @@ async def test_any_key_stat_and_conditional_copy(s3: S3Env) -> None:
     assert not await st.any_key("cond/dst2")
     big = await st.list_keys("cond/", max_keys=1)
     assert len(big) > 1  # truncated listing signals "more than max_keys"
+
+
+@pytest.mark.integration
+async def test_presigned_post_enforces_size_cap(s3: S3Env) -> None:
+    import httpx
+
+    cfg = ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+    st = S3Storage(cfg)
+    cap = 1000
+
+    async def post(key: str, data: bytes, mutate: dict[str, str] | None = None) -> httpx.Response:
+        p = await st.presign_post(key, cap)
+        fields = {**p.fields, **(mutate or {})}
+        async with httpx.AsyncClient(timeout=30) as c:
+            return await c.post(p.url, data=fields, files={"file": ("o.jsonl", data)})
+
+    # (a) exactly at the cap is accepted
+    r = await post("post/a", b"x" * cap)
+    assert r.is_success, r.status_code
+    assert await st.head("post/a") == cap
+    # (b) one byte over is refused and nothing is stored
+    r = await post("post/b", b"x" * (cap + 1))
+    assert not r.is_success
+    assert await st.head("post/b") is None
+    # (c) an oversize POST onto an existing key leaves the old object intact
+    s3.client.put_object(Bucket=s3.bucket, Key="post/c", Body=b"old")
+    r = await post("post/c", b"y" * (cap + 1))
+    assert not r.is_success
+    assert s3.client.get_object(Bucket=s3.bucket, Key="post/c")["Body"].read() == b"old"
+    # (d) a tampered key is not accepted (SeaweedFS answers 307, AWS 403) and nothing is stored
+    r = await post("post/d", b"z", {"key": "post/d-evil"})
+    assert not r.is_success
+    assert await st.head("post/d-evil") is None and await st.head("post/d") is None
+    # (e) a bad signature is 403
+    r = await post("post/e", b"z", {"x-amz-signature": "0" * 64})
+    assert r.status_code == 403
+    assert await st.head("post/e") is None
+
+
+def _cfg(s3: S3Env) -> ServerSettings:
+    return ServerSettings(
+        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+        s3_endpoint_url=s3.endpoint_url,
+        s3_access_key=SecretStr(s3.access_key),
+        s3_secret_key=SecretStr(s3.secret_key),
+        s3_bucket=s3.bucket,
+        s3_region=s3.region,
+    )
+
+
+@pytest.mark.integration
+async def test_presigned_post_policy_expiry_is_enforced(s3: S3Env) -> None:
+    import asyncio
+
+    import httpx
+
+    st = S3Storage(_cfg(s3))
+    p = await st.presign_post("post/expiry", 1000, ttl_s=1)
+    await asyncio.sleep(2.5)
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(p.url, data=p.fields, files={"file": ("o", b"x")})
+    assert not r.is_success
+    assert await st.head("post/expiry") is None
+
+
+@pytest.mark.integration
+async def test_promotion_copy_drops_executor_supplied_metadata_and_acl(s3: S3Env) -> None:
+    import httpx
+
+    st = S3Storage(_cfg(s3))
+    uploaded = 0
+    # extras outside the policy: SeaweedFS accepts Content-Type / x-amz-meta (laxness) but may
+    # answer 307 for some of them; whatever it stores must not survive promotion
+    for extra in (
+        {"Content-Type": "text/html"},
+        {"x-amz-meta-evil": "1"},
+        {"acl": "public-read"},
+        {"Content-Type": "text/html", "acl": "public-read", "x-amz-meta-evil": "1"},
+    ):
+        p = await st.presign_post("post/meta-src", 1000)
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(p.url, data={**p.fields, **extra}, files={"file": ("o", b"x\n")})
+        uploaded += r.is_success
+    assert uploaded >= 1, "no variant uploaded; the test would prove nothing"
+    await st.copy("post/meta-src", "post/meta-dst")
+    head = s3.client.head_object(Bucket=s3.bucket, Key="post/meta-dst")
+    # AWS/MinIO store application/x-ndjson; SeaweedFS 4.05 ignores the copy's ContentType and
+    # falls back to octet-stream. Either way the executor-supplied text/html must be gone.
+    assert head["ContentType"] in ("application/x-ndjson", "application/octet-stream")
+    assert "evil" not in head.get("Metadata", {})
+    url = f"{s3.endpoint_url}/{s3.bucket}/post/meta-dst"
+    async with httpx.AsyncClient(timeout=30) as c:
+        assert not (await c.get(url)).is_success  # not anonymously readable

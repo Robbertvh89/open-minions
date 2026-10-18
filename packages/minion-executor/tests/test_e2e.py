@@ -463,7 +463,7 @@ async def test_prefer_command_makes_the_next_acquire_prefer_that_team(live: Live
     await seed_task(live.sm, "older", 3, team="aaa")  # older: FIFO would serve this first
     await seed_task(live.sm, "newer", 3, team="bbb")
     token = SecretStr(await live.token("pref"))
-    req = AcquireRequest(engines=[Engine.MLX], budget=BUDGET)
+    req = AcquireRequest(engines=[Engine.MLX], budget=BUDGET, output_upload="post")
     async with ExecutorClient(live.url, token) as c:
         await _send_preference(live.url, token, PreferenceRequest(team="bbb"))
         for _ in range(2):

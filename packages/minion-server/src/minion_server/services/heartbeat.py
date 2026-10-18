@@ -62,9 +62,10 @@ async def heartbeat(
     # Presign outside the transaction: pure local signing, no lock needed.
     out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
     ttl = min(settings.presign_ttl_s, MAX_PRESIGN_TTL_S)
-    url = await storage.presign_put(attempt_key(out.key, o.subtask_id, o.attempt), ttl)
+    akey = attempt_key(out.key, o.subtask_id, o.attempt)
+    post = await storage.presign_post(akey, settings.max_output_bytes, ttl)
     return HeartbeatResponse(
         cancel=o.task_status == TaskStatus.CANCELLED,
-        output_url=url,
+        output_post=post,
         expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
     )

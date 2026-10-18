@@ -380,7 +380,7 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 ### 6.1 User-facing
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/tasks` | Create task. `input_uri` and `output_uri` are prefixes: a missing trailing `/` is added, and `output_uri` must be unique across tasks. Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
+| `POST` | `/tasks` | Create task. `input_uri` and `output_uri` are prefixes: a missing trailing `/` is added, `output_uri` must be unique across tasks, and an `output_uri` containing `"` is rejected with `422 INVALID_URI` (it becomes part of the presigned POST form, ADR-0017). Body: `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask (1..100 000, default 500), priority? (-1000..1000, default 0), allowed_pool?` → `202` + task |
 | `GET` | `/tasks?team=&project=&status=&cursor=&limit=` | Tasks of the caller's teams, newest first (`TaskPage {items: [TaskOut], next_cursor}`). `team` outside the caller's teams → `403`; `limit` 1..100 (default 50). Keyset pagination on `(created_at, team, project, task_name)` DESC: stable under concurrent inserts. `cursor` is opaque and strictly validated (tampered/foreign → `422 INVALID_CURSOR`); it carries a sort position only, the team filter is always re-applied. Counts for the page come from one grouped query |
 | `GET` | `/tasks/{team}/{project}/{task_name}` | Task detail + progress counts (`TaskOut`, below) |
 | `GET` | `/tasks/{team}/{project}/{task_name}/subtasks?status=&cursor=&limit=` | Subtasks by `subtask_id` (`SubtaskPage`; `limit` 1..100, default 100); same `403`/`404` rules as task detail. `SubtaskOut`: `subtask_id, status, attempt, max_attempts, record_count, error_code, updated_at` only: no input/output keys, presigned URLs or executor identity (S-11) |
@@ -392,8 +392,8 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 |---|---|---|
 | `POST` | `/executor/register` | Report host capabilities + engines + capacity profile; returns `executor_id` |
 | `PUT` | `/executor/preference` | Set/clear `(team?, project?, task_name?)` preference |
-| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size, cpu_priority? (background|low|normal)}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb`, engine and `allowed_pool`. `200` + assignment (presigned input GET URL, presigned output PUT URL, `max_output_bytes`, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
-| `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state. Body (all optional, unknown fields rejected): `progress? {records_done, records_total}` (ints 0..2^31-1, `done ≤ total`; `total` above the subtask's `record_count` → `422 INVALID_PROGRESS`), `budget?` (`memory_gb` 0..1024 finite, `gpu_duty_cycle` 0..1, `max_batch_size` 1..4096, `cpu_priority?` `background|low|normal`), `paused_reason?` (`[a-z_]{1,64}`). Response `200 {cancel: bool, output_url, expires_at}` (`output_url` is a refreshed presigned PUT for the same attempt key); stale/foreign `acquirement_id` → `409 STALE_ACQUIREMENT` |
+| `POST` | `/executor/acquire` | Body: `{engines, budget: {profile, memory_gb, gpu_duty_cycle, max_batch_size, cpu_priority? (background|low|normal)}}`. Server filters candidates by `model.memory_gb ≤ budget.memory_gb`, engine and `allowed_pool`. Body also carries `output_upload: "post"` (capability marker): without it the server answers `426 EXECUTOR_OUTDATED` before claiming anything (ADR-0017). `200` + assignment (presigned input GET URL, presigned output POST `output_post {url, fields}`, `max_output_bytes`, model entry, params, `acquirement_id`, `attempt`) or `204` = no eligible work (empty body) |
+| `POST` | `/executor/subtasks/{acquirement_id}/heartbeat` | Liveness + progress + current budget/pause state. Body (all optional, unknown fields rejected): `progress? {records_done, records_total}` (ints 0..2^31-1, `done ≤ total`; `total` above the subtask's `record_count` → `422 INVALID_PROGRESS`), `budget?` (`memory_gb` 0..1024 finite, `gpu_duty_cycle` 0..1, `max_batch_size` 1..4096, `cpu_priority?` `background|low|normal`), `paused_reason?` (`[a-z_]{1,64}`). Response `200 {cancel: bool, output_post, expires_at}` (`output_post` is a refreshed presigned POST for the same attempt key); stale/foreign `acquirement_id` → `409 STALE_ACQUIREMENT` |
 | `POST` | `/executor/presence` | Low-frequency ping while idle/paused: `{budget, paused_reason?}` (`budget.cpu_priority` optional; `paused_reason` `[a-z_]{1,64}`). Response `204`; updates the caller's own executor row only (profile, budget, paused_reason, `last_seen_at`); revoked/invalid token → `401`; bad body → `422`. `acquire` clears `paused_reason` |
 | `POST` | `/executor/subtasks/{acquirement_id}/complete` | Report success + output metadata (record count, checksum) |
 | `POST` | `/executor/subtasks/{acquirement_id}/fail` | Report error `{retryable, code, message}` |
@@ -445,16 +445,15 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   on backends that enforce SigV4 signed headers (AWS S3, MinIO) it can read only that slice (403 to a
   missing or different Range); verify for others (SeaweedFS: see the CI warning of
   `test_signed_range_get_enforced_by_s3`). The boundary is per URL, not per executor: an executor
-  holds URLs only for subtasks it owns, and `allowed_pool` is the control for confidential tasks. The output PUT is scoped to
-  one attempt key. An attempt object above `MINION_MAX_OUTPUT_BYTES` (default 4 GiB, checked by HEAD
-  at complete) is never promoted: `422 OUTPUT_TOO_LARGE`, after which the
+  holds URLs only for subtasks it owns, and `allowed_pool` is the control for confidential tasks. The output is a presigned POST scoped to
+  one attempt key whose signed policy carries `content-length-range 0..MINION_MAX_OUTPUT_BYTES`, so S3
+  itself refuses a larger upload (ADR-0017). The HEAD check at complete stays as defence in depth: an attempt object above `MINION_MAX_OUTPUT_BYTES` (default 4 GiB) is never promoted: `422 OUTPUT_TOO_LARGE`, after which the
   server best-effort deletes the attempt object. The executor reports it as a non-retryable
   `OUTPUT_TOO_LARGE` failure (a re-run gives the same output). The assignment carries the server cap
   (`max_output_bytes`) and the executor refuses to upload a larger file (`min` of it and
   `MINION_EXECUTOR_MAX_OUTPUT_BYTES`; both `<= 5 GiB`; fail `OUTPUT_TOO_LARGE`, not retryable).
-  Not enforced at upload time (presigned PUT cannot carry `content-length-range`; deferred to TASK-19,
-  presigned POST would): an executor can still write a large object under its own attempt key until complete
-  rejects it; operators should keep versioning off, set a bucket quota and expire `_attempts/` objects with an S3 lifecycle rule (ARCHITECTURE §3.3).
+  The guarantee starts one presign TTL after the cutover (older PUT URLs live up to 1 h). Run S3 behind a body-limit proxy (`max_output_bytes` + 64 KiB): some stores (SeaweedFS) spool an oversize POST before checking the range. Upgrade the server before the executors.
+  Attempts times the cap can still accumulate under `_attempts/`: operators should keep versioning off, set a bucket quota and expire `_attempts/` objects with an S3 lifecycle rule (ARCHITECTURE §3.3).
 - S-3. Executor tokens: random 256-bit (`token_urlsafe(32)`), stored as SHA-256 hash only, revocable,
   scoped to a pool, optional expiry (`token_expires_at`). Tokens are pre-issued by the operator with
   `minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days N]` (N = 1..365,

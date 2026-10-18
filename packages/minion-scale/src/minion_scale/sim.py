@@ -29,6 +29,7 @@ from typing import Any, NamedTuple, TypeVar
 import httpx
 from minion_common.client import ApiError, ExecutorClient, StaleAcquirementError
 from minion_common.enums import CapacityProfile, Engine
+from minion_common.s3post import encode_post_form
 from minion_common.schemas import (
     AcquireRequest,
     Assignment,
@@ -249,7 +250,9 @@ class SimExecutor:
                     assignment = await self._call(
                         "acquire_error",
                         self._client.acquire(
-                            AcquireRequest(engines=[Engine.FAKE], budget=sim_budget())
+                            AcquireRequest(
+                                engines=[Engine.FAKE], budget=sim_budget(), output_upload="post"
+                            )
                         ),
                         ok_op=lambda a: "acquire_empty" if a is None else "acquire_assigned",
                         ok_status=lambda a: 204 if a is None else 200,
@@ -407,7 +410,12 @@ class SimExecutor:
         body = output_body(a.record_count)
         t0 = time.perf_counter()
         try:
-            resp = await self._put.put(a.output_url, content=body)
+            parts = encode_post_form(a.output_post.fields)
+            resp = await self._put.post(
+                a.output_post.url,
+                content=parts.preamble + body + parts.epilogue,
+                headers={"Content-Type": parts.content_type},
+            )
         except httpx.HTTPError:
             self.rec.record("output_put", time.perf_counter() - t0, TRANSPORT)
             return False

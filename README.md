@@ -24,7 +24,7 @@ short-lived presigned S3 URLs and never talk to PostgreSQL.
   | (FastAPI)   |         +------------+     |   S3    |
   +------+------+              ^             +----+----+
          ^                     | SQL              ^
-         | REST + executor     |                  | presigned GET / PUT
+         | REST + executor     |                  | presigned GET / POST
          | token (pull)   +----+-------+          |
          |                | watchdog   |          |
          |                | (reclaim)  |          |
@@ -530,8 +530,10 @@ CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the
 - **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15):
 a misbehaving or compromised worker can exceed it.
   Measured on one Mac (Apple M3 Pro, [`docs/bench/`](docs/bench/)); other chips are untested.
-- **Presigned PUT cannot cap upload size.** An executor can write a large object under its own
-  attempt key until `complete` rejects it; use a bucket quota and lifecycle rules (TASK-19, S-2).
+- **Output size is capped by the S3 policy, not the quota.** The presigned POST refuses a body above
+  `MINION_MAX_OUTPUT_BYTES`, but attempts accumulate under `_attempts/`: use a bucket quota and
+  lifecycle rules (S-2, [ADR-0017](docs/adr/0017-presigned-post-output-uploads.md)). Executors older
+  than this release are refused with `426 EXECUTOR_OUTDATED`.
 - **Signed `Range` reads are not verified on SeaweedFS** (the dev S3); AWS S3 and MinIO enforce them.
   A `check-storage` admin command is planned (TASK-20).
 - **Server logs are plain, not JSON** (the watchdog's are structured; TASK-17). Task list/detail
