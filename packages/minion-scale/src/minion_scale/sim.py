@@ -438,7 +438,8 @@ class SimExecutor:
                 saw_5xx = saw_5xx or isinstance(exc, ApiError)
                 attempt += 1
                 if self.stop.is_set():
-                    return _ok(await self._release(a, "STOP"))
+                    await self._release(a, "STOP")
+                    return Outcome.NEUTRAL  # the executor returns STOPPED either way
                 if attempt >= self.cfg.complete_retries:
                     self.rec.count("complete_failed")
                     if saw_5xx:  # deterministic server fault: burn the retry budget
@@ -482,7 +483,7 @@ class SimExecutor:
             return True
         except (ApiError, httpx.HTTPError):
             return False
-        self.rec.count("failed_retryable")
+        self.rec.count("failed_retryable" if retryable else "failed_permanent")
         return False  # the executor backs off after a failed subtask
 
 
