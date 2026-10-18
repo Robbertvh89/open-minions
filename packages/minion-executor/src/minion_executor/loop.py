@@ -1221,9 +1221,10 @@ class ExecutorLoop:
                         await self._release(a, bound, "STOP")
                         return _Outcome.STOPPED
                     if now - shed_since >= self._complete_shed_budget_s:
-                        # a shed 503 means nothing committed: release (RELEASED is not budget
-                        # counted; a watchdog reclaim would be EXPIRED plus an idle lease). If
-                        # the release fails too, the watchdog reclaims it.
+                        # a shed 503 commits nothing for that request, so release (RELEASED is
+                        # not budget counted; a watchdog reclaim would be EXPIRED plus an idle
+                        # lease). If an earlier timed-out attempt did commit, the release gets a
+                        # 409 and is harmless; if the release fails, the watchdog reclaims it.
                         bound.error("complete_shed_budget_exhausted", sheds=sheds)
                         await self._release(a, bound, "SERVER_BUSY")
                         return _Outcome.RELEASED
