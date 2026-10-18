@@ -360,9 +360,12 @@ async def test_removed_model_does_not_starve_valid_work(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("finished", [True, False])
+@pytest.mark.parametrize(
+    ("status", "bump"),
+    [("SUCCEEDED", True), ("PENDING", True), ("SUCCEEDED", False), ("FAILED", False)],
+)
 async def test_snapshot_stale_subtask_is_rejected_by_recheck(
-    sm: async_sessionmaker[AsyncSession], fresh_url: str, finished: bool
+    sm: async_sessionmaker[AsyncSession], fresh_url: str, status: str, bump: bool
 ) -> None:
     """Production path: after the claim INSERT won, another session finishes (SUCCEEDED, attempt
     bump) or reclaims (attempt bump, PENDING) the picked subtask. The re-check UPDATE fails, the
@@ -372,21 +375,20 @@ async def test_snapshot_stale_subtask_is_rejected_by_recheck(
     ((p, _),) = await make_executors(sm, 1)
 
     async def flip() -> None:
-        status = "SUCCEEDED" if finished else "PENDING"
         async with sm() as s, s.begin():
             await s.execute(
                 text(
-                    "UPDATE minion_subtask SET status=:st, attempt=attempt+1"
+                    "UPDATE minion_subtask SET status=:st, attempt=attempt+:inc"
                     " WHERE task_name='stale' AND subtask_id=0"
                 ),
-                {"st": status},
+                {"st": status, "inc": int(bump)},
             )
 
     got = await acquire_after_claim(
         sm, p, flip, settings=cfg, storage=S3Storage(cfg), models=MODELS, window=1
     )
     assert got is not None
-    assert (got.subtask_id, got.attempt) == ((1, 1) if finished else (0, 2))
+    assert (got.subtask_id, got.attempt) == ((0, 2) if status == "PENDING" else (1, 1))
     async with sm() as s:
         rows = (
             await s.execute(

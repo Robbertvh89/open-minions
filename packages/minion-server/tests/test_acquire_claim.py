@@ -60,11 +60,18 @@ async def test_200_racers_64_pending_unique_owners(
     await seed_task(sm, "r64", 64)
     execs = await make_executors(sm, 200)
     results = await asyncio.gather(*(_acquire(sm, p, cfg) for p, _ in execs))
+    # MAX_ROUNDS exhaustion is allowed (ADR-0013): top up with loser retries until no work is left
     winners = [r for r in results if r is not None]
+    for p, _ in execs:
+        if len(winners) == 64:
+            break
+        got = await _acquire(sm, p, cfg)
+        if got is not None:
+            winners.append(got)
     assert len(winners) == 64
     assert len({w.subtask_id for w in winners}) == 64
     assert len({w.acquirement_id for w in winners}) == 64
-    assert results.count(None) == 136
+    assert await _acquire(sm, execs[0][0], cfg) is None
     async with sm() as s:
         owners, rows = (
             await s.execute(

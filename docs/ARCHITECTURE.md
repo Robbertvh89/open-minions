@@ -371,14 +371,14 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
   deliberately unlocked; losing an insert race is cheap.
-- Candidate query is index-driven in two steps (TASK-7.4.2), O(16 + live tasks) regardless of queue
+- Candidate query is index-driven in two steps (TASK-7.4.2; window = MINION_ACQUIRE_WINDOW, default 16), O(window + live tasks) regardless of queue
   length: eligible live tasks are walked in queue order on the partial index
   `ix_minion_task_live_queue (priority DESC, created_at, team, project, task_name) WHERE status IN
-  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT 16` range scan runs on
+  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT window` range scan runs on
   `ix_minion_subtask_pending (team, project, task_name, subtask_id) WHERE status = 'PENDING'`; the
-  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT 16` yields exactly the FR-22 order of the old
-  single join (the task key is unique, so the order is total and the global top 16 holds at most 16
-  rows per task, each within that task's top 16). Status values are SQL literals, not bind
+  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT window` yields exactly the FR-22 order of the old
+  single join (the task key is unique, so the order is total and the global top window holds at most window
+  rows per task, each within that task's top window). Status values are SQL literals, not bind
   parameters, so asyncpg's generic plans still match the partial-index predicates. Residual cost:
   ~1 us / ~3 buffers per eligible live task that has no PENDING subtasks ahead of the first match
   (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms).
