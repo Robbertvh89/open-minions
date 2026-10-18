@@ -28,9 +28,9 @@ ever having started it.
   with code `NOT_ACKNOWLEDGED`. The free count is `count(*) FROM minion_subtask_attempt WHERE
   subtask key AND outcome = 'EXPIRED' AND error->>'code' = 'NOT_ACKNOWLEDGED'`. No schema change.
   A cancelled task still ends the subtask `CANCELLED`.
-- Max-lease expiries (`MAX_LEASE_EXCEEDED`) are unaffected: an acquirement that passes the lease
-  check on a never-beaten row is still the unacknowledged case only when the heartbeat is stale;
-  the lease path keeps counting.
+- Only the stale-heartbeat path is affected; `MAX_LEASE_EXCEEDED` expiries keep counting.
+- The cap is `MINION_RELEASE_LIMIT` for the watchdog too (`WatchdogSettings.release_limit`); 0 turns
+  the feature off (every expiry counts, paper semantics).
 - Executor ack: right after a successful acquire and before the worker starts, the executor sends
   an immediate heartbeat. 429 / 5xx / transport errors on the ack are non-fatal (regular heartbeats
   follow); `409` means the assignment is stale and it is dropped without running. The server exempts
