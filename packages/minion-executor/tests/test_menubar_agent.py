@@ -362,6 +362,17 @@ def test_chain_refuses_writable_component(
         launchd.check_install_chain(str(exe))
 
 
+def test_chain_tolerates_admin_group_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stock Homebrew leaves /opt/homebrew/Cellar admin-group writable; admins can sudo anyway."""
+    exe = _chain(tmp_path, monkeypatch)
+    exe.parent.chmod(0o775)
+    monkeypatch.setattr(launchd, "ADMIN_GID", exe.parent.stat().st_gid)
+    launchd.check_install_chain(str(exe))
+    exe.parent.chmod(0o777)  # others-writable stays refused even for the admin group
+    with pytest.raises(ValueError, match="writable by others"):
+        launchd.check_install_chain(str(exe))
+
+
 def test_chain_refuses_foreign_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     exe = _chain(tmp_path, monkeypatch)
     monkeypatch.setattr(os, "geteuid", lambda: exe.stat().st_uid + 1000)

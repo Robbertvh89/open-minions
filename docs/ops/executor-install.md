@@ -128,7 +128,8 @@ start exits 0), and logs to `~/Library/Logs/open-minions/com.open-minions.menuba
 The plist holds no token or other secret, only `MINION_EXECUTOR_STATE_DIR` / `MINION_EXECUTOR_CONFIG`
 when you set them (other `MINION_EXECUTOR_*` variables are warned about, not carried). The same rules as
 the service apply, plus: not as root, and the executable, its Python and every parent directory must be
-owned by you or root and not group/other writable (shared `/tmp` is refused); install the tool outside Documents, Desktop,
+owned by you or root and not writable by others or by a group other than admin (stock Homebrew's
+admin-writable Cellar is fine; shared `/tmp` is refused); install the tool outside Documents, Desktop,
 Downloads and iCloud Drive, and not with `MINION_EXECUTOR_DEV=1`. It re-runs idempotently (an identical
 plist is left alone); a different plist needs `menubar uninstall` first.
 

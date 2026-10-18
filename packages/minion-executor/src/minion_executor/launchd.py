@@ -91,6 +91,9 @@ def refuse_root() -> None:
         raise ValueError("refusing to run as root; run as the user who owns the agent")
 
 
+ADMIN_GID = 80  # macOS "admin" group
+
+
 def _check_owned_not_writable(path: Path) -> None:
     try:
         st = path.lstat()
@@ -100,14 +103,19 @@ def _check_owned_not_writable(path: Path) -> None:
         return  # the resolved chain is vetted separately
     if st.st_uid not in (os.geteuid(), 0):
         raise ValueError(f"{path} is owned by another user; refusing")
-    if st.st_mode & 0o022:
-        raise ValueError(f"{path} is writable by group or others (or sticky/shared); refusing")
+    if st.st_mode & 0o002:
+        raise ValueError(f"{path} is writable by others (or sticky/shared); refusing")
+    # Group write is tolerated only for the macOS admin group: its members can sudo, so they
+    # gain nothing new. Stock Homebrew leaves /opt/homebrew/Cellar admin-group writable.
+    if st.st_mode & 0o020 and st.st_gid != ADMIN_GID:
+        raise ValueError(f"{path} is writable by a non-admin group; refusing")
 
 
 def check_install_chain(exe: str) -> None:
     """The launchd job runs `exe` with `sys.executable` and `sys.prefix` in your name: every
     one of them and every ancestor (as written and symlink-resolved) must be owned by you or root
-    and not group/other writable. Sticky world-writable directories such as /tmp are refused."""
+    and not writable by others or by a group other than admin. Sticky world-writable directories
+    such as /tmp are refused."""
     for raw in (exe, sys.executable, sys.prefix):
         candidates = {Path(os.path.abspath(raw))}  # noqa: PTH100 - normalise ".." only
         with contextlib.suppress(OSError, RuntimeError):
