@@ -5,7 +5,8 @@ output to the presigned URL, complete. It talks to the server through `minion_co
 and to object storage through presigned URLs only (invariants 1 and 4): this module and its
 imports must stay free of sqlalchemy/asyncpg (a test enforces that). Back-off after an empty
 acquire (204), a 429 or a failure follows the real executor's loop; a test compares the constants
-and the delay formulas with `minion_executor.loop`.
+and the delay formulas with `minion_executor.loop`. Honouring a 503 `Retry-After` (acquire and
+complete) anticipates TASK-7.4.4: the executor does not do this yet.
 
 Injected faults, drawn per assignment: `vanish` (stop beating and walk away: the watchdog must
 reclaim), `release`, `fail` (retryable), `late` (go silent past the heartbeat timeout, then
@@ -16,7 +17,6 @@ import asyncio
 import contextlib
 import enum
 import hashlib
-import math
 import multiprocessing as mp
 import queue
 import random
@@ -51,6 +51,7 @@ MAX_RETRY_AFTER_S = 300.0  # loop.py MAX_RETRY_AFTER_S
 ACQUIRE_PACE_S = 0.4  # ExecutorSettings.acquire_pace_s default
 MAX_CONSECUTIVE_FAILURES = 5  # ExecutorLoop max_consecutive_failures default
 FAILURE_PAUSE_S = 300.0  # ExecutorLoop failure_pause_s default
+COMPLETE_RETRIES = 5  # ExecutorLoop complete_retries default
 FAULT_CODE = "SCALE_FAULT"
 
 
@@ -140,6 +141,9 @@ class SimConfig:
     timeout_s: float = 30.0
     max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES
     failure_pause_s: float = FAILURE_PAUSE_S
+    complete_retries: int = COMPLETE_RETRIES
+    # Each sim waits uniform(0, this) once before its first acquire (0: all start at once).
+    first_acquire_jitter_s: float = 0.0
     seed: int = 0
 
 
@@ -222,6 +226,8 @@ class SimExecutor:
         try:
             if not await self._register():
                 return
+            if self.cfg.first_acquire_jitter_s > 0:
+                await self._sleep(self._rng.uniform(0, self.cfg.first_acquire_jitter_s))
             last_acquire: float | None = None
             while not self.stop.is_set():
                 if last_acquire is not None and self.cfg.acquire_pace_s > 0:
@@ -300,7 +306,9 @@ class SimExecutor:
     async def _after_acquire_error(self, exc: Exception) -> bool:
         """Executor loop semantics: 429 waits Retry-After, 5xx/transport back off, other 4xx end
         the executor. Returns False when this sim must stop."""
-        limited = isinstance(exc, ApiError) and exc.status_code == 429
+        limited = isinstance(exc, ApiError) and (
+            exc.status_code == 429 or (exc.status_code == 503 and exc.retry_after is not None)
+        )
         if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
             self.rec.count("sim_aborted")
             return False
@@ -402,18 +410,58 @@ class SimExecutor:
             byte_size=len(body),
             sha256=hashlib.sha256(body).hexdigest(),
         )
-        try:
-            await self._call("complete", self._client.complete(a.acquirement_id, req))
-        except StaleAcquirementError:
-            self.rec.count("late_complete_409" if expect_stale else "complete_409")
-            return Outcome.NEUTRAL  # someone else owns it now: nothing to report
-        except (ApiError, httpx.HTTPError):
-            self.rec.count("complete_failed")
-            return Outcome.FAILED
-        self.rec.count("completed")
-        if expect_stale:
-            self.rec.count("late_complete_accepted")  # the watchdog had not reclaimed it yet
-        return Outcome.DONE
+        attempt = 0
+        saw_5xx = False
+        while True:
+            try:
+                await self._call("complete", self._client.complete(a.acquirement_id, req))
+            except StaleAcquirementError:
+                # Also the answer to a repeat after a lost response only when someone else owns
+                # it now (a same-owner repeat is a 200): counted once, here.
+                self.rec.count("late_complete_409" if expect_stale else "complete_409")
+                return Outcome.NEUTRAL  # someone else owns it now: nothing to report
+            except (ApiError, httpx.HTTPError) as exc:
+                # Executor `_complete`: transport errors and 5xx are retried; 409 is discarded;
+                # other 4xx are reported as a failure.
+                if isinstance(exc, ApiError) and exc.status_code == 409:
+                    self.rec.count("complete_409")
+                    return Outcome.NEUTRAL
+                if isinstance(exc, ApiError) and exc.status_code < 500:
+                    self.rec.count("complete_failed")
+                    too_large = exc.status_code == 422 and exc.code == "OUTPUT_TOO_LARGE"
+                    await self._fail(
+                        a,
+                        code="OUTPUT_TOO_LARGE" if too_large else "COMPLETE_REJECTED",
+                        retryable=not too_large,
+                    )
+                    return Outcome.FAILED
+                saw_5xx = saw_5xx or isinstance(exc, ApiError)
+                attempt += 1
+                if self.stop.is_set():
+                    await self._release(a, "STOP")
+                    return Outcome.NEUTRAL  # the executor returns STOPPED either way
+                if attempt >= self.cfg.complete_retries:
+                    self.rec.count("complete_failed")
+                    if saw_5xx:  # deterministic server fault: burn the retry budget
+                        await self._fail(a, code="COMPLETE_FAILED")
+                    # transport-only: leave it to the watchdog (counts EXPIRED), as the executor
+                    return Outcome.FAILED
+                self.rec.count("complete_retried")
+                retry_after = (
+                    exc.retry_after
+                    if isinstance(exc, ApiError) and exc.status_code == 503
+                    else None
+                )
+                if retry_after is not None:
+                    delay = rate_limit_delay(retry_after, attempt - 1, self.cfg.backoff, self._rng)
+                else:
+                    delay = backoff_delay(attempt - 1, self.cfg.backoff, self._rng)
+                await self._sleep(delay)
+                continue
+            self.rec.count("completed")
+            if expect_stale:
+                self.rec.count("late_complete_accepted")  # the watchdog had not reclaimed it yet
+            return Outcome.DONE
 
     async def _release(self, a: Assignment, code: str) -> bool:
         try:
@@ -427,15 +475,15 @@ class SimExecutor:
         self.rec.count("released")
         return True
 
-    async def _fail(self, a: Assignment, code: str = FAULT_CODE) -> bool:
-        req = FailRequest(retryable=True, code=code, message="injected by minion-scale")
+    async def _fail(self, a: Assignment, code: str = FAULT_CODE, *, retryable: bool = True) -> bool:
+        req = FailRequest(retryable=retryable, code=code, message="injected by minion-scale")
         try:
             await self._call("fail", self._client.fail(a.acquirement_id, req))
         except StaleAcquirementError:
             return True
         except (ApiError, httpx.HTTPError):
             return False
-        self.rec.count("failed_retryable")
+        self.rec.count("failed_retryable" if retryable else "failed_permanent")
         return False  # the executor backs off after a failed subtask
 
 
@@ -542,22 +590,22 @@ async def run_fleet(
     """
     started = time.monotonic()
     stalled = False
-    stall_polls = math.ceil(stall_s / poll_s) if progress is not None and stall_s else 0
+    watch_stall = progress is not None and bool(stall_s)
 
     async def drained() -> bool:
         nonlocal stalled
         last: int | None = None
-        same = 0
+        changed_at = time.monotonic()
         while True:
             if max_duration_s is not None and time.monotonic() - started >= max_duration_s:
                 return False
             if await until():
                 return True
-            if stall_polls and progress is not None:
+            if watch_stall and progress is not None and stall_s:
                 now = await progress()
-                same = same + 1 if now == last else 0
-                last = now
-                if same >= stall_polls:
+                if now != last:
+                    last, changed_at = now, time.monotonic()
+                if time.monotonic() - changed_at >= stall_s:
                     stalled = True
                     return False
             await asyncio.sleep(poll_s)

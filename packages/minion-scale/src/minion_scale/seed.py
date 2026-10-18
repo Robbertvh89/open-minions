@@ -261,3 +261,17 @@ async def count_remaining(sm: Sm, *, team: str = DEFAULT_TEAM) -> int:
             {"team": team},
         )
         return int(row.scalar_one())
+
+
+async def sum_remaining(sm: Sm, *, team: str = DEFAULT_TEAM) -> int:
+    """Subtasks of the seeded team not yet terminal, from the task counters (one row per task,
+    no scan of `minion_subtask`): the cheap progress poll of `run`."""
+    async with sm() as session:
+        row = await session.execute(
+            text(
+                "SELECT coalesce(sum(total_subtasks - succeeded_subtasks - failed_subtasks), 0)"
+                " FROM minion_task WHERE team = :team AND status IN ('PENDING', 'RUNNING')"
+            ),
+            {"team": team},
+        )
+        return int(row.scalar_one())

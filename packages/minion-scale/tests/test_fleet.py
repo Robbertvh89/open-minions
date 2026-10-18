@@ -5,7 +5,9 @@ object store is needed.
 """
 
 import asyncio
+import itertools
 import multiprocessing as mp
+import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -272,3 +274,28 @@ async def test_only_a_completion_resets_the_failure_streak() -> None:
     ex._sleep = no_sleep  # type: ignore[method-assign,assignment]
     await asyncio.wait_for(ex.run(), 5)
     assert seen == [0, 1, 1, 2, 0]  # NEUTRAL kept the streak, only DONE reset it
+
+
+async def test_progress_is_polled_every_poll_s_and_stall_is_in_seconds(unavailable: str) -> None:
+    stamps: list[float] = []
+
+    async def progress() -> int:
+        stamps.append(time.monotonic())
+        return 7
+
+    rec, secs, drained = await asyncio.wait_for(
+        run_fleet(
+            _cfg(unavailable),
+            _tokens(1),
+            procs=1,
+            until=_never,
+            poll_s=0.25,
+            progress=progress,
+            stall_s=0.6,
+        ),
+        20,
+    )
+    assert drained is False and rec.events["stalled"] == 1
+    gaps = [b - a for a, b in itertools.pairwise(stamps)]
+    assert gaps and all(0.2 <= g < 0.6 for g in gaps)
+    assert 0.6 <= secs < 1.5  # stall_s seconds, not stall_s rounded up to whole polls
