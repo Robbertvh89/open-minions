@@ -18,7 +18,7 @@ class WatchdogSettings(BaseSettings):
     max_lease_s: float = Field(default=6 * 3600.0, gt=0)
     # Free NOT_ACKNOWLEDGED expiries per subtask before one counts (ADR-0014); same variable as the
     # server's release cap. 0 = every expiry counts.
-    release_limit: int = Field(default=10, ge=0)
+    release_limit: int = Field(default=10, ge=0, le=100)  # keep equal to the server value
     watchdog_interval_s: float = Field(default=60.0, gt=0)
     watchdog_batch_size: int = Field(default=500, ge=1)
     cancel_sweep_window_s: float = Field(default=3600.0, gt=0)  # how far back to heal cancels

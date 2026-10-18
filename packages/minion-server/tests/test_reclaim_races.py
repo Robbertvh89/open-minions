@@ -654,6 +654,36 @@ async def test_free_unacked_expiries_are_capped(env: tuple[AsyncClient, Any]) ->
 
 
 @pytest.mark.integration
+async def test_free_rows_do_not_count_toward_the_budget(env: tuple[AsyncClient, Any]) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "excl", 1, team="excl")
+    await _max_attempts(sm, 2)
+    ((_, tok),) = await make_executors(sm, 1)
+    for _ in range(CAP):
+        assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    # over the cap: the first counted expiry sees 0 earlier counted attempts (1 of 2 used)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("PENDING",)]
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_FAILED  # 2 of 2
+
+
+@pytest.mark.integration
+async def test_ghost_cycle_then_retryable_fail_requeues(
+    env: tuple[AsyncClient, Any],
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await seed_task(sm, "gfail", 1, team="gfail")
+    await _max_attempts(sm, 2)
+    ((_, tok),) = await make_executors(sm, 1)
+    assert await _ghost_cycle(c, sm, tok) == ReclaimResult.EXPIRED_REQUEUED
+    a = await _acquire(c, tok)
+    assert (await _call(c, a, tok, "fail")).status_code == 204
+    assert await _rows(sm, "SELECT status FROM minion_subtask") == [("PENDING",)]
+
+
+@pytest.mark.integration
 async def test_cap_zero_keeps_paper_semantics(env: tuple[AsyncClient, Any]) -> None:
     c, app = env
     sm: Sm = app.state.sessionmaker

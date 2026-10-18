@@ -144,6 +144,13 @@ async def finish_unacknowledged(
     HEARTBEAT_TIMEOUT expiry (bounded, no livelock). Caller holds the acquirement lock.
     """
     if await repo.unacknowledged_attempt_count(session, o) >= free_cap:
+        log.info(
+            "unacked_cap_reached",
+            acquirement_id=str(o.acquirement_id),
+            subtask_id=o.subtask_id,
+            attempt=o.attempt,
+            free_cap=free_cap,
+        )
         return await finish_failed(
             session,
             o,

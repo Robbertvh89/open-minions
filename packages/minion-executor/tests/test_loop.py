@@ -1092,7 +1092,7 @@ async def test_beat_signal_during_inflight_upload(tmp_path: Path, sig: str) -> N
 async def test_failing_heartbeater_task_is_no_signal_and_work_completes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def boom(self: Any) -> None:
+    async def boom(self: Any, first_delay: float | None = None) -> None:
         raise RuntimeError("secret detail")
 
     monkeypatch.setattr("minion_executor.loop.Heartbeater.run", boom)
@@ -3572,3 +3572,31 @@ async def test_ack_409_drops_the_assignment_without_running(tmp_path: Path) -> N
     await loop.run()
     assert worker.batches == [] and not worker.ensured
     assert client.kinds() == ["acquire", "acquire"]  # no complete / fail / release
+
+
+async def test_ack_cancel_releases_without_starting_the_worker(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    s3 = FakeS3()
+    client.ack_script = [hb_resp(cancel=True)]
+    loop = make_loop(
+        client, worker, s3, tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(0, []),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await loop.run()
+    assert client.release_codes == ["CANCELLED"]
+    assert worker.batches == [] and not worker.ensured
+    assert "complete" not in client.kinds() and "fail" not in client.kinds()
+
+
+async def test_failed_ack_retry_delay_is_the_first_heartbeat_delay(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    client.ack_script = [ApiError(503, "UNAVAILABLE", "down")]
+    delays: list[float] = []
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [],
+        heartbeat_interval_s=100.0, heartbeat_sleep=gated_sleep(5, delays),
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await loop.run()
+    assert delays and 30.0 <= delays[0] <= 33.0  # min(30 s, interval), not the 100 s interval

@@ -443,6 +443,7 @@ Never expire the promoted `NNNNNN.jsonl` outputs. Not automated in v1.
 ```
 Executor (every heartbeat interval, 300 s by default, while running): POST /heartbeat {progress, budget, paused_reason}
   Server: owner check under lock (acquirement, else 409); 429 if closer than MINION_HEARTBEAT_MIN_INTERVAL_S
+          (the first beat after a claim, the ack, is exempt: ADR-0014)
           UPDATE minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
           respond {cancel: task.status == CANCELLED, output_url (fresh presigned PUT), expires_at}
 
@@ -594,6 +595,8 @@ Container hardening (`deploy/Dockerfile`, `x-minion-app` in `compose.yml`): one 
 Startup order with `docker compose -f deploy/compose.yml --profile app up -d --build`: postgres (healthy via `pg_isready -h 127.0.0.1`, TCP because the socket-only initdb server would report healthy too early) → `migrate` (one-shot `alembic upgrade head`, replaces the manual `uv run alembic upgrade head` in container mode) and `s3-init` → `server` (healthy on `/healthz`) and `watchdog` (healthy while its health file is newer than 3 × interval + 30 s). Only the `app` profile starts these; without it the infra-only flow runs the server natively.
 
 Ports: the server is published on `127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}` only. Secrets: `${MINION_SECRETS_DIR:-./secrets}` (default `deploy/secrets/`, git-ignored) is mounted read-only at `/run/minion-secrets` and holds `api-keys.yaml`; the directory is mounted, not the file, so the atomic temp+rename reload reaches the container. `MINION_UI_SESSION_SECRET` and `MINION_METRICS_TOKEN` come from the environment (compose reads the shell or `deploy/.env`), never from the image. Ownership: `auth.py` refuses a keys file or directory not owned by root or the server uid. On macOS Docker Desktop the bind mount shows the file as owned by the container uid, so it works as is. On Linux hosts, either `chown -R 10001:10001` the secrets directory and file, or leave them `root:root` (file 0644 in a 0755 directory); the keys file must not be group/world-writable. `api-keys.yaml` must exist before `up`, otherwise Docker creates an empty directory at the mount source. The watchdog healthcheck reads `MINION_WATCHDOG_INTERVAL_S`, which compose passes to the watchdog too (default 60) so both use one value.
+
+`MINION_RELEASE_LIMIT` (0..100) is read by both server and watchdog and must have the same value on both (the watchdog applies it to free `NOT_ACKNOWLEDGED` expiries, the server to releases).
 
 Database role: the compose `minion` superuser is dev only. A non-dev deployment runs `migrate` as the schema owner and the server and watchdog as a separate non-superuser, DML-only application role.
 
