@@ -4,6 +4,7 @@ Ownership is decided solely by `INSERT ... ON CONFLICT DO NOTHING` into
 `minion_subtask_acquirement` (CLAUDE.md invariant 2). Candidate selection is deliberately unlocked.
 """
 
+import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
-from sqlalchemy import Select, exists, literal, select, update
+from sqlalchemy import ColumnElement, Select, exists, literal, literal_column, select, true, update
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +49,15 @@ class Won:
     attempt: int
 
 
+def _lit(status: TaskStatus | SubtaskStatus) -> ColumnElement[str]:
+    """A SQL string literal (never a bind param): asyncpg's generic plans cannot prove a bound
+    status matches a partial-index predicate, a literal always can. Values are enum constants."""
+    value = status.value
+    if not re.fullmatch(r"[A-Z_]+", value):
+        raise ValueError(f"unsafe status literal: {value!r}")
+    return literal_column("'" + value + "'")
+
+
 def candidates_stmt(
     *,
     engines: list[Engine],
@@ -57,30 +67,33 @@ def candidates_stmt(
     preference: tuple[str | None, str | None, str | None] | None,
     limit: int = CANDIDATE_LIMIT,
 ) -> Select[Any]:
-    """The candidate query (also what the scale harness EXPLAINs)."""
-    stmt = (
+    """The candidate query (also what the scale harness EXPLAINs).
+
+    Two-step, index-driven: walk the eligible live tasks in FR-22 order on
+    `ix_minion_task_live_queue`, and for each take its first `limit` PENDING subtasks from
+    `ix_minion_subtask_pending` (LATERAL, ordered by subtask_id, LIMIT). Cost is
+    O(limit + live tasks), independent of the number of pending subtasks.
+
+    Order equivalence with the single-join form `ORDER BY priority DESC, created_at, team,
+    project, task_name, subtask_id LIMIT k`: the task key (team, project, task_name) is the
+    primary key, so the sort key is a total order and rows of one task are contiguous, ordered
+    by subtask_id. The global first k rows therefore contain at most k rows of any one task, and
+    those are that task's first k PENDING subtasks by subtask_id, which is exactly what each
+    lateral branch returns. The outer ORDER BY + LIMIT then yields the same list.
+    """
+    live = (
         select(
-            Subtask.team,
-            Subtask.project,
-            Subtask.task_name,
-            Subtask.subtask_id,
+            Task.team,
+            Task.project,
+            Task.task_name,
             Task.model_id,
-            Subtask.input_object_key,
-            Subtask.byte_start,
-            Subtask.byte_end,
-            Subtask.record_count,
             Task.output_uri,
             Task.params,
-        )
-        .join(
-            Task,
-            (Task.team == Subtask.team)
-            & (Task.project == Subtask.project)
-            & (Task.task_name == Subtask.task_name),
+            Task.priority,
+            Task.created_at,
         )
         .where(
-            Subtask.status == SubtaskStatus.PENDING.value,
-            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+            Task.status.in_([_lit(TaskStatus.PENDING), _lit(TaskStatus.RUNNING)]),
             Task.model_id.in_(list(model_ids)),  # removed models must not occupy the head
             Task.engine.in_([e.value for e in engines]),
             Task.model_memory_gb <= Decimal(str(memory_gb)),
@@ -89,19 +102,60 @@ def candidates_stmt(
         .order_by(
             Task.priority.desc(),
             Task.created_at,
-            Subtask.team,
-            Subtask.project,
-            Subtask.task_name,
+            Task.team,
+            Task.project,
+            Task.task_name,
+        )
+    )
+    if preference is not None:
+        for col, value in zip((Task.team, Task.project, Task.task_name), preference, strict=True):
+            if value is not None:
+                live = live.where(col == value)
+    t = live.subquery("t")
+    per_task = (
+        select(
             Subtask.subtask_id,
+            Subtask.input_object_key,
+            Subtask.byte_start,
+            Subtask.byte_end,
+            Subtask.record_count,
+        )
+        .where(
+            Subtask.team == t.c.team,
+            Subtask.project == t.c.project,
+            Subtask.task_name == t.c.task_name,
+            Subtask.status == _lit(SubtaskStatus.PENDING),
+        )
+        .order_by(Subtask.subtask_id)
+        .limit(limit)
+        .lateral("s")
+    )
+    stmt = (
+        select(
+            t.c.team,
+            t.c.project,
+            t.c.task_name,
+            per_task.c.subtask_id,
+            t.c.model_id,
+            per_task.c.input_object_key,
+            per_task.c.byte_start,
+            per_task.c.byte_end,
+            per_task.c.record_count,
+            t.c.output_uri,
+            t.c.params,
+        )
+        .select_from(t)
+        .join(per_task, true())
+        .order_by(
+            t.c.priority.desc(),
+            t.c.created_at,
+            t.c.team,
+            t.c.project,
+            t.c.task_name,
+            per_task.c.subtask_id,
         )
         .limit(limit)
     )
-    if preference is not None:
-        for col, value in zip(
-            (Subtask.team, Subtask.project, Subtask.task_name), preference, strict=True
-        ):
-            if value is not None:
-                stmt = stmt.where(col == value)
     return cast("Select[Any]", stmt)
 
 
