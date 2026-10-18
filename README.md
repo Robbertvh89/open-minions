@@ -328,7 +328,8 @@ You donate idle capacity and keep working. Full install notes:
 [`docs/ops/executor-install.md`](docs/ops/executor-install.md).
 
 **Menu-bar app:** `uv run minion-executor menubar` shows a status item to pause, resume and pick
-the profile without a terminal (launch at login: TASK-7.6, pending).
+the profile without a terminal. Launch it at login with `uv run minion-executor menubar install`
+(`--dry-run` previews the plist; `menubar uninstall` removes it; independent of the executor service).
 
 **Install as a background service** (per-user LaunchAgent, [ADR-0011](docs/adr/0011-launchd-user-agent.md)).
 Install a non-editable copy (launchd cannot read `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud
@@ -537,8 +538,7 @@ a misbehaving or compromised worker can exceed it.
   aggregate subtask counts per request (TASK-16); rate-limit the read endpoints at the proxy.
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
   capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)).
-- **Not built yet:** the scale test (TASK-7) and the menu-bar app's launch-at-login agent
-  (TASK-7.6; the app itself exists, see Mac owners), timer-based split-lease renewal for very
+- **Not built yet:** the scale test (TASK-7), timer-based split-lease renewal for very
 large single-object inputs (TASK-11).
 - **Hardening gaps (TASK-9):** no absolute per-batch wall-clock cap, no server cap on
   `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state dir or

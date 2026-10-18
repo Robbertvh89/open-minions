@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from minion_common.client import ApiError
 from minion_common.enums import Engine
-from minion_executor import service
+from minion_executor import launchd, service
 from minion_executor.loop import GovernorStoppedError
 from minion_executor.main import NO_ENGINE_MSG, StartupError, app
 from minion_executor.settings import ExecutorSettings
@@ -157,15 +157,16 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeLaunchctl:
     monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(tmp_path / "state"))
     for k in SECRETS:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr(service, "_executable", lambda: "/opt/bin/minion-executor")
+    monkeypatch.setattr(launchd, "executable", lambda: "/opt/bin/minion-executor")
     monkeypatch.setattr("minion_executor.secrets.keychain_token", lambda: SecretStr("kc"))
     monkeypatch.setattr("minion_executor.secrets.keychain_present", lambda: True)
-    monkeypatch.setattr(service, "_is_darwin", lambda: True)
+    monkeypatch.setattr(launchd, "is_darwin", lambda: True)
     monkeypatch.setattr(service, "probe_engines", lambda requested, settings: [Engine.MLX])
-    monkeypatch.setattr(service, "_sleep", lambda s: None)
+    monkeypatch.setattr(launchd, "_sleep", lambda s: None)
+    monkeypatch.setattr(launchd, "check_install_chain", lambda exe: None)
     monkeypatch.setattr("minion_executor.worker.process.restrict_environ", lambda: None)
     fake = FakeLaunchctl()
-    monkeypatch.setattr(service, "run_launchctl", fake)
+    monkeypatch.setattr(launchd, "run_launchctl", fake)
     return fake
 
 
@@ -252,7 +253,7 @@ def test_write_plist_refuses_symlink(tmp_path: Path) -> None:
     link = tmp_path / "l.plist"
     link.symlink_to(target)
     with pytest.raises(OSError):
-        service.write_plist_safely(link, b"data")
+        launchd.write_plist_safely(link, b"data")
     assert target.read_text() == "x"
 
 
@@ -313,7 +314,7 @@ def install_plist(tmp_path: Path, grace: float = 30.0) -> Path:
     ag = tmp_path / "ag"
     ag.mkdir(exist_ok=True)
     plist = ag / "com.test.x.plist"
-    plist.write_bytes(render(grace, executable="/opt/bin/minion-executor"))
+    plist.write_bytes(render(grace, label="com.test.x", executable="/opt/bin/minion-executor"))
     return plist
 
 
@@ -368,7 +369,7 @@ def test_launchctl_helper_uses_absolute_path_no_shell(monkeypatch: pytest.Monkey
         return subprocess.CompletedProcess(argv, 0, "o", "")
 
     monkeypatch.setattr(subprocess, "run", fake)
-    assert service.run_launchctl(["print", "x"]) == (0, "o")
+    assert launchd.run_launchctl(["print", "x"]) == (0, "o")
     assert seen["argv"] == ["/bin/launchctl", "print", "x"]
     assert seen["kw"]["timeout"] > 0 and not seen["kw"].get("shell")
 
@@ -508,7 +509,7 @@ def test_dry_run_does_not_probe(
 def test_install_refuses_non_darwin(
     env: FakeLaunchctl, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_is_darwin", lambda: False)
+    monkeypatch.setattr(launchd, "is_darwin", lambda: False)
     res = runner.invoke(app, install_args(tmp_path))
     assert res.exit_code == 2 and "macOS" in res.output
     assert not (tmp_path / "state").exists()
@@ -600,7 +601,7 @@ def test_uninstall_waits_for_graceful_stop_on_einprogress(
     def sleep(s: float) -> None:
         ticks["n"] += 1
 
-    monkeypatch.setattr(service, "_sleep", sleep)
+    monkeypatch.setattr(launchd, "_sleep", sleep)
     res = runner.invoke(
         app, ["service", "uninstall", "--label", "com.test.x", "--agents-dir", str(tmp_path / "ag")]
     )
@@ -616,12 +617,12 @@ def test_uninstall_keeps_plist_if_stop_never_finishes(
     env.queue["bootout"] = [(36, "")]
     env.rc, env.out = 0, "state = running"
     clock = {"t": 0.0}
-    monkeypatch.setattr(service, "_now", lambda: clock["t"])
+    monkeypatch.setattr(launchd, "_now", lambda: clock["t"])
 
     def sleep(s: float) -> None:
         clock["t"] += s
 
-    monkeypatch.setattr(service, "_sleep", sleep)
+    monkeypatch.setattr(launchd, "_sleep", sleep)
     res = runner.invoke(
         app, ["service", "uninstall", "--label", "com.test.x", "--agents-dir", str(tmp_path / "ag")]
     )
@@ -659,8 +660,8 @@ def test_uninstall_polls_after_bootout_rc0_and_reports_stop_time(
     env.queue["bootout"] = [(0, "")]  # launchd answers 0 while the job is still stopping
     env.queue["print"] = [(0, "state = running")] * 5 + [(113, "")]
     clock = {"t": 0.0}
-    monkeypatch.setattr(service, "_now", lambda: clock["t"])
-    monkeypatch.setattr(service, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(launchd, "_now", lambda: clock["t"])
+    monkeypatch.setattr(launchd, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     res = _uninstall(tmp_path)
     assert res.exit_code == 0, res.output
     assert [c[0][0] for c in env.calls] == ["bootout"] + ["print"] * 6
@@ -675,8 +676,8 @@ def test_uninstall_rc0_but_never_unloads_keeps_plist(
     env.queue["bootout"] = [(0, "")]
     env.rc, env.out = 0, "state = running"
     clock = {"t": 0.0}
-    monkeypatch.setattr(service, "_now", lambda: clock["t"])
-    monkeypatch.setattr(service, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(launchd, "_now", lambda: clock["t"])
+    monkeypatch.setattr(launchd, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     res = _uninstall(tmp_path)
     assert res.exit_code == 2 and plist.exists()
     assert "launchctl bootout" in res.output
@@ -769,7 +770,7 @@ def test_install_refuses_executable_under_documents(
 ) -> None:
     home = tmp_path / "home"
     exe = home / "Documents" / "repo" / ".venv" / "bin" / "minion-executor"
-    monkeypatch.setattr(service, "_executable", lambda: str(exe))
+    monkeypatch.setattr(launchd, "executable", lambda: str(exe))
     for extra in ((), ("--dry-run",)):
         res = runner.invoke(app, install_args(tmp_path, *extra))
         assert res.exit_code == 2 and "macOS-protected folder" in res.output

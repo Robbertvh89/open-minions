@@ -307,7 +307,7 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   **Status (TASK-5.5):** the loop sends the governor's live budget (the per-dimension minimum while a
   profile hold is running) and `paused_reason`; presence goes out on entering a pause, on a reason or
   budget change and every `MINION_EXECUTOR_PRESENCE_INTERVAL_S` (60).
-- FR-56. **Owner control.** CLI and a menu-bar app (`minion-executor menubar`, TASK-7.5; local files only, no server or token):
+- FR-56. **Owner control.** CLI and a menu-bar app (`minion-executor menubar`, TASK-7.5; local files only, no server or token; launch at login via `minion-executor menubar install`, a separate Aqua-session LaunchAgent, TASK-7.6):
   `minion-executor profile <name>`,
   `pause`, `resume`, `status` (shows budget, current task, GPU share, today's contribution).
   **Status (TASK-5.4):** `pause [--for 1h]`, `resume` and `profile <name|auto>` write the owner's

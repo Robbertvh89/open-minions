@@ -111,4 +111,26 @@ launchctl bootout gui/$(id -u)/com.open-minions.executor
 rm ~/Library/LaunchAgents/com.open-minions.executor.plist
 ```
 
+## 5. Menu bar at login (optional)
+
+```bash
+minion-executor menubar install --dry-run   # preview the plist
+minion-executor menubar install             # ~/Library/LaunchAgents/com.open-minions.menubar.plist
+minion-executor menubar status
+minion-executor menubar uninstall
+```
+A second LaunchAgent, independent of the executor service (own label and plist; uninstalling one never
+touches the other). It starts `minion-executor menubar` in your GUI (Aqua) session only, as
+`ProcessType=Interactive`, restarts it after a crash or SIGTERM/kill, but not after Quit (`KeepAlive`
+`SuccessfulExit=false`; Quit stays quit until your next login, or `launchctl kickstart`), retries a
+persistent start-up error every 30 s, runs only one instance (`menubar.lock` in the state dir; a second
+start exits 0), and logs to `~/Library/Logs/open-minions/com.open-minions.menubar.log`.
+The plist holds no token or other secret, only `MINION_EXECUTOR_STATE_DIR` / `MINION_EXECUTOR_CONFIG`
+when you set them (other `MINION_EXECUTOR_*` variables are warned about, not carried). The same rules as
+the service apply, plus: not as root, and the executable, its Python and every parent directory must be
+owned by you or root and not writable by others or by a group other than admin (stock Homebrew's
+admin-writable Cellar is fine; shared `/tmp` is refused; a Nix-store interpreter, group `nixbld`, is refused too); install the tool outside Documents, Desktop,
+Downloads and iCloud Drive, and not with `MINION_EXECUTOR_DEV=1`. It re-runs idempotently (an identical
+plist is left alone); a different plist needs `menubar uninstall` first.
+
 See ADR-0011 for the design. `pause`/`resume`/`profile` keep working against the service.
