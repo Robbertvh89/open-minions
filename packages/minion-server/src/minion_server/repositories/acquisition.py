@@ -4,6 +4,7 @@ Ownership is decided solely by `INSERT ... ON CONFLICT DO NOTHING` into
 `minion_subtask_acquirement` (CLAUDE.md invariant 2). Candidate selection is deliberately unlocked.
 """
 
+import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -48,9 +49,12 @@ class Won:
     attempt: int
 
 
-def _lit(value: str) -> ColumnElement[str]:
+def _lit(status: TaskStatus | SubtaskStatus) -> ColumnElement[str]:
     """A SQL string literal (never a bind param): asyncpg's generic plans cannot prove a bound
     status matches a partial-index predicate, a literal always can. Values are enum constants."""
+    value = status.value
+    if not re.fullmatch(r"[A-Z_]+", value):
+        raise ValueError(f"unsafe status literal: {value!r}")
     return literal_column("'" + value + "'")
 
 
@@ -89,7 +93,7 @@ def candidates_stmt(
             Task.created_at,
         )
         .where(
-            Task.status.in_([_lit(TaskStatus.PENDING.value), _lit(TaskStatus.RUNNING.value)]),
+            Task.status.in_([_lit(TaskStatus.PENDING), _lit(TaskStatus.RUNNING)]),
             Task.model_id.in_(list(model_ids)),  # removed models must not occupy the head
             Task.engine.in_([e.value for e in engines]),
             Task.model_memory_gb <= Decimal(str(memory_gb)),
@@ -120,7 +124,7 @@ def candidates_stmt(
             Subtask.team == t.c.team,
             Subtask.project == t.c.project,
             Subtask.task_name == t.c.task_name,
-            Subtask.status == _lit(SubtaskStatus.PENDING.value),
+            Subtask.status == _lit(SubtaskStatus.PENDING),
         )
         .order_by(Subtask.subtask_id)
         .limit(limit)

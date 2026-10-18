@@ -29,4 +29,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_index("ix_minion_task_live_queue", table_name="minion_task")
