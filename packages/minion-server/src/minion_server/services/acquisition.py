@@ -83,6 +83,9 @@ async def acquire(
                     )
                     if result.n_candidates > 0 and result.won is None:
                         raise _LostRaceError  # roll back a failed re-check; harmless otherwise
+                    if deadline is not None and time.monotonic() >= deadline:
+                        # the claim returned too late: roll back so no acquirement is committed
+                        raise busy_error("ACQUIRE_DEADLINE", "acquire deadline exceeded")
             except _LostRaceError:
                 continue
             except DBAPIError as exc:

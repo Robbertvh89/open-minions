@@ -476,7 +476,7 @@ async def test_complete_sheds_beyond_the_retry_count_still_complete(tmp_path: Pa
     assert all(s >= 2.0 for s in sleeps[:9])  # each waits the Retry-After
 
 
-async def test_complete_shed_budget_exhausted_leaves_to_watchdog(tmp_path: Path) -> None:
+async def test_complete_shed_budget_exhausted_releases_server_busy(tmp_path: Path) -> None:
     client, sleeps = FakeClient([assignment()]), list[float]()
     client.complete_exc = ApiError(503, "SERVER_BUSY", "busy", retry_after=2.0)
     now = [0.0]
@@ -492,7 +492,8 @@ async def test_complete_shed_budget_exhausted_leaves_to_watchdog(tmp_path: Path)
     client.on_empty = loop.stop
     assert await loop.run() == 0
     assert client.kinds().count("complete") == 4  # t=0, 10, 20, 30 >= 25
-    assert "fail" not in client.kinds() and "release" not in client.kinds()
+    assert "fail" not in client.kinds() and client.kinds().count("release") == 1
+    assert client.release_codes == ["SERVER_BUSY"]
 
 
 async def test_complete_5xx_exhaustion_fails_retryable(tmp_path: Path) -> None:

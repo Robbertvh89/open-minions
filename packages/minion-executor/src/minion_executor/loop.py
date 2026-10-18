@@ -314,8 +314,8 @@ class ExecutorLoop:
         self._fail_pause_s = failure_pause_s
         self._complete_retries = complete_retries
         # Wall-clock cap on 503+Retry-After (shed) answers to one complete; sheds do not use up
-        # `complete_retries`. Keep it below the heartbeat timeout (the owner stops beating while it
-        # waits); past it the subtask is left to the watchdog (TASK-7.4.4).
+        # `complete_retries`. Heartbeats continue while it retries; past the cap the subtask is
+        # released (SERVER_BUSY), not left to the watchdog (TASK-7.4.4).
         self._complete_shed_budget_s = complete_shed_budget_s
         self._allow_http = allow_http_loopback
         self._hb_interval = heartbeat_interval_s
@@ -1221,9 +1221,12 @@ class ExecutorLoop:
                         await self._release(a, bound, "STOP")
                         return _Outcome.STOPPED
                     if now - shed_since >= self._complete_shed_budget_s:
-                        # leave it to the watchdog (counts EXPIRED); no COMPLETE_FAILED burn
+                        # a shed 503 means nothing committed: release (RELEASED is not budget
+                        # counted; a watchdog reclaim would be EXPIRED plus an idle lease). If
+                        # the release fails too, the watchdog reclaims it.
                         bound.error("complete_shed_budget_exhausted", sheds=sheds)
-                        return _Outcome.FAILED
+                        await self._release(a, bound, "SERVER_BUSY")
+                        return _Outcome.RELEASED
                     await self._pause(
                         self._rate_limit_delay(exc, sheds - 1, repeated=sheds > 1),
                         until=self._hard_stop,

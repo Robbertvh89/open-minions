@@ -322,7 +322,7 @@ async def test_many_complete_sheds_do_not_use_up_the_retry_count() -> None:
     assert len(delays) == n
 
 
-async def test_complete_shed_budget_exhausted_is_left_to_the_watchdog() -> None:
+async def test_complete_shed_budget_exhausted_releases_server_busy() -> None:
     from minion_common.client import ApiError
 
     err = ApiError(503, "SERVER_BUSY", "busy", retry_after=1.0)
@@ -337,9 +337,9 @@ async def test_complete_shed_budget_exhausted_is_left_to_the_watchdog() -> None:
         await real(seconds)
 
     ex._sleep = tick  # type: ignore[method-assign]
-    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.NEUTRAL
     assert len(calls) == 4  # t=0, 4, 8, 12 -> over the 10 s budget
-    assert ex.reports == []  # type: ignore[attr-defined]  # no COMPLETE_FAILED budget burn
+    assert ex.reports == [("release", "SERVER_BUSY", None)]  # type: ignore[attr-defined]  # no fail
 
 
 async def test_transport_error_retry_that_gets_409_counts_complete_409_once() -> None:

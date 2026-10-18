@@ -462,7 +462,8 @@ class SimExecutor:
                         return Outcome.NEUTRAL
                     if now - shed_since >= self.cfg.complete_shed_budget_s:
                         self.rec.count("complete_failed")
-                        return Outcome.FAILED  # left to the watchdog, no COMPLETE_FAILED burn
+                        await self._release(a, "SERVER_BUSY")  # executor parity; else watchdog
+                        return Outcome.NEUTRAL
                     self.rec.count("complete_retried")
                     delay = rate_limit_delay(
                         exc.retry_after, sheds - 1, self.cfg.backoff, self._rng, repeated=sheds > 1

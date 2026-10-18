@@ -154,7 +154,7 @@ async def acquire(
     if inflight is not None and inflight.get(eid, 0) >= MAX_ACQUIRES_PER_EXECUTOR:
         # a client ignoring the pace limit (acquire_min_interval_s = 0) cannot fill the slots
         if metrics is not None:
-            metrics.acquires.labels(outcome="shed").inc()
+            metrics.acquires.labels(outcome="rate_limited").inc()
         raise HTTPException(
             status_code=429,
             detail={"code": "TOO_MANY_REQUESTS", "message": "acquire already in flight"},

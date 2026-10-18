@@ -154,6 +154,27 @@ async def test_slow_claim_statement_is_cancelled_at_the_deadline(
 
 
 @pytest.mark.integration
+async def test_deadline_passing_after_the_claim_rolls_back_the_acquirement(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = await make(acquire_deadline_s=1.0, acquire_concurrency=1)
+    await seed_task(app.state.sessionmaker, "al", 3, team="al")
+    [(_, tok)] = await make_executors(app.state.sessionmaker, 1)
+    real = acquisition_repo.claim
+
+    async def claim_then_stall(session: Any, *a: Any, **kw: Any) -> Any:
+        out = await real(session, *a, **kw)  # the INSERT has run inside the open transaction
+        await asyncio.sleep(1.3)  # work after the claim outlives the deadline
+        return out
+
+    monkeypatch.setattr(acquisition_repo, "claim", claim_then_stall)
+    r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
+    _assert_shed(r, "ACQUIRE_DEADLINE")
+    assert await _acquirements(app) == 0
+    _assert_slots_free(app)
+
+
+@pytest.mark.integration
 async def test_client_gives_up_before_the_server_finishes_leaves_no_ghost_acquirement(
     make: Make, monkeypatch: pytest.MonkeyPatch
 ) -> None:
