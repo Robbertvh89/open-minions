@@ -15,6 +15,7 @@ from minion_scale.seed import (
     revoke_executors,
     seed_executors,
     seed_queue,
+    sum_remaining,
     upload_input,
     write_tokens_file,
 )
@@ -131,6 +132,39 @@ async def test_seed_creates_pending_queue_and_hashed_tokens(sm: Sm, s3: S3Env) -
     assert hashes.isdisjoint(tokens)
     with pytest.raises(Exception):  # noqa: B017 - same output prefix: unique violation
         await seed_queue(sm, spec, input_bytes=size)
+
+
+@pytest.mark.integration
+async def test_sum_remaining_tracks_count_remaining(sm: Sm, s3: S3Env) -> None:
+    spec = _spec(tasks=2, subtasks=4)
+    await seed_queue(sm, spec, input_bytes=upload_input(s3.client, spec))
+    assert await sum_remaining(sm) == await count_remaining(sm) == 8
+    async with sm() as s, s.begin():  # one subtask completes, another fails for good
+        await s.execute(
+            text(
+                "WITH t AS (SELECT team, project, task_name FROM minion_task ORDER BY task_name"
+                " LIMIT 1), p AS (SELECT s.team, s.project, s.task_name, s.subtask_id"
+                " FROM minion_subtask s JOIN t USING (team, project, task_name)"
+                " ORDER BY s.subtask_id LIMIT 2),"
+                " u AS (UPDATE minion_subtask m SET status = CASE WHEN m.subtask_id ="
+                " (SELECT min(subtask_id) FROM p) THEN 'SUCCEEDED' ELSE 'FAILED' END"
+                " FROM p WHERE m.team = p.team AND m.project = p.project"
+                " AND m.task_name = p.task_name AND m.subtask_id = p.subtask_id RETURNING 1)"
+                " UPDATE minion_task k SET succeeded_subtasks = 1, failed_subtasks = 1"
+                " FROM t WHERE k.team = t.team AND k.project = t.project"
+                " AND k.task_name = t.task_name"
+            )
+        )
+    assert await count_remaining(sm) == 6
+    assert await sum_remaining(sm) == 6
+    async with sm() as s, s.begin():  # a terminal task contributes nothing
+        await s.execute(
+            text(
+                "UPDATE minion_task SET status = 'SUCCEEDED'"
+                " WHERE task_name = (SELECT min(task_name) FROM minion_task)"
+            )
+        )
+    assert await sum_remaining(sm) == 4
 
 
 async def _rows(sm: Sm, sql: str) -> list[Any]:

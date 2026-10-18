@@ -53,7 +53,7 @@ unreadable tokens file); `verify` exits 1 on a violation.
 ## `config`
 
 `server` (`host:port`), `sims`, `procs`, `work_s`, `heartbeat_interval_s`, `backoff_s` (`[lo, hi]`,
-default `[10, 30]`, the executor's), `acquire_pace_s` (default 0.4), `fault_rates`
+default `[10, 30]`, the executor's), `acquire_pace_s` (default 0.4), `complete_retries` (default 5, 1..20), `fault_rates`
 (`vanish`, `release`, `fail`, `late`: probability per assignment), `late_wait_s`, `poll_s`, `first_acquire_jitter_s`, `seed`, `team`.
 
 ## `run`
@@ -66,7 +66,7 @@ default `[10, 30]`, the executor's), `acquire_pace_s` (default 0.4), `fault_rate
 | `assigned` | acquires that returned work |
 | `conflicts_409`, `rate_limited_429`, `server_errors_5xx`, `transport_errors` | status totals over all API calls (`transport_errors`: connect/timeout, no response) |
 | `faults` | injected faults by kind: `vanish`, `release`, `fail`, `late` |
-| `events` | named counters: `assigned`, `completed`, `released`, `failed_retryable`, `late_complete_409` (the 409 the server must answer), `late_complete_accepted` (reclaim had not happened yet), `complete_409`, `discarded_stale`, `complete_failed` (gave up: 4xx, or `--complete-retries` transport/5xx attempts), `complete_retried` (one count per retry of a complete after a transport error or 5xx), `cancelled` (the heartbeat said cancel; released as `CANCELLED`), `failure_pause` (long pause after the consecutive-failure limit), `sim_aborted`, `stalled`, `proc_crashed` (+ `proc_crashed_<ExceptionType>`: type only), `fault_*` |
+| `events` | named counters: `assigned`, `completed`, `released`, `failed_retryable`, `late_complete_409` (the 409 the server must answer), `late_complete_accepted` (reclaim had not happened yet), `complete_409`, `discarded_stale`, `complete_failed` (gave up: 4xx, or `--complete-retries` transport/5xx attempts; the sim then reports a fail like the executor: 4xx and 5xx give-ups, not a transport-only give-up, which is left to the watchdog), `complete_retried` (one count per retry of a complete after a transport error or 5xx), `cancelled` (the heartbeat said cancel; released as `CANCELLED`), `failure_pause` (long pause after the consecutive-failure limit), `sim_aborted`, `stalled`, `proc_crashed` (+ `proc_crashed_<ExceptionType>`: type only), `fault_*` |
 | `calls` | per API operation, see below |
 | `event_loop_lag` | histogram of how late a 50 ms sleep woke up, summed over the sim processes (client-side saturation) |
 

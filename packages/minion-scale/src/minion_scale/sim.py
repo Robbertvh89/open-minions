@@ -5,7 +5,8 @@ output to the presigned URL, complete. It talks to the server through `minion_co
 and to object storage through presigned URLs only (invariants 1 and 4): this module and its
 imports must stay free of sqlalchemy/asyncpg (a test enforces that). Back-off after an empty
 acquire (204), a 429 or a failure follows the real executor's loop; a test compares the constants
-and the delay formulas with `minion_executor.loop`.
+and the delay formulas with `minion_executor.loop`. Honouring a 503 `Retry-After` (acquire and
+complete) anticipates TASK-7.4.4: the executor does not do this yet.
 
 Injected faults, drawn per assignment: `vanish` (stop beating and walk away: the watchdog must
 reclaim), `release`, `fail` (retryable), `late` (go silent past the heartbeat timeout, then
@@ -410,6 +411,7 @@ class SimExecutor:
             sha256=hashlib.sha256(body).hexdigest(),
         )
         attempt = 0
+        saw_5xx = False
         while True:
             try:
                 await self._call("complete", self._client.complete(a.acquirement_id, req))
@@ -419,19 +421,37 @@ class SimExecutor:
                 self.rec.count("late_complete_409" if expect_stale else "complete_409")
                 return Outcome.NEUTRAL  # someone else owns it now: nothing to report
             except (ApiError, httpx.HTTPError) as exc:
-                # Executor `_complete`: transport errors and 5xx are retried, other 4xx fail.
+                # Executor `_complete`: transport errors and 5xx are retried; 409 is discarded;
+                # other 4xx are reported as a failure.
+                if isinstance(exc, ApiError) and exc.status_code == 409:
+                    self.rec.count("complete_409")
+                    return Outcome.NEUTRAL
                 if isinstance(exc, ApiError) and exc.status_code < 500:
                     self.rec.count("complete_failed")
+                    too_large = exc.status_code == 422 and exc.code == "OUTPUT_TOO_LARGE"
+                    await self._fail(
+                        a,
+                        code="OUTPUT_TOO_LARGE" if too_large else "COMPLETE_REJECTED",
+                        retryable=not too_large,
+                    )
                     return Outcome.FAILED
+                saw_5xx = saw_5xx or isinstance(exc, ApiError)
                 attempt += 1
                 if self.stop.is_set():
                     return _ok(await self._release(a, "STOP"))
                 if attempt >= self.cfg.complete_retries:
                     self.rec.count("complete_failed")
+                    if saw_5xx:  # deterministic server fault: burn the retry budget
+                        await self._fail(a, code="COMPLETE_FAILED")
+                    # transport-only: leave it to the watchdog (counts EXPIRED), as the executor
                     return Outcome.FAILED
                 self.rec.count("complete_retried")
-                retry_after = exc.retry_after if isinstance(exc, ApiError) else None
-                if retry_after is not None:  # 503 + Retry-After
+                retry_after = (
+                    exc.retry_after
+                    if isinstance(exc, ApiError) and exc.status_code == 503
+                    else None
+                )
+                if retry_after is not None:
                     delay = rate_limit_delay(retry_after, attempt - 1, self.cfg.backoff, self._rng)
                 else:
                     delay = backoff_delay(attempt - 1, self.cfg.backoff, self._rng)
@@ -454,8 +474,8 @@ class SimExecutor:
         self.rec.count("released")
         return True
 
-    async def _fail(self, a: Assignment, code: str = FAULT_CODE) -> bool:
-        req = FailRequest(retryable=True, code=code, message="injected by minion-scale")
+    async def _fail(self, a: Assignment, code: str = FAULT_CODE, *, retryable: bool = True) -> bool:
+        req = FailRequest(retryable=retryable, code=code, message="injected by minion-scale")
         try:
             await self._call("fail", self._client.fail(a.acquirement_id, req))
         except StaleAcquirementError:

@@ -256,6 +256,7 @@ def _complete_sim(
 ) -> tuple[sim.SimExecutor, list[int]]:
     """A sim whose `complete` plays `responses` (an exception is raised, else returned)."""
     calls: list[int] = []
+    reports: list[tuple[str, str, bool | None]] = []
 
     async def complete(_aid: Any, _req: Any) -> None:
         calls.append(1)
@@ -271,7 +272,15 @@ def _complete_sim(
         asyncio.Event(),
         None,  # type: ignore[arg-type]
     )
-    ex._client = types.SimpleNamespace(complete=complete)  # type: ignore[assignment]
+
+    async def fail(_aid: Any, req: Any) -> None:
+        reports.append(("fail", req.code, req.retryable))
+
+    async def release(_aid: Any, req: Any) -> None:
+        reports.append(("release", req.code, None))
+
+    ex._client = types.SimpleNamespace(complete=complete, fail=fail, release=release)  # type: ignore[assignment]
+    ex.reports = reports  # type: ignore[attr-defined]
 
     async def record(seconds: float) -> None:
         delays.append(seconds)
@@ -308,21 +317,78 @@ async def test_transport_error_retry_that_gets_409_counts_complete_409_once() ->
     assert "completed" not in ex.rec.events and len(delays) == 1
 
 
-async def test_complete_gives_up_after_the_executor_retry_count() -> None:
+async def test_complete_gives_up_on_5xx_with_a_retryable_fail() -> None:
     from minion_common.client import ApiError
 
     delays: list[float] = []
     ex, calls = _complete_sim([ApiError(500, "E", "x")] * 9, delays)
     assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
     assert len(calls) == sim.COMPLETE_RETRIES and ex.rec.events["complete_failed"] == 1
+    assert ex.reports == [("fail", "COMPLETE_FAILED", True)]  # type: ignore[attr-defined]
 
 
-async def test_a_4xx_complete_is_not_retried() -> None:
+async def test_complete_gives_up_on_transport_errors_without_reporting() -> None:
+    import httpx
+
+    ex, calls = _complete_sim([httpx.ConnectError("x")] * 9, [])
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert len(calls) == sim.COMPLETE_RETRIES and ex.rec.events["complete_failed"] == 1
+    assert ex.reports == []  # type: ignore[attr-defined]  # the watchdog reclaims it
+
+
+async def test_a_5xx_then_transport_errors_still_counts_as_a_server_fault() -> None:
+    import httpx
     from minion_common.client import ApiError
 
-    ex, calls = _complete_sim([ApiError(422, "E", "x")], [])
+    errs: list[Any] = [ApiError(502, "E", "x"), *[httpx.ConnectError("x")] * 9]
+    ex, _ = _complete_sim(errs, [])
     assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
-    assert len(calls) == 1
+    assert ex.reports == [("fail", "COMPLETE_FAILED", True)]  # type: ignore[attr-defined]
+
+
+async def test_a_4xx_complete_is_not_retried_and_is_reported() -> None:
+    from minion_common.client import ApiError
+
+    ex, calls = _complete_sim([ApiError(400, "E", "x")], [])
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert len(calls) == 1 and ex.rec.events["complete_failed"] == 1
+    assert ex.reports == [("fail", "COMPLETE_REJECTED", True)]  # type: ignore[attr-defined]
+
+
+async def test_output_too_large_is_a_non_retryable_fail() -> None:
+    from minion_common.client import ApiError
+
+    ex, _ = _complete_sim([ApiError(422, "OUTPUT_TOO_LARGE", "x")], [])
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.FAILED
+    assert ex.reports == [("fail", "OUTPUT_TOO_LARGE", False)]  # type: ignore[attr-defined]
+
+
+async def test_a_non_stale_409_is_discarded_and_counted() -> None:
+    from minion_common.client import ApiError
+
+    ex, calls = _complete_sim([ApiError(409, "OTHER", "x")], [])
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.NEUTRAL
+    assert len(calls) == 1 and ex.rec.events["complete_409"] == 1
+    assert ex.reports == []  # type: ignore[attr-defined]
+
+
+async def test_stop_mid_retry_releases_with_stop() -> None:
+    import httpx
+
+    ex, calls = _complete_sim([httpx.ConnectError("x")] * 3, [])
+    ex.stop.set()
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.NEUTRAL
+    assert len(calls) == 1 and "complete_retried" not in ex.rec.events
+    assert ex.reports == [("release", "STOP", None)]  # type: ignore[attr-defined]
+
+
+async def test_retry_after_is_honoured_only_on_503() -> None:
+    from minion_common.client import ApiError
+
+    delays: list[float] = []
+    ex, _ = _complete_sim([ApiError(500, "E", "x", retry_after=200.0), None], delays)
+    assert await ex._complete(_assignment(), expect_stale=False) is sim.Outcome.DONE
+    assert delays[0] <= 4.0
 
 
 async def test_acquire_503_with_retry_after_waits_it_out() -> None:
@@ -349,7 +415,8 @@ async def test_first_acquire_jitter_is_applied_once_before_the_first_acquire() -
 
     async def acquire(_req: Any) -> None:
         order.append("acquire")
-        ex.stop.set()
+        if order.count("acquire") == 2:
+            ex.stop.set()
 
     async def aclose() -> None:
         return None
@@ -357,6 +424,6 @@ async def test_first_acquire_jitter_is_applied_once_before_the_first_acquire() -
     ex._register = register  # type: ignore[method-assign]
     ex._client = types.SimpleNamespace(acquire=acquire, aclose=aclose)  # type: ignore[assignment]
     await ex.run()
-    assert order == ["register", "acquire"]
-    # the jitter once, then the idle back-off of the empty acquire
-    assert len(delays) == 2 and 0 <= delays[0] <= 3.0
+    assert order == ["register", "acquire", "acquire"]
+    # one jitter delay before the first acquire, then one idle back-off per empty acquire
+    assert len(delays) == 3 and 0 <= delays[0] <= 3.0 and all(d <= 4.0 for d in delays[1:])

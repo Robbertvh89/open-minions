@@ -46,6 +46,7 @@ from minion_scale.seed import (
 )
 from minion_scale.sim import (
     ACQUIRE_PACE_S,
+    COMPLETE_RETRIES,
     DEFAULT_STALL_S,
     EXECUTOR_BACKOFF,
     FAILURE_PAUSE_S,
@@ -248,6 +249,10 @@ def run_cmd(
     failure_pause_s: Annotated[
         float, typer.Option(min=0, help="The long pause after that many failures in a row")
     ] = FAILURE_PAUSE_S,
+    complete_retries: Annotated[
+        int,
+        typer.Option(min=1, max=20, help="Attempts at a complete (transport/5xx) before giving up"),
+    ] = COMPLETE_RETRIES,
     vanish: Annotated[float, typer.Option(min=0, max=1, help="P(stop beating, walk away)")] = 0.0,
     release: Annotated[float, typer.Option(min=0, max=1)] = 0.0,
     fail: Annotated[float, typer.Option(min=0, max=1, help="P(retryable fail)")] = 0.0,
@@ -272,7 +277,10 @@ def run_cmd(
         typer.Option(min=0.05, help="Seconds between remaining-work polls (task counter sum)"),
     ] = 5.0,
     first_acquire_jitter_s: Annotated[
-        float, typer.Option(min=0, help="Each sim waits uniform(0, this) before its first acquire")
+        float,
+        typer.Option(
+            min=0, max=300, help="Each sim waits uniform(0, this) before its first acquire"
+        ),
     ] = 0.0,
     seed: int = 0,
     docker_project: Annotated[
@@ -303,6 +311,7 @@ def run_cmd(
         acquire_pace_s=acquire_pace_s,
         max_consecutive_failures=max_consecutive_failures,
         failure_pause_s=failure_pause_s,
+        complete_retries=complete_retries,
         faults=faults,
         late_wait_s=late_wait_s,
         first_acquire_jitter_s=first_acquire_jitter_s,
@@ -350,6 +359,7 @@ def run_cmd(
                 "acquire_pace_s": acquire_pace_s,
                 "max_consecutive_failures": max_consecutive_failures,
                 "failure_pause_s": failure_pause_s,
+                "complete_retries": complete_retries,
                 "fault_rates": {"vanish": vanish, "release": release, "fail": fail, "late": late},
                 "late_wait_s": late_wait_s,
                 "poll_s": poll_s,
