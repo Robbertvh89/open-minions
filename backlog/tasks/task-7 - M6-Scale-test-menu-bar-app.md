@@ -1,10 +1,10 @@
 ---
 id: TASK-7
 title: 'M6: Scale test & menu-bar app'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 14:02'
-updated_date: '2026-10-17 20:36'
+updated_date: '2026-10-18 18:18'
 labels:
   - milestone
   - M6

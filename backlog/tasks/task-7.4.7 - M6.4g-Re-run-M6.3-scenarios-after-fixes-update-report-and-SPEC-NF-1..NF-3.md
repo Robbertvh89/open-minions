@@ -1,10 +1,10 @@
 ---
 id: TASK-7.4.7
 title: M6.4g Re-run M6.3 scenarios after fixes; update report and SPEC NF-1..NF-3
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 02:21'
-updated_date: '2026-10-18 11:57'
+updated_date: '2026-10-18 18:18'
 labels:
   - scale
 dependencies: []
