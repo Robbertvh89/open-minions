@@ -50,6 +50,8 @@ Concurrent stale lookups of one digest are not coalesced (not worth the cancella
 ## Consequences
 
 - Revocation is no longer instant for complete/fail/release (bounded by the TTL).
+- `PUT /executors/me/preference` also does not re-check the token, so a revoked token can change its own
+  work preference for up to the TTL; nothing leaks, since acquire is refused immediately.
 - Executors registered after a worker started are unknown to it and authenticate through the small
   pool once (about 1-2 ms per lookup); a first-contact herd may see 503 and retries. Executor register honours 503 +
   Retry-After; release is best effort and falls back to the watchdog.

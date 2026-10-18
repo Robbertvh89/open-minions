@@ -12,7 +12,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Self
@@ -64,7 +64,8 @@ class ExecutorPrincipal:
     executor_id: uuid.UUID
     owner: str
     pool: str
-    token_hash: str | None = None  # digest this request authenticated with (mutations match it)
+    # digest this request authenticated with (mutations match it); never in repr/logs
+    token_hash: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)

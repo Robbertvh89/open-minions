@@ -249,10 +249,12 @@ async def test_preloaded_known_executor_bypasses_the_auth_lane_after_restart(
     assert app.state.executor_tokens.lookup(_digest(tok)).state.value == "stale"
     real = executors_repo.get_by_token_hash
     binds: dict[str, Any] = {}
+    flooding = asyncio.Event()
 
     async def slow_for_unknown(session: Any, token_hash: str) -> Any:
         if token_hash != _digest(tok):
             await real(session, token_hash)
+            flooding.set()
             await asyncio.sleep(1.0)  # holds the only auth connection
         else:
             binds["known"] = session.bind
@@ -262,7 +264,7 @@ async def test_preloaded_known_executor_bypasses_the_auth_lane_after_restart(
     flood = asyncio.gather(
         *(c.post(HB, json={}, headers=_auth(secrets.token_urlsafe(32))) for _ in range(20))
     )
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(flooding.wait(), 5)
     t0 = time.monotonic()
     assert await _status(c, HB, tok, {}) == 409
     assert time.monotonic() - t0 < 0.5
