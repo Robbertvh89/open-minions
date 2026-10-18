@@ -138,3 +138,19 @@ def test_main_refuses_an_unsafe_operator_metrics_dir(
     with pytest.raises(SystemExit) as exc:
         app_module.main()
     assert exc.value.code == 2
+
+
+def test_main_single_worker_refuses_an_unsafe_inherited_multiproc_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import uvicorn
+
+    _main_env(monkeypatch)
+    d = tmp_path / "shared"
+    d.mkdir()
+    d.chmod(0o777)
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(d))
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: pytest.fail("must not start"))
+    with pytest.raises(SystemExit) as exc:
+        app_module.main()
+    assert exc.value.code == 2

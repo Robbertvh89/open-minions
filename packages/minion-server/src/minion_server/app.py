@@ -145,6 +145,11 @@ def main() -> None:
             limit=settings.connection_limit,
         )
     if settings.server_workers == 1:
+        # single process: prometheus_client already chose its value class at import, so an
+        # inherited multiprocess dir cannot be dropped here; validate it like an operator dir
+        inherited = os.environ.get(MULTIPROC_ENV)
+        if inherited:
+            os.environ[MULTIPROC_ENV], _ = prepare_metrics_dir(inherited)
         uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
         return
     metrics_dir: str | None = None
