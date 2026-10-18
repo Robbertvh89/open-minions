@@ -33,7 +33,7 @@ MODELS = {
 
 @pytest.fixture
 async def big_engine(fresh_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_engine(SecretStr(fresh_url), pool_size=50, max_overflow=0)
+    eng = create_engine(SecretStr(fresh_url), pool_size=50, max_overflow=0, pool_timeout=60)
     yield eng
     await eng.dispose()
 

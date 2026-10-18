@@ -110,3 +110,14 @@ def test_acquire_concurrency_default_floors_at_one(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("MINION_DB_POOL_SIZE", "1")
     monkeypatch.setenv("MINION_DB_MAX_OVERFLOW", "0")
     assert ServerSettings(_env_file=None).acquire_concurrency_limit == 1
+
+
+def test_pool_timeout_plus_deadline_must_fit_the_executor_http_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINION_DB_POOL_TIMEOUT_S", "10")
+    monkeypatch.setenv("MINION_ACQUIRE_DEADLINE_S", "15")  # 25 s: fits with the 5 s margin
+    ServerSettings(_env_file=None)
+    monkeypatch.setenv("MINION_ACQUIRE_DEADLINE_S", "16")  # 26 s: a client would time out first
+    with pytest.raises(ValidationError):
+        ServerSettings(_env_file=None)

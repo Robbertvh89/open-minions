@@ -42,6 +42,7 @@ def _cfg(url: str, s3: S3Env, **extra: Any) -> ServerSettings:
         models_file=TEST_MODELS_FILE,
         splitter_poll_s=3600,
         db_pool_size=60,
+        db_pool_timeout_s=15.0,  # race tests queue many requests on the pool (default 5 s)
         **{
             "register_min_interval_s": 0.0,
             "acquire_min_interval_s": 0.0,

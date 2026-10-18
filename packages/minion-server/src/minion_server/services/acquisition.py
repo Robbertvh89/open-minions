@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from minion_common.schemas import AcquireRequest, Assignment, ModelEntry
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
@@ -65,6 +66,11 @@ async def acquire(
                     await session.connection()  # the pool wait happens here, not in the claim
                     if deadline is not None and time.monotonic() >= deadline:
                         raise busy_error("ACQUIRE_DEADLINE", "acquire deadline exceeded")
+                    if deadline is not None:
+                        # the claim may not outlive the deadline (a lock wait on the acquirement
+                        # unique index, a slow plan): the statement is cancelled and nothing commits
+                        left_ms = int((deadline - time.monotonic()) * 1000) + 100
+                        await repo.set_statement_timeout(session, max(100, left_ms))
                     result = await repo.claim(
                         session,
                         principal.executor_id,
@@ -79,6 +85,10 @@ async def acquire(
                         raise _LostRaceError  # roll back a failed re-check; harmless otherwise
             except _LostRaceError:
                 continue
+            except DBAPIError as exc:
+                if deadline is not None and repo.is_query_canceled(exc):
+                    raise busy_error("ACQUIRE_DEADLINE", "acquire deadline exceeded") from None
+                raise
             if result.n_candidates == 0:
                 exhausted = False
                 break

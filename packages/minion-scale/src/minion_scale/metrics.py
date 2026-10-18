@@ -98,11 +98,17 @@ class Recorder:
         self.latency: dict[str, Histogram] = {}
         self.statuses: dict[str, Counter[int]] = {}
         self.events: Counter[str] = Counter()
+        self.shed: Counter[str] = Counter()  # per op: 503s the server sent with Retry-After
         self.lag = Histogram()
 
-    def record(self, op: str, seconds: float, status: int) -> None:
+    def record(self, op: str, seconds: float, status: int, *, shed: bool = False) -> None:
+        """`shed`: a 503 from the server API that carried a numeric Retry-After (deliberate
+        overload shedding, TASK-7.4.4). Any other 503 (S3 SlowDown on `output_put`, a proxy's
+        bare 503) is a server error."""
         self.latency.setdefault(op, Histogram()).observe(seconds)
         self.statuses.setdefault(op, Counter())[status] += 1
+        if shed and status == 503:
+            self.shed[op] += 1
 
     def count(self, event: str, n: int = 1) -> None:
         self.events[event] += n
@@ -120,12 +126,12 @@ class Recorder:
 
     @property
     def server_errors_5xx(self) -> int:
-        """5xx other than 503: a 503 is the server shedding load on purpose (TASK-7.4.4)."""
-        return self._status_total(lambda s: 500 <= s <= 599 and s != 503)
+        """5xx except the deliberate sheds (503 + Retry-After from the server API, TASK-7.4.4)."""
+        return self._status_total(lambda s: 500 <= s <= 599) - self.shed_503
 
     @property
     def shed_503(self) -> int:
-        return self._status_total(lambda s: s == 503)
+        return sum(self.shed.values())
 
     @property
     def transport_errors(self) -> int:
@@ -137,6 +143,7 @@ class Recorder:
         for op, c in other.statuses.items():
             self.statuses.setdefault(op, Counter()).update(c)
         self.events.update(other.events)
+        self.shed.update(other.shed)
         self.lag.merge(other.lag)
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +151,7 @@ class Recorder:
             "calls": {
                 op: {
                     **h.to_dict(),
+                    "shed_503": self.shed.get(op, 0),
                     "statuses": {
                         str(s): n for s, n in sorted(self.statuses.get(op, Counter()).items())
                     },
@@ -165,6 +173,8 @@ class Recorder:
         for op, call in d["calls"].items():
             r.latency[op] = Histogram.from_dict(call)
             r.statuses[op] = Counter({int(s): n for s, n in call["statuses"].items()})
+            if call.get("shed_503"):
+                r.shed[op] = int(call["shed_503"])
         r.events.update(d["events"])
         r.lag = Histogram.from_dict(d["event_loop_lag"])
         return r

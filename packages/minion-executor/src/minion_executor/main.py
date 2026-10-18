@@ -337,6 +337,7 @@ async def _run(
             presence_interval_s=settings.presence_interval_s,
             acquire_pace_s=settings.acquire_pace_s,
             first_acquire_jitter_s=settings.first_acquire_jitter_s,
+            complete_shed_budget_s=min(settings.complete_shed_budget_s, heartbeat_interval_s),
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,
             status_dir=settings.state_dir,

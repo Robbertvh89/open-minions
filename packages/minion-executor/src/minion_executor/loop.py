@@ -243,6 +243,7 @@ class ExecutorLoop:
         max_consecutive_failures: int = 5,
         failure_pause_s: float = 300.0,
         complete_retries: int = 5,
+        complete_shed_budget_s: float = 120.0,
         allow_http_loopback: bool = False,
         heartbeat_interval_s: float = 300.0,
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -312,6 +313,10 @@ class ExecutorLoop:
         self._max_fails = max_consecutive_failures
         self._fail_pause_s = failure_pause_s
         self._complete_retries = complete_retries
+        # Wall-clock cap on 503+Retry-After (shed) answers to one complete; sheds do not use up
+        # `complete_retries`. Keep it below the heartbeat timeout (the owner stops beating while it
+        # waits); past it the subtask is left to the watchdog (TASK-7.4.4).
+        self._complete_shed_budget_s = complete_shed_budget_s
         self._allow_http = allow_http_loopback
         self._hb_interval = heartbeat_interval_s
         self._hb_sleep = heartbeat_sleep
@@ -1174,8 +1179,9 @@ class ExecutorLoop:
         repeat as success). Other 4xx are reported as a retryable failure."""
         attempt = 0
         saw_5xx = False
+        sheds = 0
+        shed_since: float | None = None
         while True:
-            last_exc: Exception | None = None
             try:
                 await self._call_complete(a, result)
                 bound.info("subtask_completed", records=result.record_count)
@@ -1204,8 +1210,26 @@ class ExecutorLoop:
                         err = _FailureError(True, "COMPLETE_REJECTED", f"HTTP {exc.status_code}")
                     await self._report_failure(a, err, bound)
                     return _Outcome.FAILED
+                if _is_shed(exc):
+                    # Overload shedding is not a fault: it neither burns `complete_retries` nor
+                    # marks a server error; bounded by the hard stop and a wall-clock budget.
+                    sheds += 1
+                    now = self._clock()
+                    shed_since = now if shed_since is None else shed_since
+                    bound.warning("complete_shed", sheds=sheds)
+                    if self._hard_stop.is_set():
+                        await self._release(a, bound, "STOP")
+                        return _Outcome.STOPPED
+                    if now - shed_since >= self._complete_shed_budget_s:
+                        # leave it to the watchdog (counts EXPIRED); no COMPLETE_FAILED burn
+                        bound.error("complete_shed_budget_exhausted", sheds=sheds)
+                        return _Outcome.FAILED
+                    await self._pause(
+                        self._rate_limit_delay(exc, sheds - 1, repeated=sheds > 1),
+                        until=self._hard_stop,
+                    )
+                    continue
                 saw_5xx = True
-                last_exc = exc
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
             except httpx.HTTPError as exc:
                 bound.warning("complete_failed", error=type(exc).__name__, attempt=attempt)
@@ -1220,13 +1244,7 @@ class ExecutorLoop:
                     await self._report_failure(a, err, bound)
                 # transport-only: leave it to the watchdog (counts EXPIRED)
                 return _Outcome.FAILED
-            # 503 + Retry-After (server shed load): wait that long, like a 429 (TASK-7.4.4)
-            wait = (
-                self._rate_limit_delay(last_exc, attempt - 1)
-                if last_exc is not None
-                else self._delay(attempt - 1)
-            )
-            await self._pause(wait, until=self._hard_stop)
+            await self._pause(self._delay(attempt - 1), until=self._hard_stop)
 
     async def _call_complete(self, a: Assignment, result: CompleteRequest) -> None:
         """`client.complete`, but once a hard stop is set (or arrives mid-call) the call gets only

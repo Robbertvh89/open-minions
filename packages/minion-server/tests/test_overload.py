@@ -3,15 +3,18 @@ acquire concurrency slots, owner-operation headroom."""
 
 import asyncio
 import re
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from minion_server.app import create_app
+from minion_server.repositories import acquisition as acquisition_repo
 from minion_server.repositories import executors as executors_repo
 from pydantic import SecretStr
 from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from conftest import S3Env, _auth, _settings, make_executors, seed_task
 
@@ -62,10 +65,22 @@ async def _acquirements(app: Any) -> int:
         )
 
 
-def _assert_shed(r: Any, code: str) -> None:
+def _assert_shed(r: Any, code: str, retry_after: tuple[int, int] = (1, 3)) -> None:
     assert r.status_code == 503, r.text
     assert r.json()["detail"]["code"] == code
     assert re.fullmatch(r"[1-9]\d*", r.headers["Retry-After"])
+    assert retry_after[0] <= int(r.headers["Retry-After"]) <= retry_after[1]
+
+
+def _assert_slots_free(app: Any, limit: int = 1) -> None:
+    """Every acquire slot and per-executor counter is back (no leak on any exit path)."""
+    assert not app.state.acquire_slots.locked()
+    assert app.state.acquire_slots._value == limit
+    assert app.state.acquire_inflight == {}
+
+
+def _shed_count(app: Any) -> float:
+    return float(app.state.metrics.acquires.labels(outcome="shed")._value.get())
 
 
 def _slow_preference(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
@@ -82,13 +97,60 @@ def _slow_preference(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
 async def test_acquire_past_deadline_commits_no_acquirement(
     make: Make, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    c, app = await make(acquire_deadline_s=1.0)
+    c, app = await make(acquire_deadline_s=1.0, acquire_concurrency=1, metrics_enabled=True)
     await seed_task(app.state.sessionmaker, "dl", 3, team="dl")
     [(_, tok)] = await make_executors(app.state.sessionmaker, 1)
-    _slow_preference(monkeypatch, 1.2)  # work before the claim INSERT eats the deadline
+    # The pool's last connection is busy past the deadline: the claim round's connection() call
+    # returns late. Simulated at the call (a pool wait is the same await), after the preference
+    # read so only the claim round is delayed.
+    real_pref = executors_repo.get_preference
+    real_conn = AsyncSession.connection
+    after_pref = False
+
+    async def pref(*a: Any, **kw: Any) -> Any:
+        nonlocal after_pref
+        out = await real_pref(*a, **kw)
+        after_pref = True
+        return out
+
+    async def late_connection(self: Any, *a: Any, **kw: Any) -> Any:
+        if after_pref:
+            await asyncio.sleep(1.3)  # held past the 1 s deadline
+        return await real_conn(self, *a, **kw)
+
+    monkeypatch.setattr(executors_repo, "get_preference", pref)
+    monkeypatch.setattr(AsyncSession, "connection", late_connection)
     r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
+    # session.connection() returned late (after the holder released): the check fires before claim
     _assert_shed(r, "ACQUIRE_DEADLINE")
     assert await _acquirements(app) == 0
+    _assert_slots_free(app)
+    assert _shed_count(app) == 1
+
+
+@pytest.mark.integration
+async def test_slow_claim_statement_is_cancelled_at_the_deadline(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = await make(acquire_deadline_s=1.0, acquire_concurrency=1)
+    await seed_task(app.state.sessionmaker, "sc", 3, team="sc")
+    [(_, tok)] = await make_executors(app.state.sessionmaker, 1)
+    real = acquisition_repo.claim
+
+    async def slow_claim(session: Any, *a: Any, **kw: Any) -> Any:
+        await session.execute(text("SELECT pg_sleep(5)"))  # a claim stuck behind a lock
+        return await real(session, *a, **kw)
+
+    monkeypatch.setattr(acquisition_repo, "claim", slow_claim)
+    t0 = time.monotonic()
+    r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
+    assert time.monotonic() - t0 < 3.0  # cancelled by statement_timeout, not run to the end
+    _assert_shed(r, "ACQUIRE_DEADLINE")
+    assert await _acquirements(app) == 0
+    _assert_slots_free(app)
+    monkeypatch.setattr(acquisition_repo, "claim", real)
+    ok = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
+    assert ok.status_code == 200  # the connection is clean again (timeout was LOCAL)
 
 
 @pytest.mark.integration
@@ -109,13 +171,16 @@ async def test_client_gives_up_before_the_server_finishes_leaves_no_ghost_acquir
 
 @pytest.mark.integration
 async def test_pool_exhaustion_is_503_with_retry_after_never_500(make: Make) -> None:
-    c, app = await make(db_pool_size=1, db_max_overflow=0, db_pool_timeout_s=0.5)
+    c, app = await make(
+        db_pool_size=1, db_max_overflow=0, db_pool_timeout_s=0.5, acquire_concurrency=1
+    )
     [(_, tok)] = await make_executors(app.state.sessionmaker, 1)
     async with app.state.engine.connect() as held:  # the only connection
         await held.execute(text("SELECT 1"))
         for path, body in [("acquire", ACQ), ("presence", {"budget": BUDGET})]:
             r = await c.post(f"{BASE}/{path}", json=body, headers=_auth(tok))
-            _assert_shed(r, "SERVER_BUSY")
+            _assert_shed(r, "SERVER_BUSY", (2, 10))
+    _assert_slots_free(app)
     r = await c.post(f"{BASE}/presence", json={"budget": BUDGET}, headers=_auth(tok))
     assert r.status_code == 204  # recovered once the connection is back
 
@@ -163,3 +228,43 @@ async def test_heartbeat_succeeds_while_acquires_are_shed(make: Make) -> None:
     r = await c.post(f"{BASE}/subtasks/{acq}/heartbeat", json={}, headers=_auth(tok))
     assert r.status_code == 200, r.text
     app.state.acquire_slots.release()
+
+
+@pytest.mark.integration
+async def test_cancelled_acquire_releases_its_slot(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = await make(acquire_concurrency=1)
+    [(_, tok)] = await make_executors(app.state.sessionmaker, 1)
+    _slow_preference(monkeypatch, 5.0)
+    task = asyncio.ensure_future(c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok)))
+    for _ in range(100):  # wait until the acquire holds the slot
+        if app.state.acquire_slots.locked():
+            break
+        await asyncio.sleep(0.02)
+    assert app.state.acquire_slots.locked()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    _assert_slots_free(app)
+
+
+@pytest.mark.integration
+async def test_one_executor_cannot_hold_more_than_two_acquire_slots(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = await make(acquire_concurrency=8, acquire_min_interval_s=0.0)
+    sm = app.state.sessionmaker
+    await seed_task(sm, "cap", 6, team="cap")
+    [(_, tok), (_, tok2)] = await make_executors(sm, 2)
+    _slow_preference(monkeypatch, 0.6)
+    rs = await asyncio.gather(
+        *[c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok)) for _ in range(4)]
+    )
+    codes = sorted(r.status_code for r in rs)
+    assert codes.count(429) == 2 and codes.count(200) == 2, codes
+    assert all(r.headers["Retry-After"] == "1" for r in rs if r.status_code == 429)
+    _assert_slots_free(app, 8)
+    # another executor is not affected by the first one's cap
+    r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok2))
+    assert r.status_code == 200

@@ -6,7 +6,7 @@ and to object storage through presigned URLs only (invariants 1 and 4): this mod
 imports must stay free of sqlalchemy/asyncpg (a test enforces that). Back-off after an empty
 acquire (204), a 429 or a failure follows the real executor's loop; a test compares the constants
 and the delay formulas with `minion_executor.loop`. Honouring a 503 `Retry-After` (acquire and
-complete) anticipates TASK-7.4.4: the executor does not do this yet.
+complete) mirrors the executor (TASK-7.4.4); a complete shed does not use up the retry count.
 
 Injected faults, drawn per assignment: `vanish` (stop beating and walk away: the watchdog must
 reclaim), `release`, `fail` (retryable), `late` (go silent past the heartbeat timeout, then
@@ -52,6 +52,7 @@ ACQUIRE_PACE_S = 0.4  # ExecutorSettings.acquire_pace_s default
 MAX_CONSECUTIVE_FAILURES = 5  # ExecutorLoop max_consecutive_failures default
 FAILURE_PAUSE_S = 300.0  # ExecutorLoop failure_pause_s default
 COMPLETE_RETRIES = 5  # ExecutorLoop complete_retries default
+COMPLETE_SHED_BUDGET_S = 120.0  # ExecutorLoop complete_shed_budget_s default
 FAULT_CODE = "SCALE_FAULT"
 
 
@@ -142,6 +143,7 @@ class SimConfig:
     max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES
     failure_pause_s: float = FAILURE_PAUSE_S
     complete_retries: int = COMPLETE_RETRIES
+    complete_shed_budget_s: float = COMPLETE_SHED_BUDGET_S
     # Each sim waits uniform(0, this) once before its first acquire (0: all start at once).
     first_acquire_jitter_s: float = 0.0
     seed: int = 0
@@ -187,6 +189,7 @@ class SimExecutor:
         self._put = put_http
         self._rng = random.Random(f"{cfg.seed}:{index}")  # noqa: S311 - jitter, not security
         self._client = ExecutorClient(cfg.base_url, token, timeout=cfg.timeout_s)
+        self._clock: Callable[[], float] = time.monotonic  # injectable for tests
         self._idle = 0
         self._fails = 0
         self._limited = 0
@@ -206,7 +209,12 @@ class SimExecutor:
         try:
             result = await aw
         except ApiError as exc:
-            self.rec.record(op, time.perf_counter() - t0, exc.status_code)
+            self.rec.record(
+                op,
+                time.perf_counter() - t0,
+                exc.status_code,
+                shed=exc.status_code == 503 and exc.retry_after is not None,
+            )
             raise
         except httpx.HTTPError:
             self.rec.record(op, time.perf_counter() - t0, TRANSPORT)
@@ -415,6 +423,8 @@ class SimExecutor:
         )
         attempt = 0
         saw_5xx = False
+        sheds = 0
+        shed_since: float | None = None
         while True:
             try:
                 await self._call("complete", self._client.complete(a.acquirement_id, req))
@@ -438,6 +448,27 @@ class SimExecutor:
                         retryable=not too_large,
                     )
                     return Outcome.FAILED
+                if (
+                    isinstance(exc, ApiError)
+                    and exc.status_code == 503
+                    and exc.retry_after is not None
+                ):
+                    # shed: not a fault, does not use up the retry count (executor parity)
+                    sheds += 1
+                    now = self._clock()
+                    shed_since = now if shed_since is None else shed_since
+                    if self.stop.is_set():
+                        await self._release(a, "STOP")
+                        return Outcome.NEUTRAL
+                    if now - shed_since >= self.cfg.complete_shed_budget_s:
+                        self.rec.count("complete_failed")
+                        return Outcome.FAILED  # left to the watchdog, no COMPLETE_FAILED burn
+                    self.rec.count("complete_retried")
+                    delay = rate_limit_delay(
+                        exc.retry_after, sheds - 1, self.cfg.backoff, self._rng, repeated=sheds > 1
+                    )
+                    await self._sleep(delay)
+                    continue
                 saw_5xx = saw_5xx or isinstance(exc, ApiError)
                 attempt += 1
                 if self.stop.is_set():
@@ -450,16 +481,7 @@ class SimExecutor:
                     # transport-only: leave it to the watchdog (counts EXPIRED), as the executor
                     return Outcome.FAILED
                 self.rec.count("complete_retried")
-                retry_after = (
-                    exc.retry_after
-                    if isinstance(exc, ApiError) and exc.status_code == 503
-                    else None
-                )
-                if retry_after is not None:
-                    delay = rate_limit_delay(retry_after, attempt - 1, self.cfg.backoff, self._rng)
-                else:
-                    delay = backoff_delay(attempt - 1, self.cfg.backoff, self._rng)
-                await self._sleep(delay)
+                await self._sleep(backoff_delay(attempt - 1, self.cfg.backoff, self._rng))
                 continue
             self.rec.count("completed")
             if expect_stale:

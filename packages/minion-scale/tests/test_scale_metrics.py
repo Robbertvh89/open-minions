@@ -23,21 +23,24 @@ def test_recorder_counts_statuses_and_round_trips_through_dicts() -> None:
     r.record("acquire_assigned", 0.01, 200)
     r.record("acquire_assigned", 0.02, 429)
     r.record("complete", 0.03, 409)
-    r.record("complete", 0.03, 503)
+    r.record("complete", 0.03, 503, shed=True)
+    r.record("output_put", 0.03, 503)  # S3 SlowDown: a server error, not a shed
+    r.record("acquire_empty", 0.03, 503)  # a bare 503 without Retry-After
     r.record("heartbeat", 0.01, TRANSPORT)
     r.count("completed", 3)
     r.record("complete", 0.03, 500)
     assert (r.conflicts_409, r.rate_limited_429, r.server_errors_5xx, r.transport_errors) == (
         1,
         1,
-        1,
+        3,
         1,
     )
-    assert r.shed_503 == 1  # a 503 is shedding, not a 5xx fault
+    assert r.shed_503 == 1  # only the API 503 with Retry-After is shedding
     merged = merge_dicts([r.to_dict(), r.to_dict()])
     d = merged.to_dict()
     assert d["calls"]["complete"]["count"] == 6
     assert d["calls"]["complete"]["statuses"] == {"409": 2, "500": 2, "503": 2}
+    assert d["shed_503"] == 2 and d["server_errors_5xx"] == 6
     assert d["conflicts_409"] == 2 and d["events"]["completed"] == 6
 
 

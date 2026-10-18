@@ -56,6 +56,7 @@ def _cfg(url: str, s3: S3Env, keys: Path | None = None) -> ServerSettings:
         models_file=TEST_MODELS_FILE,
         splitter_poll_s=3600,  # tests drive split_one themselves
         db_pool_size=60,
+        db_pool_timeout_s=15.0,  # race tests queue many requests on the pool (default 5 s)
         register_min_interval_s=0,  # tests acquire back-to-back (TASK-6.2 has its own tests)
         acquire_min_interval_s=0,
         presence_min_interval_s=0,
@@ -273,7 +274,7 @@ async def test_concurrent_completes_counters_exact_status_derived_once(
 async def test_concurrent_splitters_no_duplicates_full_coverage(fresh_url: str, s3: S3Env) -> None:
     cfg = _cfg(fresh_url, s3)
     storage = S3Storage(cfg)
-    engine = create_engine(cfg.database_url, pool_size=20, max_overflow=0)
+    engine = create_engine(cfg.database_url, pool_size=20, max_overflow=0, pool_timeout=60)
     sm = create_sessionmaker(engine)
     try:
         a = b"".join(f'{{"id":"a{i}","t":"{"x" * (i % 7)}"}}\n'.encode() for i in range(257))

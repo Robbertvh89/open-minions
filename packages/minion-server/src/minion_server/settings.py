@@ -166,6 +166,13 @@ class ServerSettings(BaseSettings):
             raise ValueError(
                 f"acquire_deadline_s must be below the executor HTTP timeout ({DEFAULT_TIMEOUT_S} s)"  # noqa: E501
             )
+        # worst case a request waits db_pool_timeout_s for a connection that arrives right at the
+        # deadline: both must fit in the client's timeout with a margin for the response
+        if self.db_pool_timeout_s + self.acquire_deadline_s > DEFAULT_TIMEOUT_S - 5:
+            raise ValueError(
+                "db_pool_timeout_s + acquire_deadline_s must be at most "
+                f"{DEFAULT_TIMEOUT_S - 5:g} s (executor HTTP timeout {DEFAULT_TIMEOUT_S:g} s - 5 s)"
+            )
         cap = self.db_pool_size + self.db_max_overflow
         if self.acquire_concurrency is not None and self.acquire_concurrency > cap:
             raise ValueError(f"acquire_concurrency must be <= pool_size + max_overflow ({cap})")

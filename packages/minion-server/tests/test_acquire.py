@@ -42,7 +42,7 @@ MODELS = {
 
 @pytest.fixture
 async def big_engine(fresh_url: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_engine(SecretStr(fresh_url), pool_size=N + 5, max_overflow=0)
+    eng = create_engine(SecretStr(fresh_url), pool_size=N + 5, max_overflow=0, pool_timeout=60)
     yield eng
     await eng.dispose()
 
@@ -142,7 +142,12 @@ async def test_service_race_unique_owners(
 async def http(fresh_url: str) -> AsyncIterator[tuple[AsyncClient, Any]]:
     # N simultaneous acquires must all run (the race is the point): pool and slots sized for it
     cfg = _settings(fresh_url).model_copy(
-        update={"db_pool_size": N + 5, "db_max_overflow": 0, "acquire_concurrency": N}
+        update={
+            "db_pool_size": N + 5,
+            "db_max_overflow": 0,
+            "db_pool_timeout_s": 15.0,
+            "acquire_concurrency": N,
+        }
     )
     app = create_app(cfg)
     async with (

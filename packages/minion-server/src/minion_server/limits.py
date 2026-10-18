@@ -1,6 +1,7 @@
 """Request body size cap (pure ASGI, runs before auth so unauthenticated floods are cut early)."""
 
 import json
+import time
 from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -15,6 +16,22 @@ def _limit(scope: Scope) -> int:
     app: Any = scope.get("app")
     settings = getattr(getattr(app, "state", None), "settings", None)
     return int(getattr(settings, "max_request_body_bytes", DEFAULT_MAX_BODY_BYTES))
+
+
+ARRIVAL_KEY = "minion_arrival"  # scope key: time.monotonic() when the request reached the app
+
+
+class ArrivalStampMiddleware:
+    """Stamp the arrival time so deadlines (acquire, TASK-7.4.4) start when the request reached
+    the server, not when the handler finally runs behind a busy event loop."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            scope[ARRIVAL_KEY] = time.monotonic()
+        await self.app(scope, receive, send)
 
 
 class BodyLimitMiddleware:

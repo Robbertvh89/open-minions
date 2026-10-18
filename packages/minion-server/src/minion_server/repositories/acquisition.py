@@ -26,6 +26,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.db.models import (
@@ -262,6 +263,28 @@ class Claim:
     n_candidates: int
     candidate: Candidate | None = None
     won: Won | None = None
+
+
+QUERY_CANCELED = "57014"  # PostgreSQL SQLSTATE: statement_timeout (or a cancel) fired
+
+
+async def set_statement_timeout(session: AsyncSession, ms: int) -> None:
+    """`SET LOCAL statement_timeout` for the current transaction (a no-op after commit/rollback)."""
+    await session.execute(select(func.set_config("statement_timeout", str(ms), True)))
+
+
+def is_query_canceled(exc: BaseException) -> bool:
+    """True for a statement cancelled by `statement_timeout` (asyncpg QueryCanceledError, wrapped
+    by SQLAlchemy as a DBAPIError)."""
+    if not isinstance(exc, DBAPIError):
+        return False
+    orig: Any = exc.orig
+    for obj in (orig, getattr(orig, "__cause__", None)):
+        if getattr(obj, "sqlstate", None) == QUERY_CANCELED:
+            return True
+        if getattr(obj, "pgcode", None) == QUERY_CANCELED:
+            return True
+    return False
 
 
 async def claim(
