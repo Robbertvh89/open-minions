@@ -46,3 +46,17 @@ task, so all completions of one task row-locked the same row. After TASK-7.4.3 t
 - Readers sum the shards (`minion_ro.task`, `minion-scale` verify and progress poll).
 - Not done: a counter-less derivation from `minion_subtask` (a count over millions of rows per
   completion); a deferred batch job (stale counts for minutes).
+
+## Measured (scale stack, 4 server workers, 500 sims, pg_stat_statements reset before each run)
+
+| | before (main) | after |
+|---|---|---|
+| B-20k chaos: counter statement | `UPDATE minion_task SET succeeded_subtasks...` 20,000 x 61.05 ms (1,221 s total) | shard upsert 20,000 x 0.24 ms (4.8 s) + settle read 0.09 ms (1.7 s) |
+| B-20k: drain, `verify` | 145.7 s (137/s), PASS | 165.7 s (121/s), PASS |
+| A stress (1M pending, 300 s): counter statement | 51,818 x 71.80 ms (3,720 s total) | upsert 49,554 x 0.26 ms (13 s) + settle read 0.06 ms (3 s) |
+| A stress: completed in 300 s | 51,818 (172/s), 0 FAILED | 49,554 (164/s), 0 FAILED |
+| complete p50 / p99 (client) | B: 500 ms / 1 s; A: 250 ms / 1 s | B: 250 ms / 1 s; A: 250 ms / 1 s |
+
+The counter statement is no longer the top entry; end-to-end throughput did not change within run
+noise because the acquire candidate query (2.7-3.0 ms mean, top entry) and the 503 acquire
+back-pressure now bound it.
