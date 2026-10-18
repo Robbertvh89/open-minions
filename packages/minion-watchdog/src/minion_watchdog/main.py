@@ -13,7 +13,12 @@ import time
 
 import structlog
 from minion_server.db.session import create_engine, create_sessionmaker
-from minion_server.services.reclaim import ReclaimResult, reclaim_stale, sweep_cancelled
+from minion_server.services.reclaim import (
+    ReclaimResult,
+    reclaim_stale,
+    settle_stuck,
+    sweep_cancelled,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_watchdog.settings import WatchdogSettings
@@ -39,7 +44,7 @@ def backoff_s(interval_s: float, failures: int, cap_s: float) -> float:
 async def tick(
     sm: async_sessionmaker[AsyncSession], cfg: WatchdogSettings, stop: asyncio.Event
 ) -> None:
-    """One pass: reclaim (repeated while batches come back full), then sweep cancelled tasks."""
+    """One pass: reclaim (repeated while batches come back full), settle, sweep cancelled."""
     started = time.monotonic()
     rounds = 0
     for _ in range(MAX_ROUNDS_PER_TICK):
@@ -56,6 +61,11 @@ async def tick(
         expired = sum(n for r, n in results.items() if r in _EXPIRED)
         if expired < cfg.watchdog_batch_size or stop.is_set():
             break
+    # Backstop for the post-commit task settle (ADR-0015); own try so it never stalls the rest.
+    try:
+        await settle_stuck(sm)
+    except Exception as exc:
+        log.error("watchdog_settle_failed", error=type(exc).__name__)
     # Housekeeping: a failing sweep must not stall reclaim nor trigger tick backoff.
     try:
         await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)

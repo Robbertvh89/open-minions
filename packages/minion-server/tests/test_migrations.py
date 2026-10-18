@@ -91,11 +91,11 @@ def test_0003_task_error_round_trip(fresh_url: str) -> None:
 def test_downgrade_upgrade_round_trip(fresh_url: str) -> None:
     cfg = alembic_config(fresh_url)
     command.upgrade(cfg, "head")
-    assert asyncio.run(_table_count(fresh_url)) == 7
+    assert asyncio.run(_table_count(fresh_url)) == 8
     command.downgrade(cfg, "base")
     assert asyncio.run(_table_count(fresh_url)) == 0
     command.upgrade(cfg, "head")
-    assert asyncio.run(_table_count(fresh_url)) == 7
+    assert asyncio.run(_table_count(fresh_url)) == 8
 
 
 async def _has_constraint(url: str, name: str) -> bool:
@@ -218,3 +218,99 @@ def test_0010_subtask_autovacuum_round_trip(fresh_url: str) -> None:
     assert asyncio.run(_subtask_reloptions(fresh_url)) == []
     command.upgrade(cfg, "head")
     assert len(asyncio.run(_subtask_reloptions(fresh_url))) == 3
+
+
+async def _exec(url: str, sql: str) -> None:
+    eng = create_async_engine(url)
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(text(sql))
+    finally:
+        await eng.dispose()
+
+
+async def _view_cols(url: str) -> list[tuple[str, str]]:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod)"
+                    " FROM pg_attribute a WHERE a.attrelid = 'minion_ro.task'::regclass"
+                    " AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+                )
+            )
+            return [(r[0], r[1]) for r in res]
+    finally:
+        await eng.dispose()
+
+
+_INSERT_TASK_0010 = (
+    "INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,"
+    " input_uri, output_uri, created_by, status, total_subtasks, succeeded_subtasks,"
+    " failed_subtasks) VALUES ('t', 'p', '{n}', 'embedding', 'm', 'mlx', 1, 's3://i',"
+    " 's3://o/{n}', 'u', 'RUNNING', 10, {s}, {f})"
+)
+
+
+def test_0011_task_counters_backfill_and_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0010")
+    before = asyncio.run(_view_cols(fresh_url))
+    asyncio.run(_exec(fresh_url, _INSERT_TASK_0010.format(n="a", s=4, f=2)))
+    asyncio.run(_exec(fresh_url, _INSERT_TASK_0010.format(n="z", s=0, f=0)))
+
+    command.upgrade(cfg, "0011")
+    assert asyncio.run(_view_cols(fresh_url)) == before  # same names and types
+    assert (
+        asyncio.run(_scalar(fresh_url, "SELECT sum(succeeded + failed) FROM minion_task_counter"))
+        == 6
+    )
+    assert asyncio.run(_scalar(fresh_url, "SELECT count(*) FROM minion_task_counter")) == 1
+    assert (
+        asyncio.run(
+            _scalar(
+                fresh_url,
+                "SELECT count(*) FROM minion_ro.task WHERE task_name='a' AND succeeded_subtasks=4"
+                " AND failed_subtasks=2",
+            )
+        )
+        == 1
+    )
+    cols = (
+        "SELECT count(*) FROM information_schema.columns WHERE table_name='minion_task'"
+        " AND column_name IN ('succeeded_subtasks', 'failed_subtasks')"
+    )
+    assert asyncio.run(_scalar(fresh_url, cols)) == 0
+    assert asyncio.run(_table_count(fresh_url)) == 8
+    privs = asyncio.run(_view_privileges(fresh_url))
+    assert all(ok for _, ok in privs), privs
+
+    # a second shard is summed by the view; the downgrade folds all shards back
+    asyncio.run(
+        _exec(
+            fresh_url,
+            "INSERT INTO minion_task_counter VALUES ('t', 'p', 'a', 5, 3, 1)",
+        )
+    )
+    command.downgrade(cfg, "0010")
+    assert asyncio.run(_scalar(fresh_url, cols)) == 2
+    assert asyncio.run(_view_cols(fresh_url)) == before
+    assert asyncio.run(_table_count(fresh_url)) == 7
+    assert (
+        asyncio.run(
+            _scalar(
+                fresh_url,
+                "SELECT succeeded_subtasks * 100 + failed_subtasks FROM minion_task"
+                " WHERE task_name='a'",
+            )
+        )
+        == 7 * 100 + 3
+    )
+    command.upgrade(cfg, "head")
+    assert (
+        asyncio.run(
+            _scalar(fresh_url, "SELECT succeeded_subtasks FROM minion_ro.task WHERE task_name='a'")
+        )
+        == 7
+    )

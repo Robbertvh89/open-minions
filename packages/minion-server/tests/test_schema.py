@@ -17,10 +17,11 @@ EXPECTED_TABLES = {
     "minion_executor",
     "minion_executor_preference",
     "minion_subtask_attempt",
+    "minion_task_counter",
 }
 
 
-async def test_baseline_creates_seven_tables(engine: AsyncEngine) -> None:
+async def test_schema_has_the_eight_tables(engine: AsyncEngine) -> None:
     async with engine.connect() as conn:
         rows = await conn.execute(
             text(
@@ -123,13 +124,48 @@ async def test_subtask_checks_reject_bad_rows(
 
 
 @pytest.mark.parametrize(
+    ("vals", "constraint"),
+    [((-1, 0), "succeeded_nonneg"), ((0, -1), "failed_nonneg")],
+)
+async def test_task_counter_checks_reject_negative(
+    engine: AsyncEngine, vals: tuple[int, int], constraint: str
+) -> None:
+    with pytest.raises(IntegrityError, match=f"ck_minion_task_counter_{constraint}"):
+        async with engine.begin() as conn:
+            name = await _insert_task(conn)
+            await conn.execute(
+                text(
+                    "INSERT INTO minion_task_counter (team, project, task_name, shard, succeeded,"
+                    " failed) VALUES ('t', 'p', :name, 0, :s, :f)"
+                ),
+                {"name": name, "s": vals[0], "f": vals[1]},
+            )
+
+
+async def test_task_counter_cascades_with_task(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        name = await _insert_task(conn)
+        await conn.execute(
+            text(
+                "INSERT INTO minion_task_counter (team, project, task_name, shard)"
+                " VALUES ('t', 'p', :name, 3)"
+            ),
+            {"name": name},
+        )
+        await conn.execute(text("DELETE FROM minion_task WHERE task_name = :name"), {"name": name})
+        left = await conn.execute(
+            text("SELECT count(*) FROM minion_task_counter WHERE task_name = :name"),
+            {"name": name},
+        )
+        assert left.scalar_one() == 0
+
+
+@pytest.mark.parametrize(
     ("extra", "constraint"),
     [
         ("records_per_subtask=0", "records_per_subtask_positive"),
         ("max_attempts=0", "max_attempts_positive"),
         ("total_subtasks=-1", "total_subtasks_nonneg"),
-        ("succeeded_subtasks=-1", "succeeded_subtasks_nonneg"),
-        ("failed_subtasks=-1", "failed_subtasks_nonneg"),
     ],
 )
 async def test_task_checks_reject_bad_rows(

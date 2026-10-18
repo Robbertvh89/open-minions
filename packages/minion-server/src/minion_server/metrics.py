@@ -125,6 +125,14 @@ class Metrics:
             buckets=ACQUIRE_BUCKETS_S,
             registry=self.registry,
         )
+        self.task_settle_failed = Counter(
+            "minion_task_settle_failed_total",
+            "Post-commit task settles that raised (the watchdog's settle_stuck finishes the task).",
+            registry=self.registry,
+        )
+
+    def settle_failed(self) -> None:
+        self.task_settle_failed.inc()
 
     def observe_acquire(self, outcome: str, seconds: float) -> None:
         self.acquire_seconds.labels(outcome=outcome).observe(seconds)

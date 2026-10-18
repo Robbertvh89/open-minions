@@ -341,7 +341,7 @@ Subtask:  PENDING ──acquire──▶ RUNNING ──complete──▶ SUCCEED
 
 Task:     SPLITTING ─▶ PENDING ─▶ RUNNING ─▶ SUCCEEDED | FAILED | PARTIAL | CANCELLED
 ```
-Task status is derived from subtask counts and updated by the server on each subtask transition.
+Task status is derived from subtask counts. The server sets the terminal status just after the last subtask transition commits (a post-commit settle, ADR-0015); the watchdog settles any task whose settle was lost, so a finished task may show `RUNNING` for up to one watchdog interval. A concurrent cancel wins: a `CANCELLED` task is never moved to another status.
 
 ## 6. API (v1)
 
@@ -415,20 +415,20 @@ allowed_pool, status` (`SPLITTING | PENDING | RUNNING | SUCCEEDED | FAILED | PAR
 `created_by` (the API key's name), `created_at`, `finished_at` (null until terminal), `error` (null or a
 short diagnostic), `counts: {total, pending, running, succeeded, failed, cancelled}`.
 
-## 7. Data model (PostgreSQL — 7 tables)
+## 7. Data model (PostgreSQL — 8 tables)
 
-The paper states 7 tables and names `minion_subtask_acquirement` and a heartbeat table. Proposed set **[ours]**:
+The paper states 7 tables (we add an eighth, `minion_task_counter`, ADR-0015) and names `minion_subtask_acquirement` and a heartbeat table. Proposed set **[ours]**:
 
-1. `minion_task` — `(team, project, task_name)` PK/unique; type, model_id (→ allow-list; engine and memory_gb snapshotted at create), input_uri, output_uri, params jsonb, status, priority, counts, created_by, timestamps. `output_uri` is UNIQUE; `split_attempts` and `next_split_at` implement the splitter lease and retry backoff.
+1. `minion_task` — `(team, project, task_name)` PK/unique; type, model_id (→ allow-list; engine and memory_gb snapshotted at create), input_uri, output_uri, params jsonb, status, priority, total_subtasks, created_by, timestamps. `output_uri` is UNIQUE; `split_attempts` and `next_split_at` implement the splitter lease and retry backoff.
 2. `minion_subtask` — `(team, project, task_name, subtask_id)` unique; input slice, status, attempt, max_attempts, error, output_uri, timestamps.
 3. `minion_subtask_acquirement` — **UNIQUE `(team, project, task_name, subtask_id)`** **[paper]**; `acquirement_id` uuid, executor_id, attempt, acquired_at.
 4. `minion_executor_heartbeat` — acquirement_id (the executor is reached by joining `minion_subtask_acquirement`), last_seen_at, progress jsonb (one row per active acquirement, upserted).
 5. `minion_executor` — executor_id, token_hash, hostname, owner, pool, chip, total_memory_gb, os_version, engines, status, **profile, budget jsonb, paused_reason**, registered_at, last_seen_at, token_expires_at (NULL = no expiry; auth rejects tokens past it).
 6. `minion_executor_preference` — executor_id, team, project, task_name (nullable for wildcards).
 7. `minion_subtask_attempt` — history: one row per finished attempt (executor, outcome `SUCCEEDED|FAILED|EXPIRED|RELEASED|CANCELLED`, duration, error). Feeds Grafana.
+8. `minion_task_counter` **[ours]** — `(team, project, task_name, shard)` PK, `succeeded`, `failed`; sharded by `subtask_id % 16` so concurrent completions of one task do not serialize on one `minion_task` row; counts are the sum over shards ([ADR-0015](adr/0015-sharded-task-counters.md)). `minion_ro.task` exposes the sums as `succeeded_subtasks` / `failed_subtasks`.
 
-The model allow-list is configuration (`models.yaml`, loaded by the server at start), not a table, so
-the paper's 7-table count holds.
+The model allow-list is configuration (`models.yaml`, loaded by the server at start), not a table.
 
 Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the acquire query.
 

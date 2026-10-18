@@ -1,4 +1,4 @@
-"""ORM models for the 7 PostgreSQL tables (SPEC §7, ARCHITECTURE §5).
+"""ORM models for the 8 PostgreSQL tables (SPEC §7, ARCHITECTURE §5).
 
 Subtasks are identified by the natural key `(team, project, task_name, subtask_id)`, as in the
 paper. The UNIQUE constraint on `minion_subtask_acquirement` is the only mutual-exclusion mechanism
@@ -32,6 +32,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -103,8 +104,6 @@ class Task(Base):
         CheckConstraint("records_per_subtask > 0", name="records_per_subtask_positive"),
         CheckConstraint("max_attempts > 0", name="max_attempts_positive"),
         CheckConstraint("total_subtasks >= 0", name="total_subtasks_nonneg"),
-        CheckConstraint("succeeded_subtasks >= 0", name="succeeded_subtasks_nonneg"),
-        CheckConstraint("failed_subtasks >= 0", name="failed_subtasks_nonneg"),
         # Two tasks sharing an output prefix would share attempt and promoted keys.
         UniqueConstraint("output_uri"),
         CheckConstraint("split_attempts >= 0", name="split_attempts_nonneg"),
@@ -129,8 +128,6 @@ class Task(Base):
         _enum(TaskStatus, "task_status"), server_default=TaskStatus.SPLITTING.value
     )
     total_subtasks: Mapped[int] = mapped_column(Integer, server_default=text("0"))
-    succeeded_subtasks: Mapped[int] = mapped_column(Integer, server_default=text("0"))
-    failed_subtasks: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     created_by: Mapped[str] = mapped_column(String(128))
     error: Mapped[str | None] = mapped_column(Text)  # task-level failure (e.g. empty input)
     # Splitter lease/backoff: a SPLITTING task is only claimable once next_split_at has passed.
@@ -139,6 +136,33 @@ class Task(Base):
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _updated_at()
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TaskCounter(Base):
+    """Succeeded/failed subtask counters of a task, sharded by `subtask_id % 16` (ADR-0015).
+
+    Summed on read; sharding spreads completions of one task over several rows instead of one
+    hot `minion_task` row.
+    """
+
+    __tablename__ = "minion_task_counter"
+    __table_args__ = (
+        PrimaryKeyConstraint("team", "project", "task_name", "shard"),
+        ForeignKeyConstraint(
+            ["team", "project", "task_name"],
+            ["minion_task.team", "minion_task.project", "minion_task.task_name"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("succeeded >= 0", name="succeeded_nonneg"),
+        CheckConstraint("failed >= 0", name="failed_nonneg"),
+    )
+
+    team: Mapped[str] = mapped_column(String(64))
+    project: Mapped[str] = mapped_column(String(64))
+    task_name: Mapped[str] = mapped_column(String(128))
+    shard: Mapped[int] = mapped_column(SmallInteger)
+    succeeded: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    failed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
 
 
 class Subtask(Base):

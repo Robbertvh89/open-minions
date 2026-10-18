@@ -124,14 +124,14 @@ async def test_complete_promotes_and_is_idempotent(
         " (SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='done'),"
         " (SELECT count(*) FROM minion_subtask_attempt WHERE task_name='done'"
         "  AND outcome='SUCCEEDED')"
-        " FROM minion_subtask s JOIN minion_task t USING (team, project, task_name)"
+        " FROM minion_subtask s JOIN minion_ro.task t USING (team, project, task_name)"
         " WHERE s.task_name='done'",
     )
     assert tuple(st) == ("SUCCEEDED", f"s3://minion/{dst}", "SUCCEEDED", 1, True, 0, 1)
     # lost-response retry by the same owner is a no-op; another executor still gets 409
     assert (await c.post(url, json=_complete_body(), headers=_auth(tok))).status_code == 204
     assert (await c.post(url, json=_complete_body(), headers=_auth(qtok))).status_code == 409
-    again = await _one(sm, "SELECT succeeded_subtasks FROM minion_task WHERE task_name='done'")
+    again = await _one(sm, "SELECT succeeded_subtasks FROM minion_ro.task WHERE task_name='done'")
     assert again[0] == 1
 
 
@@ -435,7 +435,7 @@ async def test_fail_consumes_budget_then_terminal(http: tuple[AsyncClient, Any])
         row = await _one(
             sm,
             "SELECT (SELECT string_agg(status, ',' ORDER BY subtask_id) FROM minion_subtask"
-            " WHERE task_name='fl'), t.status, t.failed_subtasks FROM minion_task t"
+            " WHERE task_name='fl'), t.status, t.failed_subtasks FROM minion_ro.task t"
             " WHERE task_name='fl'",
         )
         return tuple(row)
@@ -488,7 +488,7 @@ async def test_task_partial_when_mixed(http: tuple[AsyncClient, Any], s3: S3Env)
     end = await _one(
         sm,
         "SELECT status, finished_at IS NOT NULL, succeeded_subtasks, failed_subtasks"
-        " FROM minion_task WHERE task_name='mix'",
+        " FROM minion_ro.task WHERE task_name='mix'",
     )
     assert tuple(end) == ("PARTIAL", True, 1, 1)
 

@@ -217,12 +217,18 @@ async def heartbeat(
     storage: Annotated[S3Storage, Depends(_storage)],
 ) -> HeartbeatResponse:
     return await heartbeat_service.heartbeat(
-        session, principal, acquirement_id, body, settings=settings, storage=storage
+        session,
+        principal,
+        acquirement_id,
+        body,
+        settings=settings,
+        storage=storage,
     )
 
 
 @router.post("/subtasks/{acquirement_id}/complete", status_code=204)
 async def complete(
+    request: Request,
     acquirement_id: uuid.UUID,
     body: CompleteRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
@@ -231,24 +237,38 @@ async def complete(
     storage: Annotated[S3Storage, Depends(_storage)],
 ) -> Response:
     await completion.complete(
-        session, principal, acquirement_id, body, settings=settings, storage=storage
+        session,
+        principal,
+        acquirement_id,
+        body,
+        settings=settings,
+        storage=storage,
+        metrics=getattr(request.app.state, "metrics", None),
     )
     return Response(status_code=204)
 
 
 @router.post("/subtasks/{acquirement_id}/fail", status_code=204)
 async def fail(
+    request: Request,
     acquirement_id: uuid.UUID,
     body: FailRequest,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> Response:
-    await completion.fail(session, principal, acquirement_id, body)
+    await completion.fail(
+        session,
+        principal,
+        acquirement_id,
+        body,
+        metrics=getattr(request.app.state, "metrics", None),
+    )
     return Response(status_code=204)
 
 
 @router.post("/subtasks/{acquirement_id}/release", status_code=204)
 async def release(
+    request: Request,
     acquirement_id: uuid.UUID,
     principal: Annotated[ExecutorPrincipal, Depends(current_executor)],
     session: Annotated[AsyncSession, Depends(get_session)],
@@ -261,5 +281,6 @@ async def release(
         acquirement_id,
         settings=settings,
         code=body.code if body is not None else None,
+        metrics=getattr(request.app.state, "metrics", None),
     )
     return Response(status_code=204)

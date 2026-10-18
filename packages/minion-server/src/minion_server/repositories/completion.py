@@ -19,8 +19,10 @@ from minion_server.db.models import (
     SubtaskAcquirement,
     SubtaskAttempt,
     Task,
+    TaskCounter,
 )
 
+TASK_COUNTER_SHARDS = 16  # ADR-0015
 BUDGET_OUTCOMES = (AttemptOutcome.FAILED.value, AttemptOutcome.EXPIRED.value)
 NOT_ACKNOWLEDGED = "NOT_ACKNOWLEDGED"  # ADR-0014: EXPIRED, never heartbeated after the claim
 
@@ -230,34 +232,103 @@ async def finish_attempt(
     )
 
 
-async def bump_counters(
-    session: AsyncSession, o: Owned, *, succeeded: int, failed: int
-) -> TaskCounts:
-    """Atomically bump task counters; the UPDATE row-locks the task for status derivation."""
+def counter_shard(subtask_id: int) -> int:
+    """Counter shard of a subtask (ADR-0015)."""
+    return subtask_id % TASK_COUNTER_SHARDS
+
+
+async def bump_counters(session: AsyncSession, o: Owned, *, succeeded: int, failed: int) -> None:
+    """Add to this subtask's counter shard (upsert); the row lock is per shard, not per task."""
+    ins = pg_insert(TaskCounter).values(
+        team=o.team,
+        project=o.project,
+        task_name=o.task_name,
+        shard=counter_shard(o.subtask_id),
+        succeeded=succeeded,
+        failed=failed,
+    )
+    await session.execute(
+        ins.on_conflict_do_update(
+            index_elements=["team", "project", "task_name", "shard"],
+            set_={
+                "succeeded": TaskCounter.succeeded + ins.excluded.succeeded,
+                "failed": TaskCounter.failed + ins.excluded.failed,
+            },
+        )
+    )
+
+
+@dataclass(frozen=True)
+class TaskKey:
+    team: str
+    project: str
+    task_name: str
+
+
+async def task_counts(session: AsyncSession, key: TaskKey) -> TaskCounts | None:
+    """Task status, total and the shard sums; None if the task is gone."""
     row = (
         await session.execute(
-            update(Task)
-            .where(Task.team == o.team, Task.project == o.project, Task.task_name == o.task_name)
-            .values(
-                succeeded_subtasks=Task.succeeded_subtasks + succeeded,
-                failed_subtasks=Task.failed_subtasks + failed,
-            )
-            .returning(
-                Task.total_subtasks, Task.succeeded_subtasks, Task.failed_subtasks, Task.status
+            select(
+                Task.total_subtasks,
+                select(func.coalesce(func.sum(TaskCounter.succeeded), 0))
+                .where(
+                    TaskCounter.team == Task.team,
+                    TaskCounter.project == Task.project,
+                    TaskCounter.task_name == Task.task_name,
+                )
+                .scalar_subquery(),
+                select(func.coalesce(func.sum(TaskCounter.failed), 0))
+                .where(
+                    TaskCounter.team == Task.team,
+                    TaskCounter.project == Task.project,
+                    TaskCounter.task_name == Task.task_name,
+                )
+                .scalar_subquery(),
+                Task.status,
+            ).where(
+                Task.team == key.team, Task.project == key.project, Task.task_name == key.task_name
             )
         )
-    ).one()
-    return TaskCounts(row[0], row[1], row[2], TaskStatus(row[3]))
+    ).one_or_none()
+    if row is None:
+        return None
+    return TaskCounts(int(row[0]), int(row[1]), int(row[2]), TaskStatus(row[3]))
 
 
-async def set_task_terminal(session: AsyncSession, o: Owned, status: TaskStatus) -> None:
-    await session.execute(
+async def set_task_terminal(session: AsyncSession, key: TaskKey, status: TaskStatus) -> bool:
+    """PENDING/RUNNING -> terminal. True for the one call that made the transition."""
+    result = await session.execute(
         update(Task)
         .where(
-            Task.team == o.team,
-            Task.project == o.project,
-            Task.task_name == o.task_name,
+            Task.team == key.team,
+            Task.project == key.project,
+            Task.task_name == key.task_name,
             Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
         )
         .values(status=status.value, finished_at=func.now())
     )
+    return bool(result.rowcount == 1)  # type: ignore[attr-defined]
+
+
+async def settleable_tasks(session: AsyncSession, limit: int) -> list[TaskKey]:
+    """Live tasks whose counters already cover every subtask (a lost or crashed settle)."""
+    rows = (
+        await session.execute(
+            select(Task.team, Task.project, Task.task_name)
+            .join(
+                TaskCounter,
+                (TaskCounter.team == Task.team)
+                & (TaskCounter.project == Task.project)
+                & (TaskCounter.task_name == Task.task_name),
+            )
+            .where(
+                Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+                Task.total_subtasks > 0,
+            )
+            .group_by(Task.team, Task.project, Task.task_name, Task.total_subtasks)
+            .having(func.sum(TaskCounter.succeeded + TaskCounter.failed) >= Task.total_subtasks)
+            .limit(limit)
+        )
+    ).all()
+    return [TaskKey(r[0], r[1], r[2]) for r in rows]

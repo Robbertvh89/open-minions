@@ -347,7 +347,7 @@
           "format": "table",
           "rawQuery": true,
           "editorMode": "code",
-          "rawSql": "SELECT team, project, task_name, status, succeeded_subtasks, failed_subtasks, total_subtasks, updated_at\nFROM minion_ro.task\nWHERE status IN ('SPLITTING', 'PENDING', 'RUNNING')\nORDER BY updated_at DESC LIMIT 50"
+          "rawSql": "SELECT team, project, task_name, status, succeeded_subtasks, failed_subtasks, total_subtasks, updated_at\nFROM minion_ro.task\nWHERE status IN ('SPLITTING', 'PENDING', 'RUNNING')\nORDER BY created_at DESC LIMIT 50"
         }
       ],
       "fieldConfig": {
