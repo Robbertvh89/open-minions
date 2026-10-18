@@ -1,9 +1,10 @@
 ---
 id: TASK-7.4
 title: M6.4 Scale fixes (scoped from M6.3 findings)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-18 02:21'
 labels:
   - scale
 dependencies: []

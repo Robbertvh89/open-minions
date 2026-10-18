@@ -1,10 +1,10 @@
 ---
 id: TASK-7.3
 title: M6.3 Run the scale test on this Mac and report NF-1..NF-3
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 20:36'
-updated_date: '2026-10-18 00:46'
+updated_date: '2026-10-18 02:20'
 labels:
   - scale
 dependencies: []
@@ -20,8 +20,14 @@ Scenarios: A) NF-1: 1M PENDING (>=10 tasks), 500 sims, stress (work 1-3 s) and r
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Report gives acquire p50/p95/p99 (client + server/pg_stat_statements) at 1M pending; pass/fail vs NF-1 stated
-- [ ] #2 Scenario B verify passes (zero double-completion, zero lost subtasks) or failures filed
-- [ ] #3 Watchdog tick time and EXPLAIN plans recorded
-- [ ] #4 Limits/extrapolation section present; SPEC NF-1..NF-3 rows link the report
+- [x] #1 Report gives acquire p50/p95/p99 (client + server/pg_stat_statements) at 1M pending; pass/fail vs NF-1 stated
+- [x] #2 Scenario B verify passes (zero double-completion, zero lost subtasks) or failures filed
+- [x] #3 Watchdog tick time and EXPLAIN plans recorded
+- [x] #4 Limits/extrapolation section present; SPEC NF-1..NF-3 rows link the report
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #46: M6 scale report on M3 Pro. NF-1 FAIL at 1M pending (candidate query seq scan+sort ~200 ms single-sim; PG saturated at 500 sims); NF-2/NF-3 PASS at 20k drain with faults; watchdog scan 2-3 ms; rate limits OK. Limits incl. 20 s overlay heartbeat timeout. Fixes split into TASK-7.4.x.
+<!-- SECTION:FINAL_SUMMARY:END -->
