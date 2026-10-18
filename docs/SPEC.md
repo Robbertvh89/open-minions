@@ -200,6 +200,9 @@ Errors from the worker and engines (the full set of codes the executor reports; 
 - FR-22. Dynamic task binding: if the executor has a preference, matching subtasks are dequeued first;
   otherwise (or if none match) fall back to the **global FIFO** queue (ordered by task `created_at`,
   then `subtask_id`).
+  Note (ADR-0013): among the top `MINION_ACQUIRE_WINDOW` (default 16) candidates of the highest priority
+  present the pick is random, to avoid head contention; priority is never inverted, and with window 1
+  the order is strict.
 
 ### 4.4 Fault tolerance (Watchdog)
 - FR-30. Watchdog monitors heartbeats **only for executors currently running subtasks** **[paper]**.

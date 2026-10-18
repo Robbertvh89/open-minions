@@ -351,7 +351,8 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
                ORDER BY task.priority DESC, task.created_at, subtask_id
                LIMIT 16
   if empty: candidates = same query without preference filter (engine, memory and allowed_pool filters stay) -- pass 2 (global FIFO)
-  for c in shuffle_head(candidates):          -- light shuffle reduces contention
+  one statement per round (ADR-0013): candidates (LIMIT MINION_ACQUIRE_WINDOW=16), pick one at random
+  among the highest priority present, then
       INSERT INTO minion_subtask_acquirement (...) VALUES (...)
         ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
         RETURNING acquirement_id
@@ -359,7 +360,7 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
           UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ...  (same txn)
           INSERT minion_executor_heartbeat(...)                           (same txn)
           COMMIT → return assignment + presigned URLs
-  return 204   (the whole round repeats up to MAX_ROUNDS=10 when every candidate lost its insert race; then 204)
+  return 204   (a round repeats up to MAX_ROUNDS=10 when the picked candidate lost its insert race; then 204)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
@@ -376,7 +377,7 @@ Notes:
   ~1 us / ~3 buffers per eligible live task that has no PENDING subtasks ahead of the first match
   (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms).
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
-  paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0002).
+  paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).
 
 ### 3.3 Execute & report
 ```
@@ -602,7 +603,7 @@ token in macOS Keychain.
 
 ## 9. ADR index
 - [ADR-0001](adr/0001-python-for-all-components.md): Python for all components — **Accepted**
-- ADR-0002: Unique-constraint acquisition over `SKIP LOCKED` *(to write)*
+- ADR-0013: Single-statement acquisition claim over a random window; unique-constraint acquisition over `SKIP LOCKED`
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
