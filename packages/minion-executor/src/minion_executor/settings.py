@@ -92,6 +92,10 @@ class ExecutorSettings(BaseSettings):
     # MINION_ACQUIRE_MIN_INTERVAL_S (0.2). Only the remainder is slept. 0 disables.
     acquire_pace_s: float = Field(default=0.4, ge=0, le=60, allow_inf_nan=False)
 
+    # After register, wait uniform(0, this) before the first acquire so a fleet that starts together
+    # does not stampede the queue head (ADR-0013). A stop interrupts the wait. 0 disables.
+    first_acquire_jitter_s: float = Field(default=15.0, ge=0, le=300, allow_inf_nan=False)
+
     @field_validator("acquire_pace_s")
     @classmethod
     def _pace_not_below_server_default(cls, v: float) -> float:

@@ -250,11 +250,13 @@ class ExecutorLoop:
         status_dir: Path | None = None,
         status_interval_s: float = STATUS_INTERVAL_S,
         acquire_pace_s: float = 0.0,
+        first_acquire_jitter_s: float = 0.0,
         max_output_bytes: int = MAX_OUTPUT_BYTES_DEFAULT,
     ) -> None:
         self._max_output_bytes = max_output_bytes
         self._cache = model_cache
         self._acquire_pace_s = acquire_pace_s  # min gap between acquire calls; 0 disables
+        self._first_acquire_jitter_s = first_acquire_jitter_s  # ADR-0013 D5; 0 disables
         self._last_acquire: float | None = None
         self._client = client
         self._worker = worker
@@ -544,6 +546,9 @@ class ExecutorLoop:
                     d0 = self._gov.decision
                     reg = reg.model_copy(update={"profile": d0.profile, "budget": d0.budget})
                 await self._register_with_retry(reg)
+            if self._first_acquire_jitter_s > 0 and not self.stopping:
+                # Spread a fleet that restarts together off the queue head (ADR-0013 D5).
+                await self._pause(random.uniform(0, self._first_acquire_jitter_s))  # noqa: S311
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
                 if gov_task.done():  # nothing steers the budget any more: stop, do not acquire
                     exc = None if gov_task.cancelled() else gov_task.exception()
