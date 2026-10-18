@@ -134,6 +134,39 @@ async def finish_failed(
     return status
 
 
+async def finish_unacknowledged(
+    session: AsyncSession, o: repo.Owned, *, free_cap: int
+) -> SubtaskStatus:
+    """Reclaim of an acquirement that never heartbeated after the claim (ADR-0014).
+
+    EXPIRED / NOT_ACKNOWLEDGED, requeued without consuming budget while the subtask has fewer than
+    `free_cap` earlier such expiries; past the cap it is an ordinary budget-consuming
+    HEARTBEAT_TIMEOUT expiry (bounded, no livelock). Caller holds the acquirement lock.
+    """
+    if await repo.unacknowledged_attempt_count(session, o) >= free_cap:
+        return await finish_failed(
+            session,
+            o,
+            outcome=AttemptOutcome.EXPIRED,
+            error={"code": "HEARTBEAT_TIMEOUT", "message": "no heartbeat", "retryable": True},
+            retryable=True,
+        )
+    cancelled = o.task_status == TaskStatus.CANCELLED
+    status = SubtaskStatus.CANCELLED if cancelled else SubtaskStatus.PENDING
+    await repo.finish_attempt(
+        session,
+        o,
+        outcome=AttemptOutcome.EXPIRED,
+        subtask_status=status,
+        attempt_error={
+            "code": repo.NOT_ACKNOWLEDGED,
+            "message": "never acknowledged after claim",
+            "retryable": True,
+        },
+    )
+    return status
+
+
 _CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
 _FAIL_FALLBACK = "RUNNER_ERROR"
 

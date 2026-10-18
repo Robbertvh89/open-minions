@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy import func, null, select, update
+from sqlalchemy import false, func, null, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,14 @@ from minion_server.db.models import (
 )
 
 BUDGET_OUTCOMES = (AttemptOutcome.FAILED.value, AttemptOutcome.EXPIRED.value)
+NOT_ACKNOWLEDGED = "NOT_ACKNOWLEDGED"  # ADR-0014: EXPIRED, never heartbeated after the claim
+
+
+def _unacked_expiry() -> Any:
+    """Attempt rows that are free EXPIRED / NOT_ACKNOWLEDGED (history `error.code`)."""
+    return (SubtaskAttempt.outcome == AttemptOutcome.EXPIRED.value) & (
+        SubtaskAttempt.error["code"].astext == NOT_ACKNOWLEDGED
+    )
 
 
 @dataclass(frozen=True)
@@ -112,7 +120,8 @@ async def completed_by(session: AsyncSession, acquirement_id: uuid.UUID) -> uuid
 
 
 async def failed_attempt_count(session: AsyncSession, o: Owned) -> int:
-    """Attempts that consume the retry budget (FAILED + EXPIRED); RELEASED does not."""
+    """Attempts that consume the retry budget (FAILED + EXPIRED); RELEASED and the free
+    NOT_ACKNOWLEDGED expiries (ADR-0014) do not."""
     return int(
         (
             await session.execute(
@@ -124,6 +133,7 @@ async def failed_attempt_count(session: AsyncSession, o: Owned) -> int:
                     SubtaskAttempt.task_name == o.task_name,
                     SubtaskAttempt.subtask_id == o.subtask_id,
                     SubtaskAttempt.outcome.in_(BUDGET_OUTCOMES),
+                    ~func.coalesce(_unacked_expiry(), false()),
                 )
             )
         ).scalar_one()
@@ -143,6 +153,25 @@ async def released_attempt_count(session: AsyncSession, o: Owned) -> int:
                     SubtaskAttempt.task_name == o.task_name,
                     SubtaskAttempt.subtask_id == o.subtask_id,
                     SubtaskAttempt.outcome == AttemptOutcome.RELEASED.value,
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def unacknowledged_attempt_count(session: AsyncSession, o: Owned) -> int:
+    """Earlier NOT_ACKNOWLEDGED expiries of this subtask (free until the cap, ADR-0014)."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(SubtaskAttempt)
+                .where(
+                    SubtaskAttempt.team == o.team,
+                    SubtaskAttempt.project == o.project,
+                    SubtaskAttempt.task_name == o.task_name,
+                    SubtaskAttempt.subtask_id == o.subtask_id,
+                    _unacked_expiry(),
                 )
             )
         ).scalar_one()

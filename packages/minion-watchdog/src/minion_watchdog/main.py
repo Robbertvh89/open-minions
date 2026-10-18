@@ -49,6 +49,7 @@ async def tick(
             timeout_s=cfg.heartbeat_timeout_s,
             batch_size=cfg.watchdog_batch_size,
             max_lease_s=cfg.max_lease_s,
+            unacked_free_cap=cfg.release_limit,
         )
         if results:
             log.info("watchdog_reclaim", **{k.value: v for k, v in results.items()})
