@@ -4253,7 +4253,8 @@
   "vanish": 1055,
   "late_complete_409": 528,
   "late_complete_accepted": 0,
-  "late_sims_stopped_at_drain_got_409_on_release": 12
+  "release_409": 12,
+  "release_409_note": "inferred from counts (2,100 release calls vs 2,088 released): late sims releasing expired attempts at drain end; not logged per sim"
  },
  "server_cpu_percent": {
   "a_stress_rerun_180s": {

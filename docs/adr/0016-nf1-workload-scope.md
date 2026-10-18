@@ -25,7 +25,7 @@ one core of twelve), with the load generator on the same cores.
 - NF-1 is defined against a **tested numeric scope**: 500 executors, 0.9 to 1M PENDING subtasks
   (894,924 in the realistic run), production heartbeat 300 s with watchdog timeout 900 s, first-acquire
   jitter 15 s, 75 s subtasks, and an aggregate acquire rate up to the highest measured passing rate:
-  23.5 acquires/s (50 sims, server p99 <= 100 ms) and about 6.6/s (the realistic run, server p99 <=
+  about 24 acquires/s (23.5 completes/s; 50 sims, server p99 <= 100 ms) and about 6.6/s (the realistic run, server p99 <=
   50 ms). Within that scope it is **met**. Above that rate the contract is fail-fast shedding, not a
   latency promise.
 - It is **not met** for the 2 s-work stress mix (gap about 2x over 200 ms). That is a capacity limit,
