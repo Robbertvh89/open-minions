@@ -352,7 +352,11 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
   (executor only calls this when governor state ≠ PAUSED)
   for pass in [preference, none]:            -- pass 2 (global FIFO) only if there is a preference;
                                              -- engine, memory and allowed_pool filters stay in both
-    repeat up to MAX_ROUNDS=10 times:        -- one transaction and ONE statement per round (ADR-0013)
+    repeat up to MAX_ROUNDS=10 times:        -- one transaction per round (ADR-0013, ADR-0019)
+      SELECT ... FROM minion_executor WHERE executor_id = me FOR NO KEY UPDATE
+                                             -- missing / REVOKED -> 401; serialises this executor's rounds
+      SELECT count(*) FROM minion_subtask_acquirement WHERE executor_id = me   -- separate statement
+      count >= MINION_MAX_OPEN_ACQUIREMENTS -> 429 TOO_MANY_ACQUIREMENTS, Retry-After 30 (no candidate read)
       WITH cand AS (SELECT pending subtasks of live tasks
                     WHERE task.engine = ANY(engines)
                       AND task.model_memory_gb <= budget.memory_gb   -- capacity admission
@@ -567,11 +571,19 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Live executor reclaimed between beats | `MINION_HEARTBEAT_TIMEOUT_S` ≥ 2–3× heartbeat interval (checked only when the timeout is exported to the executor); 429 keeps beats bounded |
 | Server crash mid-split | Splitter is resumable: subtasks inserted with deterministic ids + `ON CONFLICT DO NOTHING` |
 | Budget downgrade mid-subtask | Executor `release`s (same txn path as complete/reclaim); output of partial run discarded (attempt-scoped key) |
+| Rogue executor hoards subtasks (never acks) | Per-executor cap on open acquirements under an executor-row lock (ADR-0019): at most `MINION_MAX_OPEN_ACQUIREMENTS` (4) per token across all workers; revocation also stops acquire at once. Ownership of a subtask is still decided only by the unique-constraint INSERT |
 | Worker crash (Metal / OOM) | Control process survives, reports `fail(retryable)`; attempt counter bounds retries |
 
 **Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → counter shard
 (`minion_task_counter`, one of 16 rows per task; the task row is not row-locked for update by completions; the first insert per shard takes an FK KEY SHARE on it). The
-executor row (`minion_executor`) is written after the acquirement lock, never before it. Cancel txn 1
+executor row (`minion_executor`) is written after the acquirement lock, never before it. The acquire claim round takes the
+executor row first (`FOR NO KEY UPDATE`, ADR-0019), then the new acquirement, subtask, heartbeat and task rows. No
+cycle: the claim never waits on a lock an owner op holds (it inserts a new acquirement row, and `ON CONFLICT DO NOTHING`
+waits only on an in-progress insert/delete of the same key by another claim, which holds a different executor row, or by
+complete/release/reclaim, which **never write `minion_executor`**; keep it that way). `FOR NO KEY UPDATE` does not conflict with
+the FK `KEY SHARE` locks of attempt/acquirement inserts, so the watchdog is never blocked. Heartbeats and `touch` of the same
+executor wait for its claim transaction (milliseconds); the lock wait is bounded by the acquire deadline (`statement_timeout`).
+Cancel txn 1
 locks the task only; txn 2 locks PENDING subtask rows (`SKIP LOCKED`, bounded) and never a running
 acquirement, so it cannot deadlock with owner ops.
 
@@ -583,7 +595,7 @@ race, stale-acquirement rejection, splitter restart.
 ### 5.1 Key indexes
 - `minion_subtask`: partial index on `status='PENDING'`; index on `(team, project, task_name, status)` for progress.
 - `minion_executor_heartbeat`: index on `last_seen_at`.
-- `minion_subtask_acquirement`: `ix_minion_subtask_acquirement_acquired_at` on `acquired_at` serves the watchdog max-lease scan (migration 0008).
+- `minion_subtask_acquirement`: `ix_minion_subtask_acquirement_acquired_at` on `acquired_at` serves the watchdog max-lease scan (migration 0008); `ix_minion_subtask_acquirement_executor_id` on `executor_id` serves the per-executor open-acquirement count of the acquire path and the fleet join (migration 0012).
 - `minion_task`: index on `(status, priority DESC, created_at)`.
 - `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
 
@@ -609,6 +621,8 @@ Startup order with `docker compose -f deploy/compose.yml --profile app up -d --b
 Ports: the server is published on `127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}` only. Secrets: `${MINION_SECRETS_DIR:-./secrets}` (default `deploy/secrets/`, git-ignored) is mounted read-only at `/run/minion-secrets` and holds `api-keys.yaml`; the directory is mounted, not the file, so the atomic temp+rename reload reaches the container. `MINION_UI_SESSION_SECRET` and `MINION_METRICS_TOKEN` come from the environment (compose reads the shell or `deploy/.env`), never from the image. Ownership: `auth.py` refuses a keys file or directory not owned by root or the server uid. On macOS Docker Desktop the bind mount shows the file as owned by the container uid, so it works as is. On Linux hosts, either `chown -R 10001:10001` the secrets directory and file, or leave them `root:root` (file 0644 in a 0755 directory); the keys file must not be group/world-writable. `api-keys.yaml` must exist before `up`, otherwise Docker creates an empty directory at the mount source. The watchdog healthcheck reads `MINION_WATCHDOG_INTERVAL_S`, which compose passes to the watchdog too (default 60) so both use one value.
 
 Server sizing (TASK-7.4.6): `MINION_SERVER_WORKERS` (1..32, default 1) runs that many uvicorn worker processes (`minion_server.app:create_app` factory); `1` keeps the in-process single-app path. Every worker is a full replica: its own SQLAlchemy pool (`MINION_DB_POOL_SIZE` + `MINION_DB_MAX_OVERFLOW`), its own acquire semaphore (`MINION_ACQUIRE_CONCURRENCY`, default pool + overflow - 4, per process, not divided by workers), its own splitter loop (safe: claims are lease-based, `test_concurrent_splitters_no_duplicates_full_coverage`) and its own in-memory rate limiter and per-executor in-flight cap (ADR-0012). Connection budget = workers x (pool + overflow + `MINION_DB_AUTH_POOL_SIZE`, 2) + the watchdog pool (`MINION_WATCHDOG_DB_POOL_SIZE`, 2) and must stay below Postgres `max_connections` (default 100) minus other clients; `main()` logs `db_connection_budget_exceeded` at startup when the budget is >= `MINION_DB_MAX_CONNECTIONS` (default 100; set it to the real limit) minus `MINION_DB_RESERVED_CONNECTIONS` (default 7: superuser_reserved 3 + Grafana 4). `MINION_WATCHDOG_DB_POOL_SIZE` (>= 1) must be set on the server service as well as the watchdog's. Also give the application DB role a `CONNECTION LIMIT` so a runaway server cannot starve the watchdog or an admin. Rule of thumb: size workers x pool to the concurrent queries the database can serve (a few per core), not to the executor count; shed load (503 + Retry-After) beats a deeper queue. With N workers one executor can get up to N x the per-executor acquire budget and N x the rate limit; enforce per-executor limits at the proxy or route by executor with sticky routing if that matters. Metrics: with workers > 1 and `MINION_METRICS_ENABLED`, the parent creates a fresh private `mkdtemp` directory (0700, under `/tmp`, removed when the server exits) and sets `PROMETHEUS_MULTIPROC_DIR`; an operator-set `MINION_METRICS_MULTIPROC_DIR` (or an inherited `PROMETHEUS_MULTIPROC_DIR`, also with one worker) must sit under parent directories owned by you or root and not writable by others unless sticky, and is used only if it is a real directory (not a symlink) owned by the server user with mode 0700, else the server exits 2, and at startup only its `counter_*`/`histogram_*`/`gauge_*` `.db` files are deleted (via a no-follow directory fd); each worker calls `mark_process_dead` on shutdown (drops live-gauge files only; counter and histogram files stay so totals survive); `/metrics` then sums all workers (counters and histograms only; a future Gauge needs a `multiprocess_mode`). Samples of a restarted worker stay in the totals until the next full restart. `compose.scale.yml` runs 4 workers with pool 8+4 and acquire concurrency 8. Migration 0010 sets aggressive autovacuum reloptions on `minion_subtask` (scale factor 0.02, threshold 1000) to keep the hot-updated table's bloat bounded.
+
+`MINION_MAX_OPEN_ACQUIREMENTS` (4, 1..64) is per executor and DB-enforced (executor-row lock + count in the claim transaction), so unlike the ADR-0012 limits it holds across workers and replicas and needs no matching setting elsewhere; the scale overlay raises it to 64 for M6.4 parity.
 
 `MINION_RELEASE_LIMIT` (0..100) is read by both server and watchdog and must have the same value on both (the watchdog applies it to free `NOT_ACKNOWLEDGED` expiries, the server to releases).
 
@@ -655,6 +669,7 @@ Reverse proxy and flood limits (ADR-0018): the server never reads `X-Forwarded-F
 - [ADR-0016](adr/0016-nf1-workload-scope.md): NF-1 is defined against a tested numeric workload scope; overload is shed, not queued — **Accepted**
 - [ADR-0017](adr/0017-presigned-post-output-uploads.md): Output uploads use a presigned POST with a signed size range — **Accepted**
 - [ADR-0018](adr/0018-executor-token-cache-and-auth-lane.md): Executor token cache with a bounded lane for unknown tokens — **Accepted**
+- [ADR-0019](adr/0019-per-executor-open-acquirement-cap.md): Per-executor open-acquirement cap under an executor-row lock — **Accepted**
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**
