@@ -3,9 +3,10 @@ id: TASK-7.4.5
 title: >-
   M6.4e Retry budget: unacknowledged EXPIRED attempts do not consume
   max_attempts (capped)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 06:57'
 labels:
   - scale
 dependencies: []
