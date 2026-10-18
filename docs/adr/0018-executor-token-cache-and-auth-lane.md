@@ -28,8 +28,15 @@ because it runs after authentication.
 
 **Revocation bound.** A revoked or rotated-away token keeps authenticating for at most the TTL
 after the DB change, per worker (each worker's cache expires on its own). `0` restores immediate
-revocation. Register and presence stay immediate (DB status filters). `admin revoke/rotate` prints
-the bound.
+revocation. Acquire, register, presence and heartbeat are immediate: their UPDATE matches the live
+row (not revoked) and the token hash the request authenticated with, and a miss answers 401 and
+drops the digest from the cache. Only complete/fail/release (ownership-checked by acquirement id)
+rely on the TTL. `admin revoke/rotate` prints the configured bound.
+
+**Warm start.** At startup each worker preloads live executors as stale entries (one query), so a
+known executor revalidates on the main pool and never competes with a flood for the auth lane.
+A revalidation records the time before its DB read, so a concurrent 401 is not overwritten.
+Concurrent stale lookups of one digest are not coalesced (not worth the cancellation risk).
 
 ## Alternatives rejected
 
@@ -42,8 +49,8 @@ the bound.
 
 ## Consequences
 
-- Revocation is no longer instant for heartbeat/complete/fail/release (bounded by the TTL).
-- After a restart every executor is unknown and authenticates through the small pool (about 1-2 ms
-  per lookup); a first-contact herd may see 503 and retries. Executor register honours 503 +
+- Revocation is no longer instant for complete/fail/release (bounded by the TTL).
+- Executors registered after a worker started are unknown to it and authenticate through the small
+  pool once (about 1-2 ms per lookup); a first-contact herd may see 503 and retries. Executor register honours 503 +
   Retry-After; release is best effort and falls back to the watchdog.
 - Auth pool connections count against the Postgres budget (workers x 2).

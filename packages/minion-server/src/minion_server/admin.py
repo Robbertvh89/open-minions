@@ -76,7 +76,17 @@ def issue_executor_token_cmd(
     typer.echo(f"token (shown once): {token}")
 
 
-TTL_NOTE = "(the old token stops working within MINION_EXECUTOR_AUTH_CACHE_TTL_S, default 10 s)"
+def _ttl_note() -> str:
+    """The revocation bound of this deployment's settings (default text if they do not load)."""
+    try:
+        ttl = ServerSettings().executor_auth_cache_ttl_s
+    except Exception:
+        ttl = 10.0
+    when = "at once" if ttl == 0 else f"within {ttl:g} s"
+    return (
+        f"(the old token stops working {when}: MINION_EXECUTOR_AUTH_CACHE_TTL_S, "
+        "0 = immediate; per server worker)"
+    )
 
 
 @app.command("revoke-executor-token")
@@ -97,7 +107,7 @@ def revoke_executor_token_cmd(
         typer.echo(f"no such executor: {executor_id}", err=True)
         raise typer.Exit(1)
     typer.echo(f"revoked: {executor_id}")
-    typer.echo(TTL_NOTE)
+    typer.echo(_ttl_note())
 
 
 @app.command("rotate-executor-token")
@@ -125,7 +135,7 @@ def rotate_executor_token_cmd(
         raise typer.Exit(1)
     typer.echo(f"executor_id: {executor_id}")
     typer.echo(f"token (shown once): {token}")
-    typer.echo(TTL_NOTE)
+    typer.echo(_ttl_note())
 
 
 async def rotate_executor_token(

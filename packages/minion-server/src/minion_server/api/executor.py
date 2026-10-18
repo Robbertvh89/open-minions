@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal, current_executor
 from minion_server.db.session import get_session
-from minion_server.errors import api_error, busy_error
+from minion_server.errors import ExecutorRevokedError, api_error, busy_error
 from minion_server.limits import ARRIVAL_KEY
 from minion_server.ratelimit import retry_after_header
 from minion_server.repositories import executors as executors_repo
@@ -95,9 +95,10 @@ async def register(
             engines=[e.value for e in body.engines],
             profile=body.profile.value,
             budget=body.budget.model_dump(mode="json"),
+            token_hash=principal.token_hash,
         )
-    if not ok:  # revoked between auth and update
-        raise api_error(401, "UNAUTHORIZED", "invalid or missing credentials")
+    if not ok:  # revoked or rotated between auth and update
+        raise ExecutorRevokedError(principal.token_hash)
     return RegisterResponse(executor_id=principal.executor_id)
 
 

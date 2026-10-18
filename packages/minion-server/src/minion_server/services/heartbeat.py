@@ -10,7 +10,7 @@ from minion_common.schemas import HeartbeatRequest, HeartbeatResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
-from minion_server.errors import api_error
+from minion_server.errors import ExecutorRevokedError, api_error
 from minion_server.repositories import completion as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.repositories import heartbeats as heartbeats_repo
@@ -52,13 +52,16 @@ async def heartbeat(
             acquirement_id,
             req.progress.model_dump(mode="json") if req.progress else None,
         )
-        await executors_repo.report_state(
+        live = await executors_repo.report_state(
             session,
             principal.executor_id,
             profile=req.budget.profile.value if req.budget else None,
             budget=req.budget.model_dump(mode="json") if req.budget else None,
             paused_reason=req.paused_reason,
+            token_hash=principal.token_hash,
         )
+        if not live:  # revoked / rotated inside the auth-cache TTL: no fresh presigned POST
+            raise ExecutorRevokedError(principal.token_hash)
     # Presign outside the transaction: pure local signing, no lock needed.
     out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
     ttl = min(settings.presign_ttl_s, MAX_PRESIGN_TTL_S)

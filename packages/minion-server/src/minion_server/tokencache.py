@@ -12,7 +12,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
 
 
 class LookupState(StrEnum):
@@ -23,24 +22,20 @@ class LookupState(StrEnum):
 
 
 @dataclass(frozen=True)
-class Lookup:
+class Lookup[P]:
     state: LookupState
-    principal: Any = None
+    principal: P | None = None
     token_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True)
-class _Positive:
-    principal: Any
+class _Positive[P]:
+    principal: P
     token_expires_at: datetime | None
     checked_at: float
 
 
-_UNKNOWN = Lookup(LookupState.UNKNOWN)
-_NEGATIVE = Lookup(LookupState.NEGATIVE)
-
-
-class ExecutorTokenCache:
+class ExecutorTokenCache[P]:
     def __init__(
         self,
         ttl_s: float,
@@ -53,10 +48,14 @@ class ExecutorTokenCache:
         self.max_entries = max_entries
         self.negative_max = negative_max
         self._clock = clock
-        self._pos: OrderedDict[str, _Positive] = OrderedDict()
+        self._pos: OrderedDict[str, _Positive[P]] = OrderedDict()
         self._neg: OrderedDict[str, float] = OrderedDict()
 
-    def lookup(self, digest: str) -> Lookup:
+    def now(self) -> float:
+        """The cache clock; take it BEFORE a DB read and pass it to `put_valid` as `checked_at`."""
+        return self._clock()
+
+    def lookup(self, digest: str) -> Lookup[P]:
         now = self._clock()
         pos = self._pos.get(digest)
         if pos is not None:
@@ -71,16 +70,35 @@ class ExecutorTokenCache:
         if neg is not None:
             if now - neg < self.ttl_s:
                 self._neg.move_to_end(digest)
-                return _NEGATIVE
+                return Lookup(LookupState.NEGATIVE)
             del self._neg[digest]
-        return _UNKNOWN
+        return Lookup(LookupState.UNKNOWN)
 
-    def put_valid(self, digest: str, principal: Any, token_expires_at: datetime | None) -> None:
+    def put_valid(
+        self,
+        digest: str,
+        principal: P,
+        token_expires_at: datetime | None,
+        checked_at: float | None = None,
+    ) -> None:
+        """Record a successful DB read. `checked_at` is `now()` taken before that read: a negative
+        entry written after it (a concurrent revoke/401) wins over this older positive result."""
+        neg = self._neg.get(digest)
+        if neg is not None and checked_at is not None and neg > checked_at:
+            return
         self._neg.pop(digest, None)
-        self._pos[digest] = _Positive(principal, token_expires_at, self._clock())
+        self._pos[digest] = _Positive(
+            principal, token_expires_at, self._clock() if checked_at is None else checked_at
+        )
         self._pos.move_to_end(digest)
         while len(self._pos) > self.max_entries:
             self._pos.popitem(last=False)
+
+    def preload(self, digest: str, principal: P, token_expires_at: datetime | None) -> None:
+        """Startup warm-up: a known but stale entry, so the digest revalidates on the main pool
+        instead of the small auth lane. Never evicts beyond `max_entries`."""
+        if len(self._pos) < self.max_entries and digest not in self._pos:
+            self._pos[digest] = _Positive(principal, token_expires_at, float("-inf"))
 
     def put_invalid(self, digest: str) -> None:
         self._pos.pop(digest, None)

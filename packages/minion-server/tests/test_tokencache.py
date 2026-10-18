@@ -13,9 +13,9 @@ class Clock:
         return self.t
 
 
-def _cache(ttl: float = 10.0, n: int = 3, neg: int = 5) -> tuple[ExecutorTokenCache, Clock]:
+def _cache(ttl: float = 10.0, n: int = 3, neg: int = 5) -> tuple[ExecutorTokenCache[str], Clock]:
     clock = Clock()
-    return ExecutorTokenCache(ttl, n, negative_max=neg, clock=clock), clock
+    return ExecutorTokenCache[str](ttl, n, negative_max=neg, clock=clock), clock
 
 
 def test_unknown_fresh_stale() -> None:
@@ -63,10 +63,33 @@ def test_random_digest_flood_never_evicts_positives() -> None:
 
 def test_positive_lru_bound() -> None:
     c, _ = _cache(n=2)
-    c.put_valid("a", 1, None)
-    c.put_valid("b", 2, None)
+    c.put_valid("a", "1", None)
+    c.put_valid("b", "2", None)
     c.lookup("a")  # a is most recent
-    c.put_valid("c", 3, None)
+    c.put_valid("c", "3", None)
     assert c.lookup("b").state is LookupState.UNKNOWN
     assert c.lookup("a").state is LookupState.FRESH
     assert len(c._pos) == 2
+
+
+def test_older_positive_read_does_not_overwrite_a_newer_negative() -> None:
+    c, clock = _cache()
+    checked_at = c.now()  # revalidation starts
+    clock.t += 1.0
+    c.put_invalid("a")  # a concurrent request saw the revocation
+    clock.t += 1.0
+    c.put_valid("a", "P", None, checked_at)  # the slow, older read finishes last
+    assert c.lookup("a").state is LookupState.NEGATIVE
+    c.put_valid("a", "P", None, c.now())  # a newer read may replace it
+    assert c.lookup("a").state is LookupState.FRESH
+
+
+def test_preload_is_stale_bounded_and_never_overrides() -> None:
+    c, _ = _cache(n=2)
+    c.put_valid("a", "live", None)
+    c.preload("a", "other", None)
+    c.preload("b", "B", None)
+    c.preload("c", "C", None)  # full: skipped
+    assert c.lookup("a").principal == "live"
+    assert c.lookup("b").state is LookupState.STALE
+    assert c.lookup("c").state is LookupState.UNKNOWN

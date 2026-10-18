@@ -128,7 +128,8 @@ class Metrics:
         self.executor_auth = Counter(
             "minion_executor_auth_total",
             "Executor token authentications by outcome (cache_hit, negative_hit, db_valid, "
-            "db_invalid, busy: auth pool wait timed out -> 503).",
+            "db_invalid, expired: cached token past token_expires_at, busy: a pool wait timed out "
+            "-> 503).",
             ("outcome",),
             registry=self.registry,
         )

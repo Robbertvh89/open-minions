@@ -12,9 +12,9 @@ from starlette.responses import JSONResponse, Response
 from minion_server.api import executor as executor_api
 from minion_server.api import fleet as fleet_api
 from minion_server.api import tasks as tasks_api
-from minion_server.auth import KeyStore
+from minion_server.auth import ExecutorPrincipal, KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
-from minion_server.errors import busy_error
+from minion_server.errors import ExecutorRevokedError, busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
 from minion_server.metrics import (
     MULTIPROC_ENV,
@@ -27,12 +27,35 @@ from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
 from minion_server.netutil import is_loopback
 from minion_server.ratelimit import MinIntervalLimiter
+from minion_server.repositories import executors as executors_repo
 from minion_server.services.splitter import SplitLimits, run_splitter
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 from minion_server.tokencache import ExecutorTokenCache
 from minion_server.ui.headers import UiHeadersMiddleware
 from minion_server.ui.routes import router as ui_router
+
+
+async def _preload_tokens(app: FastAPI) -> None:
+    """Warm the token cache with live executors as STALE entries (one query): after a restart a
+    known executor revalidates on the main pool instead of sharing the small auth lane with a
+    flood. Best effort: a failure only costs the warm-up."""
+    cfg: ServerSettings = app.state.settings
+    cache: ExecutorTokenCache[ExecutorPrincipal] = app.state.executor_tokens
+    try:
+        async with app.state.sessionmaker() as session:
+            idents = await executors_repo.list_active_identities(
+                session, cfg.executor_auth_cache_max_entries
+            )
+    except Exception as exc:
+        structlog.get_logger().warning("auth_cache_preload_failed", error=type(exc).__name__)
+        return
+    for i in idents:
+        cache.preload(
+            i.token_hash,
+            ExecutorPrincipal(i.executor_id, i.owner, i.pool, i.token_hash),
+            i.token_expires_at,
+        )
 
 
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
@@ -55,10 +78,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             pool_size=cfg.db_auth_pool_size,
             max_overflow=0,
             pool_timeout=cfg.auth_lookup_timeout_s,
+            pre_ping=False,  # a ping would double the lookups a flood can cost on this lane
         )
         app.state.auth_engine = auth_engine
         app.state.auth_sessionmaker = create_sessionmaker(auth_engine)
-        app.state.executor_tokens = ExecutorTokenCache(
+        app.state.executor_tokens = ExecutorTokenCache[ExecutorPrincipal](
             cfg.executor_auth_cache_ttl_s, cfg.executor_auth_cache_max_entries
         )
         app.state.acquire_slots = asyncio.Semaphore(cfg.acquire_concurrency_limit)
@@ -91,6 +115,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
+        await _preload_tokens(app)
         app.state.storage = S3Storage(cfg)
         app.state.models = load_models(cfg.models_file)
         splitter = asyncio.create_task(
@@ -135,6 +160,17 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         err = busy_error("SERVER_BUSY", "server is busy, retry later", retry_after=(2, 10))
         return JSONResponse(
             {"detail": err.detail}, status_code=err.status_code, headers=err.headers
+        )
+
+    @app.exception_handler(ExecutorRevokedError)
+    async def revoked_handler(request: Request, exc: ExecutorRevokedError) -> Response:
+        """A mutation found the token's executor revoked/rotated: refuse and forget the token."""
+        cache = getattr(request.app.state, "executor_tokens", None)
+        if cache is not None and exc.token_hash is not None:
+            cache.put_invalid(exc.token_hash)
+        return JSONResponse(
+            {"detail": {"code": "UNAUTHORIZED", "message": "invalid or missing credentials"}},
+            status_code=401,
         )
 
     @app.get("/healthz")

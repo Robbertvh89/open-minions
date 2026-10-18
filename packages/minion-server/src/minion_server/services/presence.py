@@ -4,7 +4,7 @@ from minion_common.schemas import PresenceRequest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
-from minion_server.errors import api_error
+from minion_server.errors import ExecutorRevokedError
 from minion_server.repositories import executors as executors_repo
 
 
@@ -17,6 +17,7 @@ async def report(session: AsyncSession, principal: ExecutorPrincipal, req: Prese
             profile=req.budget.profile.value,
             budget=req.budget.model_dump(mode="json"),
             paused_reason=req.paused_reason,
+            token_hash=principal.token_hash,
         )
-    if not ok:  # revoked between auth and update
-        raise api_error(401, "UNAUTHORIZED", "invalid or missing credentials")
+    if not ok:  # revoked or rotated between auth and update
+        raise ExecutorRevokedError(principal.token_hash)

@@ -64,6 +64,7 @@ class ExecutorPrincipal:
     executor_id: uuid.UUID
     owner: str
     pool: str
+    token_hash: str | None = None  # digest this request authenticated with (mutations match it)
 
 
 @dataclass(frozen=True)
@@ -446,28 +447,35 @@ async def current_executor(
 
     Fresh cache hit: no DB. Known (stale) digest: revalidate on the main pool. Unknown digest:
     look up on the small dedicated auth pool so a flood of garbage tokens cannot take connections
-    owner operations need; a wait timeout there answers 503 SERVER_BUSY (counted, not logged).
-    Neither tokens nor digests are logged.
+    owner operations need; a wait timeout there answers 503 SERVER_BUSY (counted, not logged per
+    request). Mutating handlers additionally match the digest in their UPDATE, so a revoked or
+    rotated token cannot acquire/register/beat even from the cache. Neither tokens nor digests
+    are logged.
     """
     if creds is None:
         raise _unauthorized()
     digest = sha256_hex(creds.credentials)
-    cache: ExecutorTokenCache = request.app.state.executor_tokens
+    cache: ExecutorTokenCache[ExecutorPrincipal] = request.app.state.executor_tokens
     hit = cache.lookup(digest)
     if hit.state is LookupState.NEGATIVE:
         _count_auth(request, "negative_hit")
         raise _unauthorized()
-    if hit.state is LookupState.FRESH:
+    if hit.state is LookupState.FRESH and hit.principal is not None:
         if _token_expired(hit.token_expires_at):  # expiry is checked on every hit
             cache.put_invalid(digest)
+            _count_auth(request, "expired")
             raise _unauthorized()
         _count_auth(request, "cache_hit")
-        principal: ExecutorPrincipal = hit.principal
-        return principal
+        return hit.principal
+    checked_at = cache.now()  # before the read: a concurrent put_invalid must win over it
     if hit.state is LookupState.STALE:
         # Legit traffic only: same main pool as before; a pool timeout keeps the app-wide 503.
-        async with request.app.state.sessionmaker() as session:
-            ident = await executors_repo.get_by_token_hash(session, digest)
+        try:
+            async with request.app.state.sessionmaker() as session:
+                ident = await executors_repo.get_by_token_hash(session, digest)
+        except PoolTimeoutError:
+            _count_auth(request, "busy")
+            raise
     else:
         try:
             async with request.app.state.auth_sessionmaker() as session:
@@ -485,7 +493,7 @@ async def current_executor(
         cache.put_invalid(digest)
         _count_auth(request, "db_invalid")
         raise _unauthorized()
-    principal = ExecutorPrincipal(ident.executor_id, ident.owner, ident.pool)
-    cache.put_valid(digest, principal, ident.token_expires_at)
+    principal = ExecutorPrincipal(ident.executor_id, ident.owner, ident.pool, digest)
+    cache.put_valid(digest, principal, ident.token_expires_at, checked_at)
     _count_auth(request, "db_valid")
     return principal

@@ -405,7 +405,7 @@ Notes:
   connections for unknown tokens: a per-process cache answers known tokens (TTL `MINION_EXECUTOR_AUTH_CACHE_TTL_S`, expiry
   checked on every hit), a known-but-stale token revalidates on the main pool, and a token never seen is looked up on a
   separate pool (`MINION_DB_AUTH_POOL_SIZE`, no overflow, `MINION_AUTH_LOOKUP_TIMEOUT_S` then `503 SERVER_BUSY`), so a
-  bearer flood cannot hold a main-pool connection. Revocation reaches a cached token within the TTL.
+  bearer flood cannot hold a main-pool connection. Revocation reaches a cached token within the TTL for complete/fail/release; acquire, register, presence and heartbeat match the live row and token hash in their UPDATE and refuse a revoked or rotated token at once. At startup the cache is preloaded with the live executors as stale entries, so after a restart known executors revalidate on the main pool, not the auth lane.
 
 ### 3.3 Execute & report
 ```
@@ -653,6 +653,7 @@ Reverse proxy and flood limits (ADR-0018): the server never reads `X-Forwarded-F
 - [ADR-0014](adr/0014-unacknowledged-expiry-budget.md): Unacknowledged EXPIRED attempts do not consume the retry budget (capped) — **Accepted**
 - [ADR-0015](adr/0015-sharded-task-counters.md): Sharded task counters and post-commit task settle — **Accepted**
 - [ADR-0016](adr/0016-nf1-workload-scope.md): NF-1 is defined against a tested numeric workload scope; overload is shed, not queued — **Accepted**
+- [ADR-0017](adr/0017-presigned-post-output-uploads.md): Output uploads use a presigned POST with a signed size range — **Accepted**
 - [ADR-0018](adr/0018-executor-token-cache-and-auth-lane.md): Executor token cache with a bounded lane for unknown tokens — **Accepted**
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
