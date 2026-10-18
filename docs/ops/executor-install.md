@@ -121,10 +121,14 @@ minion-executor menubar uninstall
 ```
 A second LaunchAgent, independent of the executor service (own label and plist; uninstalling one never
 touches the other). It starts `minion-executor menubar` in your GUI (Aqua) session only, as
-`ProcessType=Interactive`, restarts it after a crash but not after Quit (`KeepAlive`
-`SuccessfulExit=false`), and logs to `~/Library/Logs/open-minions/com.open-minions.menubar.log`.
+`ProcessType=Interactive`, restarts it after a crash or SIGTERM/kill, but not after Quit (`KeepAlive`
+`SuccessfulExit=false`; Quit stays quit until your next login, or `launchctl kickstart`), retries a
+persistent start-up error every 30 s, runs only one instance (`menubar.lock` in the state dir; a second
+start exits 0), and logs to `~/Library/Logs/open-minions/com.open-minions.menubar.log`.
 The plist holds no token or other secret, only `MINION_EXECUTOR_STATE_DIR` / `MINION_EXECUTOR_CONFIG`
-when you set them. The same rules as the service apply: install the tool outside Documents, Desktop,
+when you set them (other `MINION_EXECUTOR_*` variables are warned about, not carried). The same rules as
+the service apply, plus: not as root, and the executable, its Python and every parent directory must be
+owned by you or root and not group/other writable (shared `/tmp` is refused); install the tool outside Documents, Desktop,
 Downloads and iCloud Drive, and not with `MINION_EXECUTOR_DEV=1`. It re-runs idempotently (an identical
 plist is left alone); a different plist needs `menubar uninstall` first.
 

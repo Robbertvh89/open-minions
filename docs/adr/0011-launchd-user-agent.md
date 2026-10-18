@@ -77,11 +77,13 @@ governor needs.
 ## Addendum (TASK-7.6): menu-bar agent
 
 `minion-executor menubar install|uninstall|status` installs a second, separate LaunchAgent
-(`com.open-minions.menubar`) for the menu-bar app, reusing the service helpers (executable
-resolution, TCC check, agents-dir vetting, `O_EXCL|O_NOFOLLOW` plist write, `launchctl` wrapper).
+(`com.open-minions.menubar`) for the menu-bar app, reusing the shared `launchd` module (executable
+resolution, install-chain ownership check, agents-dir vetting, `O_EXCL|O_NOFOLLOW` plist write,
+`launchctl` wrapper, one `uninstall_agent`); both installs and uninstalls refuse euid 0.
 Differences: `LimitLoadToSessionType=Aqua` and `ProcessType=Interactive` (it is UI, not background
-work), `ThrottleInterval` 30 s, `KeepAlive {SuccessfulExit: false}` so Quit stays quit but a crash
-restarts it, no `ExitTimeOut` tuning (nothing to release), and no Keychain requirement or engine probe
+work), `ThrottleInterval` 30 s, `KeepAlive {SuccessfulExit: false}` so Quit stays quit until the next login but a crash,
+SIGTERM or kill restarts it (a persistent start-up error retries every 30 s; a second instance exits 0
+on `menubar.lock`), no `ExitTimeOut` tuning (nothing to release), and no Keychain requirement or engine probe
 because it never touches the server. The plist carries no secret; only an explicitly set
 `MINION_EXECUTOR_STATE_DIR` / `MINION_EXECUTOR_CONFIG` is copied. It refuses `MINION_EXECUTOR_DEV=1`
 and the executor's label; each uninstall only removes a plist whose `ProgramArguments` are its own
