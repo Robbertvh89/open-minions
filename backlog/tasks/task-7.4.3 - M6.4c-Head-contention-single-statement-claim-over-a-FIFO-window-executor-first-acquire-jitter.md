@@ -3,9 +3,10 @@ id: TASK-7.4.3
 title: >-
   M6.4c Head contention: single-statement claim over a FIFO window + executor
   first-acquire jitter
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 04:08'
 labels:
   - scale
 dependencies: []
