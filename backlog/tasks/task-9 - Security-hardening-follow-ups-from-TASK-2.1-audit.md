@@ -1,10 +1,10 @@
 ---
 id: TASK-9
 title: Security hardening follow-ups from TASK-2.1 audit
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-15 14:41'
-updated_date: '2026-10-17 12:10'
+updated_date: '2026-10-18 19:47'
 labels:
   - security
 dependencies: []
@@ -19,10 +19,12 @@ Deferred MEDIUM/LOW findings from TASK-2.1 security audit: (1) pin HF model revi
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 ModelEntry requires revision SHA and runners load by revision
-- [ ] #2 Presigned GET signs Range; oversize PUT rejected
-- [ ] #3 Unknown task params rejected with 422
+- [x] #1 ModelEntry requires revision SHA and runners load by revision
+- [x] #2 Presigned GET signs Range; oversize PUT rejected
+- [x] #3 Unknown task params rejected with 422
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 

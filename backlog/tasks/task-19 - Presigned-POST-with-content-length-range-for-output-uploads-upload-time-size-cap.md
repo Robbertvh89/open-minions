@@ -3,10 +3,10 @@ id: TASK-19
 title: >-
   Presigned POST with content-length-range for output uploads (upload-time size
   cap)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 12:59'
-updated_date: '2026-10-18 18:26'
+updated_date: '2026-10-18 19:47'
 labels:
   - server
   - executor
@@ -23,9 +23,11 @@ Presigned PUT URLs accept any size until TTL; switch outputs to presigned POST w
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Output uploads above the cap are rejected by S3
-- [ ] #2 Executors handle the POST form upload; back-compat plan documented
+- [x] #1 Output uploads above the cap are rejected by S3
+- [x] #2 Executors handle the POST form upload; back-compat plan documented
 <!-- AC:END -->
+
+
 
 ## Implementation Plan
 
