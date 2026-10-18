@@ -1,10 +1,10 @@
 ---
 id: TASK-7.4.8
 title: 'M6.4h Completion hot row: bump_counters UPDATE on minion_task contended'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 05:20'
-updated_date: '2026-10-18 09:10'
+updated_date: '2026-10-18 10:52'
 labels:
   - scale
 dependencies: []
