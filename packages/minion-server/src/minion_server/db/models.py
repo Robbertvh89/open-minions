@@ -82,6 +82,16 @@ class Task(Base):
     __table_args__ = (
         PrimaryKeyConstraint("team", "project", "task_name"),
         Index("ix_minion_task_queue", "status", text("priority DESC"), "created_at"),
+        # Serves the acquire candidate query: live tasks in FR-22 order (ARCHITECTURE §3.2).
+        Index(
+            "ix_minion_task_live_queue",
+            text("priority DESC"),
+            "created_at",
+            "team",
+            "project",
+            "task_name",
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+        ),
         # Serves `GET /tasks` keyset pages (single-team listing, newest first).
         Index(
             "ix_minion_task_team_created",

@@ -364,8 +364,15 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
   deliberately unlocked; losing an insert race is cheap.
-- Candidate query is served by a partial index:
-  `CREATE INDEX ON minion_subtask (team, project, task_name, subtask_id) WHERE status = 'PENDING'`.
+- Candidate query is index-driven in two steps (TASK-7.4.2), O(16 + live tasks) regardless of queue
+  length: eligible live tasks are walked in queue order on the partial index
+  `ix_minion_task_live_queue (priority DESC, created_at, team, project, task_name) WHERE status IN
+  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT 16` range scan runs on
+  `ix_minion_subtask_pending (team, project, task_name, subtask_id) WHERE status = 'PENDING'`; the
+  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT 16` yields exactly the FR-22 order of the old
+  single join (the task key is unique, so the order is total and the global top 16 holds at most 16
+  rows per task, each within that task's top 16). Status values are SQL literals, not bind
+  parameters, so asyncpg's generic plans still match the partial-index predicates.
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
   paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0002).
 

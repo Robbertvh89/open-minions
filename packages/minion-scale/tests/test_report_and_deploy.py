@@ -77,7 +77,7 @@ def test_hot_statements_compile_to_literal_sql() -> None:
     for name, stmt in stmts.items():
         sql = compile_literal(stmt)
         assert ":" not in sql.replace("::", "") and "%(" not in sql, name
-    assert "minion_subtask.team = 'scale'" in compile_literal(stmts["candidate_preference"])
+    assert "minion_task.team = 'scale'" in compile_literal(stmts["candidate_preference"])
     assert "scale-fake" in compile_literal(stmts["candidate"])
 
 
