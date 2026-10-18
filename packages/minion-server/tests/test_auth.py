@@ -21,6 +21,7 @@ from minion_server.auth import (
 from minion_server.db.models import Executor
 from minion_server.db.session import create_sessionmaker, get_session
 from minion_server.settings import ServerSettings
+from minion_server.tokencache import ExecutorTokenCache
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -47,6 +48,8 @@ def _app(engine: AsyncEngine | None, keys: Path | None) -> FastAPI:
     app.state.api_keys = KeyStore(keys) if keys else None
     if engine is not None:
         app.state.sessionmaker = create_sessionmaker(engine)
+        app.state.auth_sessionmaker = app.state.sessionmaker
+    app.state.executor_tokens = ExecutorTokenCache(0.0, 100)  # TTL 0: immediate revocation
 
     @app.get("/u")
     async def u(user: User = Depends(current_user)) -> dict[str, object]:  # noqa: B008
@@ -242,6 +245,7 @@ def test_revoke_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINION_S3_SECRET_KEY", "sk")
     r = CliRunner().invoke(admin_app, ["revoke-executor-token", "--executor-id", eid])
     assert r.exit_code == 0, r.output
+    assert "MINION_EXECUTOR_AUTH_CACHE_TTL_S" in r.stdout
     assert asyncio.run(with_sm(status)) == ExecutorStatus.REVOKED.value
     r = CliRunner().invoke(admin_app, ["revoke-executor-token", "--executor-id", str(uuid.uuid4())])
     assert r.exit_code == 1
@@ -333,6 +337,7 @@ def test_rotate_and_list_cli(migrated_url: str, monkeypatch: pytest.MonkeyPatch)
     assert r.exit_code == 0, r.output
     new = next(ln.split(": ", 1)[1] for ln in r.stdout.splitlines() if ln.startswith("token"))
     assert new != old and eid in r.stdout
+    assert "MINION_EXECUTOR_AUTH_CACHE_TTL_S" in r.stdout
     r = CliRunner().invoke(admin_app, ["list-executors"])
     assert hashlib.sha256(new.encode()).hexdigest() not in r.stdout
     r = CliRunner().invoke(admin_app, ["rotate-executor-token", "--executor-id", str(uuid.uuid4())])

@@ -97,8 +97,8 @@ class _FakeSession:
 async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = {"claim": 0}
 
-    async def touch(*a: Any, **kw: Any) -> None:
-        return None
+    async def touch(*a: Any, **kw: Any) -> bool:
+        return True
 
     async def pref(*a: Any, **kw: Any) -> None:
         return None
@@ -132,7 +132,10 @@ async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.Monkey
     async def claim(*a: Any, **kw: Any) -> repo.Claim:
         return repo.Claim(0)
 
-    monkeypatch.setattr(executors_repo, "touch", noop)
+    async def live(*a: Any, **kw: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(executors_repo, "touch", live)
     monkeypatch.setattr(executors_repo, "get_preference", noop)
     monkeypatch.setattr(repo, "claim", claim)
     p = ExecutorPrincipal(uuid.uuid4(), "o", "default")

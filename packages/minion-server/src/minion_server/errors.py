@@ -18,3 +18,13 @@ def busy_error(code: str, message: str, *, retry_after: tuple[int, int] = (1, 3)
         detail={"code": code, "message": message},
         headers={"Retry-After": str(random.randint(*retry_after))},  # noqa: S311
     )
+
+
+class ExecutorRevokedError(Exception):
+    """The authenticated executor token no longer matches a live executor row (revoked, rotated
+    away): answered 401 by an app-wide handler, which also drops the token from the auth cache so
+    the next request is refused without a DB call (TASK-32, ADR-0018)."""
+
+    def __init__(self, token_hash: str | None) -> None:
+        super().__init__("executor token is no longer valid")
+        self.token_hash = token_hash

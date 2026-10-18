@@ -28,6 +28,35 @@ class ExecutorIdentity:
     token_hash: str
 
 
+def _token_match(token_hash: str | None) -> list[Any]:
+    """Extra WHERE terms: the row must still carry the token the caller authenticated with (a
+    rotation inside the auth-cache TTL changes it). None = no check (internal callers/tests)."""
+    return [] if token_hash is None else [Executor.token_hash == token_hash]
+
+
+async def list_active_identities(session: AsyncSession, limit: int) -> list[ExecutorIdentity]:
+    """Non-revoked, non-expired executors (token-cache preload at startup)."""
+    rows = (
+        await session.execute(
+            select(
+                Executor.executor_id,
+                Executor.owner,
+                Executor.pool,
+                Executor.status,
+                Executor.token_expires_at,
+                Executor.token_hash,
+            )
+            .where(
+                Executor.status != ExecutorStatus.REVOKED.value,
+                (Executor.token_expires_at.is_(None)) | (Executor.token_expires_at > func.now()),
+            )
+            .order_by(Executor.last_seen_at.desc().nulls_last())
+            .limit(limit)
+        )
+    ).all()
+    return [ExecutorIdentity(r[0], r[1], r[2], ExecutorStatus(r[3]), r[4], r[5]) for r in rows]
+
+
 async def get_by_token_hash(session: AsyncSession, token_hash: str) -> ExecutorIdentity | None:
     row = (
         await session.execute(
@@ -90,6 +119,7 @@ async def register(
     engines: list[str],
     profile: str,
     budget: dict[str, Any],
+    token_hash: str | None = None,
 ) -> bool:
     """Record host capabilities. A REVOKED executor is never touched (cannot un-revoke itself)."""
     result = await session.execute(
@@ -97,6 +127,7 @@ async def register(
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
+            *_token_match(token_hash),
         )
         .values(
             hostname=hostname,
@@ -119,13 +150,16 @@ async def touch(
     engines: list[str],
     profile: str,
     budget: dict[str, Any],
-) -> None:
-    """Acquire-time refresh of the reported budget and liveness."""
-    await session.execute(
+    token_hash: str | None = None,
+) -> bool:
+    """Acquire-time refresh of the reported budget and liveness. False = no live executor row
+    with this id (and token, when given): revoked or rotated away, the caller must refuse."""
+    result = await session.execute(
         update(Executor)
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
+            *_token_match(token_hash),
         )
         .values(
             engines=engines,
@@ -135,6 +169,7 @@ async def touch(
             last_seen_at=func.now(),
         )
     )
+    return bool(result.rowcount)  # type: ignore[attr-defined]
 
 
 async def report_state(
@@ -144,6 +179,7 @@ async def report_state(
     profile: str | None,
     budget: dict[str, Any] | None,
     paused_reason: str | None,
+    token_hash: str | None = None,
 ) -> bool:
     """Heartbeat/presence-time refresh of liveness and the reported budget/pause state."""
     values: dict[str, Any] = {"last_seen_at": func.now(), "paused_reason": paused_reason}
@@ -156,6 +192,7 @@ async def report_state(
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
+            *_token_match(token_hash),
         )
         .values(**values)
     )

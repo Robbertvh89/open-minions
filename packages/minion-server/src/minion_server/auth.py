@@ -12,7 +12,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Self
@@ -33,9 +33,11 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
-from minion_server.errors import api_error
+from minion_server.errors import api_error, busy_error
 from minion_server.repositories import executors as executors_repo
+from minion_server.tokencache import ExecutorTokenCache, LookupState
 
 _bearer = HTTPBearer(auto_error=False)
 log = structlog.get_logger()
@@ -62,6 +64,8 @@ class ExecutorPrincipal:
     executor_id: uuid.UUID
     owner: str
     pool: str
+    # digest this request authenticated with (mutations match it); never in repr/logs
+    token_hash: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -426,21 +430,71 @@ def resolve_pool(policy: TeamPolicy | None, requested: str | None) -> str | None
     return requested
 
 
+def _count_auth(request: Request, outcome: str) -> None:
+    metrics = getattr(request.app.state, "metrics", None)
+    if metrics is not None:
+        metrics.executor_auth.labels(outcome=outcome).inc()
+
+
+def _token_expired(expires_at: datetime | None) -> bool:
+    return expires_at is not None and expires_at <= datetime.now(UTC)
+
+
 async def current_executor(
     request: Request,
     creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
 ) -> ExecutorPrincipal:
+    """Authenticate an executor token (TASK-32, ADR-0018).
+
+    Fresh cache hit: no DB. Known (stale) digest: revalidate on the main pool. Unknown digest:
+    look up on the small dedicated auth pool so a flood of garbage tokens cannot take connections
+    owner operations need; a wait timeout there answers 503 SERVER_BUSY (counted, not logged per
+    request). Mutating handlers additionally match the digest in their UPDATE, so a revoked or
+    rotated token cannot acquire/register/beat even from the cache. Neither tokens nor digests
+    are logged.
+    """
     if creds is None:
         raise _unauthorized()
     digest = sha256_hex(creds.credentials)
-    # Own short-lived session: closed before the handler's session starts its transaction.
-    async with request.app.state.sessionmaker() as session:
-        ident = await executors_repo.get_by_token_hash(session, digest)
+    cache: ExecutorTokenCache[ExecutorPrincipal] = request.app.state.executor_tokens
+    hit = cache.lookup(digest)
+    if hit.state is LookupState.NEGATIVE:
+        _count_auth(request, "negative_hit")
+        raise _unauthorized()
+    if hit.state is LookupState.FRESH and hit.principal is not None:
+        if _token_expired(hit.token_expires_at):  # expiry is checked on every hit
+            cache.put_invalid(digest)
+            _count_auth(request, "expired")
+            raise _unauthorized()
+        _count_auth(request, "cache_hit")
+        return hit.principal
+    checked_at = cache.now()  # before the read: a concurrent put_invalid must win over it
+    if hit.state is LookupState.STALE:
+        # Legit traffic only: same main pool as before; a pool timeout keeps the app-wide 503.
+        try:
+            async with request.app.state.sessionmaker() as session:
+                ident = await executors_repo.get_by_token_hash(session, digest)
+        except PoolTimeoutError:
+            _count_auth(request, "busy")
+            raise
+    else:
+        try:
+            async with request.app.state.auth_sessionmaker() as session:
+                ident = await executors_repo.get_by_token_hash(session, digest)
+        except PoolTimeoutError:
+            _count_auth(request, "busy")
+            raise busy_error("SERVER_BUSY", "server is busy, retry later") from None
     # Hash lookup is by unique index; compare_digest guards the final equality check.
-    if ident is None or not hmac.compare_digest(ident.token_hash, digest):
+    if (
+        ident is None
+        or not hmac.compare_digest(ident.token_hash, digest)
+        or ident.status is ExecutorStatus.REVOKED
+        or _token_expired(ident.token_expires_at)
+    ):
+        cache.put_invalid(digest)
+        _count_auth(request, "db_invalid")
         raise _unauthorized()
-    if ident.status is ExecutorStatus.REVOKED:
-        raise _unauthorized()
-    if ident.token_expires_at is not None and ident.token_expires_at <= datetime.now(UTC):
-        raise _unauthorized()
-    return ExecutorPrincipal(ident.executor_id, ident.owner, ident.pool)
+    principal = ExecutorPrincipal(ident.executor_id, ident.owner, ident.pool, digest)
+    cache.put_valid(digest, principal, ident.token_expires_at, checked_at)
+    _count_auth(request, "db_valid")
+    return principal

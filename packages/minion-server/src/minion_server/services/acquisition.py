@@ -9,7 +9,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
-from minion_server.errors import busy_error
+from minion_server.errors import ExecutorRevokedError, busy_error
 from minion_server.repositories import acquisition as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
@@ -47,13 +47,16 @@ async def acquire(
     if not 1 <= window <= repo.MAX_WINDOW:
         raise ValueError(f"acquire window must be in 1..{repo.MAX_WINDOW}, got {window}")
     async with session.begin():
-        await executors_repo.touch(
+        live = await executors_repo.touch(
             session,
             principal.executor_id,
             engines=[e.value for e in req.engines],
             profile=req.budget.profile.value,
             budget=req.budget.model_dump(mode="json"),
+            token_hash=principal.token_hash,
         )
+        if not live:  # revoked / rotated inside the auth-cache TTL: nothing may be claimed
+            raise ExecutorRevokedError(principal.token_hash)
         preference = await executors_repo.get_preference(session, principal.executor_id)
 
     passes = [preference, None] if preference is not None else [None]

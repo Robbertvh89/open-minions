@@ -183,3 +183,26 @@ async def test_warns_when_online_thresholds_differ_from_the_dashboards(
     async for _ in _client(cfg):
         pass
     assert "executor_online_thresholds" in capsys.readouterr().out
+
+
+@pytest.mark.integration
+async def test_executor_auth_outcomes(fresh_url: str) -> None:
+    cfg = _settings(fresh_url).model_copy(
+        update={"metrics_enabled": True, "executor_auth_cache_ttl_s": 60.0}
+    )
+    app = create_app(cfg)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c,
+    ):
+        ((_, tok),) = await make_executors(app.state.sessionmaker, 1)
+        url = "/api/v1/executor/acquire"
+        body = _req().model_dump(mode="json")
+        for t in (tok, tok, "garbage", "garbage"):
+            await c.post(url, json=body, headers=_auth(t))
+        text = (await c.get("/metrics")).text
+    assert 'minion_executor_auth_total{outcome="db_valid"} 1.0' in text
+    assert 'minion_executor_auth_total{outcome="cache_hit"} 1.0' in text
+    assert 'minion_executor_auth_total{outcome="db_invalid"} 1.0' in text
+    assert 'minion_executor_auth_total{outcome="negative_hit"} 1.0' in text
+    assert "garbage" not in text
