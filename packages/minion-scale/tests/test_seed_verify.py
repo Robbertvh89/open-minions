@@ -150,9 +150,8 @@ async def test_sum_remaining_tracks_count_remaining(sm: Sm, s3: S3Env) -> None:
                 " (SELECT min(subtask_id) FROM p) THEN 'SUCCEEDED' ELSE 'FAILED' END"
                 " FROM p WHERE m.team = p.team AND m.project = p.project"
                 " AND m.task_name = p.task_name AND m.subtask_id = p.subtask_id RETURNING 1)"
-                " UPDATE minion_task k SET succeeded_subtasks = 1, failed_subtasks = 1"
-                " FROM t WHERE k.team = t.team AND k.project = t.project"
-                " AND k.task_name = t.task_name"
+                " INSERT INTO minion_task_counter (team, project, task_name, shard, succeeded,"
+                " failed) SELECT team, project, task_name, 0, 1, 1 FROM t"
             )
         )
     assert await count_remaining(sm) == 6
@@ -197,8 +196,14 @@ async def _drain_cleanly(sm: Sm, s3: S3Env, spec: SeedSpec) -> None:
             ),
             {"b": S3_BUCKET},
         )
+        await s.execute(text("UPDATE minion_task SET status='SUCCEEDED'"))
         await s.execute(
-            text("UPDATE minion_task SET status='SUCCEEDED', succeeded_subtasks=total_subtasks")
+            text(
+                "INSERT INTO minion_task_counter (team, project, task_name, shard, succeeded)"
+                " SELECT team, project, task_name, 0, total_subtasks FROM minion_task"
+                " ON CONFLICT (team, project, task_name, shard)"
+                " DO UPDATE SET succeeded = excluded.succeeded"
+            )
         )
     for r in await _rows(sm, "SELECT output_uri FROM minion_subtask"):
         key = r[0].removeprefix(f"s3://{S3_BUCKET}/")
@@ -272,11 +277,11 @@ async def test_verify_passes_clean_and_detects_double_success_and_orphan(sm: Sm,
     # counters drift and a missing promoted object
     async with sm() as s, s.begin():
         await s.execute(
-            text("UPDATE minion_task SET succeeded_subtasks=1 WHERE task_name='vfy-00001'")
+            text("UPDATE minion_task_counter SET succeeded=1 WHERE task_name='vfy-00001'")
         )
     assert _failed(await verify(sm, team="vfyteam")) == ["task_counters_match_subtasks"]
     async with sm() as s, s.begin():
-        await s.execute(text("UPDATE minion_task SET succeeded_subtasks=4"))
+        await s.execute(text("UPDATE minion_task_counter SET succeeded=4"))
     s3.client.delete_object(Bucket=S3_BUCKET, Key="outputs/vfyteam/vfy-00001/000002.jsonl")
     gone = await verify(sm, team="vfyteam", s3=s3.client, bucket=S3_BUCKET)
     assert _failed(gone) == ["nf2_final_objects_match_succeeded"]

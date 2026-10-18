@@ -16,7 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from minion_common.enums import SubtaskStatus
 from minion_server.app import create_app
 from minion_server.services.completion import next_status
-from minion_server.services.reclaim import ReclaimResult, reclaim_one, reclaim_stale
+from minion_server.services.reclaim import ReclaimResult, reclaim_one, reclaim_stale, settle_stuck
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
@@ -228,7 +228,7 @@ async def test_complete_vs_reclaim_randomized(env: tuple[AsyncClient, Any], s3: 
                 assert not _exists(s3, dsts[sid])  # nothing promoted
         ((succ, failed, tstatus),) = await _rows(
             sm,
-            "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_task"
+            "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_ro.task"
             " WHERE task_name=:n",
             n=name,
         )
@@ -455,10 +455,12 @@ async def test_budget_counts_failed_and_expired_not_released(
         ("EXPIRED",),
         ("EXPIRED",),
     ]
-    ((status, failed, fin),) = await _rows(
-        sm, "SELECT status, failed_subtasks, finished_at IS NOT NULL FROM minion_task"
-    )
-    assert (status, failed, fin) == ("FAILED", 1, True)
+    task_sql = "SELECT status, failed_subtasks, finished_at IS NOT NULL FROM minion_ro.task"
+    # reclaim only bumps the counters; the watchdog's settle makes the task terminal (ADR-0015)
+    assert await _rows(sm, task_sql) == [("RUNNING", 1, False)]
+    assert await settle_stuck(sm) == 1
+    assert await _rows(sm, task_sql) == [("FAILED", 1, True)]
+    assert await settle_stuck(sm) == 0
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
 
 
@@ -513,7 +515,7 @@ async def test_cancelled_task_release_fail_reclaim(env: tuple[AsyncClient, Any])
     assert {st for _, st in rows} == {"CANCELLED"}
     outcomes = await _rows(sm, "SELECT outcome FROM minion_subtask_attempt ORDER BY outcome")
     assert outcomes == [("CANCELLED",), ("EXPIRED",), ("FAILED",)]
-    assert await _rows(sm, "SELECT failed_subtasks FROM minion_task") == [(0,)]
+    assert await _rows(sm, "SELECT failed_subtasks FROM minion_ro.task") == [(0,)]
 
 
 # --- reclaim robustness -------------------------------------------------------------------------
@@ -606,7 +608,7 @@ async def test_never_beaten_reclaim_is_free(env: tuple[AsyncClient, Any]) -> Non
     assert await _rows(sm, "SELECT outcome, error->>'code' FROM minion_subtask_attempt") == [
         ("EXPIRED", "NOT_ACKNOWLEDGED")
     ]
-    assert await _rows(sm, "SELECT failed_subtasks FROM minion_task") == [(0,)]
+    assert await _rows(sm, "SELECT failed_subtasks FROM minion_ro.task") == [(0,)]
 
 
 @pytest.mark.integration

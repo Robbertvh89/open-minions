@@ -26,10 +26,13 @@ from minion_server.db.models import Subtask
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.repositories import completion as completion_repo
 from minion_server.repositories import tasks as tasks_repo
+from minion_server.services.reclaim import reclaim_one
 from minion_server.services.splitter import split_one
 from minion_server.settings import ServerSettings
 from minion_server.splitting import slice_jsonl
 from minion_server.storage import S3Storage
+from minion_watchdog.main import tick
+from minion_watchdog.settings import WatchdogSettings
 from pydantic import SecretStr
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -176,7 +179,7 @@ async def test_complete_vs_rival_exactly_one_wins(
 
     ((succ, failed, tstatus),) = await _rows(
         sm,
-        "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_task WHERE task_name=:n",
+        "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_ro.task WHERE task_name=:n",
         n=name,
     )
     n_ok = len(complete_wins)
@@ -212,14 +215,15 @@ async def test_double_complete_same_owner_is_single_promotion(
         (1,)
     ]
     assert await _rows(
-        sm, "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_task WHERE team='dbl'"
+        sm,
+        "SELECT succeeded_subtasks, failed_subtasks, status FROM minion_ro.task WHERE team='dbl'",
     ) == [(1, 0, "SUCCEEDED")]
 
 
 # --- 2. counters under concurrent completion ---------------------------------------------------
 
 
-@pytest.mark.parametrize(("n_ok", "n_bad"), [(30, 0), (14, 6)])
+@pytest.mark.parametrize(("n_ok", "n_bad"), [(30, 0), (26, 10)])
 async def test_concurrent_completes_counters_exact_status_derived_once(
     app_env: tuple[AsyncClient, Any, ASGITransport],
     s3: S3Env,
@@ -239,9 +243,11 @@ async def test_concurrent_completes_counters_exact_status_derived_once(
     terminal_calls: list[TaskStatus] = []
     real = completion_repo.set_task_terminal
 
-    async def spy(session: AsyncSession, o: Any, status: TaskStatus) -> None:
-        terminal_calls.append(status)
-        await real(session, o, status)
+    async def spy(session: AsyncSession, key: Any, status: TaskStatus) -> bool:
+        moved = await real(session, key, status)
+        if moved:
+            terminal_calls.append(status)
+        return moved
 
     monkeypatch.setattr(completion_repo, "set_task_terminal", spy)
 
@@ -256,7 +262,7 @@ async def test_concurrent_completes_counters_exact_status_derived_once(
     ((succ, failed, status, fin),) = await _rows(
         sm,
         "SELECT succeeded_subtasks, failed_subtasks, status, finished_at IS NOT NULL"
-        " FROM minion_task WHERE task_name=:n",
+        " FROM minion_ro.task WHERE task_name=:n",
         n=name,
     )
     assert (succ, failed, status, fin) == (n_ok, n_bad, expected.value, True)
@@ -266,6 +272,239 @@ async def test_concurrent_completes_counters_exact_status_derived_once(
         " ORDER BY status",
         n=name,
     ) == sorted([(s, k) for s, k in [("SUCCEEDED", n_ok), ("FAILED", n_bad)] if k])
+
+
+def test_counter_shard_mapping() -> None:
+    assert completion_repo.TASK_COUNTER_SHARDS == 16
+    assert [completion_repo.counter_shard(i) for i in (0, 1, 15, 16, 17, 1000)] == [
+        0,
+        1,
+        15,
+        0,
+        1,
+        8,
+    ]
+
+
+async def _shard_sums(sm: async_sessionmaker[AsyncSession], name: str) -> tuple[int, int, int]:
+    """(succeeded, failed, shards used) from the counter table."""
+    ((ok, bad, shards),) = await _rows(
+        sm,
+        "SELECT coalesce(sum(succeeded), 0), coalesce(sum(failed), 0), count(*)"
+        " FROM minion_task_counter WHERE task_name=:n",
+        n=name,
+    )
+    return int(ok), int(bad), int(shards)
+
+
+async def _subtask_counts(sm: async_sessionmaker[AsyncSession], name: str) -> tuple[int, int]:
+    ((ok, bad),) = await _rows(
+        sm,
+        "SELECT count(*) FILTER (WHERE status='SUCCEEDED'), count(*) FILTER (WHERE status='FAILED')"
+        " FROM minion_subtask WHERE task_name=:n",
+        n=name,
+    )
+    return int(ok), int(bad)
+
+
+async def test_forced_write_skew_last_two_completions_settle_once(
+    app_env: tuple[AsyncClient, Any, ASGITransport],
+    s3: S3Env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both final completions have bumped (uncommitted) before either commits: neither sees the
+    other's count in its own snapshot, yet the post-commit settle makes exactly one transition."""
+    c, app, _ = app_env
+    sm = app.state.sessionmaker
+    await seed_task(sm, "skew", 2, team="skew")
+    owned = await _acquire_all(c, await make_executors(sm, 2))
+    for a, _ in owned:
+        _put_output(s3, "skew", "skew", a)
+
+    barrier = asyncio.Barrier(2)
+    real_bump = completion_repo.bump_counters
+
+    async def bump(session: AsyncSession, o: Any, *, succeeded: int, failed: int) -> None:
+        await real_bump(session, o, succeeded=succeeded, failed=failed)
+        await asyncio.wait_for(barrier.wait(), 20)  # both uncommitted at once
+
+    moves: list[TaskStatus] = []
+    real_term = completion_repo.set_task_terminal
+
+    async def spy(session: AsyncSession, key: Any, status: TaskStatus) -> bool:
+        moved = await real_term(session, key, status)
+        if moved:
+            moves.append(status)
+        return moved
+
+    monkeypatch.setattr(completion_repo, "bump_counters", bump)
+    monkeypatch.setattr(completion_repo, "set_task_terminal", spy)
+    resps = await asyncio.gather(
+        *(
+            c.post(
+                f"{BASE}/subtasks/{a['acquirement_id']}/complete",
+                json=_cbody(),
+                headers=_auth(t),
+            )
+            for a, t in owned
+        )
+    )
+    assert [r.status_code for r in resps] == [204, 204]
+    assert moves == [TaskStatus.SUCCEEDED]
+    assert await _rows(
+        sm, "SELECT status, finished_at IS NOT NULL FROM minion_task WHERE task_name='skew'"
+    ) == [("SUCCEEDED", True)]
+    assert await _shard_sums(sm, "skew") == (2, 0, 2)  # two different shards
+
+
+async def test_lost_settle_is_healed_by_one_watchdog_tick(
+    app_env: tuple[AsyncClient, Any, ASGITransport],
+    s3: S3Env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    c, app, _ = app_env
+    sm = app.state.sessionmaker
+    await seed_task(sm, "lost", 2, team="lost")
+    owned = await _acquire_all(c, await make_executors(sm, 2))
+    for a, _ in owned:
+        _put_output(s3, "lost", "lost", a)
+
+    async def boom(*_a: Any, **_kw: Any) -> bool:
+        raise RuntimeError("db went away")
+
+    with monkeypatch.context() as m:
+        m.setattr(completion_repo, "set_task_terminal", boom)
+        for a, t in owned:
+            r = await c.post(
+                f"{BASE}/subtasks/{a['acquirement_id']}/complete",
+                json=_cbody(),
+                headers=_auth(t),
+            )
+            assert r.status_code == 204  # the committed owner op still succeeds
+    assert await _rows(
+        sm, "SELECT status, finished_at IS NULL FROM minion_task WHERE task_name='lost'"
+    ) == [("RUNNING", True)]
+
+    cfg = WatchdogSettings(database_url=SecretStr("postgresql+asyncpg://x/x"))
+    await tick(sm, cfg, asyncio.Event())
+    assert await _rows(
+        sm, "SELECT status, finished_at IS NOT NULL FROM minion_task WHERE task_name='lost'"
+    ) == [("SUCCEEDED", True)]
+    await tick(sm, cfg, asyncio.Event())  # idempotent
+    assert await _rows(sm, "SELECT status FROM minion_task WHERE task_name='lost'") == [
+        ("SUCCEEDED",)
+    ]
+
+
+async def test_last_complete_vs_reclaim_counters_match_subtasks(
+    app_env: tuple[AsyncClient, Any, ASGITransport], s3: S3Env
+) -> None:
+    """The last subtask's complete races a reclaim of the same acquirement over many rounds:
+    either may win, never both; counters equal the subtask statuses and the task is consistent."""
+    c, app, _ = app_env
+    sm = app.state.sessionmaker
+    import uuid
+
+    wins = {"complete": 0, "reclaim": 0}
+    for rnd in range(8):
+        name = f"lr-{rnd}"
+        await seed_task(sm, name, 3, team="lr")
+        owned = await _acquire_all(c, await make_executors(sm, 3))
+        for a, _ in owned:
+            _put_output(s3, "lr", name, a)
+        for a, t in owned[:2]:
+            r = await c.post(
+                f"{BASE}/subtasks/{a['acquirement_id']}/complete", json=_cbody(), headers=_auth(t)
+            )
+            assert r.status_code == 204
+        (last, ltok) = owned[2]
+        async with sm() as s, s.begin():
+            await s.execute(
+                text(
+                    "UPDATE minion_executor_heartbeat SET last_seen_at = now() - interval '1 hour'"
+                    " WHERE acquirement_id = CAST(:a AS uuid)"
+                ),
+                {"a": last["acquirement_id"]},
+            )
+
+        async def do_reclaim(aid: str) -> Any:
+            async with sm() as s, s.begin():
+                return await reclaim_one(s, uuid.UUID(aid), timeout_s=900)
+
+        r_complete, r_reclaim = await asyncio.gather(
+            c.post(
+                f"{BASE}/subtasks/{last['acquirement_id']}/complete",
+                json=_cbody(),
+                headers=_auth(ltok),
+            ),
+            do_reclaim(last["acquirement_id"]),
+        )
+        wins["complete" if r_complete.status_code == 204 else "reclaim"] += 1
+        ok, bad = await _subtask_counts(sm, name)
+        assert (await _shard_sums(sm, name))[:2] == (ok, bad)
+        await tick(
+            sm,
+            WatchdogSettings(database_url=SecretStr("postgresql+asyncpg://x/x")),
+            asyncio.Event(),
+        )
+        ((status,),) = await _rows(sm, "SELECT status FROM minion_task WHERE task_name=:n", n=name)
+        if r_complete.status_code == 204:
+            assert (ok, bad, status) == (3, 0, "SUCCEEDED")
+        else:
+            assert r_complete.status_code == 409
+            if r_reclaim.value == "EXPIRED_FAILED":  # budget spent: the tick settled it
+                assert (ok, bad, status) == (2, 1, "PARTIAL")
+            else:
+                assert r_reclaim.value == "EXPIRED_REQUEUED"
+                assert (ok, bad, status) == (2, 0, "RUNNING")
+                async with sm() as sess, sess.begin():  # keep the requeued one from the next round
+                    await sess.execute(
+                        text("UPDATE minion_subtask SET status='CANCELLED' WHERE status='PENDING'")
+                    )
+    assert sum(wins.values()) == 8
+
+
+async def test_cancel_concurrent_with_last_completions(
+    app_env: tuple[AsyncClient, Any, ASGITransport], s3: S3Env
+) -> None:
+    c, app, _ = app_env
+    sm = app.state.sessionmaker
+    seen: set[str] = set()
+    for rnd in range(6):
+        name = f"cc-{rnd}"
+        await seed_task(sm, name, 8, team="e2e")
+        owned = await _acquire_all(c, await make_executors(sm, 8))
+        for a, _ in owned:
+            _put_output(s3, "e2e", name, a)
+        cancel = c.post(
+            f"/api/v1/tasks/e2e/p/{name}/cancel", headers={"Authorization": f"Bearer {USER_KEY}"}
+        )
+        resps = await asyncio.gather(
+            cancel,
+            *(
+                c.post(
+                    f"{BASE}/subtasks/{a['acquirement_id']}/complete",
+                    json=_cbody(),
+                    headers=_auth(t),
+                )
+                for a, t in owned
+            ),
+        )
+        assert resps[0].status_code == 200, resps[0].text
+        assert all(r.status_code == 204 for r in resps[1:])  # owners finish even if cancelled
+        ((status,),) = await _rows(sm, "SELECT status FROM minion_task WHERE task_name=:n", n=name)
+        seen.add(status)
+        assert status in ("CANCELLED", "SUCCEEDED")  # CANCELLED xor derived, never anything else
+        ok, bad = await _subtask_counts(sm, name)
+        assert (await _shard_sums(sm, name))[:2] == (ok, bad) == (8, 0)
+        await tick(
+            sm,
+            WatchdogSettings(database_url=SecretStr("postgresql+asyncpg://x/x")),
+            asyncio.Event(),
+        )
+        assert await _rows(sm, "SELECT status FROM minion_task WHERE task_name=:n", n=name) == [
+            (status,)
+        ]  # the backstop never overrides CANCELLED
 
 
 # --- 3. concurrent splitters -------------------------------------------------------------------

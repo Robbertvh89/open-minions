@@ -116,7 +116,7 @@ async def _rows(sm: Sm, sql: str, **p: Any) -> list[tuple[Any, ...]]:
 
 async def _task_state(sm: Sm, name: str) -> tuple[str, int, list[str]]:
     (status, failed), *_ = await _rows(
-        sm, "SELECT status, failed_subtasks FROM minion_task WHERE task_name=:n", n=name
+        sm, "SELECT status, failed_subtasks FROM minion_ro.task WHERE task_name=:n", n=name
     )
     subs = await _rows(
         sm, "SELECT status FROM minion_subtask WHERE task_name=:n ORDER BY subtask_id", n=name
