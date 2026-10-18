@@ -13,12 +13,15 @@ acquirements one token held. Token revocation stays the primary response (SPEC S
 ## Decision
 
 1. Each claim round, in its transaction and after `SET LOCAL statement_timeout`:
-   `SELECT status FROM minion_executor WHERE executor_id = :e FOR NO KEY UPDATE`; a missing or
-   REVOKED row answers `401` (same path as ADR-0018), so revocation stops acquire immediately.
+   `SELECT status FROM minion_executor WHERE executor_id = :e AND token_hash = :h FOR NO KEY
+   UPDATE`; a missing, REVOKED or rotated-away row answers `401` (same path as ADR-0018). The
+   touch at the start of acquire already refuses these (TASK-32); the lock re-checks them in every
+   claim round, so a token revoked or rotated between rounds cannot claim.
 2. Then a **separate** `SELECT count(*)` of the executor's acquirements (new index
-   `ix_minion_subtask_acquirement_executor_id`, migration 0012). In READ COMMITTED a count inside
-   the locking statement, or inside the claim CTE, would use the snapshot taken before the lock
-   wait and miss a claim that committed meanwhile.
+   `ix_minion_subtask_acquirement_executor_id`, migration 0012). The count runs after the
+   lock was granted, so in READ COMMITTED it takes a fresh snapshot and sees a claim that
+   committed while we waited. (Only a count in the same statement as the lock would use the
+   earlier snapshot; the claim CTE is a separate, later statement.)
 3. `count >= MINION_MAX_OPEN_ACQUIREMENTS` (default 4, 1..64, no off switch) answers
    `429 TOO_MANY_ACQUIREMENTS` with `Retry-After: 30` before any candidate read; the round commits
    nothing. Otherwise the ADR-0013 claim statement runs unchanged.

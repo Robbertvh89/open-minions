@@ -613,7 +613,11 @@ class ExecutorLoop:
                     limited = _is_shed(exc)
                     if isinstance(exc, ApiError) and exc.status_code < 500 and not limited:
                         raise
-                    log.warning("acquire_failed", error=type(exc).__name__)
+                    log.warning(
+                        "acquire_failed",
+                        error=type(exc).__name__,
+                        code=exc.code if isinstance(exc, ApiError) else None,
+                    )
                     await self._maybe_unload()  # a warm model must not outlive a server outage
                     await self._enforce_idle_budget()
                     if limited:  # 429: back off at least Retry-After, also across a pause

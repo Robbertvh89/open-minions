@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, cast
 
 import pytest
+import structlog
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from minion_common.enums import Engine
@@ -15,6 +16,7 @@ from minion_server.auth import ExecutorPrincipal
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.repositories import acquisition as acq_repo
 from minion_server.repositories import executors as executors_repo
+from minion_server.services import acquisition as svc
 from minion_server.services.acquisition import acquire
 from minion_server.services.reclaim import reclaim_one
 from minion_server.storage import S3Storage
@@ -146,6 +148,7 @@ async def test_concurrent_acquires_of_one_executor_never_exceed_the_cap(
             await s.execute(text("DELETE FROM minion_task WHERE task_name = :n"), {"n": f"cap{i}"})
 
 
+@pytest.mark.xfail(strict=False, reason="a timing-dependent demonstration of the race")
 async def test_without_the_executor_lock_the_cap_overshoots(
     sm: async_sessionmaker[AsyncSession], fresh_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -164,8 +167,6 @@ async def test_without_the_executor_lock_the_cap_overshoots(
         over = max(over, await _held(sm, p.executor_id))
         if over > 3:
             break
-    if over <= 3:
-        pytest.skip("the race did not show up in this run")
     assert over > 3
 
 
@@ -174,13 +175,14 @@ async def test_three_workers_share_one_cap(make: Make, monkeypatch: pytest.Monke
     sm = apps[0][1].state.sessionmaker
     await seed_task(sm, "mw", 12, team="mw")
     [(p, tok)] = await make_executors(sm, 1)
-    real = executors_repo.get_preference
+    real = acq_repo.count_open_acquirements
 
     async def slow(*a: Any, **kw: Any) -> Any:
-        await asyncio.sleep(0.4)  # make the 6 acquires overlap
-        return await real(*a, **kw)
+        n = await real(*a, **kw)
+        await asyncio.sleep(0.3)  # between the count and the claim: overlaps without the lock
+        return n
 
-    monkeypatch.setattr(executors_repo, "get_preference", slow)
+    monkeypatch.setattr(acq_repo, "count_open_acquirements", slow)
     rs = await asyncio.gather(
         *[
             c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
@@ -190,6 +192,9 @@ async def test_three_workers_share_one_cap(make: Make, monkeypatch: pytest.Monke
     )
     codes = [r.status_code for r in rs]
     assert codes.count(200) == 2 and codes.count(429) == 4, codes
+    assert {r.json()["detail"]["code"] for r in rs if r.status_code == 429} == {
+        "TOO_MANY_ACQUIREMENTS"
+    }
     assert await _held(sm, p.executor_id) == 2
 
 
@@ -243,17 +248,74 @@ async def test_freed_slot_and_other_executors(make: Make) -> None:
     assert (await acq(tok)).status_code == 200
 
 
-async def test_revoked_executor_gets_401_on_acquire_despite_warm_cache(make: Make) -> None:
+def _after_touch(monkeypatch: pytest.MonkeyPatch, hook: Callable[[], Awaitable[None]]) -> None:
+    """Run `hook` (own session) once the touch txn has committed, before the claim round's lock."""
+    real = acq_repo.set_statement_timeout
+
+    async def wrapped(*a: Any, **kw: Any) -> Any:
+        await hook()
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(acq_repo, "set_statement_timeout", wrapped)
+
+
+async def test_executor_revoked_after_touch_gets_401_from_the_lock_path(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
     c, app = await make(executor_auth_cache_ttl_s=60)
     sm = app.state.sessionmaker
     await seed_task(sm, "rv", 3, team="rv")
     [(p, tok)] = await make_executors(sm, 1)
-    assert (await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))).status_code == 200
-    async with sm() as s, s.begin():
-        assert await executors_repo.revoke(s, p.executor_id)
+
+    async def revoke() -> None:
+        async with sm() as s, s.begin():
+            assert await executors_repo.revoke(s, p.executor_id)
+
+    _after_touch(monkeypatch, revoke)
     r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
     assert r.status_code == 401
-    assert await _held(sm, p.executor_id) == 1
+    assert await _held(sm) == 0
+
+
+async def test_token_rotated_after_touch_cannot_claim(
+    make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = await make(executor_auth_cache_ttl_s=60)
+    sm = app.state.sessionmaker
+    await seed_task(sm, "rot", 3, team="rot")
+    [(p, tok)] = await make_executors(sm, 1)
+
+    async def rotate() -> None:
+        async with sm() as s, s.begin():
+            await s.execute(
+                text(
+                    "UPDATE minion_executor SET token_hash = 'rotated'"
+                    " WHERE executor_id = CAST(:e AS uuid)"
+                ),
+                {"e": str(p.executor_id)},
+            )
+
+    _after_touch(monkeypatch, rotate)
+    r = await c.post(f"{BASE}/acquire", json=ACQ, headers=_auth(tok))
+    assert r.status_code == 401
+    assert await _held(sm) == 0
+
+
+async def test_capped_logs_once_per_minute_with_ids_only(
+    sm: async_sessionmaker[AsyncSession], fresh_url: str
+) -> None:
+    cfg = _settings(fresh_url).model_copy(update={"max_open_acquirements": 1})
+    [(p, _)] = await make_executors(sm, 1)
+    await seed_task(sm, "lg", 5, team="lg")
+    svc._capped_logged.clear()
+    with structlog.testing.capture_logs() as logs:
+        first = await _try(sm, p, cfg)
+        assert not isinstance(first, HTTPException)
+        assert _is_cap(await _try(sm, p, cfg))
+        assert _is_cap(await _try(sm, p, cfg))
+    [ev] = [e for e in logs if e["event"] == "acquire_capped"]
+    assert ev["executor_id"] == str(p.executor_id) and ev["open_acquirements"] == 1
+    assert set(ev) <= {"event", "log_level", "executor_id", "open_acquirements"}
 
 
 async def test_lock_helper_refuses_missing_and_revoked(
@@ -263,6 +325,7 @@ async def test_lock_helper_refuses_missing_and_revoked(
     async with sm() as s, s.begin():
         assert await acq_repo.lock_executor_for_claim(s, p.executor_id)
         assert not await acq_repo.lock_executor_for_claim(s, uuid.uuid4())
+        assert not await acq_repo.lock_executor_for_claim(s, p.executor_id, "not-its-hash")
     async with sm() as s, s.begin():
         assert await executors_repo.revoke(s, p.executor_id)
     async with sm() as s, s.begin():

@@ -36,6 +36,7 @@ from minion_server.db.models import (
     SubtaskAcquirement,
     Task,
 )
+from minion_server.repositories.executors import _token_match
 
 CANDIDATE_LIMIT = 16
 MAX_WINDOW = 256  # matches ServerSettings.acquire_window le=256
@@ -274,10 +275,13 @@ async def set_statement_timeout(session: AsyncSession, ms: int) -> None:
     await session.execute(select(func.set_config("statement_timeout", str(ms), True)))
 
 
-async def lock_executor_for_claim(session: AsyncSession, executor_id: uuid.UUID) -> bool:
+async def lock_executor_for_claim(
+    session: AsyncSession, executor_id: uuid.UUID, token_hash: str | None = None
+) -> bool:
     """`SELECT ... FOR NO KEY UPDATE` on the caller's own executor row (ADR-0019): serialises this
     executor's claim rounds across workers so the open-acquirement count below cannot be raced.
-    False = the row is missing or REVOKED (the caller answers 401).
+    False = the row is missing, REVOKED or no longer carries `token_hash` (rotated away; None =
+    no check): the caller answers 401.
 
     Deadlock-freedom depends on complete / release / reclaim NEVER writing `minion_executor`: the
     claim takes executor row -> new acquirement -> subtask -> heartbeat, owner ops take
@@ -287,7 +291,7 @@ async def lock_executor_for_claim(session: AsyncSession, executor_id: uuid.UUID)
     status = (
         await session.execute(
             select(Executor.status)
-            .where(Executor.executor_id == executor_id)
+            .where(Executor.executor_id == executor_id, *_token_match(token_hash))
             .with_for_update(key_share=True)
         )
     ).scalar_one_or_none()
