@@ -1,10 +1,10 @@
 ---
 id: TASK-28
 title: Size the minion-scale CI smoke for slow runners
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 23:31'
-updated_date: '2026-10-17 23:32'
+updated_date: '2026-10-18 00:46'
 labels:
   - test
 dependencies: []
@@ -19,6 +19,12 @@ The integration smoke (20 sims, 2k subtasks, 90 s budget) failed twice on GitHub
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Smoke workload sized for CI with margin; all correctness assertions unchanged
-- [ ] #2 Smoke green on CI in 3 consecutive runs
+- [x] #1 Smoke workload sized for CI with margin; all correctness assertions unchanged
+- [x] #2 Smoke green on CI in 3 consecutive runs
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #44: smoke sized to 1000 subtasks; CI 3/3 green (run 39079700012).
+<!-- SECTION:FINAL_SUMMARY:END -->

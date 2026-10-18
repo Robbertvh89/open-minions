@@ -1,10 +1,10 @@
 ---
 id: TASK-7.6
 title: M6.6 Menu-bar launchd agent + docs
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 20:36'
-updated_date: '2026-10-17 23:49'
+updated_date: '2026-10-18 00:46'
 labels:
   - executor
 dependencies: []
@@ -20,7 +20,13 @@ minion-executor menubar install|uninstall|status: per-user LaunchAgent com.open-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Rendered plist golden test: Aqua session, no secrets, paths outside TCC roots
-- [ ] #2 install/uninstall idempotent; refuses MINION_EXECUTOR_DEV=1 like service install
-- [ ] #3 Docs updated (FR-56, ADR-0011, executor-install.md, CLAUDE.md, README)
+- [x] #1 Rendered plist golden test: Aqua session, no secrets, paths outside TCC roots
+- [x] #2 install/uninstall idempotent; refuses MINION_EXECUTOR_DEV=1 like service install
+- [x] #3 Docs updated (FR-56, ADR-0011, executor-install.md, CLAUDE.md, README)
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #45: minion-executor menubar install|uninstall|status LaunchAgent (Aqua, KeepAlive on crash, no secrets), single-instance lock, shared launchd.py with hardened service+menubar install/uninstall (root refused, exact label/program match, install-chain ownership with admin-group exception). CI run 39083266520: 1903 passed.
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -1,9 +1,10 @@
 ---
 id: TASK-7.3
 title: M6.3 Run the scale test on this Mac and report NF-1..NF-3
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 20:36'
+updated_date: '2026-10-18 00:46'
 labels:
   - scale
 dependencies: []
