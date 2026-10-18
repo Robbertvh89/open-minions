@@ -3,9 +3,10 @@ id: TASK-7.4.2
 title: >-
   M6.4b Candidate query: index path keeping FR-22 order (live-task walk +
   LATERAL per-task top-K)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 03:23'
 labels:
   - scale
 dependencies: []

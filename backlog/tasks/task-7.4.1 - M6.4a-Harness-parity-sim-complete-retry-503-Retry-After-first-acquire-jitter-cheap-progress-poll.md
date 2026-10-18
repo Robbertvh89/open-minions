@@ -3,10 +3,10 @@ id: TASK-7.4.1
 title: >-
   M6.4a Harness parity: sim complete retry, 503 Retry-After, first-acquire
   jitter, cheap progress poll
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 02:20'
-updated_date: '2026-10-18 02:21'
+updated_date: '2026-10-18 03:23'
 labels:
   - scale
 dependencies: []
@@ -22,8 +22,14 @@ Before the other M6.4 fixes, so before/after numbers are honest. sim.py:410 give
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Sim retries complete on transport/5xx like the executor; same-owner repeat counted once
-- [ ] #2 Sim honours Retry-After on 503 for acquire and complete
-- [ ] #3 --first-acquire-jitter-s and --poll-s (default 5, counter sum) exist
-- [ ] #4 knee-10 and B-20k re-run numbers in the PR
+- [x] #1 Sim retries complete on transport/5xx like the executor; same-owner repeat counted once
+- [x] #2 Sim honours Retry-After on 503 for acquire and complete
+- [x] #3 --first-acquire-jitter-s and --poll-s (default 5, counter sum) exist
+- [x] #4 knee-10 and B-20k re-run numbers in the PR
 <!-- AC:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Merged #47: sim complete retry/give-up parity with the executor, 503 Retry-After, first-acquire jitter, counter-sum progress poll; knee-10 and B-20k baselines unchanged (server-bound). CI run 39092769947: 1917 passed.
+<!-- SECTION:FINAL_SUMMARY:END -->
