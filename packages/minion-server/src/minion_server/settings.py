@@ -37,6 +37,17 @@ class ServerSettings(BaseSettings):
     acquire_concurrency: int | None = Field(default=None, ge=1)
     max_request_body_bytes: int = Field(default=1 << 20, gt=0)  # 413 above this
 
+    # Multi-worker (TASK-7.4.6): `workers` uvicorn processes, each with its own pool, acquire
+    # semaphore, per-executor in-flight cap, rate limiter and splitter loop (ARCHITECTURE §6).
+    # db_max_connections is the Postgres max_connections the budget check compares against
+    # (startup warning only; PG default 100). The watchdog pool is added to the total.
+    server_workers: int = Field(default=1, ge=1, le=32)
+    db_max_connections: int = Field(default=100, ge=1)
+    watchdog_db_pool_size: int = Field(default=2, ge=0)  # same MINION_ var the watchdog reads
+    # Prometheus multiprocess directory, used only when workers > 1 and metrics are enabled.
+    # Wiped at startup by the parent; must be writable (the /tmp tmpfs in the container).
+    metrics_multiproc_dir: str = "/tmp/minion-metrics"  # noqa: S108
+
     # Object storage (S3 API). Executors get presigned URLs built against the public endpoint.
     s3_endpoint_url: str = "http://localhost:9000"
     s3_public_endpoint_url: str | None = None  # defaults to s3_endpoint_url
@@ -185,6 +196,12 @@ class ServerSettings(BaseSettings):
         if self.acquire_concurrency is not None:
             return self.acquire_concurrency
         return max(1, self.db_pool_size + self.db_max_overflow - 4)
+
+    @property
+    def connection_budget(self) -> int:
+        """Worst-case DB connections: every worker's full pool plus the watchdog's pool."""
+        per_worker = self.db_pool_size + self.db_max_overflow
+        return self.server_workers * per_worker + self.watchdog_db_pool_size
 
     @model_validator(mode="after")
     def _prefixes_disjoint(self) -> Self:

@@ -1,6 +1,8 @@
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 from fastapi import FastAPI, Request
@@ -14,7 +16,7 @@ from minion_server.auth import KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.errors import busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
-from minion_server.metrics import Metrics, MetricsMiddleware
+from minion_server.metrics import MULTIPROC_ENV, Metrics, MetricsMiddleware
 from minion_server.metrics import router as metrics_router
 from minion_server.models_registry import load_models
 from minion_server.netutil import is_loopback
@@ -119,8 +121,38 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     return app
 
 
+def prepare_metrics_dir(path: str) -> None:
+    """Create (0700) and empty the multiprocess metrics dir; the parent does this before forking
+    workers so a previous run's samples never leak into this one."""
+    d = Path(path)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for f in d.glob("*.db"):
+        f.unlink(missing_ok=True)
+
+
 def main() -> None:
     import uvicorn
 
     settings = ServerSettings()
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    if settings.connection_budget > settings.db_max_connections:
+        structlog.get_logger().warning(
+            "db_connection_budget_exceeded",
+            workers=settings.server_workers,
+            per_worker=settings.db_pool_size + settings.db_max_overflow,
+            watchdog=settings.watchdog_db_pool_size,
+            budget=settings.connection_budget,
+            db_max_connections=settings.db_max_connections,
+        )
+    if settings.server_workers == 1:
+        uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+        return
+    if settings.metrics_enabled:
+        prepare_metrics_dir(settings.metrics_multiproc_dir)
+        os.environ[MULTIPROC_ENV] = settings.metrics_multiproc_dir  # inherited by the workers
+    uvicorn.run(
+        "minion_server.app:create_app",
+        factory=True,
+        workers=settings.server_workers,
+        host=settings.host,
+        port=settings.port,
+    )

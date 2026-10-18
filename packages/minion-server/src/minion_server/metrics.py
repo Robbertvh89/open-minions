@@ -5,6 +5,7 @@ no ids, team or task names), the HTTP method and status, and the acquire outcome
 owner, team, key or payload value ever becomes a label or a sample.
 """
 
+import os
 import secrets
 from typing import Any
 
@@ -15,6 +16,7 @@ from prometheus_client import (
     Counter,
     Histogram,
     generate_latest,
+    multiprocess,
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -23,8 +25,17 @@ ACQUIRE_BUCKETS_S = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10
 UNMATCHED = "unmatched"  # 404s and other requests that match no route: one bucket, not the URL
 
 
+MULTIPROC_ENV = "PROMETHEUS_MULTIPROC_DIR"
+
+
 class Metrics:
-    """Counters on a private registry (not the process-global one: apps are built per test)."""
+    """Counters on a private registry (not the process-global one: apps are built per test).
+
+    With `PROMETHEUS_MULTIPROC_DIR` set (before prometheus_client is imported, which `main()` does
+    for workers > 1) every sample lives in a per-process mmap file and `render` sums all of them
+    (MultiProcessCollector). Only counters and histograms are used; a Gauge added later needs an
+    explicit `multiprocess_mode`.
+    """
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry()
@@ -62,6 +73,11 @@ class Metrics:
         ).inc()
 
     def render(self) -> bytes:
+        directory = os.environ.get(MULTIPROC_ENV)
+        if directory:
+            registry = CollectorRegistry()
+            multiprocess.MultiProcessCollector(registry, path=directory)  # type: ignore[no-untyped-call]
+            return generate_latest(registry)
         return generate_latest(self.registry)
 
 

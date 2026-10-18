@@ -29,3 +29,11 @@ candidate scan. Heartbeats already have a DB-backed minimum interval. NF-5 wants
 
 A DB or Redis counter: shared and exact, but adds a write on the hot path or a new dependency to
 guard against a problem that approximate limits solve.
+
+## Note (TASK-7.4.6): multiple workers per server
+
+`MINION_SERVER_WORKERS` > 1 makes every uvicorn worker its own replica for this purpose: the
+limiter and the per-executor in-flight acquire cap are per process, so N workers admit up to N times
+the budget per executor (and a restart of one worker forgets only its counters). Still soft state,
+still not a correctness mechanism. Where a hard per-executor limit matters, enforce it at the
+reverse proxy or use sticky routing by executor id.
