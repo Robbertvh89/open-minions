@@ -11,7 +11,7 @@ Status: **Draft v0.2** · 2026-10-15 · Companion to [`SPEC.md`](SPEC.md)
                              ▼
 ┌────────────┐  SQL  ┌───────────────┐  SQL  ┌──────────────┐
 │ PostgreSQL │◀─────▶│ Minion Server │       │   Watchdog   │
-│ (7 tables) │◀──────┴───────────────┴──────▶│ (reclaimer)  │
+│ (8 tables) │◀──────┴───────────────┴──────▶│ (reclaimer)  │
 └─────┬──────┘        ▲   REST (acquire,      └──────────────┘
       │ SQL           │   heartbeat, complete,
       ▼               │   fail, release)
@@ -417,7 +417,10 @@ Server:   verify acquirement is current (else 409)
                           CopySourceIfMatch on the ETag verified at HEAD, mismatch → 422 OUTPUT_CHANGED)
           txn: DELETE acquirement, DELETE heartbeat row,
                UPDATE subtask SUCCEEDED, INSERT minion_subtask_attempt,
-               UPDATE task counters / status
+               UPSERT counter shard (minion_task_counter, subtask_id % 16)
+          COMMIT, then a second short txn "settle": read status, total, shard sums;
+               if every subtask is terminal → task status (SUCCEEDED | PARTIAL | FAILED)
+               and finished_at, only if the task is still PENDING/RUNNING (ADR-0015)
 ```
 Input GET URLs sign the subtask's exact `Range` header (`bytes=byte_start-(byte_end-1)`), so a URL
 reads only its slice. Before promotion the server HEADs the attempt object: above
@@ -462,8 +465,8 @@ SKIP LOCKED + re-check (ADR-0008), not DELETE ... RETURNING:
       finish_failed: INSERT minion_subtask_attempt(outcome=EXPIRED, code NOT_ACKNOWLEDGED | HEARTBEAT_TIMEOUT | MAX_LEASE_EXCEEDED)
                      DELETE acquirement (cascades heartbeat row)
                      UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
-      UPDATE task counters / status
-    COMMIT
+      UPSERT counter shard when the subtask ended FAILED
+    COMMIT   (a task whose last subtask failed here is settled by the watchdog's settle_stuck)
 ```
 **Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
 (`fail` already counts the attempt being recorded). `EXPIRED` with code `NOT_ACKNOWLEDGED` (never-beaten
@@ -560,7 +563,8 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Budget downgrade mid-subtask | Executor `release`s (same txn path as complete/reclaim); output of partial run discarded (attempt-scoped key) |
 | Worker crash (Metal / OOM) | Control process survives, reports `fail(retryable)`; attempt counter bounds retries |
 
-**Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → task. The
+**Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → counter shard
+(`minion_task_counter`, one of 16 rows per task; the task row itself is not locked by completions). The
 executor row (`minion_executor`) is written after the acquirement lock, never before it. Cancel txn 1
 locks the task only; txn 2 locks PENDING subtask rows (`SKIP LOCKED`, bounded) and never a running
 acquirement, so it cannot deadlock with owner ops.
@@ -576,6 +580,8 @@ race, stale-acquirement rejection, splitter restart.
 - `minion_subtask_acquirement`: `ix_minion_subtask_acquirement_acquired_at` on `acquired_at` serves the watchdog max-lease scan (migration 0008).
 - `minion_task`: index on `(status, priority DESC, created_at)`.
 - `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
+
+- `minion_task_counter` (ADR-0015, migration 0011): PK `(team, project, task_name, shard)`, `succeeded` / `failed` per shard, `shard = subtask_id % 16`; the task counters are the sum over shards (`minion_ro.task` still exposes `succeeded_subtasks` / `failed_subtasks`). A completion upserts one shard row instead of updating the task row; the terminal task status is set by a post-commit settle (and healed by the watchdog), so `minion_task.updated_at` no longer moves per completion.
 
 ### 5.2 Input slicing **[ours]**
 Splitter records `(object_key, byte_start, byte_end, first_record, record_count)` per subtask, aligned to
