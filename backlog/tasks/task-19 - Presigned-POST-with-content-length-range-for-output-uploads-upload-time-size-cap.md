@@ -68,7 +68,9 @@ Not a deviation from the paper (the paper only says executors write through pres
   ```python
   class PresignedPost(_ResponseModel):
       url: str
-      fields: dict[str, str]   # validator: 1..16 entries; names ^[A-Za-z0-9_-]{1,64}$; values <= 8 KiB, no CR/LF/'"'; must contain "key" and "policy"
+      fields: dict[
+          str, str
+      ]  # validator: 1..16 entries; names ^[A-Za-z0-9_-]{1,64}$; values <= 8 KiB, no CR/LF/'"'; must contain "key" and "policy"
   ```
   - `Assignment.output_post: PresignedPost` replaces `output_url`.
   - `HeartbeatResponse.output_post: PresignedPost` replaces `output_url`.

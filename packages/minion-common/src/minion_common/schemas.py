@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
@@ -255,9 +255,39 @@ class PreferenceRequest(_Model):
     task_name: str | None = Field(default=None, pattern=SLUG_PATTERN)
 
 
+_POST_FIELD_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+_POST_MAX_FIELDS = 16
+_POST_MAX_VALUE_BYTES = 8 << 10
+
+
+class PresignedPost(_ResponseModel):
+    """S3 presigned POST: form `url` plus the signed `fields` (policy incl. size range).
+
+    Both are credentials: never log them.
+    """
+
+    url: str = Field(min_length=1, max_length=4096)
+    fields: dict[str, str]
+
+    @model_validator(mode="after")
+    def _check_fields(self) -> Self:
+        if not 1 <= len(self.fields) <= _POST_MAX_FIELDS:
+            raise ValueError(f"fields must have 1..{_POST_MAX_FIELDS} entries")
+        for name, value in self.fields.items():
+            if not _POST_FIELD_NAME_RE.fullmatch(name):
+                raise ValueError("invalid form field name")
+            if len(value.encode()) > _POST_MAX_VALUE_BYTES or any(c in value for c in '\r\n"'):
+                raise ValueError("invalid form field value")
+        if "key" not in self.fields or "policy" not in self.fields:
+            raise ValueError("fields must contain 'key' and 'policy'")
+        return self
+
+
 class AcquireRequest(_Model):
     engines: list[Engine] = Field(min_length=1, max_length=16)
     budget: Budget
+    # Capability marker: executors that upload outputs with a presigned POST send "post".
+    output_upload: Literal["post"] | None = None
 
 
 class Assignment(_ResponseModel):
@@ -275,6 +305,7 @@ class Assignment(_ResponseModel):
     byte_end: int = Field(gt=0, description="Exclusive end offset")
     record_count: int = Field(ge=1)
     output_url: str
+    output_post: PresignedPost | None = None
     expires_at: AwareDatetime
     # The server's output size cap; the executor enforces min(local, this). Absent on old servers.
     max_output_bytes: int | None = Field(default=None, gt=0)
@@ -338,6 +369,7 @@ class PresenceRequest(_Model):
 class HeartbeatResponse(_ResponseModel):
     cancel: bool
     output_url: str = Field(description="Refreshed presigned PUT URL for the same attempt key")
+    output_post: PresignedPost | None = None
     expires_at: AwareDatetime
 
 
