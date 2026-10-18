@@ -1,0 +1,2996 @@
+{
+ "schema": "open-minions-m6-scale/1 (derived figures; harness reports follow minion-scale-report/1)",
+ "task": "TASK-7.3",
+ "date": "2026-10-18",
+ "commit": "3d03959",
+ "setup": {
+  "host": {
+   "chip": "Apple M3 Pro",
+   "cpu_cores": 12,
+   "memory_gb": 36,
+   "macos": "27.0.1"
+  },
+  "docker": {
+   "engine": "29.5.2",
+   "client": "27.4.1",
+   "vm_cpus": 12,
+   "vm_memory_bytes": 8321429504
+  },
+  "postgres": {
+   "version": "16.15 (postgres:16-alpine, aarch64)",
+   "shared_buffers": "1GB",
+   "effective_cache_size": "3GB",
+   "max_connections": 300,
+   "work_mem": "4MB",
+   "random_page_cost": 4,
+   "synchronous_commit": "on",
+   "max_wal_size": "1GB",
+   "shared_preload_libraries": "pg_stat_statements",
+   "alembic_head": "0008"
+  },
+  "server": {
+   "processes": 1,
+   "python": "3.12.15",
+   "fastapi": "0.143.2",
+   "sqlalchemy": "2.1.4",
+   "asyncpg": "0.32.0",
+   "uvicorn": "0.54.0",
+   "db_pool_size": 20,
+   "db_max_overflow": 20,
+   "acquire_min_interval_s": 0.2,
+   "heartbeat_min_interval_s": 1.0,
+   "candidate_limit": 16
+  },
+  "watchdog": {
+   "heartbeat_timeout_s": 20,
+   "interval_s": 5,
+   "batch_size": 500
+  },
+  "load_generator": {
+   "python": "3.12.7",
+   "httpx": "0.28.1",
+   "host": "same Mac, loopback to Docker Desktop port forward"
+  }
+ },
+ "scenario_a_nf1": {
+  "seed": {
+   "tasks": 100,
+   "subtasks_per_task": 10000,
+   "pending": 1000000,
+   "seed_s": 22.4,
+   "db_size_after": "351 MB (minion_subtask 337 MB)"
+  },
+  "explain_at_1m_pending": [
+   {
+    "name": "candidate",
+    "plan_kind": "custom",
+    "planning_ms": 0.417,
+    "execution_ms": 214.451,
+    "top_buffers": "hit=20633",
+    "seq_scan": true,
+    "plan": [
+     "Limit  (cost=40379.02..40380.89 rows=16 width=146) (actual time=212.681..214.409 rows=16 loops=1)",
+     "  Buffers: shared hit=20633",
+     "  ->  Gather Merge  (cost=40379.02..137608.11 rows=833334 width=146) (actual time=212.680..214.407 rows=16 loops=1)",
+     "        Workers Planned: 2",
+     "        Workers Launched: 2",
+     "        Buffers: shared hit=20633",
+     "        ->  Sort  (cost=39378.99..40420.66 rows=416667 width=146) (actual time=211.252..211.254 rows=16 loops=3)",
+     "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+     "              Sort Method: top-N heapsort  Memory: 29kB",
+     "              Buffers: shared hit=20633",
+     "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+     "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+     "              ->  Hash Join  (cost=8.00..28962.32 rows=416667 width=146) (actual time=0.118..99.896 rows=333333 loops=3)",
+     "                    Hash Cond: (((minion_subtask.team)::text = (minion_task.team)::text) AND ((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+     "                    Buffers: shared hit=20521",
+     "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..25617.33 rows=416667 width=79) (actual time=0.006..31.307 rows=333333 loops=3)",
+     "                          Filter: ((status)::text = 'PENDING'::text)",
+     "                          Buffers: shared hit=20409",
+     "                    ->  Hash  (cost=6.25..6.25 rows=100 width=90) (actual time=0.050..0.051 rows=100 loops=3)",
+     "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+     "                          Buffers: shared hit=12",
+     "                          ->  Seq Scan on minion_task  (cost=0.00..6.25 rows=100 width=90) (actual time=0.007..0.030 rows=100 loops=3)",
+     "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+     "                                Buffers: shared hit=12",
+     "Planning:",
+     "  Buffers: shared hit=148",
+     "Planning Time: 0.417 ms",
+     "Execution Time: 214.451 ms"
+    ]
+   },
+   {
+    "name": "candidate_preference",
+    "plan_kind": "custom",
+    "planning_ms": 0.158,
+    "execution_ms": 195.475,
+    "top_buffers": "hit=20633",
+    "seq_scan": true,
+    "plan": [
+     "Limit  (cost=40322.25..40324.11 rows=16 width=146) (actual time=193.466..195.428 rows=16 loops=1)",
+     "  Buffers: shared hit=20633",
+     "  ->  Gather Merge  (cost=40322.25..137551.33 rows=833334 width=146) (actual time=193.465..195.425 rows=16 loops=1)",
+     "        Workers Planned: 2",
+     "        Workers Launched: 2",
+     "        Buffers: shared hit=20633",
+     "        ->  Sort  (cost=39322.22..40363.89 rows=416667 width=146) (actual time=192.288..192.290 rows=11 loops=3)",
+     "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+     "              Sort Method: top-N heapsort  Memory: 29kB",
+     "              Buffers: shared hit=20633",
+     "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+     "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+     "              ->  Hash Join  (cost=8.00..28905.55 rows=416667 width=146) (actual time=0.109..89.555 rows=333333 loops=3)",
+     "                    Hash Cond: (((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+     "                    Buffers: shared hit=20521",
+     "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..26659.00 rows=416667 width=79) (actual time=0.004..32.803 rows=333333 loops=3)",
+     "                          Filter: (((team)::text = 'scale'::text) AND ((status)::text = 'PENDING'::text))",
+     "                          Buffers: shared hit=20409",
+     "                    ->  Hash  (cost=6.50..6.50 rows=100 width=90) (actual time=0.046..0.046 rows=100 loops=3)",
+     "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+     "                          Buffers: shared hit=12",
+     "                          ->  Seq Scan on minion_task  (cost=0.00..6.50 rows=100 width=90) (actual time=0.006..0.029 rows=100 loops=3)",
+     "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((team)::text = 'scale'::text) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+     "                                Buffers: shared hit=12",
+     "Planning Time: 0.158 ms",
+     "Execution Time: 195.475 ms"
+    ]
+   },
+   {
+    "name": "stale_heartbeat",
+    "plan_kind": "custom",
+    "planning_ms": 0.1,
+    "execution_ms": 0.016,
+    "top_buffers": "hit=13",
+    "seq_scan": true,
+    "plan": [
+     "Limit  (cost=0.01..0.02 rows=1 width=24) (actual time=0.005..0.005 rows=0 loops=1)",
+     "  ->  Sort  (cost=0.01..0.02 rows=1 width=24) (actual time=0.005..0.005 rows=0 loops=1)",
+     "        Sort Key: last_seen_at",
+     "        Sort Method: quicksort  Memory: 25kB",
+     "        ->  Seq Scan on minion_executor_heartbeat  (cost=0.00..0.00 rows=1 width=24) (actual time=0.001..0.001 rows=0 loops=1)",
+     "              Filter: (last_seen_at < (now() - '00:00:20'::interval))",
+     "Planning:",
+     "  Buffers: shared hit=13",
+     "Planning Time: 0.100 ms",
+     "Execution Time: 0.016 ms"
+    ]
+   },
+   {
+    "name": "over_lease",
+    "plan_kind": "custom",
+    "planning_ms": 0.049,
+    "execution_ms": 0.008,
+    "top_buffers": "hit=9",
+    "seq_scan": true,
+    "plan": [
+     "Limit  (cost=0.01..0.02 rows=1 width=24) (actual time=0.003..0.003 rows=0 loops=1)",
+     "  ->  Sort  (cost=0.01..0.02 rows=1 width=24) (actual time=0.003..0.003 rows=0 loops=1)",
+     "        Sort Key: acquired_at",
+     "        Sort Method: quicksort  Memory: 25kB",
+     "        ->  Seq Scan on minion_subtask_acquirement  (cost=0.00..0.00 rows=1 width=24) (actual time=0.001..0.001 rows=0 loops=1)",
+     "              Filter: (acquired_at < (now() - '06:00:00'::interval))",
+     "Planning:",
+     "  Buffers: shared hit=9",
+     "Planning Time: 0.049 ms",
+     "Execution Time: 0.008 ms"
+    ]
+   }
+  ],
+  "stress_500_sims_work_2s": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 8,
+    "seed": 0,
+    "sims": 500,
+    "team": "scale",
+    "work_s": 2.0
+   },
+   "run": {
+    "assigned": 3148,
+    "completed": 1279,
+    "conflicts_409": 775,
+    "drained": false,
+    "duration_s": 629.375,
+    "events": {
+     "assigned": 3148,
+     "complete_409": 446,
+     "complete_failed": 1285,
+     "completed": 1279,
+     "failure_pause": 8,
+     "released": 131
+    },
+    "faults": {},
+    "procs": 8,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 6,
+    "sims": 500,
+    "throughput_per_s": 2.032,
+    "transport_errors": 4857
+   },
+   "event_loop_lag": {
+    "count": 94310,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.089066
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 3148,
+     "mean_ms": 18879.9,
+     "p50_ms": 30000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30002.1,
+     "statuses": {
+      "200": 3148
+     }
+    },
+    "acquire_error": {
+     "count": 3487,
+     "mean_ms": 30004.6,
+     "p50_ms": 30050.3,
+     "p95_ms": 30050.3,
+     "p99_ms": 30050.3,
+     "max_ms": 30050.3,
+     "statuses": {
+      "0": 3483,
+      "500": 4
+     }
+    },
+    "complete": {
+     "count": 3010,
+     "mean_ms": 22749.0,
+     "p50_ms": 30000.0,
+     "p95_ms": 30013.9,
+     "p99_ms": 30013.9,
+     "max_ms": 30013.9,
+     "statuses": {
+      "0": 1283,
+      "200": 1279,
+      "409": 446,
+      "500": 2
+     }
+    },
+    "heartbeat": {
+     "count": 1087,
+     "mean_ms": 13893.3,
+     "p50_ms": 30000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 27004.4,
+     "statuses": {
+      "200": 765,
+      "409": 322
+     }
+    },
+    "output_put": {
+     "count": 3010,
+     "mean_ms": 8.8,
+     "p50_ms": 10.0,
+     "p95_ms": 25.0,
+     "p99_ms": 25.0,
+     "max_ms": 57.9,
+     "statuses": {
+      "200": 3010
+     }
+    },
+    "register": {
+     "count": 591,
+     "mean_ms": 11995.7,
+     "p50_ms": 10000.0,
+     "p95_ms": 30218.9,
+     "p99_ms": 30218.9,
+     "max_ms": 30218.9,
+     "statuses": {
+      "0": 91,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 138,
+     "mean_ms": 10668.5,
+     "p50_ms": 30000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 25277.8,
+     "statuses": {
+      "200": 131,
+      "409": 7
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 9916,
+     "mean_exec_ms": 2435.87,
+     "total_exec_ms": 24154064.15,
+     "rows": 158656,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 748,
+     "mean_exec_ms": 273.53,
+     "total_exec_ms": 204601.77,
+     "rows": 748,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 122701,
+     "mean_exec_ms": 0.08,
+     "total_exec_ms": 10187.26,
+     "rows": 5086,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 5086,
+     "mean_exec_ms": 0.21,
+     "total_exec_ms": 1056.33,
+     "rows": 5086,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 5086,
+     "mean_exec_ms": 0.14,
+     "total_exec_ms": 705.38,
+     "rows": 5086,
+     "query": "INSERT INTO minion_executor_heartbeat (acquirement_id) VALUES ($1::UUID)"
+    },
+    {
+     "calls": 5094,
+     "mean_exec_ms": 0.13,
+     "total_exec_ms": 661.19,
+     "rows": 5094,
+     "query": "UPDATE minion_executor SET engines=$1::VARCHAR(16)[], profile=$2, budget=$3::JSONB, paused_reason=$4::VARCHAR, last_seen_at=now() WHERE minion_executor.executor"
+    },
+    {
+     "calls": 1658,
+     "mean_exec_ms": 0.39,
+     "total_exec_ms": 640.84,
+     "rows": 1658,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    },
+    {
+     "calls": 12412,
+     "mean_exec_ms": 0.04,
+     "total_exec_ms": 535.04,
+     "rows": 12412,
+     "query": "SELECT minion_executor.executor_id, minion_executor.owner, minion_executor.pool, minion_executor.status, minion_executor.token_expires_at, minion_executor.token"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 6449,
+     "deletes": 0,
+     "hot_updates": 5984,
+     "seq_scans": 0,
+     "idx_scans": 28889,
+     "autovacuum_count": 7,
+     "dead_tuples_after": 131,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 5079,
+     "updates": 826,
+     "deletes": 4951,
+     "hot_updates": 0,
+     "seq_scans": 149,
+     "idx_scans": 10164,
+     "autovacuum_count": 10,
+     "dead_tuples_after": 643,
+     "live_tuples_after": 104
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 10030,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 14096,
+     "idx_scans": 144649,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 10030,
+     "live_tuples_after": 1000000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 5083,
+     "updates": 0,
+     "deletes": 4955,
+     "hot_updates": 0,
+     "seq_scans": 112,
+     "idx_scans": 24543,
+     "autovacuum_count": 10,
+     "dead_tuples_after": 591,
+     "live_tuples_after": 104
+    },
+    "minion_subtask_attempt": {
+     "inserts": 4951,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 342,
+     "idx_scans": 4064,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 4992
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 1658,
+     "deletes": 0,
+     "hot_updates": 1656,
+     "seq_scans": 37222,
+     "idx_scans": 119,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 28,
+     "live_tuples_after": 100
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 5086,
+     "mean_ms": 15706.4,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    },
+    "error": {
+     "count": 798,
+     "mean_ms": 30004.2,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    },
+    "empty": {
+     "count": 8,
+     "mean_ms": 44400.2,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    }
+   },
+   "docker_in_run": {
+    "postgres_cpu_pct_median": 1175,
+    "postgres_cpu_pct_max": 1194,
+    "postgres_mem_max": "709 MiB",
+    "server_cpu_pct_median": 44,
+    "server_cpu_pct_max": 64,
+    "server_log": "3181 x sqlalchemy QueuePool limit of size 20 overflow 20 reached (30 s timeout) -> 500"
+   }
+  },
+  "realistic_500_sims_work_75s": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 8,
+    "seed": 0,
+    "sims": 500,
+    "team": "scale",
+    "work_s": 75.0
+   },
+   "run": {
+    "assigned": 3941,
+    "completed": 2937,
+    "conflicts_409": 525,
+    "drained": false,
+    "duration_s": 602.321,
+    "events": {
+     "assigned": 3941,
+     "complete_409": 33,
+     "complete_failed": 4,
+     "completed": 2937,
+     "discarded_stale": 468,
+     "released": 499
+    },
+    "faults": {},
+    "procs": 8,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 500,
+    "throughput_per_s": 4.876,
+    "transport_errors": 545
+   },
+   "event_loop_lag": {
+    "count": 94365,
+    "p50_s": 0.001,
+    "p99_s": 0.0025,
+    "max_s": 0.100363
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 3941,
+     "mean_ms": 4440.1,
+     "p50_ms": 250.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 29982.3,
+     "statuses": {
+      "200": 3941
+     }
+    },
+    "acquire_error": {
+     "count": 320,
+     "mean_ms": 30003.3,
+     "p50_ms": 30006.6,
+     "p95_ms": 30006.6,
+     "p99_ms": 30006.6,
+     "max_ms": 30006.6,
+     "statuses": {
+      "0": 320
+     }
+    },
+    "complete": {
+     "count": 2974,
+     "mean_ms": 462.1,
+     "p50_ms": 25.0,
+     "p95_ms": 500.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30005.0,
+     "statuses": {
+      "0": 4,
+      "200": 2937,
+      "409": 33
+     }
+    },
+    "heartbeat": {
+     "count": 43285,
+     "mean_ms": 741.2,
+     "p50_ms": 25.0,
+     "p95_ms": 5000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30008.0,
+     "statuses": {
+      "0": 150,
+      "200": 42643,
+      "409": 492
+     }
+    },
+    "output_put": {
+     "count": 2974,
+     "mean_ms": 4.2,
+     "p50_ms": 5.0,
+     "p95_ms": 10.0,
+     "p99_ms": 25.0,
+     "max_ms": 30.2,
+     "statuses": {
+      "200": 2974
+     }
+    },
+    "register": {
+     "count": 571,
+     "mean_ms": 10261.2,
+     "p50_ms": 10000.0,
+     "p95_ms": 30128.5,
+     "p99_ms": 30128.5,
+     "max_ms": 30128.5,
+     "statuses": {
+      "0": 71,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 499,
+     "mean_ms": 863.8,
+     "p50_ms": 1000.0,
+     "p95_ms": 2500.0,
+     "p99_ms": 2500.0,
+     "max_ms": 1319.0,
+     "statuses": {
+      "200": 499
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 5500,
+     "mean_exec_ms": 1243.48,
+     "total_exec_ms": 6839141.41,
+     "rows": 88000,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 543,
+     "mean_exec_ms": 94.4,
+     "total_exec_ms": 51259.61,
+     "rows": 543,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 37186,
+     "mean_exec_ms": 0.12,
+     "total_exec_ms": 4473.35,
+     "rows": 4163,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 42643,
+     "mean_exec_ms": 0.06,
+     "total_exec_ms": 2487.87,
+     "rows": 42643,
+     "query": "UPDATE minion_executor SET paused_reason=$1::VARCHAR, last_seen_at=now() WHERE minion_executor.executor_id = $2::UUID AND minion_executor.status != $3"
+    },
+    {
+     "calls": 46812,
+     "mean_exec_ms": 0.05,
+     "total_exec_ms": 2288.14,
+     "rows": 46812,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attempts, minion_task.output_uri, minion_task.status FROM minion_subtask JOIN minion_task ON minion_task."
+    },
+    {
+     "calls": 46771,
+     "mean_exec_ms": 0.04,
+     "total_exec_ms": 1767.23,
+     "rows": 46080,
+     "query": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acquirement.team, minion_subtask_acquirement.project, minion_subtask_acquirement.task_name, min"
+    },
+    {
+     "calls": 51556,
+     "mean_exec_ms": 0.03,
+     "total_exec_ms": 1748.27,
+     "rows": 51556,
+     "query": "SELECT minion_executor.executor_id, minion_executor.owner, minion_executor.pool, minion_executor.status, minion_executor.token_expires_at, minion_executor.token"
+    },
+    {
+     "calls": 42643,
+     "mean_exec_ms": 0.04,
+     "total_exec_ms": 1536.88,
+     "rows": 42643,
+     "query": "UPDATE minion_executor_heartbeat SET last_seen_at=now() WHERE minion_executor_heartbeat.acquirement_id = $1::UUID"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 47329,
+     "deletes": 0,
+     "hot_updates": 47008,
+     "seq_scans": 0,
+     "idx_scans": 107082,
+     "autovacuum_count": 10,
+     "dead_tuples_after": 198,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 4163,
+     "updates": 42642,
+     "deletes": 4061,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 90460,
+     "autovacuum_count": 10,
+     "dead_tuples_after": 5137,
+     "live_tuples_after": 103
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 8224,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 12254,
+     "idx_scans": 97652,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 18396,
+     "live_tuples_after": 1000000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 4172,
+     "updates": 0,
+     "deletes": 4070,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 60358,
+     "autovacuum_count": 10,
+     "dead_tuples_after": 697,
+     "live_tuples_after": 103
+    },
+    "minion_subtask_attempt": {
+     "inserts": 4061,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 1159,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 9228
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 3021,
+     "deletes": 0,
+     "hot_updates": 3021,
+     "seq_scans": 74933,
+     "idx_scans": 118,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 47,
+     "live_tuples_after": 100
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 4163,
+     "mean_ms": 3954.3,
+     "p50": "<= 250 ms",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.6332
+    },
+    "error": {
+     "count": 45,
+     "mean_ms": 30008.1,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    },
+    "empty": {
+     "count": 3,
+     "mean_ms": 41823.4,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    }
+   },
+   "docker_in_run": {
+    "postgres_cpu_pct_median": 394,
+    "postgres_cpu_pct_max": 1183,
+    "server_cpu_pct_median": 48,
+    "server_cpu_pct_max": 92
+   }
+  },
+  "knee_1_sim_work_2s": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 1,
+    "seed": 0,
+    "sims": 1,
+    "team": "scale",
+    "work_s": 2.0
+   },
+   "run": {
+    "assigned": 54,
+    "completed": 53,
+    "conflicts_409": 0,
+    "drained": false,
+    "duration_s": 120.112,
+    "events": {
+     "assigned": 54,
+     "completed": 53,
+     "released": 1
+    },
+    "faults": {},
+    "procs": 1,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 1,
+    "throughput_per_s": 0.441,
+    "transport_errors": 0
+   },
+   "event_loop_lag": {
+    "count": 2349,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.00295
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 54,
+     "mean_ms": 205.7,
+     "p50_ms": 250.0,
+     "p95_ms": 250.0,
+     "p99_ms": 250.0,
+     "max_ms": 215.5,
+     "statuses": {
+      "200": 54
+     }
+    },
+    "complete": {
+     "count": 53,
+     "mean_ms": 27.3,
+     "p50_ms": 50.0,
+     "p95_ms": 50.0,
+     "p99_ms": 50.0,
+     "max_ms": 33.4,
+     "statuses": {
+      "200": 53
+     }
+    },
+    "output_put": {
+     "count": 53,
+     "mean_ms": 7.9,
+     "p50_ms": 10.0,
+     "p95_ms": 25.0,
+     "p99_ms": 25.0,
+     "max_ms": 11.1,
+     "statuses": {
+      "200": 53
+     }
+    },
+    "register": {
+     "count": 1,
+     "mean_ms": 21.4,
+     "p50_ms": 25.0,
+     "p95_ms": 25.0,
+     "p99_ms": 25.0,
+     "max_ms": 21.4,
+     "statuses": {
+      "200": 1
+     }
+    },
+    "release": {
+     "count": 1,
+     "mean_ms": 26.4,
+     "p50_ms": 50.0,
+     "p95_ms": 50.0,
+     "p99_ms": 50.0,
+     "max_ms": 26.4,
+     "statuses": {
+      "200": 1
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 54,
+     "mean_exec_ms": 187.01,
+     "total_exec_ms": 10098.47,
+     "rows": 864,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 114,
+     "mean_exec_ms": 42.95,
+     "total_exec_ms": 4896.66,
+     "rows": 114,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 53,
+     "mean_exec_ms": 0.31,
+     "total_exec_ms": 16.32,
+     "rows": 53,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 54,
+     "mean_exec_ms": 0.23,
+     "total_exec_ms": 12.65,
+     "rows": 54,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 54,
+     "mean_exec_ms": 0.17,
+     "total_exec_ms": 8.95,
+     "rows": 54,
+     "query": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquirement.acquirement_id = $1::UUID"
+    },
+    {
+     "calls": 109,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 7.18,
+     "rows": 109,
+     "query": "SELECT minion_executor.executor_id, minion_executor.owner, minion_executor.pool, minion_executor.status, minion_executor.token_expires_at, minion_executor.token"
+    },
+    {
+     "calls": 60,
+     "mean_exec_ms": 0.12,
+     "total_exec_ms": 7.16,
+     "rows": 0,
+     "query": "SELECT minion_task.team, minion_task.project, minion_task.task_name, minion_task.type, minion_task.model_id, minion_task.engine, minion_task.model_memory_gb, mi"
+    },
+    {
+     "calls": 54,
+     "mean_exec_ms": 0.12,
+     "total_exec_ms": 6.43,
+     "rows": 54,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attempts, minion_task.output_uri, minion_task.status FROM minion_subtask JOIN minion_task ON minion_task."
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 55,
+     "deletes": 0,
+     "hot_updates": 55,
+     "seq_scans": 0,
+     "idx_scans": 272,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 5,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 54,
+     "updates": 0,
+     "deletes": 54,
+     "hot_updates": 0,
+     "seq_scans": 78,
+     "idx_scans": 0,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 54,
+     "live_tuples_after": 0
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 108,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 162,
+     "idx_scans": 612,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 18606,
+     "live_tuples_after": 1000000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 54,
+     "updates": 0,
+     "deletes": 54,
+     "hot_updates": 0,
+     "seq_scans": 186,
+     "idx_scans": 54,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 54,
+     "live_tuples_after": 0
+    },
+    "minion_subtask_attempt": {
+     "inserts": 54,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 1,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 9303
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 53,
+     "deletes": 0,
+     "hot_updates": 53,
+     "seq_scans": 492,
+     "idx_scans": 24,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 40,
+     "live_tuples_after": 100
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 54,
+     "mean_ms": 198.4,
+     "p50": "<= 250 ms",
+     "p95": "<= 250 ms",
+     "p99": "<= 250 ms",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 1.0
+    }
+   }
+  },
+  "knee_10_sims_work_2s": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 4,
+    "seed": 0,
+    "sims": 10,
+    "team": "scale",
+    "work_s": 2.0
+   },
+   "run": {
+    "assigned": 530,
+    "completed": 520,
+    "conflicts_409": 0,
+    "drained": false,
+    "duration_s": 121.205,
+    "events": {
+     "assigned": 530,
+     "completed": 520,
+     "released": 10
+    },
+    "faults": {},
+    "procs": 4,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 10,
+    "throughput_per_s": 4.29,
+    "transport_errors": 0
+   },
+   "event_loop_lag": {
+    "count": 9433,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.005213
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 530,
+     "mean_ms": 244.2,
+     "p50_ms": 250.0,
+     "p95_ms": 500.0,
+     "p99_ms": 1000.0,
+     "max_ms": 772.2,
+     "statuses": {
+      "200": 530
+     }
+    },
+    "complete": {
+     "count": 520,
+     "mean_ms": 24.8,
+     "p50_ms": 25.0,
+     "p95_ms": 50.0,
+     "p99_ms": 50.0,
+     "max_ms": 60.6,
+     "statuses": {
+      "200": 520
+     }
+    },
+    "output_put": {
+     "count": 520,
+     "mean_ms": 6.0,
+     "p50_ms": 10.0,
+     "p95_ms": 10.0,
+     "p99_ms": 25.0,
+     "max_ms": 19.9,
+     "statuses": {
+      "200": 520
+     }
+    },
+    "register": {
+     "count": 10,
+     "mean_ms": 40.9,
+     "p50_ms": 50.0,
+     "p95_ms": 50.0,
+     "p99_ms": 50.0,
+     "max_ms": 46.0,
+     "statuses": {
+      "200": 10
+     }
+    },
+    "release": {
+     "count": 10,
+     "mean_ms": 26.0,
+     "p50_ms": 50.0,
+     "p95_ms": 50.0,
+     "p99_ms": 50.0,
+     "max_ms": 30.1,
+     "statuses": {
+      "200": 10
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 530,
+     "mean_exec_ms": 223.37,
+     "total_exec_ms": 118385.63,
+     "rows": 8480,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 115,
+     "mean_exec_ms": 41.67,
+     "total_exec_ms": 4792.58,
+     "rows": 115,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 904,
+     "mean_exec_ms": 0.18,
+     "total_exec_ms": 165.3,
+     "rows": 530,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 520,
+     "mean_exec_ms": 0.16,
+     "total_exec_ms": 84.44,
+     "rows": 520,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    },
+    {
+     "calls": 520,
+     "mean_exec_ms": 0.16,
+     "total_exec_ms": 83.27,
+     "rows": 520,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 530,
+     "mean_exec_ms": 0.1,
+     "total_exec_ms": 53.77,
+     "rows": 530,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 1070,
+     "mean_exec_ms": 0.05,
+     "total_exec_ms": 52.32,
+     "rows": 1070,
+     "query": "SELECT minion_executor.executor_id, minion_executor.owner, minion_executor.pool, minion_executor.status, minion_executor.token_expires_at, minion_executor.token"
+    },
+    {
+     "calls": 520,
+     "mean_exec_ms": 0.1,
+     "total_exec_ms": 52.2,
+     "rows": 520,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR, error=$7, updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask.project = $4:"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 540,
+     "deletes": 0,
+     "hot_updates": 540,
+     "seq_scans": 0,
+     "idx_scans": 2650,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 55,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 530,
+     "updates": 0,
+     "deletes": 520,
+     "hot_updates": 0,
+     "seq_scans": 545,
+     "idx_scans": 0,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 79,
+     "live_tuples_after": 11
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 1050,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 1510,
+     "idx_scans": 3328,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 19656,
+     "live_tuples_after": 1000000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 537,
+     "updates": 0,
+     "deletes": 527,
+     "hot_updates": 0,
+     "seq_scans": 1595,
+     "idx_scans": 605,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 79,
+     "live_tuples_after": 11
+    },
+    "minion_subtask_attempt": {
+     "inserts": 520,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 0,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 9823
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 520,
+     "deletes": 0,
+     "hot_updates": 520,
+     "seq_scans": 4234,
+     "idx_scans": 25,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 36,
+     "live_tuples_after": 100
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 530,
+     "mean_ms": 236.8,
+     "p50": "<= 250 ms",
+     "p95": "<= 500 ms",
+     "p99": "<= 1000 ms",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.8604
+    }
+   }
+  },
+  "knee_50_sims_work_2s": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 4,
+    "seed": 0,
+    "sims": 50,
+    "team": "scale",
+    "work_s": 2.0
+   },
+   "run": {
+    "assigned": 927,
+    "completed": 877,
+    "conflicts_409": 0,
+    "drained": false,
+    "duration_s": 121.781,
+    "events": {
+     "assigned": 927,
+     "completed": 877,
+     "released": 50
+    },
+    "faults": {},
+    "procs": 4,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 50,
+    "throughput_per_s": 7.201,
+    "transport_errors": 0
+   },
+   "event_loop_lag": {
+    "count": 9404,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.002982
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 927,
+     "mean_ms": 4469.0,
+     "p50_ms": 5000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 27309.4,
+     "statuses": {
+      "200": 927
+     }
+    },
+    "acquire_empty": {
+     "count": 1,
+     "mean_ms": 29586.7,
+     "p50_ms": 30000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 29586.7,
+     "statuses": {
+      "204": 1
+     }
+    },
+    "complete": {
+     "count": 877,
+     "mean_ms": 43.0,
+     "p50_ms": 50.0,
+     "p95_ms": 100.0,
+     "p99_ms": 250.0,
+     "max_ms": 177.6,
+     "statuses": {
+      "200": 877
+     }
+    },
+    "output_put": {
+     "count": 877,
+     "mean_ms": 8.6,
+     "p50_ms": 10.0,
+     "p95_ms": 25.0,
+     "p99_ms": 25.0,
+     "max_ms": 25.3,
+     "statuses": {
+      "200": 877
+     }
+    },
+    "register": {
+     "count": 50,
+     "mean_ms": 188.2,
+     "p50_ms": 250.0,
+     "p95_ms": 500.0,
+     "p99_ms": 1000.0,
+     "max_ms": 535.2,
+     "statuses": {
+      "200": 50
+     }
+    },
+    "release": {
+     "count": 50,
+     "mean_ms": 45.4,
+     "p50_ms": 50.0,
+     "p95_ms": 250.0,
+     "p99_ms": 250.0,
+     "max_ms": 128.9,
+     "statuses": {
+      "200": 50
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 1937,
+     "mean_exec_ms": 2062.97,
+     "total_exec_ms": 3995973.86,
+     "rows": 30992,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 93,
+     "mean_exec_ms": 262.11,
+     "total_exec_ms": 24376.47,
+     "rows": 93,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 24275,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 1820.9,
+     "rows": 927,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 877,
+     "mean_exec_ms": 0.39,
+     "total_exec_ms": 338.63,
+     "rows": 877,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 877,
+     "mean_exec_ms": 0.36,
+     "total_exec_ms": 317.68,
+     "rows": 877,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    },
+    {
+     "calls": 927,
+     "mean_exec_ms": 0.17,
+     "total_exec_ms": 158.57,
+     "rows": 927,
+     "query": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquirement.acquirement_id = $1::UUID"
+    },
+    {
+     "calls": 927,
+     "mean_exec_ms": 0.15,
+     "total_exec_ms": 139.1,
+     "rows": 927,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 877,
+     "mean_exec_ms": 0.15,
+     "total_exec_ms": 134.65,
+     "rows": 877,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR, error=$7, updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask.project = $4:"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 978,
+     "deletes": 0,
+     "hot_updates": 978,
+     "seq_scans": 0,
+     "idx_scans": 4687,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 155,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 909,
+     "updates": 0,
+     "deletes": 912,
+     "hot_updates": 0,
+     "seq_scans": 436,
+     "idx_scans": 501,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 460,
+     "live_tuples_after": 4
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 1821,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 2866,
+     "idx_scans": 28036,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 21487,
+     "live_tuples_after": 1000000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 909,
+     "updates": 0,
+     "deletes": 912,
+     "hot_updates": 0,
+     "seq_scans": 1357,
+     "idx_scans": 2470,
+     "autovacuum_count": 2,
+     "dead_tuples_after": 460,
+     "live_tuples_after": 4
+    },
+    "minion_subtask_attempt": {
+     "inserts": 912,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 35,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 10762
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 877,
+     "deletes": 0,
+     "hot_updates": 868,
+     "seq_scans": 5357,
+     "idx_scans": 2191,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 155,
+     "live_tuples_after": 100
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 927,
+     "mean_ms": 4444.7,
+     "p50": "<= 5000 ms",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    },
+    "empty": {
+     "count": 1,
+     "mean_ms": 29576.6,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    }
+   }
+  }
+ },
+ "scenario_b_drain_chaos": {
+  "seed": {
+   "tasks": 20,
+   "subtasks_per_task": 1000,
+   "pending": 20000
+  },
+  "aborted_first_attempt_100k": {
+   "note": "100k x 500 sims drained at ~22 subtasks/s (2672 done in ~150 s, server container ~98 % CPU, postgres 350-430 %); projected ~75 min, so it was stopped (sims released cleanly, 0 RUNNING left) and B was re-run on a fresh 20k seed",
+   "candidate_mean_ms_at_100k_explain": 32.4,
+   "acquirement_insert_calls": 70555,
+   "candidate_calls": 6962
+  },
+  "run": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.02,
+     "late": 0.005,
+     "release": 0.02,
+     "vanish": 0.01
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 40.0,
+    "max_consecutive_failures": 5,
+    "procs": 8,
+    "seed": 0,
+    "sims": 500,
+    "team": "scale",
+    "work_s": 1.0
+   },
+   "run": {
+    "assigned": 21355,
+    "completed": 19895,
+    "conflicts_409": 227,
+    "drained": true,
+    "duration_s": 670.949,
+    "events": {
+     "assigned": 21355,
+     "complete_409": 80,
+     "complete_failed": 233,
+     "completed": 19895,
+     "failed_retryable": 424,
+     "fault_fail": 427,
+     "fault_late": 101,
+     "fault_release": 418,
+     "fault_vanish": 203,
+     "late_complete_409": 98,
+     "released": 413
+    },
+    "faults": {
+     "fail": 427,
+     "late": 101,
+     "release": 418,
+     "vanish": 203
+    },
+    "procs": 8,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 500,
+    "throughput_per_s": 29.652,
+    "transport_errors": 535
+   },
+   "event_loop_lag": {
+    "count": 105383,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.03473
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 21355,
+     "mean_ms": 6504.4,
+     "p50_ms": 5000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 29991.8,
+     "statuses": {
+      "200": 21355
+     }
+    },
+    "acquire_empty": {
+     "count": 1425,
+     "mean_ms": 2069.0,
+     "p50_ms": 25.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 29839.8,
+     "statuses": {
+      "204": 1425
+     }
+    },
+    "acquire_error": {
+     "count": 243,
+     "mean_ms": 30003.0,
+     "p50_ms": 30007.2,
+     "p95_ms": 30007.2,
+     "p99_ms": 30007.2,
+     "max_ms": 30007.2,
+     "statuses": {
+      "0": 243
+     }
+    },
+    "complete": {
+     "count": 20306,
+     "mean_ms": 6536.3,
+     "p50_ms": 5000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30006.6,
+     "max_ms": 30006.6,
+     "statuses": {
+      "0": 233,
+      "200": 19895,
+      "409": 178
+     }
+    },
+    "fail": {
+     "count": 427,
+     "mean_ms": 5837.0,
+     "p50_ms": 5000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30003.4,
+     "statuses": {
+      "0": 3,
+      "200": 424
+     }
+    },
+    "heartbeat": {
+     "count": 8591,
+     "mean_ms": 2708.9,
+     "p50_ms": 2500.0,
+     "p95_ms": 10000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 24557.9,
+     "statuses": {
+      "0": 1,
+      "200": 8543,
+      "409": 47
+     }
+    },
+    "output_put": {
+     "count": 20306,
+     "mean_ms": 3.5,
+     "p50_ms": 5.0,
+     "p95_ms": 10.0,
+     "p99_ms": 10.0,
+     "max_ms": 36.1,
+     "statuses": {
+      "200": 20306
+     }
+    },
+    "register": {
+     "count": 551,
+     "mean_ms": 4110.8,
+     "p50_ms": 2500.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30076.8,
+     "statuses": {
+      "0": 51,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 419,
+     "mean_ms": 6317.3,
+     "p50_ms": 5000.0,
+     "p95_ms": 30000.0,
+     "p99_ms": 30000.0,
+     "max_ms": 30002.9,
+     "statuses": {
+      "0": 4,
+      "200": 413,
+      "409": 2
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 418083,
+     "mean_exec_ms": 0.7,
+     "total_exec_ms": 292860.69,
+     "rows": 21518,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 47098,
+     "mean_exec_ms": 6.09,
+     "total_exec_ms": 287064.47,
+     "rows": 729955,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 20000,
+     "mean_exec_ms": 0.98,
+     "total_exec_ms": 19606.53,
+     "rows": 20000,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    },
+    {
+     "calls": 36236,
+     "mean_exec_ms": 0.08,
+     "total_exec_ms": 3073.73,
+     "rows": 29449,
+     "query": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acquirement.team, minion_subtask_acquirement.project, minion_subtask_acquirement.task_name, min"
+    },
+    {
+     "calls": 1327,
+     "mean_exec_ms": 1.63,
+     "total_exec_ms": 2157.8,
+     "rows": 1327,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 20000,
+     "mean_exec_ms": 0.08,
+     "total_exec_ms": 1518.79,
+     "rows": 20000,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 21518,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 1461.13,
+     "rows": 21518,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 20000,
+     "mean_exec_ms": 0.06,
+     "total_exec_ms": 1169.78,
+     "rows": 20000,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR, error=$7, updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask.project = $4:"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 32027,
+     "deletes": 0,
+     "hot_updates": 31574,
+     "seq_scans": 0,
+     "idx_scans": 134867,
+     "autovacuum_count": 11,
+     "dead_tuples_after": 273,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 21518,
+     "updates": 8607,
+     "deletes": 21515,
+     "hot_updates": 0,
+     "seq_scans": 92,
+     "idx_scans": 39501,
+     "autovacuum_count": 11,
+     "dead_tuples_after": 1451,
+     "live_tuples_after": 3
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 43033,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 47446,
+     "idx_scans": 513729,
+     "autovacuum_count": 7,
+     "dead_tuples_after": 1940,
+     "live_tuples_after": 20000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 21762,
+     "updates": 0,
+     "deletes": 21759,
+     "hot_updates": 0,
+     "seq_scans": 171,
+     "idx_scans": 147935,
+     "autovacuum_count": 11,
+     "dead_tuples_after": 1110,
+     "live_tuples_after": 3
+    },
+    "minion_subtask_attempt": {
+     "inserts": 21515,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 1,
+     "idx_scans": 1716,
+     "autovacuum_count": 6,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 21532
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 20039,
+     "deletes": 0,
+     "hot_updates": 19992,
+     "seq_scans": 183782,
+     "idx_scans": 130,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 45,
+     "live_tuples_after": 20
+    }
+   },
+   "server_minion_acquire_seconds": {
+    "assigned": {
+     "count": 21518,
+     "mean_ms": 4362.8,
+     "p50": "<= 5000 ms",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.1715
+    },
+    "empty": {
+     "count": 1428,
+     "mean_ms": 1341.5,
+     "p50": "<= 10 ms",
+     "p95": "<= 10000 ms",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.7836
+    },
+    "error": {
+     "count": 49,
+     "mean_ms": 30016.1,
+     "p50": "> 10 s (overflow)",
+     "p95": "> 10 s (overflow)",
+     "p99": "> 10 s (overflow)",
+     "share_le_200ms_est": null,
+     "share_le_250ms": 0.0
+    }
+   }
+  },
+  "verify": {
+   "checks": [
+    {
+     "detail": {
+      "samples": [],
+      "violations": 0
+     },
+     "name": "nf2_one_succeeded_attempt_per_succeeded_subtask",
+     "ok": true
+    },
+    {
+     "detail": {
+      "final_objects": 20000,
+      "missing": 0,
+      "succeeded": 20000,
+      "unexpected": 0
+     },
+     "name": "nf2_final_objects_match_succeeded",
+     "ok": true
+    },
+    {
+     "detail": {
+      "non_terminal": 0,
+      "samples": []
+     },
+     "name": "nf3_all_subtasks_terminal",
+     "ok": true
+    },
+    {
+     "detail": {
+      "orphans": 0,
+      "samples": []
+     },
+     "name": "nf3_no_orphan_acquirements",
+     "ok": true
+    },
+    {
+     "detail": {
+      "samples": [],
+      "violations": 0
+     },
+     "name": "task_counters_match_subtasks",
+     "ok": true
+    },
+    {
+     "detail": {
+      "non_terminal_tasks": 0
+     },
+     "name": "tasks_terminal",
+     "ok": true
+    }
+   ],
+   "counts": {
+    "acquirements": 0,
+    "attempts": 21518,
+    "cancelled": 0,
+    "failed": 0,
+    "subtasks": 20000,
+    "succeeded": 20000,
+    "tasks": 20
+   },
+   "ok": true
+  }
+ },
+ "scenario_c_watchdog": {
+  "setup": "container watchdog stopped; 500 sims each acquire once and vanish (fault vanish=1.0, acquire pace 1e5 s); wait > 20 s; then one tick of minion_watchdog.main.tick run from the host with DEBUG logging (same code path); minion_subtask holds 1,000,000 rows",
+  "with_0008": {
+   "ticks": [
+    [
+     {
+      "scan_ms": 2,
+      "hits": 0,
+      "event": "over_lease_scan",
+      "level": "debug"
+     },
+     {
+      "EXPIRED_REQUEUED": 500,
+      "event": "watchdog_reclaim",
+      "level": "info"
+     },
+     {
+      "scan_ms": 0,
+      "hits": 0,
+      "event": "over_lease_scan",
+      "level": "debug"
+     },
+     {
+      "duration_ms": 2361,
+      "rounds": 2,
+      "event": "watchdog_tick",
+      "level": "info"
+     },
+     {
+      "event": "wall",
+      "ms": 2361
+     }
+    ],
+    [
+     {
+      "scan_ms": 2,
+      "hits": 0,
+      "event": "over_lease_scan",
+      "level": "debug"
+     },
+     {
+      "EXPIRED_REQUEUED": 436,
+      "event": "watchdog_reclaim",
+      "level": "info"
+     },
+     {
+      "duration_ms": 1687,
+      "rounds": 1,
+      "event": "watchdog_tick",
+      "level": "info"
+     },
+     {
+      "event": "wall",
+      "ms": 1687
+     }
+    ]
+   ],
+   "explain": [
+    {
+     "name": "candidate",
+     "plan_kind": "custom",
+     "planning_ms": 0.443,
+     "execution_ms": 201.799,
+     "top_buffers": "hit=20814",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40454.60..40456.47 rows=16 width=146) (actual time=199.750..201.751 rows=16 loops=1)",
+      "  Buffers: shared hit=20814",
+      "  ->  Gather Merge  (cost=40454.60..137051.54 rows=827916 width=146) (actual time=199.748..201.747 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20814",
+      "        ->  Sort  (cost=39454.58..40489.47 rows=413958 width=146) (actual time=196.657..196.659 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20814",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29105.63 rows=413958 width=146) (actual time=0.117..91.728 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.team)::text = (minion_task.team)::text) AND ((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20692",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..25779.33 rows=413958 width=79) (actual time=0.005..27.804 rows=331119 loops=3)",
+      "                          Filter: ((status)::text = 'PENDING'::text)",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20571",
+      "                    ->  Hash  (cost=9.25..9.25 rows=100 width=90) (actual time=0.055..0.056 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.25 rows=100 width=90) (actual time=0.007..0.038 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning:",
+      "  Buffers: shared hit=128",
+      "Planning Time: 0.443 ms",
+      "Execution Time: 201.799 ms"
+     ]
+    },
+    {
+     "name": "candidate_preference",
+     "plan_kind": "custom",
+     "planning_ms": 0.165,
+     "execution_ms": 192.475,
+     "top_buffers": "hit=20804",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40404.97..40406.84 rows=16 width=146) (actual time=190.374..192.432 rows=16 loops=1)",
+      "  Buffers: shared hit=20804",
+      "  ->  Gather Merge  (cost=40404.97..137001.91 rows=827916 width=146) (actual time=190.374..192.430 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20804",
+      "        ->  Sort  (cost=39404.94..40439.84 rows=413958 width=146) (actual time=189.059..189.061 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20804",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29055.99 rows=413958 width=146) (actual time=0.121..88.400 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20692",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..26821.00 rows=413958 width=79) (actual time=0.006..32.570 rows=331119 loops=3)",
+      "                          Filter: (((team)::text = 'scale'::text) AND ((status)::text = 'PENDING'::text))",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20571",
+      "                    ->  Hash  (cost=9.50..9.50 rows=100 width=90) (actual time=0.056..0.056 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.50 rows=100 width=90) (actual time=0.007..0.039 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((team)::text = 'scale'::text) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning Time: 0.165 ms",
+      "Execution Time: 192.475 ms"
+     ]
+    },
+    {
+     "name": "stale_heartbeat",
+     "plan_kind": "custom",
+     "planning_ms": 0.177,
+     "execution_ms": 0.175,
+     "top_buffers": "hit=47",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=78.16..79.41 rows=500 width=24) (actual time=0.110..0.150 rows=500 loops=1)",
+      "  Buffers: shared hit=47",
+      "  ->  Sort  (cost=78.16..79.41 rows=500 width=24) (actual time=0.109..0.126 rows=500 loops=1)",
+      "        Sort Key: last_seen_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=47",
+      "        ->  Seq Scan on minion_executor_heartbeat  (cost=0.00..55.75 rows=500 width=24) (actual time=0.005..0.074 rows=500 loops=1)",
+      "              Filter: (last_seen_at < (now() - '00:00:20'::interval))",
+      "              Buffers: shared hit=47",
+      "Planning:",
+      "  Buffers: shared hit=32",
+      "Planning Time: 0.177 ms",
+      "Execution Time: 0.175 ms"
+     ]
+    },
+    {
+     "name": "over_lease",
+     "plan_kind": "custom",
+     "planning_ms": 0.095,
+     "execution_ms": 0.009,
+     "top_buffers": "hit=2",
+     "seq_scan": false,
+     "plan": [
+      "Limit  (cost=0.28..4.51 rows=1 width=24) (actual time=0.004..0.004 rows=0 loops=1)",
+      "  Buffers: shared hit=2",
+      "  ->  Index Scan using ix_minion_subtask_acquirement_acquired_at on minion_subtask_acquirement  (cost=0.28..4.51 rows=1 width=24) (actual time=0.003..0.004 rows=0 loops=1)",
+      "        Index Cond: (acquired_at < (now() - '06:00:00'::interval))",
+      "        Buffers: shared hit=2",
+      "Planning:",
+      "  Buffers: shared hit=34",
+      "Planning Time: 0.095 ms",
+      "Execution Time: 0.009 ms"
+     ]
+    }
+   ],
+   "explain_max_lease_30s": [
+    {
+     "name": "candidate",
+     "plan_kind": "custom",
+     "planning_ms": 0.442,
+     "execution_ms": 199.043,
+     "top_buffers": "hit=20804",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40454.16..40456.02 rows=16 width=146) (actual time=197.143..198.995 rows=16 loops=1)",
+      "  Buffers: shared hit=20804",
+      "  ->  Gather Merge  (cost=40454.16..137048.07 rows=827890 width=146) (actual time=197.142..198.992 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20804",
+      "        ->  Sort  (cost=39454.13..40489.00 rows=413945 width=146) (actual time=195.776..195.777 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20804",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29105.51 rows=413945 width=146) (actual time=0.117..90.990 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.team)::text = (minion_task.team)::text) AND ((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20692",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..25779.33 rows=413945 width=79) (actual time=0.005..27.463 rows=331119 loops=3)",
+      "                          Filter: ((status)::text = 'PENDING'::text)",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20571",
+      "                    ->  Hash  (cost=9.25..9.25 rows=100 width=90) (actual time=0.053..0.053 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.25 rows=100 width=90) (actual time=0.006..0.036 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning:",
+      "  Buffers: shared hit=122",
+      "Planning Time: 0.442 ms",
+      "Execution Time: 199.043 ms"
+     ]
+    },
+    {
+     "name": "candidate_preference",
+     "plan_kind": "custom",
+     "planning_ms": 0.152,
+     "execution_ms": 193.978,
+     "top_buffers": "hit=20804",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40404.56..40406.43 rows=16 width=146) (actual time=192.014..193.936 rows=16 loops=1)",
+      "  Buffers: shared hit=20804",
+      "  ->  Gather Merge  (cost=40404.56..136998.47 rows=827890 width=146) (actual time=192.013..193.933 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20804",
+      "        ->  Sort  (cost=39404.54..40439.40 rows=413945 width=146) (actual time=190.755..190.756 rows=11 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20804",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29055.91 rows=413945 width=146) (actual time=0.111..88.654 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20692",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..26821.00 rows=413945 width=79) (actual time=0.004..32.884 rows=331119 loops=3)",
+      "                          Filter: (((team)::text = 'scale'::text) AND ((status)::text = 'PENDING'::text))",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20571",
+      "                    ->  Hash  (cost=9.50..9.50 rows=100 width=90) (actual time=0.051..0.052 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.50 rows=100 width=90) (actual time=0.006..0.036 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((team)::text = 'scale'::text) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning Time: 0.152 ms",
+      "Execution Time: 193.978 ms"
+     ]
+    },
+    {
+     "name": "stale_heartbeat",
+     "plan_kind": "custom",
+     "planning_ms": 0.131,
+     "execution_ms": 0.171,
+     "top_buffers": "hit=47",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=78.16..79.41 rows=500 width=24) (actual time=0.108..0.147 rows=500 loops=1)",
+      "  Buffers: shared hit=47",
+      "  ->  Sort  (cost=78.16..79.41 rows=500 width=24) (actual time=0.107..0.123 rows=500 loops=1)",
+      "        Sort Key: last_seen_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=47",
+      "        ->  Seq Scan on minion_executor_heartbeat  (cost=0.00..55.75 rows=500 width=24) (actual time=0.004..0.070 rows=500 loops=1)",
+      "              Filter: (last_seen_at < (now() - '00:00:20'::interval))",
+      "              Buffers: shared hit=47",
+      "Planning:",
+      "  Buffers: shared hit=18",
+      "Planning Time: 0.131 ms",
+      "Execution Time: 0.171 ms"
+     ]
+    },
+    {
+     "name": "over_lease",
+     "plan_kind": "custom",
+     "planning_ms": 0.061,
+     "execution_ms": 0.16,
+     "top_buffers": "hit=63",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=94.16..95.41 rows=500 width=24) (actual time=0.101..0.140 rows=500 loops=1)",
+      "  Buffers: shared hit=63",
+      "  ->  Sort  (cost=94.16..95.41 rows=500 width=24) (actual time=0.101..0.118 rows=500 loops=1)",
+      "        Sort Key: acquired_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=63",
+      "        ->  Seq Scan on minion_subtask_acquirement  (cost=0.00..71.75 rows=500 width=24) (actual time=0.002..0.065 rows=500 loops=1)",
+      "              Filter: (acquired_at < (now() - '00:00:30'::interval))",
+      "              Buffers: shared hit=63",
+      "Planning:",
+      "  Buffers: shared hit=14",
+      "Planning Time: 0.061 ms",
+      "Execution Time: 0.160 ms"
+     ]
+    }
+   ]
+  },
+  "without_0008": {
+   "ticks": [
+    [
+     {
+      "scan_ms": 3,
+      "hits": 0,
+      "event": "over_lease_scan",
+      "level": "debug"
+     },
+     {
+      "EXPIRED_REQUEUED": 500,
+      "event": "watchdog_reclaim",
+      "level": "info"
+     },
+     {
+      "scan_ms": 2,
+      "hits": 0,
+      "event": "over_lease_scan",
+      "level": "debug"
+     },
+     {
+      "duration_ms": 6971,
+      "rounds": 2,
+      "event": "watchdog_tick",
+      "level": "info"
+     },
+     {
+      "event": "wall",
+      "ms": 6971
+     }
+    ]
+   ],
+   "explain": [
+    {
+     "name": "candidate",
+     "plan_kind": "custom",
+     "planning_ms": 0.423,
+     "execution_ms": 200.94,
+     "top_buffers": "hit=20831",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40459.22..40461.08 rows=16 width=146) (actual time=199.102..200.893 rows=16 loops=1)",
+      "  Buffers: shared hit=20831",
+      "  ->  Gather Merge  (cost=40459.22..136968.66 rows=827166 width=146) (actual time=199.100..200.890 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20831",
+      "        ->  Sort  (cost=39459.19..40493.15 rows=413583 width=146) (actual time=196.139..196.140 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20831",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29119.62 rows=413583 width=146) (actual time=0.115..91.214 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.team)::text = (minion_task.team)::text) AND ((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20709",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..25796.33 rows=413583 width=79) (actual time=0.005..27.482 rows=331119 loops=3)",
+      "                          Filter: ((status)::text = 'PENDING'::text)",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20588",
+      "                    ->  Hash  (cost=9.25..9.25 rows=100 width=90) (actual time=0.053..0.053 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.25 rows=100 width=90) (actual time=0.006..0.036 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning:",
+      "  Buffers: shared hit=127",
+      "Planning Time: 0.423 ms",
+      "Execution Time: 200.940 ms"
+     ]
+    },
+    {
+     "name": "candidate_preference",
+     "plan_kind": "custom",
+     "planning_ms": 0.139,
+     "execution_ms": 193.369,
+     "top_buffers": "hit=20821",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40410.58..40412.44 rows=16 width=146) (actual time=191.489..193.325 rows=16 loops=1)",
+      "  Buffers: shared hit=20821",
+      "  ->  Gather Merge  (cost=40410.58..136920.01 rows=827166 width=146) (actual time=191.488..193.322 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20821",
+      "        ->  Sort  (cost=39410.55..40444.51 rows=413583 width=146) (actual time=190.290..190.292 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20821",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29070.98 rows=413583 width=146) (actual time=0.114..88.770 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20709",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..26838.00 rows=413583 width=79) (actual time=0.005..32.640 rows=331119 loops=3)",
+      "                          Filter: (((team)::text = 'scale'::text) AND ((status)::text = 'PENDING'::text))",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20588",
+      "                    ->  Hash  (cost=9.50..9.50 rows=100 width=90) (actual time=0.054..0.054 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.50 rows=100 width=90) (actual time=0.006..0.037 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((team)::text = 'scale'::text) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning Time: 0.139 ms",
+      "Execution Time: 193.369 ms"
+     ]
+    },
+    {
+     "name": "stale_heartbeat",
+     "plan_kind": "custom",
+     "planning_ms": 0.126,
+     "execution_ms": 0.149,
+     "top_buffers": "hit=38",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=69.16..70.41 rows=500 width=24) (actual time=0.088..0.128 rows=500 loops=1)",
+      "  Buffers: shared hit=38",
+      "  ->  Sort  (cost=69.16..70.41 rows=500 width=24) (actual time=0.088..0.104 rows=500 loops=1)",
+      "        Sort Key: last_seen_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=38",
+      "        ->  Seq Scan on minion_executor_heartbeat  (cost=0.00..46.75 rows=500 width=24) (actual time=0.003..0.052 rows=500 loops=1)",
+      "              Filter: (last_seen_at < (now() - '00:00:20'::interval))",
+      "              Buffers: shared hit=38",
+      "Planning:",
+      "  Buffers: shared hit=32",
+      "Planning Time: 0.126 ms",
+      "Execution Time: 0.149 ms"
+     ]
+    },
+    {
+     "name": "over_lease",
+     "plan_kind": "custom",
+     "planning_ms": 0.084,
+     "execution_ms": 0.058,
+     "top_buffers": "hit=42",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=50.76..50.77 rows=1 width=24) (actual time=0.052..0.052 rows=0 loops=1)",
+      "  Buffers: shared hit=42",
+      "  ->  Sort  (cost=50.76..50.77 rows=1 width=24) (actual time=0.052..0.052 rows=0 loops=1)",
+      "        Sort Key: acquired_at",
+      "        Sort Method: quicksort  Memory: 25kB",
+      "        Buffers: shared hit=42",
+      "        ->  Seq Scan on minion_subtask_acquirement  (cost=0.00..50.75 rows=1 width=24) (actual time=0.050..0.050 rows=0 loops=1)",
+      "              Filter: (acquired_at < (now() - '06:00:00'::interval))",
+      "              Rows Removed by Filter: 500",
+      "              Buffers: shared hit=42",
+      "Planning:",
+      "  Buffers: shared hit=24",
+      "Planning Time: 0.084 ms",
+      "Execution Time: 0.058 ms"
+     ]
+    }
+   ],
+   "explain_max_lease_30s": [
+    {
+     "name": "candidate",
+     "plan_kind": "custom",
+     "planning_ms": 0.405,
+     "execution_ms": 198.856,
+     "top_buffers": "hit=20821",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40471.16..40473.02 rows=16 width=146) (actual time=196.926..198.805 rows=16 loops=1)",
+      "  Buffers: shared hit=20821",
+      "  ->  Gather Merge  (cost=40471.16..137065.07 rows=827890 width=146) (actual time=196.925..198.802 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20821",
+      "        ->  Sort  (cost=39471.13..40506.00 rows=413945 width=146) (actual time=195.486..195.488 rows=11 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20821",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29122.51 rows=413945 width=146) (actual time=0.124..90.799 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.team)::text = (minion_task.team)::text) AND ((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20709",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..25796.33 rows=413945 width=79) (actual time=0.005..27.414 rows=331119 loops=3)",
+      "                          Filter: ((status)::text = 'PENDING'::text)",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20588",
+      "                    ->  Hash  (cost=9.25..9.25 rows=100 width=90) (actual time=0.055..0.056 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.25 rows=100 width=90) (actual time=0.006..0.038 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning:",
+      "  Buffers: shared hit=120",
+      "Planning Time: 0.405 ms",
+      "Execution Time: 198.856 ms"
+     ]
+    },
+    {
+     "name": "candidate_preference",
+     "plan_kind": "custom",
+     "planning_ms": 0.156,
+     "execution_ms": 192.069,
+     "top_buffers": "hit=20821",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=40421.56..40423.43 rows=16 width=146) (actual time=190.113..192.028 rows=16 loops=1)",
+      "  Buffers: shared hit=20821",
+      "  ->  Gather Merge  (cost=40421.56..137015.47 rows=827890 width=146) (actual time=190.112..192.026 rows=16 loops=1)",
+      "        Workers Planned: 2",
+      "        Workers Launched: 2",
+      "        Buffers: shared hit=20821",
+      "        ->  Sort  (cost=39421.54..40456.40 rows=413945 width=146) (actual time=188.932..188.933 rows=16 loops=3)",
+      "              Sort Key: minion_task.priority DESC, minion_task.created_at, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id",
+      "              Sort Method: top-N heapsort  Memory: 29kB",
+      "              Buffers: shared hit=20821",
+      "              Worker 0:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              Worker 1:  Sort Method: top-N heapsort  Memory: 29kB",
+      "              ->  Hash Join  (cost=11.00..29072.91 rows=413945 width=146) (actual time=0.112..88.531 rows=331119 loops=3)",
+      "                    Hash Cond: (((minion_subtask.project)::text = (minion_task.project)::text) AND ((minion_subtask.task_name)::text = (minion_task.task_name)::text))",
+      "                    Buffers: shared hit=20709",
+      "                    ->  Parallel Seq Scan on minion_subtask  (cost=0.00..26838.00 rows=413945 width=79) (actual time=0.004..32.626 rows=331119 loops=3)",
+      "                          Filter: (((team)::text = 'scale'::text) AND ((status)::text = 'PENDING'::text))",
+      "                          Rows Removed by Filter: 2214",
+      "                          Buffers: shared hit=20588",
+      "                    ->  Hash  (cost=9.50..9.50 rows=100 width=90) (actual time=0.052..0.053 rows=100 loops=3)",
+      "                          Buckets: 1024  Batches: 1  Memory Usage: 21kB",
+      "                          Buffers: shared hit=21",
+      "                          ->  Seq Scan on minion_task  (cost=0.00..9.50 rows=100 width=90) (actual time=0.006..0.037 rows=100 loops=3)",
+      "                                Filter: (((status)::text = ANY ('{PENDING,RUNNING}'::text[])) AND (model_memory_gb <= 8.0) AND ((allowed_pool IS NULL) OR ((allowed_pool)::text = 'scale'::text)) AND ((team)::text = 'scale'::text) AND ((model_id)::text = 'scale-fake'::text) AND ((engine)::text = 'fake'::text))",
+      "                                Buffers: shared hit=21",
+      "Planning Time: 0.156 ms",
+      "Execution Time: 192.069 ms"
+     ]
+    },
+    {
+     "name": "stale_heartbeat",
+     "plan_kind": "custom",
+     "planning_ms": 0.09,
+     "execution_ms": 0.159,
+     "top_buffers": "hit=38",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=69.16..70.41 rows=500 width=24) (actual time=0.089..0.138 rows=500 loops=1)",
+      "  Buffers: shared hit=38",
+      "  ->  Sort  (cost=69.16..70.41 rows=500 width=24) (actual time=0.089..0.105 rows=500 loops=1)",
+      "        Sort Key: last_seen_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=38",
+      "        ->  Seq Scan on minion_executor_heartbeat  (cost=0.00..46.75 rows=500 width=24) (actual time=0.003..0.053 rows=500 loops=1)",
+      "              Filter: (last_seen_at < (now() - '00:00:20'::interval))",
+      "              Buffers: shared hit=38",
+      "Planning:",
+      "  Buffers: shared hit=18",
+      "Planning Time: 0.090 ms",
+      "Execution Time: 0.159 ms"
+     ]
+    },
+    {
+     "name": "over_lease",
+     "plan_kind": "custom",
+     "planning_ms": 0.046,
+     "execution_ms": 0.172,
+     "top_buffers": "hit=42",
+     "seq_scan": true,
+     "plan": [
+      "Limit  (cost=73.16..74.41 rows=500 width=24) (actual time=0.114..0.153 rows=500 loops=1)",
+      "  Buffers: shared hit=42",
+      "  ->  Sort  (cost=73.16..74.41 rows=500 width=24) (actual time=0.114..0.130 rows=500 loops=1)",
+      "        Sort Key: acquired_at",
+      "        Sort Method: quicksort  Memory: 60kB",
+      "        Buffers: shared hit=42",
+      "        ->  Seq Scan on minion_subtask_acquirement  (cost=0.00..50.75 rows=500 width=24) (actual time=0.003..0.071 rows=500 loops=1)",
+      "              Filter: (acquired_at < (now() - '00:00:30'::interval))",
+      "              Buffers: shared hit=42",
+      "Planning:",
+      "  Buffers: shared hit=12",
+      "Planning Time: 0.046 ms",
+      "Execution Time: 0.172 ms"
+     ]
+    }
+   ],
+   "note": "index dropped in the scale DB only and recreated (same name and definition) right after"
+  }
+ },
+ "scenario_d_rate_limits": {
+  "probe_single_executor": {
+   "calls": 50,
+   "span_s": 0.262,
+   "statuses": {
+    "200": 2,
+    "429": 48
+   },
+   "retry_after_values_s": {
+    "1.0": 48
+   },
+   "latency_ms_p50": 3.64,
+   "latency_ms_max": 55.97,
+   "db_delta": {
+    "pg_stat_statements": {
+     "candidate_select": 2,
+     "acquirement_insert": 2,
+     "executor_update_on_acquire": 2,
+     "register_update": 1,
+     "subtask_attempt_insert": 2
+    },
+    "n_tup_ins_upd_del": [
+     6,
+     8,
+     4
+    ],
+    "note": "all deltas belong to the 2 admitted acquires (+ their 2 releases) and 1 register; the 48 throttled calls ran no statement"
+   }
+  },
+  "harness_throttled_pace_0_05": {
+   "config": {
+    "acquire_pace_s": 0.05,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 2,
+    "seed": 0,
+    "sims": 20,
+    "team": "scale",
+    "work_s": 0.0
+   },
+   "run": {
+    "assigned": 1049,
+    "completed": 1049,
+    "conflicts_409": 0,
+    "drained": false,
+    "duration_s": 60.744,
+    "events": {
+     "assigned": 1049,
+     "completed": 1049
+    },
+    "faults": {},
+    "procs": 2,
+    "rate_limited_429": 1034,
+    "server_errors_5xx": 0,
+    "sims": 20,
+    "throughput_per_s": 17.269,
+    "transport_errors": 0
+   },
+   "event_loop_lag": {
+    "count": 2353,
+    "p50_s": 0.0025,
+    "p99_s": 0.0025,
+    "max_s": 0.003624
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 1049,
+     "mean_ms": 29.3,
+     "p50_ms": 25.0,
+     "p95_ms": 50.0,
+     "p99_ms": 250.0,
+     "max_ms": 370.8,
+     "statuses": {
+      "200": 1049
+     }
+    },
+    "acquire_error": {
+     "count": 1034,
+     "mean_ms": 5.3,
+     "p50_ms": 10.0,
+     "p95_ms": 10.0,
+     "p99_ms": 25.0,
+     "max_ms": 26.3,
+     "statuses": {
+      "429": 1034
+     }
+    },
+    "complete": {
+     "count": 1049,
+     "mean_ms": 15.0,
+     "p50_ms": 25.0,
+     "p95_ms": 50.0,
+     "p99_ms": 100.0,
+     "max_ms": 88.9,
+     "statuses": {
+      "200": 1049
+     }
+    },
+    "output_put": {
+     "count": 1049,
+     "mean_ms": 3.8,
+     "p50_ms": 5.0,
+     "p95_ms": 10.0,
+     "p99_ms": 10.0,
+     "max_ms": 12.1,
+     "statuses": {
+      "200": 1049
+     }
+    },
+    "register": {
+     "count": 20,
+     "mean_ms": 59.7,
+     "p50_ms": 100.0,
+     "p95_ms": 100.0,
+     "p99_ms": 100.0,
+     "max_ms": 79.4,
+     "statuses": {
+      "200": 20
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 1053,
+     "mean_exec_ms": 7.32,
+     "total_exec_ms": 7707.43,
+     "rows": 16848,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 1309,
+     "mean_exec_ms": 0.4,
+     "total_exec_ms": 524.67,
+     "rows": 1049,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 60,
+     "mean_exec_ms": 3.09,
+     "total_exec_ms": 185.65,
+     "rows": 60,
+     "query": "SELECT count(*) FROM minion_subtask WHERE team = $1 AND status IN ($2, $3)"
+    },
+    {
+     "calls": 1049,
+     "mean_exec_ms": 0.11,
+     "total_exec_ms": 110.59,
+     "rows": 1049,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 3152,
+     "mean_exec_ms": 0.03,
+     "total_exec_ms": 96.1,
+     "rows": 3152,
+     "query": "SELECT minion_executor.executor_id, minion_executor.owner, minion_executor.pool, minion_executor.status, minion_executor.token_expires_at, minion_executor.token"
+    },
+    {
+     "calls": 1049,
+     "mean_exec_ms": 0.08,
+     "total_exec_ms": 79.12,
+     "rows": 1049,
+     "query": "UPDATE minion_executor SET engines=$1::VARCHAR(16)[], profile=$2, budget=$3::JSONB, paused_reason=$4::VARCHAR, last_seen_at=now() WHERE minion_executor.executor"
+    },
+    {
+     "calls": 1049,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 78.1,
+     "rows": 1049,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 1049,
+     "mean_exec_ms": 0.06,
+     "total_exec_ms": 65.43,
+     "rows": 1049,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 1049,
+     "deletes": 0,
+     "hot_updates": 1049,
+     "seq_scans": 0,
+     "idx_scans": 6206,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 38,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 1031,
+     "updates": 0,
+     "deletes": 1029,
+     "hot_updates": 0,
+     "seq_scans": 1031,
+     "idx_scans": 10,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 954,
+     "live_tuples_after": 10
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 2060,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 960,
+     "idx_scans": 6321,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 2064,
+     "live_tuples_after": 30000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 1050,
+     "updates": 0,
+     "deletes": 1048,
+     "hot_updates": 0,
+     "seq_scans": 3101,
+     "idx_scans": 1241,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 964,
+     "live_tuples_after": 10
+    },
+    "minion_subtask_attempt": {
+     "inserts": 1029,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 0,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 22566
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 1031,
+     "deletes": 0,
+     "hot_updates": 1029,
+     "seq_scans": 6324,
+     "idx_scans": 0,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 42,
+     "live_tuples_after": 30
+    }
+   }
+  },
+  "harness_control_pace_0_4": {
+   "config": {
+    "acquire_pace_s": 0.4,
+    "backoff_s": [
+     10.0,
+     30.0
+    ],
+    "failure_pause_s": 300.0,
+    "fault_rates": {
+     "fail": 0.0,
+     "late": 0.0,
+     "release": 0.0,
+     "vanish": 0.0
+    },
+    "heartbeat_interval_s": 5.0,
+    "late_wait_s": 30.0,
+    "max_consecutive_failures": 5,
+    "procs": 2,
+    "seed": 0,
+    "sims": 20,
+    "team": "scale",
+    "work_s": 0.0
+   },
+   "run": {
+    "assigned": 2980,
+    "completed": 2980,
+    "conflicts_409": 0,
+    "drained": false,
+    "duration_s": 60.711,
+    "events": {
+     "assigned": 2980,
+     "completed": 2980
+    },
+    "faults": {},
+    "procs": 2,
+    "rate_limited_429": 0,
+    "server_errors_5xx": 0,
+    "sims": 20,
+    "throughput_per_s": 49.085,
+    "transport_errors": 0
+   },
+   "event_loop_lag": {
+    "count": 2355,
+    "p50_s": 0.001,
+    "p99_s": 0.0025,
+    "max_s": 0.011554
+   },
+   "client_calls": {
+    "acquire_assigned": {
+     "count": 2980,
+     "mean_ms": 178.5,
+     "p50_ms": 250.0,
+     "p95_ms": 500.0,
+     "p99_ms": 500.0,
+     "max_ms": 378.1,
+     "statuses": {
+      "200": 2980
+     }
+    },
+    "complete": {
+     "count": 2980,
+     "mean_ms": 52.8,
+     "p50_ms": 50.0,
+     "p95_ms": 100.0,
+     "p99_ms": 250.0,
+     "max_ms": 155.7,
+     "statuses": {
+      "200": 2980
+     }
+    },
+    "output_put": {
+     "count": 2980,
+     "mean_ms": 3.4,
+     "p50_ms": 5.0,
+     "p95_ms": 10.0,
+     "p99_ms": 10.0,
+     "max_ms": 14.2,
+     "statuses": {
+      "200": 2980
+     }
+    },
+    "register": {
+     "count": 20,
+     "mean_ms": 57.0,
+     "p50_ms": 100.0,
+     "p95_ms": 100.0,
+     "p99_ms": 100.0,
+     "max_ms": 78.2,
+     "statuses": {
+      "200": 20
+     }
+    }
+   },
+   "pg_stat_statements_top": [
+    {
+     "calls": 24605,
+     "mean_exec_ms": 1.02,
+     "total_exec_ms": 25071.87,
+     "rows": 2980,
+     "query": "INSERT INTO minion_subtask_acquirement (acquirement_id, team, project, task_name, subtask_id, executor_id, attempt) SELECT $1::UUID AS anon_1, minion_subtask.te"
+    },
+    {
+     "calls": 3421,
+     "mean_exec_ms": 5.59,
+     "total_exec_ms": 19135.76,
+     "rows": 54736,
+     "query": "SELECT minion_subtask.team, minion_subtask.project, minion_subtask.task_name, minion_subtask.subtask_id, minion_task.model_id, minion_subtask.input_object_key, "
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.23,
+     "total_exec_ms": 674.63,
+     "rows": 2980,
+     "query": "UPDATE minion_task SET succeeded_subtasks=(minion_task.succeeded_subtasks + $1::INTEGER), failed_subtasks=(minion_task.failed_subtasks + $2::INTEGER), updated_a"
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 223.39,
+     "rows": 2980,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquirement_id, executor_id, outcome, started_at, error) VALUES ($1::VARCHAR,"
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.07,
+     "total_exec_ms": 201.9,
+     "rows": 2980,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask.attempt + $2::INTEGER), updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask"
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.06,
+     "total_exec_ms": 165.39,
+     "rows": 2980,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR, error=$7, updated_at=now() WHERE minion_subtask.team = $3::VARCHAR AND minion_subtask.project = $4:"
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.05,
+     "total_exec_ms": 161.45,
+     "rows": 2980,
+     "query": "UPDATE minion_executor SET engines=$1::VARCHAR(16)[], profile=$2, budget=$3::JSONB, paused_reason=$4::VARCHAR, last_seen_at=now() WHERE minion_executor.executor"
+    },
+    {
+     "calls": 2980,
+     "mean_exec_ms": 0.05,
+     "total_exec_ms": 154.4,
+     "rows": 2980,
+     "query": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquirement.acquirement_id = $1::UUID"
+    }
+   ],
+   "table_deltas": {
+    "minion_executor": {
+     "inserts": 0,
+     "updates": 2973,
+     "deletes": 0,
+     "hot_updates": 2970,
+     "seq_scans": 0,
+     "idx_scans": 14767,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 32,
+     "live_tuples_after": 500
+    },
+    "minion_executor_heartbeat": {
+     "inserts": 2942,
+     "updates": 0,
+     "deletes": 2940,
+     "hot_updates": 0,
+     "seq_scans": 2952,
+     "idx_scans": 0,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 255,
+     "live_tuples_after": 9
+    },
+    "minion_subtask": {
+     "inserts": 0,
+     "updates": 5882,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 3394,
+     "idx_scans": 36097,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 533,
+     "live_tuples_after": 30000
+    },
+    "minion_subtask_acquirement": {
+     "inserts": 3817,
+     "updates": 0,
+     "deletes": 3815,
+     "hot_updates": 0,
+     "seq_scans": 8834,
+     "idx_scans": 19410,
+     "autovacuum_count": 1,
+     "dead_tuples_after": 336,
+     "live_tuples_after": 9
+    },
+    "minion_subtask_attempt": {
+     "inserts": 2940,
+     "updates": 0,
+     "deletes": 0,
+     "hot_updates": 0,
+     "seq_scans": 0,
+     "idx_scans": 0,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 0,
+     "live_tuples_after": 25524
+    },
+    "minion_task": {
+     "inserts": 0,
+     "updates": 2944,
+     "deletes": 0,
+     "hot_updates": 2940,
+     "seq_scans": 25882,
+     "idx_scans": 1,
+     "autovacuum_count": 0,
+     "dead_tuples_after": 41,
+     "live_tuples_after": 30
+    }
+   }
+  }
+ }
+}
