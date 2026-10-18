@@ -21,7 +21,7 @@ Status: **Draft v0.2** · 2026-10-15 · Companion to [`SPEC.md`](SPEC.md)
                │ governor+MLX │ governor+MLX │ governor+MLX │
                │ (Ollama/HF)  │ (Ollama/HF)  │ (Ollama/HF)  │
                └──────┬───────┴──────┬───────┴──────┬───────┘
-                      │ presigned GET/PUT           │
+                      │ presigned GET/POST          │
                       ▼                             ▼
                   ┌──────────────── S3 / SeaweedFS─────────┐
                   │ inputs/…   outputs/…   (no traffic via │
@@ -156,7 +156,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   if 4xx, raise (exit non-zero); if no assignment, backoff; else handle one subtask.
 - **Per subtask** (`_execute`): ranged GET of `[byte_start, byte_end)` → parse exactly `record_count`
   records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
-  temp dir → presigned PUT → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
+  temp dir → presigned POST → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
   unlinked in `finally`.
 - **Error → report mapping.** Only executor-local connectivity trouble (connect/timeout/network/
   remote-protocol errors, local `OSError`) is `release`d (immediate requeue, no retry budget burned).
@@ -168,15 +168,16 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   | input GET: connect/timeout/network/remote-protocol/proxy error | release | `INPUT_UNAVAILABLE` | n/a |
   | input GET: HTTP error status, not `206`, or != requested bytes | fail | `INPUT_UNAVAILABLE` | yes |
   | temp-file I/O error | release | `LOCAL_IO_ERROR` | n/a |
-  | output PUT: connect/timeout/network/remote-protocol/proxy error | release | `UPLOAD_FAILED` | n/a |
-  | output PUT: HTTP error status (e.g. expired presigned URL) | fail | `UPLOAD_FAILED` | yes |
+  | output POST: connect/timeout/network/remote-protocol/proxy error | release | `UPLOAD_FAILED` | n/a |
+  | output POST: HTTP error status incl. a 3xx (e.g. expired policy; SeaweedFS answers 307) | fail | `UPLOAD_FAILED` | yes |
+  | output POST: `400 EntityTooLarge` (above the signed size range) | fail | `OUTPUT_TOO_LARGE` | no |
   | presigned URL not https (http only if the server URL is loopback) | fail | `INSECURE_URL` | yes |
   | worker died / timed out (per-op: load 900 s, run 600 s → kill) | fail | `WORKER_CRASHED` | yes |
   | `RunnerError` from worker | fail | runner's code (≤64 chars) | yes |
   | runner returned a different number of records than the input | fail | `OUTPUT_MISMATCH` | yes |
   | any other exception in the handler (poison pill) | fail (type name only in logs) | `EXECUTOR_ERROR` | yes |
   | `complete`: transport error / 5xx | retried with jittered backoff (≤5 tries; server treats a same-owner repeat as success), then given up: if any 5xx was seen, best-effort `fail` (retryable, burns budget); transport-only, nothing (the watchdog reclaims and counts EXPIRED) | `COMPLETE_FAILED` | yes |
-  | output file above `min(local, server)` cap (`max_output_bytes`), checked before the PUT | fail | `OUTPUT_TOO_LARGE` | no |
+  | output file above `min(local, server)` cap (`max_output_bytes`), checked before the upload | fail | `OUTPUT_TOO_LARGE` | no |
   | `complete`: `422 OUTPUT_TOO_LARGE` | fail | `OUTPUT_TOO_LARGE` | no |
   | `complete`: other 4xx except 409 | fail | `COMPLETE_REJECTED` | yes |
   | `complete` or `fail` returns 409 | discard, no retry | — | — |
@@ -249,7 +250,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 - **Heartbeater** (`heartbeat.py`, TASK-3.3, FR-14): an asyncio task beside the work coroutine.
   Interval `--heartbeat-interval` / `MINION_EXECUTOR_HEARTBEAT_INTERVAL_S` (default 300 s, min 1 s),
   each sleep jittered ×U(0.9, 1.1). Each beat sends progress, budget and pause reason, and keeps the
-  latest `output_url` from the response (the upload uses the refreshed URL, same attempt-scoped key).
+  latest `output_post` from the response (the upload uses the refreshed POST; accepted only if it names the same URL and `key` field).
   `429` waits `Retry-After` (capped at 600 s) and is non-fatal; `5xx` and transport errors retry with
   a jittered delay (≤30 s); other errors are logged and the beat continues.
   `cancel=true` returns `CANCEL` → interrupt worker, `release` (server records `CANCELLED`).
@@ -412,7 +413,7 @@ Worker:   load model (or reuse warm one) with MLX memory/cache limits from budge
                 ctl.checkpoint()  ← duty-cycle sleep + check governor events
           stream results back to control process
 Executor: write results to local temp JSONL
-          PUT to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
+          POST to presigned URL  {output_prefix}/_attempts/{subtask_id:06d}/{attempt}.jsonl
           POST /complete {record_count, sha256}
 Server:   verify acquirement is current (else 409)
           S3 CopyObject → {output_prefix}/{subtask_id:06d}.jsonl   (promotion = idempotency;
@@ -432,9 +433,9 @@ carries the server cap as `max_output_bytes`; the executor checks `min(local, se
 local file before uploading (`MINION_EXECUTOR_MAX_OUTPUT_BYTES`; both settings are `<= 5 GiB`) and
 fails `OUTPUT_TOO_LARGE` (not retryable). A `422 OUTPUT_TOO_LARGE` on complete is reported the same
 way (fail, non-retryable: a re-run yields the same output). A size equal to the cap is accepted on
-both sides. A presigned PUT cannot cap upload size (`content-length-range` needs presigned POST;
-TASK-19), so an executor can still write a large object under its own attempt key until complete.
-Operators should therefore: keep bucket versioning off (or expire noncurrent versions, since a
+both sides. The output is a presigned POST whose signed policy has `content-length-range 0..MINION_MAX_OUTPUT_BYTES`, so S3 itself
+refuses a larger body (ADR-0017); the HEAD above is defence in depth. Attempts times the cap can still
+accumulate, so operators should: keep bucket versioning off (or expire noncurrent versions, since a
 delete otherwise keeps the bytes), set a bucket or tenant quota (SeaweedFS `s3.bucket.quota`, AWS
 budget/size alarms), and apply the lifecycle rule below to `_attempts/`.
 
@@ -450,7 +451,7 @@ Executor (every heartbeat interval, 300 s by default, while running): POST /hear
   Server: owner check under lock (acquirement, else 409); 429 if closer than MINION_HEARTBEAT_MIN_INTERVAL_S
           (the first beat after a claim, the ack, is exempt: ADR-0014)
           UPDATE minion_executor_heartbeat.last_seen_at = now(); report executor row (after the acquirement lock)
-          respond {cancel: task.status == CANCELLED, output_url (fresh presigned PUT), expires_at}
+          respond {cancel: task.status == CANCELLED, output_post (fresh presigned POST), expires_at}
 
 Watchdog (every 60 s; also reclaims acquirements older than MINION_MAX_LEASE_S regardless of beats,
 then sweeps PENDING subtasks of recently cancelled tasks to CANCELLED). Implemented as
