@@ -210,8 +210,14 @@ Errors from the worker and engines (the full set of codes the executor reports; 
   watchdog deletes the acquirement, archives it as `EXPIRED`, and sets the subtask back to
   `PENDING` (or `FAILED` once the budget is spent) **[paper semantics]**. Reclaim does not touch
   `attempt`: the next acquire increments it, so attempt-scoped output keys stay unique.
+  Deviation **[ours]** (ADR-0014): an acquirement whose heartbeat was never refreshed after the
+  claim (executor never acknowledged it, e.g. the acquire response was lost) is archived as
+  `EXPIRED` with code `NOT_ACKNOWLEDGED` and does not consume the budget, up to
+  `MINION_RELEASE_LIMIT` such attempts per subtask; beyond that it expires as `HEARTBEAT_TIMEOUT`
+  and counts. Executors therefore send an immediate heartbeat (ack) after a successful acquire.
 - FR-31a. Hard lease: an acquirement older than `max_lease` (`MINION_MAX_LEASE_S`, default 6 h) is reclaimed as `EXPIRED` (code `MAX_LEASE_EXCEEDED`, consumes budget) even while it heartbeats, so a looping executor cannot hold a subtask forever **[ours]**.
-- FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts; once it reaches
+- FR-32. The retry budget is the number of `FAILED` + `EXPIRED` attempts (not counting
+  `NOT_ACKNOWLEDGED` expiries within their cap, FR-31); once it reaches
   `max_attempts` (default 3) the subtask becomes `FAILED`; task becomes `FAILED` or `PARTIAL`
   depending on policy. A voluntary `release` does not consume the budget **[ours]**, but a
   subtask already released `MINION_RELEASE_LIMIT` times (default 10) records further releases as
