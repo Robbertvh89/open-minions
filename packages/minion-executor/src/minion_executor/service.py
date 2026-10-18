@@ -13,13 +13,9 @@ import json
 import math
 import os
 import plistlib
-import re
-import shlex
 import stat
-import subprocess
 import sys
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -27,15 +23,19 @@ from urllib.parse import urlsplit
 import typer
 from minion_common.enums import Engine
 
+from minion_executor import launchd
+from minion_executor.launchd import (
+    SERVICE_NOT_FOUND,
+    STOP_WAIT_SLACK_S,
+    AgentsDirOpt,
+    LabelOpt,
+)
 from minion_executor.settings import ExecutorSettings
 
 DEFAULT_LABEL = "com.open-minions.executor"
-LAUNCHCTL = "/bin/launchctl"
-LAUNCHCTL_TIMEOUT_S = 30.0
 EXIT_TIMEOUT_MARGIN_S = 15  # FR-17: shutdown budget is grace + 10 s, plus slack
 THROTTLE_INTERVAL_S = 60
 DEFAULT_SERVER = "http://localhost:8080"
-_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 # Non-secret settings copied from the installing shell. Everything else (TOKEN, DEV, TEST_HOOKS,
 # SANDBOX, FETCH_SANDBOX, FAKE_SIGNALS, HF_TOKEN, proxy and CA variables) is dropped on purpose.
@@ -55,12 +55,6 @@ LABEL_ENV = "MINION_EXECUTOR_SERVICE_LABEL"
 SERVER_AUTH_CODES = frozenset({"UNAUTHORIZED", "FORBIDDEN"})  # the server's own 401/403 codes
 FAILURE_FILE = "service_failure.json"
 FAILURE_MAX_BYTES = 4096
-BOOTOUT_IN_PROGRESS = 36  # EINPROGRESS: a graceful stop is under way
-SERVICE_NOT_FOUND = 113
-STOP_POLL_S = 1.0
-STOP_WAIT_SLACK_S = 10.0
-_now: Callable[[], float] = time.monotonic
-_sleep: Callable[[float], None] = time.sleep
 
 
 def service_mode() -> bool:
@@ -294,21 +288,6 @@ def render_plist(
     return plistlib.dumps(doc, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
-def run_launchctl(args: list[str], timeout: float = LAUNCHCTL_TIMEOUT_S) -> tuple[int, str]:
-    """(returncode, combined output). OSError/timeout map to (127, message)."""
-    try:
-        out = subprocess.run(  # noqa: S603 - fixed binary, no shell
-            [LAUNCHCTL, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 127, f"launchctl failed: {exc}"
-    return out.returncode, (out.stdout + out.stderr).strip()
-
-
 _PRINT_FIELDS = {
     "state": "state",
     "pid": "pid",
@@ -335,24 +314,6 @@ def parse_print(text: str) -> dict[str, str]:
         if sep and name is not None and name not in found:
             found[name] = value.strip()
     return found
-
-
-def check_agents_dir(path: Path, *, create: bool) -> None:
-    """A real directory (not a symlink) we own, not writable by group or others."""
-    if create:
-        path.mkdir(mode=0o755, parents=True, exist_ok=True)
-    try:
-        st = path.lstat()
-    except FileNotFoundError:
-        if create:
-            raise
-        return
-    if not stat.S_ISDIR(st.st_mode):
-        raise ValueError(f"{path} is not a real directory (symlink?); refusing")
-    if st.st_uid != os.getuid():
-        raise ValueError(f"{path} is not owned by you; refusing")
-    if st.st_mode & 0o022:
-        raise ValueError(f"{path} is writable by group or others; refusing")
 
 
 def prepare_log_file(path: Path) -> None:
@@ -382,81 +343,12 @@ def probe_engines(requested: list[Engine], settings: ExecutorSettings) -> list[E
     return probe_available(requested, sandbox_policy(settings, requested))
 
 
-def read_plist(path: Path) -> dict[str, object] | None:
-    """The installed plist as a dict, or None when absent or unreadable."""
-    try:
-        with path.open("rb") as f:
-            doc = plistlib.load(f)
-    except (OSError, plistlib.InvalidFileException, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
-
-
 def is_our_plist(doc: Mapping[str, object] | None) -> bool:
     """ProgramArguments are `[…/minion-executor, run, …]`: the only jobs we remove."""
-    args = doc.get("ProgramArguments") if doc else None
-    return (
-        isinstance(args, list)
-        and len(args) >= 2
-        and isinstance(args[0], str)
-        and args[0].endswith("minion-executor")
-        and args[1] == "run"
-    )
-
-
-def write_plist_safely(path: Path, data: bytes) -> None:
-    """Create `path` 0644, refusing an existing file or symlink (O_EXCL | O_NOFOLLOW)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    try:
-        os.fchmod(fd, 0o644)  # umask-proof
-        with os.fdopen(fd, "wb") as f:
-            fd = -1
-            f.write(data)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        with contextlib.suppress(OSError):
-            path.unlink()
-        raise
-
-
-def _is_darwin() -> bool:
-    return sys.platform == "darwin"
-
-
-def _uid() -> int:
-    return os.getuid()
-
-
-def _fail(message: str) -> typer.Exit:
-    typer.echo(f"error: {message}", err=True)
-    return typer.Exit(code=2)
-
-
-def _executable() -> str:
-    """Absolute path of the `minion-executor` script in this install's own environment (e.g. the
-    `uv tool` venv's bin/), not the `~/.local/bin` shim. It survives `uv tool upgrade`; after an
-    uninstall and reinstall of the tool, re-run `service install`."""
-    sibling = Path(sys.executable).parent / "minion-executor"
-    if sibling.is_file():
-        return str(sibling.absolute())
-    raise ValueError("cannot find the minion-executor script next to the Python interpreter")
+    return launchd.is_our_program(doc, "run")
 
 
 service_app = typer.Typer(help="Run the executor as a per-user launchd LaunchAgent.")
-
-LabelOpt = Annotated[str, typer.Option(help="launchd label")]
-AgentsDirOpt = Annotated[Path | None, typer.Option(hidden=True)]
-
-
-def _agents_dir(override: Path | None) -> Path:
-    return override or Path.home() / "Library" / "LaunchAgents"
-
-
-def _check_label(label: str) -> None:
-    if not _LABEL_RE.fullmatch(label):
-        raise ValueError(f"invalid label {label!r}")
 
 
 @service_app.command()
@@ -487,13 +379,16 @@ def install(
     from minion_executor.secrets import ENV_VAR, KEYCHAIN_SERVICE, keychain_present
     from minion_executor.worker.process import restrict_environ
 
-    if not _is_darwin():
-        raise _fail("launchd services are macOS only")
+    if not launchd.is_darwin():
+        raise launchd.fail("launchd services are macOS only")
     home = Path.home()
     log_path = default_log_path(home, label)
-    plist_dir = _agents_dir(agents_dir)
+    plist_dir = launchd.agents_dir(agents_dir)
     try:
-        _check_label(label)
+        launchd.refuse_root()
+        launchd.check_label(label)
+        if label == launchd.MENUBAR_LABEL:
+            raise ValueError(f"{label} is the menu-bar agent's label; use `menubar` for it")
         if os.environ.get(DEV_ENV) == "1":
             raise ValueError(f"refusing to install with {DEV_ENV}=1 (dev mode is never a service)")
         require_secure_url(server)
@@ -509,7 +404,8 @@ def install(
         default_source(
             None, want_call=config.on_call is not OnCall.IGNORE
         )  # the real signal source must be readable
-        executable = _executable()
+        executable = launchd.executable()
+        launchd.check_install_chain(executable)
         check_not_protected(home, install_locations(executable, settings))
         if not keychain_present():
             hint = f" (${ENV_VAR} is not visible to launchd)" if os.environ.get(ENV_VAR) else ""
@@ -518,7 +414,7 @@ def install(
                 raise ValueError(msg)
             typer.echo(f"warning: {msg}", err=True)
         if not dry_run:
-            check_agents_dir(plist_dir, create=True)
+            launchd.check_agents_dir(plist_dir, create=True)
             ensure_private_dir(settings.state_dir)
             if (plist_dir / f"{label}.plist").is_symlink() or (
                 plist_dir / f"{label}.plist"
@@ -528,7 +424,7 @@ def install(
                     f"{label}` first"
                 )
     except (ValueError, RuntimeError, OSError) as exc:
-        raise _fail(str(exc)) from None
+        raise launchd.fail(str(exc)) from None
 
     carried = _carried_env(settings)
     for name in sorted(os.environ):
@@ -559,27 +455,29 @@ def install(
     try:
         available = probe_engines(requested, settings)
     except Exception as exc:  # RunnerError / WorkerCrashed / sandbox failure
-        raise _fail(f"engine probe failed: {exc}") from None
+        raise launchd.fail(f"engine probe failed: {exc}") from None
     if not available:
         from minion_executor.main import NO_ENGINE_MSG
 
-        raise _fail(NO_ENGINE_MSG)
+        raise launchd.fail(NO_ENGINE_MSG)
     typer.echo(f"engines: {','.join(e.value for e in available)}")
     try:
         prepare_log_file(log_path)
-        write_plist_safely(plist_path, data)
+        launchd.write_plist_safely(plist_path, data)
     except FileExistsError:
-        raise _fail(f"{plist_path} exists; run `service uninstall --label {label}` first") from None
+        raise launchd.fail(
+            f"{plist_path} exists; run `service uninstall --label {label}` first"
+        ) from None
     except (OSError, ValueError) as exc:
-        raise _fail(f"cannot write {plist_path}: {exc}") from None
+        raise launchd.fail(f"cannot write {plist_path}: {exc}") from None
     typer.echo(f"wrote {plist_path}")
     if no_load:
         return
-    rc, out = run_launchctl(["bootstrap", f"gui/{_uid()}", str(plist_path)])
+    rc, out = launchd.run_launchctl(["bootstrap", f"gui/{launchd.uid()}", str(plist_path)])
     if rc != 0:
         with contextlib.suppress(OSError):
             plist_path.unlink()
-        raise _fail(f"launchctl bootstrap failed ({rc}): {out}")
+        raise launchd.fail(f"launchctl bootstrap failed ({rc}): {out}")
     typer.echo(f"loaded {label}")
 
 
@@ -610,79 +508,29 @@ def _carried_env(settings: ExecutorSettings) -> dict[str, str]:
     return env
 
 
-def _wait_unloaded(label: str, timeout_s: float) -> bool:
-    """Poll `launchctl print` until the service is gone (rc 113) or `timeout_s` passes."""
-    deadline = _now() + timeout_s
-    while True:
-        rc, _ = run_launchctl(["print", f"gui/{_uid()}/{label}"])
-        if rc == SERVICE_NOT_FOUND:
-            return True
-        if _now() >= deadline:
-            return False
-        _sleep(STOP_POLL_S)
-
-
-def _manual_removal(label: str, plist_path: Path) -> str:
-    rm = shlex.quote(str(plist_path))
-    return f"remove it by hand: `launchctl bootout gui/$(id -u)/{label}` then `rm {rm}`"
-
-
 @service_app.command()
 def uninstall(label: LabelOpt = DEFAULT_LABEL, agents_dir: AgentsDirOpt = None) -> None:
     """Stop the service (SIGTERM, graceful) and remove the plist."""
     try:
-        _check_label(label)
-        plist_dir = _agents_dir(agents_dir)
-        check_agents_dir(plist_dir, create=False)
+        launchd.refuse_root()
+        launchd.check_label(label)
+        plist_dir = launchd.agents_dir(agents_dir)
+        launchd.check_agents_dir(plist_dir, create=False)
     except (ValueError, OSError) as exc:
-        raise _fail(str(exc)) from None
-    plist_path = plist_dir / f"{label}.plist"
-    doc = read_plist(plist_path)
-    if doc is None:
-        # Absent or unreadable. Only "not loaded and no file" is a clean nothing-to-do: a loaded
-        # job, a launchd we cannot query, or a file we cannot parse must not be silently left.
-        rc, _ = run_launchctl(["print", f"gui/{_uid()}/{label}"])
-        present = plist_path.is_symlink() or plist_path.exists()
-        if rc != SERVICE_NOT_FOUND or present:
-            state = (
-                "loaded"
-                if rc == 0
-                else "not loaded"
-                if rc == SERVICE_NOT_FOUND
-                else "not confirmed unloaded"
-            )
-            file_state = "unreadable or malformed" if present else "missing"
-            raise _fail(
-                f"{plist_path} is {file_state} and the service is {state}; "
-                + _manual_removal(label, plist_path)
-            )
-        typer.echo(f"{plist_path} not present and {label} not loaded; nothing to remove")
-        return
-    if not is_our_plist(doc):
-        raise _fail(f"{plist_path} is not a minion-executor service plist; refusing to touch it")
-    raw_timeout = doc.get("ExitTimeOut")
-    exit_timeout = float(raw_timeout) if isinstance(raw_timeout, int | float) else 315.0
-    started = _now()
-    rc, out = run_launchctl(["bootout", f"gui/{_uid()}/{label}"], timeout=LAUNCHCTL_TIMEOUT_S + 330)
-    # rc 0 and 36 (EINPROGRESS) both mean "stop under way": launchd answers before the job has
-    # exited (measured: rc 0 after 0.6 s, process gone ~5 s later). Wait until it is unloaded.
-    if rc in (0, BOOTOUT_IN_PROGRESS):
-        if not _wait_unloaded(label, exit_timeout + STOP_WAIT_SLACK_S):
-            raise _fail(
-                "service is still stopping after the exit timeout; plist left in place. "
-                + _manual_removal(label, plist_path)
-            )
-        typer.echo(f"stopped {label} in {_now() - started:.1f} s")
-    # 3 = not loaded (ESRCH), 113 = could not find service: fine, we still remove the plist
-    elif rc not in (3, SERVICE_NOT_FOUND):
-        raise _fail(f"launchctl bootout failed ({rc}): {out}; plist left in place")
-    try:
-        plist_path.unlink()
-        typer.echo(f"removed {plist_path}")
-    except FileNotFoundError:
-        typer.echo(f"{plist_path} not present")
-    except OSError as exc:
-        raise _fail(f"cannot remove {plist_path}: {exc}") from None
+        raise launchd.fail(str(exc)) from None
+
+    def wait_s(doc: Mapping[str, object]) -> float:
+        raw = doc.get("ExitTimeOut")
+        return (float(raw) if isinstance(raw, int | float) else 315.0) + STOP_WAIT_SLACK_S
+
+    launchd.uninstall_agent(
+        label=label,
+        plist_dir=plist_dir,
+        is_ours=is_our_plist,
+        wait_s=wait_s,
+        kind="service",
+        bootout_timeout=launchd.LAUNCHCTL_TIMEOUT_S + 330,
+    )
 
 
 def _installed_settings(
@@ -692,9 +540,9 @@ def _installed_settings(
     candidates = []
     if info.get("path"):
         candidates.append(Path(info["path"]))
-    candidates.append(_agents_dir(None) / f"{label}.plist")
+    candidates.append(launchd.agents_dir(None) / f"{label}.plist")
     for path in candidates:
-        doc = read_plist(path)
+        doc = launchd.read_plist(path)
         if doc is None:
             continue
         raw = doc.get("ExitTimeOut")
@@ -719,12 +567,12 @@ def service_status(label: LabelOpt = DEFAULT_LABEL) -> None:
     from minion_executor.main import status as executor_status
 
     try:
-        _check_label(label)
+        launchd.check_label(label)
         settings = ExecutorSettings()
     except ValueError as exc:
-        raise _fail(str(exc)) from None
+        raise launchd.fail(str(exc)) from None
     state_dir = settings.state_dir
-    rc, out = run_launchctl(["print", f"gui/{_uid()}/{label}"])
+    rc, out = launchd.run_launchctl(["print", f"gui/{launchd.uid()}/{label}"])
     if rc == SERVICE_NOT_FOUND:
         typer.echo(f"{label}: not loaded")
     elif rc != 0:

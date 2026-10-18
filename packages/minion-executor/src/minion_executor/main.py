@@ -670,9 +670,21 @@ def menubar(ctx: typer.Context) -> None:
     except (ValueError, SafeFileError) as exc:  # pydantic's ValidationError is a ValueError
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from None
+    from minion_executor.menubar.lock import acquire_menubar_lock
+
+    try:
+        lock_fd = acquire_menubar_lock(state_dir)
+    except SafeFileError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from None
+    if lock_fd is None:
+        # Exit 0: launchd's KeepAlive must not restart a second instance in a loop.
+        typer.echo("the menu-bar app is already running")
+        return
     from minion_executor.menubar.app import run as run_menubar  # no AppKit import off macOS
 
-    run_menubar(state_dir, config_path)
+    run_menubar(state_dir, config_path)  # lock_fd stays open (and locked) until the process exits
+    os.close(lock_fd)
 
 
 def _check_out_path(out: Path) -> None:
