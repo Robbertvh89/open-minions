@@ -264,12 +264,18 @@ async def count_remaining(sm: Sm, *, team: str = DEFAULT_TEAM) -> int:
 
 
 async def sum_remaining(sm: Sm, *, team: str = DEFAULT_TEAM) -> int:
-    """Subtasks of the seeded team not yet terminal, from the task counters (one row per task,
-    no scan of `minion_subtask`): the cheap progress poll of `run`."""
+    """Outstanding work of the seeded team from the task counters (one row per task, no scan of
+    `minion_subtask`): the cheap progress poll of `run`.
+
+    Counts the subtasks the counters have not covered yet PLUS one per task that is still
+    PENDING/RUNNING, so it is 0 only once every task is terminal (the settle, or the watchdog's
+    `settle_stuck` backstop, has run). Both parts only fall, so it also serves as stall progress.
+    """
     async with sm() as session:
         row = await session.execute(
             text(
                 "SELECT coalesce(sum(t.total_subtasks), 0) - coalesce(sum(k.done), 0)"
+                " + count(*)"
                 " FROM minion_task t LEFT JOIN ("
                 "   SELECT team, project, task_name, sum(succeeded + failed) AS done"
                 "   FROM minion_task_counter WHERE team = :team GROUP BY team, project, task_name"

@@ -138,7 +138,8 @@ async def test_seed_creates_pending_queue_and_hashed_tokens(sm: Sm, s3: S3Env) -
 async def test_sum_remaining_tracks_count_remaining(sm: Sm, s3: S3Env) -> None:
     spec = _spec(tasks=2, subtasks=4)
     await seed_queue(sm, spec, input_bytes=upload_input(s3.client, spec))
-    assert await sum_remaining(sm) == await count_remaining(sm) == 8
+    assert await count_remaining(sm) == 8
+    assert await sum_remaining(sm) == 8 + 2  # + one per live task
     async with sm() as s, s.begin():  # one subtask completes, another fails for good
         await s.execute(
             text(
@@ -155,7 +156,7 @@ async def test_sum_remaining_tracks_count_remaining(sm: Sm, s3: S3Env) -> None:
             )
         )
     assert await count_remaining(sm) == 6
-    assert await sum_remaining(sm) == 6
+    assert await sum_remaining(sm) == 6 + 2
     async with sm() as s, s.begin():  # a terminal task contributes nothing
         await s.execute(
             text(
@@ -163,7 +164,19 @@ async def test_sum_remaining_tracks_count_remaining(sm: Sm, s3: S3Env) -> None:
                 " WHERE task_name = (SELECT min(task_name) FROM minion_task)"
             )
         )
-    assert await sum_remaining(sm) == 4
+    assert await sum_remaining(sm) == 4 + 1
+    async with sm() as s, s.begin():  # counters cover everything but the task is still live
+        await s.execute(
+            text(
+                "INSERT INTO minion_task_counter (team, project, task_name, shard, succeeded,"
+                " failed) SELECT team, project, task_name, 1, 0, 4 FROM minion_task"
+                " WHERE status IN ('PENDING', 'RUNNING')"
+            )
+        )
+    assert await sum_remaining(sm) > 0  # not drained until the task itself is terminal
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_task SET status = 'FAILED'"))
+    assert await sum_remaining(sm) == 0
 
 
 async def _rows(sm: Sm, sql: str) -> list[Any]:

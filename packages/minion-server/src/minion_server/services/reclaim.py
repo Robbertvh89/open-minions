@@ -138,23 +138,32 @@ async def sweep_cancelled(
     return total
 
 
-async def settle_stuck(sm: async_sessionmaker[AsyncSession], *, batch: int = 100) -> int:
+async def settle_stuck(
+    sm: async_sessionmaker[AsyncSession], *, batch: int = 100, max_rounds: int = 50
+) -> int:
     """Backstop for ADR-0015: finish live tasks whose counters already cover every subtask.
 
     Covers a settle lost after the owner op committed (crash, DB blip), a reclaim that failed the
     last subtask, and a retried complete. One short transaction per task. Returns the number of
     tasks made terminal.
+    Repeats while a batch comes back full, at most `max_rounds` times per call.
     """
-    async with sm() as s:
-        keys = await completion_repo.settleable_tasks(s, batch)
     settled = 0
-    for key in keys:
-        try:
-            async with sm() as s, s.begin():
-                if await settle_in_tx(s, key):
-                    settled += 1
-        except Exception as exc:  # one bad task must not block the rest
-            log.error("task_settle_failed", error=type(exc).__name__)
+    for _ in range(max_rounds):
+        async with sm() as s:
+            keys = await completion_repo.settleable_tasks(s, batch)
+        failed = 0
+        for key in keys:
+            try:
+                async with sm() as s, s.begin():
+                    if await settle_in_tx(s, key):
+                        settled += 1
+            except Exception as exc:  # one bad task must not block the rest
+                failed += 1
+                log.error("task_settle_failed", error=type(exc).__name__)
+        # a failing task stays settleable and would be re-read forever: stop on any failure
+        if len(keys) < batch or failed:
+            break
     if settled:
         log.info("tasks_settled", count=settled)
     return settled

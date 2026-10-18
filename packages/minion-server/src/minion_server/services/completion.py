@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
 from minion_server.errors import api_error
+from minion_server.metrics import Metrics
 from minion_server.repositories import completion as repo
 from minion_server.services.acquisition import attempt_key
 from minion_server.settings import ServerSettings
@@ -61,7 +62,9 @@ async def settle_in_tx(session: AsyncSession, key: repo.TaskKey) -> bool:
     return await repo.set_task_terminal(session, key, final)
 
 
-async def settle_task(session: AsyncSession, key: repo.TaskKey) -> None:
+async def settle_task(
+    session: AsyncSession, key: repo.TaskKey, metrics: Metrics | None = None
+) -> None:
     """Post-commit settle in its own short transaction (ADR-0015).
 
     The owner op has already committed; a failure here is logged (class only) and swallowed, the
@@ -73,6 +76,8 @@ async def settle_task(session: AsyncSession, key: repo.TaskKey) -> None:
             await settle_in_tx(session, key)
     except Exception as exc:
         log.error("task_settle_failed", error=type(exc).__name__)
+        if metrics is not None:
+            metrics.settle_failed()
 
 
 async def complete(
@@ -83,6 +88,7 @@ async def complete(
     *,
     settings: ServerSettings,
     storage: S3Storage,
+    metrics: Metrics | None = None,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
@@ -120,7 +126,7 @@ async def complete(
         )
         await repo.bump_counters(session, o, succeeded=1, failed=0)
     # The retried-complete branch above skips the settle: a lost settle is the watchdog's job.
-    await settle_task(session, task_key(o))
+    await settle_task(session, task_key(o), metrics)
 
 
 def next_status(
@@ -216,6 +222,7 @@ async def fail(
     principal: ExecutorPrincipal,
     acquirement_id: uuid.UUID,
     req: FailRequest,
+    metrics: Metrics | None = None,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
@@ -233,7 +240,7 @@ async def fail(
             retryable=req.retryable,
         )
     if status == SubtaskStatus.FAILED:
-        await settle_task(session, task_key(o))
+        await settle_task(session, task_key(o), metrics)
 
 
 async def release(
@@ -243,6 +250,7 @@ async def release(
     *,
     settings: ServerSettings,
     code: str | None = None,
+    metrics: Metrics | None = None,
 ) -> None:
     async with session.begin():
         o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
@@ -281,4 +289,4 @@ async def release(
                 attempt_error=reason,
             )
     if status == SubtaskStatus.FAILED:
-        await settle_task(session, task_key(o))
+        await settle_task(session, task_key(o), metrics)

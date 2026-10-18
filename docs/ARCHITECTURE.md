@@ -270,8 +270,10 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   its DB pool is `MINION_WATCHDOG_DB_POOL_SIZE` (default 2; the server uses `MINION_DB_POOL_SIZE`, 10) and each statement has
   `MINION_DB_COMMAND_TIMEOUT_S`.
 - Loop every `MINION_WATCHDOG_INTERVAL_S` (60 s). A tick reclaims in batches of
-  `MINION_WATCHDOG_BATCH_SIZE` (repeats while batches come back full, max 100 rounds), then runs the
-  cancel sweep. Sweep failures are logged and do not stall reclaim. DB errors back off exponentially,
+  `MINION_WATCHDOG_BATCH_SIZE` (repeats while batches come back full, max 100 rounds), then
+  `settle_stuck` (finishes live tasks whose counters cover every subtask, ADR-0015; repeats while its
+  batch comes back full, round-capped), then the cancel sweep. Settle and sweep each have their own
+  error handling: a failure is logged and stalls neither reclaim nor the other step. DB errors back off exponentially,
   capped at `MINION_WATCHDOG_MAX_BACKOFF_S` (300 s). SIGTERM abandons the tick; each step is its own
   transaction and rolls back.
 - Replicas are safe: candidates are locked with `SKIP LOCKED` and re-checked (§3.4, ADR-0008).
@@ -564,7 +566,7 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Worker crash (Metal / OOM) | Control process survives, reports `fail(retryable)`; attempt counter bounds retries |
 
 **Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → counter shard
-(`minion_task_counter`, one of 16 rows per task; the task row itself is not locked by completions). The
+(`minion_task_counter`, one of 16 rows per task; the task row is not row-locked for update by completions; the first insert per shard takes an FK KEY SHARE on it). The
 executor row (`minion_executor`) is written after the acquirement lock, never before it. Cancel txn 1
 locks the task only; txn 2 locks PENDING subtask rows (`SKIP LOCKED`, bounded) and never a running
 acquirement, so it cannot deadlock with owner ops.

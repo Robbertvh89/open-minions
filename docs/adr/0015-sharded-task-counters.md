@@ -57,6 +57,8 @@ task, so all completions of one task row-locked the same row. After TASK-7.4.3 t
 | A stress: completed in 300 s | 51,818 (172/s), 0 FAILED | 49,554 (164/s), 0 FAILED |
 | complete p50 / p99 (client) | B: 500 ms / 1 s; A: 250 ms / 1 s | B: 250 ms / 1 s; A: 250 ms / 1 s |
 
-The counter statement is no longer the top entry; end-to-end throughput did not change within run
-noise because the acquire candidate query (2.7-3.0 ms mean, top entry) and the 503 acquire
-back-pressure now bound it.
+The counter statement is no longer the top entry. These are single runs (one per side), not
+repeated measurements: B-20k drained about 14% slower in this run (165.7 s vs 145.7 s) and A stress
+was about 5% lower, so throughput was not improved. The bottleneck moved to the acquire candidate
+query (2.7-3.0 ms mean, top entry) and the 503 acquire back-pressure; run-to-run variance was not
+measured, so no difference is claimed either way.

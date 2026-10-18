@@ -65,7 +65,7 @@ async def tick(
     try:
         await settle_stuck(sm)
     except Exception as exc:
-        log.error("watchdog_settle_failed", error_class=type(exc).__name__)
+        log.error("watchdog_settle_failed", error=type(exc).__name__)
     # Housekeeping: a failing sweep must not stall reclaim nor trigger tick backoff.
     try:
         await sweep_cancelled(sm, window_s=cfg.cancel_sweep_window_s)

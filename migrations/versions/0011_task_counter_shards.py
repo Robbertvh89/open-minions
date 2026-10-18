@@ -50,7 +50,7 @@ _GRANT = """
 DO $$
 BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'minion_readonly') THEN
-        GRANT SELECT ON ALL TABLES IN SCHEMA minion_ro TO minion_readonly;
+        GRANT SELECT ON minion_ro.task TO minion_readonly;
     END IF;
 END
 $$
