@@ -1,8 +1,8 @@
-"""Acquire service: two-pass candidate selection, one transaction per candidate (plan D5)."""
+"""Acquire service: one-statement claim per round (ADR-0013)."""
 
-import random
 from datetime import UTC, datetime, timedelta
 
+import structlog
 from minion_common.schemas import AcquireRequest, Assignment, ModelEntry
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,8 +13,8 @@ from minion_server.settings import ServerSettings
 from minion_server.storage import MAX_PRESIGN_TTL_S, S3Storage
 from minion_server.uris import parse_s3_uri
 
-SHUFFLE_HEAD = 4
 MAX_ROUNDS = 10
+_log = structlog.get_logger(__name__)
 
 
 class _LostRaceError(Exception):
@@ -34,10 +34,11 @@ async def acquire(
     settings: ServerSettings,
     storage: S3Storage,
     models: dict[str, ModelEntry],
-    shuffle_head: int = SHUFFLE_HEAD,
-    rng: random.Random | None = None,
+    window: int | None = None,
 ) -> Assignment | None:
-    rng = rng or random.Random()  # noqa: S311 - contention spreading, not security
+    window = settings.acquire_window if window is None else window
+    if not 1 <= window <= repo.MAX_WINDOW:
+        raise ValueError(f"acquire window must be in 1..{repo.MAX_WINDOW}, got {window}")
     async with session.begin():
         await executors_repo.touch(
             session,
@@ -50,31 +51,39 @@ async def acquire(
 
     passes = [preference, None] if preference is not None else [None]
     for pref in passes:
-        # Losing every candidate means they were all taken meanwhile: re-read the queue.
+        # A round whose pick lost the insert race (n > 0, no row) re-reads a fresh window.
+        exhausted = True
         for _ in range(MAX_ROUNDS):
-            async with session.begin():
-                cands = await repo.candidates(
-                    session,
-                    engines=req.engines,
-                    model_ids=list(models),
-                    memory_gb=req.budget.memory_gb,
-                    pool=principal.pool,
-                    preference=pref,
-                )
-            if not cands:
+            try:
+                async with session.begin():
+                    result = await repo.claim(
+                        session,
+                        principal.executor_id,
+                        engines=req.engines,
+                        model_ids=list(models),
+                        memory_gb=req.budget.memory_gb,
+                        pool=principal.pool,
+                        preference=pref,
+                        window=window,
+                    )
+                    if result.n_candidates > 0 and result.won is None:
+                        raise _LostRaceError  # roll back a failed re-check; harmless otherwise
+            except _LostRaceError:
+                continue
+            if result.n_candidates == 0:
+                exhausted = False
                 break
-            head = cands[:shuffle_head]
-            rng.shuffle(head)
-            for c in head + cands[shuffle_head:]:
-                model = models[c.model_id]  # candidates are filtered to registry keys in SQL
-                try:
-                    async with session.begin():
-                        won = await repo.try_acquire(session, c, principal.executor_id)
-                        if won is None:
-                            raise _LostRaceError
-                except _LostRaceError:
-                    continue
-                return await _assignment(c, won, model, settings, storage)
+            if result.candidate is None or result.won is None:  # unreachable: raised above
+                continue
+            model = models[result.candidate.model_id]  # candidates are filtered to registry keys
+            return await _assignment(result.candidate, result.won, model, settings, storage)
+        if exhausted:  # every round had work but lost the race: answer "empty", executor re-polls
+            _log.warning(
+                "acquire_rounds_exhausted",
+                rounds=MAX_ROUNDS,
+                window=window,
+                preferred_pass=pref is not None,
+            )
     return None
 
 

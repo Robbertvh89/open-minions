@@ -10,12 +10,10 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from minion_common.enums import Engine
 from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.app import create_app
-from minion_server.repositories import acquisition as acq_repo
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.acquisition import _LostRaceError
+from minion_server.services.acquisition import acquire
 from minion_server.services.reclaim import (
     ReclaimResult,
     reclaim_one,
@@ -28,7 +26,15 @@ from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import TEST_MODELS_FILE, S3Env, _auth, _req, make_executors, seed_task
+from conftest import (
+    TEST_MODELS_FILE,
+    S3Env,
+    _auth,
+    _req,
+    acquire_after_claim,
+    make_executors,
+    seed_task,
+)
 
 BASE = "/api/v1/executor"
 TASKS = "/api/v1/tasks"
@@ -382,69 +388,47 @@ async def test_cancel_concurrent_with_acquires(env: tuple[AsyncClient, Any]) -> 
 
 
 @pytest.mark.integration
-async def test_stale_candidate_cannot_acquire_after_cancel(env: tuple[AsyncClient, Any]) -> None:
+async def test_acquire_after_cancel_commit_gets_nothing(env: tuple[AsyncClient, Any]) -> None:
+    """A cancel committed before the claim statement starts is seen by it: no acquirement."""
     c, app = env
     sm = app.state.sessionmaker
     await seed_task(sm, "sc", 2)
     [(ex, _)] = await make_executors(sm, 1)
-    async with sm() as s, s.begin():
-        stale = await acq_repo.candidates(
-            s,
-            engines=[Engine.MLX],
-            model_ids=["fake-embed"],
-            memory_gb=8,
-            pool="default",
-            preference=None,
-        )
-    assert len(stale) == 2
     assert (await _cancel(c, "sc")).status_code == 200
-    for cand in stale:  # candidate list read before the cancel committed
-        async with sm() as s, s.begin():
-            assert await acq_repo.try_acquire(s, cand, ex.executor_id) is None
+    async with sm() as s:
+        got = await acquire(
+            s, ex, _req(), settings=app.state.settings, storage=app.state.storage,
+            models=app.state.models,
+        )  # fmt: skip
+    assert got is None
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
     assert (await _task_state(sm, "sc"))[2] == ["CANCELLED"] * 2
 
 
 @pytest.mark.integration
-async def test_acquire_update_guard_rolls_back(
-    env: tuple[AsyncClient, Any],
-) -> None:
-    """If the task is cancelled between the INSERT and the subtask UPDATE, nothing is left."""
+@pytest.mark.parametrize("window", [1, 16])
+async def test_acquire_update_guard_rolls_back(env: tuple[AsyncClient, Any], window: int) -> None:
+    """Production path (acquire -> claim): the task is cancelled (committed by another session)
+    after the claim INSERT won and before the re-check UPDATE. n_candidates > 0 and won None ->
+    _LostRaceError -> rollback; the next round sees the cancelled task and returns None."""
     _, app = env
     sm = app.state.sessionmaker
-    await seed_task(sm, "ug", 1)
+    await seed_task(sm, "ug", 2)
     [(ex, _)] = await make_executors(sm, 1)
-    async with sm() as s, s.begin():
-        [cand] = await acq_repo.candidates(
-            s,
-            engines=[Engine.MLX],
-            model_ids=["fake-embed"],
-            memory_gb=8,
-            pool="default",
-            preference=None,
-        )
-    async with sm() as s:
-        # Simulate a cancel landing between the INSERT and the subtask UPDATE: flip the task
-        # inside this same transaction right after the INSERT (first execute) wins.
-        real_execute = s.execute
-        calls = {"n": 0}
 
-        async def execute(stmt: Any, *a: Any, **kw: Any) -> Any:
-            res = await real_execute(stmt, *a, **kw)
-            calls["n"] += 1
-            if calls["n"] == 1:  # after the INSERT won
-                await real_execute(
-                    text("UPDATE minion_task SET status='CANCELLED' WHERE task_name='ug'")
-                )
-            return res
+    async def cancel() -> None:
+        async with sm() as s, s.begin():
+            await s.execute(text("UPDATE minion_task SET status='CANCELLED' WHERE task_name='ug'"))
 
-        s.execute = execute
-        with pytest.raises(_LostRaceError):  # same txn shape as services.acquisition.acquire
-            async with s.begin():
-                if await acq_repo.try_acquire(s, cand, ex.executor_id) is None:
-                    raise _LostRaceError
+    got = await acquire_after_claim(
+        sm, ex, cancel, settings=app.state.settings, storage=app.state.storage,
+        models=app.state.models, window=window,
+    )  # fmt: skip
+    assert got is None
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
-    assert (await _task_state(sm, "ug"))[2] == ["PENDING"]
+    assert await _rows(sm, "SELECT count(*) FROM minion_executor_heartbeat") == [(0,)]
+    status, _, subs = await _task_state(sm, "ug")
+    assert status == "CANCELLED" and subs == ["PENDING"] * 2
 
 
 # --- max lease -----------------------------------------------------------------------------------

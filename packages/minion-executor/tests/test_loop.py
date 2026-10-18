@@ -3395,3 +3395,46 @@ async def test_status_marks_call_cap_from_a_real_decision_and_keeps_it_off_the_w
 
     req = PresenceRequest(budget=d.budget, paused_reason=None)
     assert "call_capped" not in req.model_dump_json()
+
+
+async def test_first_acquire_waits_jitter_once(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([assignment()]), list[float]()
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps, first_acquire_jitter_s=15.0)
+    await loop.run(max_subtasks=1)
+    assert len(sleeps) == 1 and 0.0 <= sleeps[0] <= 15.0  # before the first acquire only
+
+
+async def test_first_acquire_jitter_zero_disables(tmp_path: Path) -> None:
+    client, sleeps = FakeClient([assignment()]), list[float]()
+    loop = make_loop(client, FakeWorker(), FakeS3(), tmp_path, sleeps, first_acquire_jitter_s=0.0)
+    await loop.run(max_subtasks=1)
+    assert sleeps == []
+
+
+async def test_first_acquire_jitter_is_interrupted_by_stop(tmp_path: Path) -> None:
+    client = FakeClient([assignment()])
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(FakeS3().handler))
+    loop = ExecutorLoop(
+        client,  # type: ignore[arg-type]
+        FakeWorker(),
+        BUDGET,
+        [Engine.MLX],
+        http=http,
+        tmp_root=tmp_path,
+        first_acquire_jitter_s=300.0,
+    )
+    task = asyncio.ensure_future(loop.run())
+    await asyncio.sleep(0.2)
+    loop.stop()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+def test_first_acquire_jitter_setting_bounds() -> None:
+    from minion_executor.settings import ExecutorSettings
+
+    assert ExecutorSettings.model_fields["first_acquire_jitter_s"].default == 15.0
+    for bad in (-1.0, 301.0):
+        with pytest.raises(ValueError):
+            ExecutorSettings(first_acquire_jitter_s=bad)
+    assert ExecutorSettings(first_acquire_jitter_s=0).first_acquire_jitter_s == 0

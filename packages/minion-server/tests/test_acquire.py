@@ -17,7 +17,15 @@ from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from conftest import _auth, _budget, _req, _settings, make_executors, seed_task
+from conftest import (
+    _auth,
+    _budget,
+    _req,
+    _settings,
+    acquire_after_claim,
+    make_executors,
+    seed_task,
+)
 
 N = 60
 MODELS = {
@@ -199,17 +207,17 @@ async def test_preference_before_fifo(sm: async_sessionmaker[AsyncSession], fres
     await seed_task(sm, "fifo-old", 2)  # older: global FIFO would serve this first
     await seed_task(sm, "fifo-pref", 2)
     ((p, _),) = await make_executors(sm, 1)
-    first = await _acquire(sm, p, cfg, shuffle_head=1)
+    first = await _acquire(sm, p, cfg, window=1)
     assert first.task_name == "fifo-old" and first.subtask_id == 0  # no preference: FIFO
     async with sm() as s, s.begin():
         await executors_repo.set_preference(
             s, p.executor_id, team=None, project=None, task_name="fifo-pref"
         )
     for expected in (0, 1):
-        got = await _acquire(sm, p, cfg, shuffle_head=1)
+        got = await _acquire(sm, p, cfg, window=1)
         assert (got.task_name, got.subtask_id) == ("fifo-pref", expected)
     # preferred task exhausted -> falls back to global FIFO
-    fallback = await _acquire(sm, p, cfg, shuffle_head=1)
+    fallback = await _acquire(sm, p, cfg, window=1)
     assert (fallback.task_name, fallback.subtask_id) == ("fifo-old", 1)
     # clearing the preference (all None) restores plain FIFO
     async with sm() as s, s.begin():
@@ -227,7 +235,7 @@ async def test_priority_orders_before_age(
     await seed_task(sm, "prio-low", 1)
     await seed_task(sm, "prio-high", 1, priority=5)
     ((p, _),) = await make_executors(sm, 1)
-    got = await _acquire(sm, p, cfg, shuffle_head=1)
+    got = await _acquire(sm, p, cfg, window=1)
     assert got.task_name == "prio-high"
 
 
@@ -352,57 +360,66 @@ async def test_removed_model_does_not_starve_valid_work(
 
 
 @pytest.mark.integration
-async def test_stale_candidate_cannot_reacquire_finished_subtask(
-    sm: async_sessionmaker[AsyncSession],
+@pytest.mark.parametrize(
+    ("status", "bump"),
+    [("SUCCEEDED", True), ("PENDING", True), ("SUCCEEDED", False), ("FAILED", False)],
+)
+async def test_snapshot_stale_subtask_is_rejected_by_recheck(
+    sm: async_sessionmaker[AsyncSession], fresh_url: str, status: str, bump: bool
 ) -> None:
-    """Deterministic D5 re-check: a candidate read before another owner finished is rejected."""
-    from minion_server.repositories import acquisition as repo
-
+    """Production path: after the claim INSERT won, another session finishes (SUCCEEDED, attempt
+    bump) or reclaims (attempt bump, PENDING) the picked subtask. The re-check UPDATE fails, the
+    round rolls back (no orphan acquirement) and the next round serves a consistent subtask."""
+    cfg = _settings(fresh_url)
     await seed_task(sm, "stale", 2)
-    (a, _), (b, _) = await make_executors(sm, 2)
+    ((p, _),) = await make_executors(sm, 1)
 
-    async def read() -> list[repo.Candidate]:
+    async def flip() -> None:
         async with sm() as s, s.begin():
-            return await repo.candidates(
-                s,
-                engines=[Engine.MLX],
-                model_ids=["fake-embed"],
-                memory_gb=8,
-                pool="default",
-                preference=None,
+            await s.execute(
+                text(
+                    "UPDATE minion_subtask SET status=:st, attempt=attempt+:inc"
+                    " WHERE task_name='stale' AND subtask_id=0"
+                ),
+                {"st": status, "inc": int(bump)},
             )
 
-    stale = await read()
-    c0, c1 = stale[0], stale[1]
-    async with sm() as s, s.begin():
-        won = await repo.try_acquire(s, c0, a.executor_id)
-        assert won is not None
-    # owner finishes (what complete does): acquirement dropped, subtask terminal
-    async with sm() as s, s.begin():
-        await s.execute(text("DELETE FROM minion_subtask_acquirement WHERE subtask_id=0"))
-        await s.execute(
-            text(
-                "UPDATE minion_subtask SET status='SUCCEEDED'"
-                " WHERE subtask_id=0 AND task_name='stale'"
-            )
-        )
-    async with sm() as s, s.begin():
-        assert await repo.try_acquire(s, c0, b.executor_id) is None
-    # terminal failure likewise
-    async with sm() as s, s.begin():
-        assert await repo.try_acquire(s, c1, a.executor_id) is not None
-        await s.execute(text("DELETE FROM minion_subtask_acquirement WHERE subtask_id=1"))
-        await s.execute(
-            text(
-                "UPDATE minion_subtask SET status='FAILED' WHERE subtask_id=1 AND task_name='stale'"
-            )
-        )
-    async with sm() as s, s.begin():
-        assert await repo.try_acquire(s, c1, b.executor_id) is None
+    got = await acquire_after_claim(
+        sm, p, flip, settings=cfg, storage=S3Storage(cfg), models=MODELS, window=1
+    )
+    assert got is not None
+    assert (got.subtask_id, got.attempt) == ((0, 2) if status == "PENDING" else (1, 1))
     async with sm() as s:
-        n = (
+        rows = (
             await s.execute(
-                text("SELECT count(*) FROM minion_subtask_acquirement WHERE task_name='stale'")
+                text(
+                    "SELECT subtask_id, attempt FROM minion_subtask_acquirement"
+                    " WHERE task_name='stale'"
+                )
             )
-        ).scalar_one()
-    assert n == 0  # the rejected acquires left no acquirement rows behind
+        ).all()
+    assert [tuple(r) for r in rows] == [(got.subtask_id, got.attempt)]
+
+
+@pytest.mark.integration
+async def test_default_window_drains_preferred_before_other_work(
+    sm: async_sessionmaker[AsyncSession], fresh_url: str
+) -> None:
+    """With the default (random) window the preference pass still comes first: every preferred
+    subtask is served before any older non-preferred one; pass 2 only when none is left."""
+    cfg = _settings(fresh_url)
+    assert cfg.acquire_window > 1
+    await seed_task(sm, "pf-old-a", 4)
+    await seed_task(sm, "pf-old-b", 4)
+    for n in ("pf-x", "pf-y", "pf-z"):
+        await seed_task(sm, n, 3)
+    ((p, _),) = await make_executors(sm, 1)
+    async with sm() as s, s.begin():
+        await executors_repo.set_preference(
+            s, p.executor_id, team=None, project=None, task_name="pf-y"
+        )
+    got = [await _acquire(sm, p, cfg) for _ in range(3)]
+    assert [g.task_name for g in got] == ["pf-y"] * 3
+    assert len({g.subtask_id for g in got}) == 3
+    rest = await _acquire(sm, p, cfg)  # preferred work gone: pass 2 serves the rest
+    assert rest is not None and rest.task_name != "pf-y"

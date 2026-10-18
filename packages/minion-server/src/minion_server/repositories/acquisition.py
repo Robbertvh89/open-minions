@@ -12,7 +12,18 @@ from decimal import Decimal
 from typing import Any, cast
 
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
-from sqlalchemy import ColumnElement, Select, exists, literal, literal_column, select, true, update
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    and_,
+    exists,
+    func,
+    literal,
+    literal_column,
+    select,
+    true,
+    update,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +36,7 @@ from minion_server.db.models import (
 )
 
 CANDIDATE_LIMIT = 16
+MAX_WINDOW = 256  # matches ServerSettings.acquire_window le=256
 ACQUIREMENT_CONSTRAINT = "uq_minion_subtask_acquirement_subtask"
 
 
@@ -66,6 +78,7 @@ def candidates_stmt(
     pool: str,
     preference: tuple[str | None, str | None, str | None] | None,
     limit: int = CANDIDATE_LIMIT,
+    with_priority: bool = False,
 ) -> Select[Any]:
     """The candidate query (also what the scale harness EXPLAINs).
 
@@ -130,20 +143,23 @@ def candidates_stmt(
         .limit(limit)
         .lateral("s")
     )
+    cols: list[ColumnElement[Any]] = [
+        t.c.team,
+        t.c.project,
+        t.c.task_name,
+        per_task.c.subtask_id,
+        t.c.model_id,
+        per_task.c.input_object_key,
+        per_task.c.byte_start,
+        per_task.c.byte_end,
+        per_task.c.record_count,
+        t.c.output_uri,
+        t.c.params,
+    ]
+    if with_priority:
+        cols.append(t.c.priority)
     stmt = (
-        select(
-            t.c.team,
-            t.c.project,
-            t.c.task_name,
-            per_task.c.subtask_id,
-            t.c.model_id,
-            per_task.c.input_object_key,
-            per_task.c.byte_start,
-            per_task.c.byte_end,
-            per_task.c.record_count,
-            t.c.output_uri,
-            t.c.params,
-        )
+        select(*cols)
         .select_from(t)
         .join(per_task, true())
         .order_by(
@@ -202,32 +218,93 @@ async def candidates(
     ]
 
 
-async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUID) -> Won | None:
-    """Race for one candidate inside the caller's open transaction.
-
-    Returns None if another executor owns it, it is no longer PENDING, or its task is no longer
-    PENDING/RUNNING (cancelled). The caller must roll back on None (so no acquirement survives a
-    failed re-check); on success it commits.
-
-    The task-status guard takes no task row lock (FOR SHARE would deadlock with the PENDING ->
-    RUNNING task update below). Residual window under READ COMMITTED: a statement that began
-    before a concurrent cancel committed can still win; that owner is told to stop by
-    `heartbeat.cancel=true` and the sweep heals the rest.
-    """
-    acquirement_id = uuid.uuid4()
+async def _after_win(
+    session: AsyncSession, k: tuple[str, str, str, int], acquirement_id: uuid.UUID, attempt: int
+) -> Won | None:
+    """Steps that follow a won acquirement INSERT, in the same transaction. None = roll back."""
+    team, project, task_name, subtask_id = k
     live = [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
-    task_key = (
-        Task.team == c.team,
-        Task.project == c.project,
-        Task.task_name == c.task_name,
-    )
+    task_key = (Task.team == team, Task.project == project, Task.task_name == task_name)
     key = (
-        Subtask.team == c.team,
-        Subtask.project == c.project,
-        Subtask.task_name == c.task_name,
-        Subtask.subtask_id == c.subtask_id,
+        Subtask.team == team,
+        Subtask.project == project,
+        Subtask.task_name == task_name,
+        Subtask.subtask_id == subtask_id,
     )
-    insert = (
+    # Re-check closes the race with a concurrent completion that deleted the old acquirement.
+    bumped = (
+        await session.execute(
+            update(Subtask)
+            .where(*key, Subtask.status == SubtaskStatus.PENDING.value)
+            .where(Subtask.attempt == attempt - 1)
+            .where(exists(select(1).where(*task_key, Task.status.in_(live))))
+            .values(status=SubtaskStatus.RUNNING.value, attempt=Subtask.attempt + 1)
+            .returning(Subtask.attempt)
+        )
+    ).one_or_none()
+    if bumped is None:
+        return None
+    await session.execute(pg_insert(ExecutorHeartbeat).values(acquirement_id=acquirement_id))
+    await session.execute(
+        update(Task)
+        .where(*task_key, Task.status == TaskStatus.PENDING.value)
+        .values(status=TaskStatus.RUNNING.value)
+    )
+    return Won(acquirement_id, attempt)
+
+
+@dataclass(frozen=True)
+class Claim:
+    """Outcome of one `claim` round. `n_candidates == 0`: no work. `n_candidates > 0` with
+    `candidate is None`: the pick lost the insert race. `candidate` set but `won is None`: the
+    INSERT won but the re-check failed; the caller must roll back. Either way: read again."""
+
+    n_candidates: int
+    candidate: Candidate | None = None
+    won: Won | None = None
+
+
+async def claim(
+    session: AsyncSession,
+    executor_id: uuid.UUID,
+    *,
+    engines: list[Engine],
+    model_ids: Collection[str],
+    memory_gb: float,
+    pool: str,
+    preference: tuple[str | None, str | None, str | None] | None,
+    window: int,
+) -> Claim:
+    """One-statement claim (ADR-0013): read the top `window` candidates, pick one at random among
+    the highest priority present, `INSERT ... ON CONFLICT DO NOTHING` it into the acquirement
+    table, all in a single round trip. Ownership is decided only by that INSERT (invariant 2).
+
+    Runs in the caller's open transaction; on a win the re-check UPDATE, heartbeat insert and task
+    update follow here. If the re-check fails the result has no `won` and the caller must roll back.
+    """
+    if not 1 <= window <= MAX_WINDOW:
+        raise ValueError(f"claim window must be in 1..{MAX_WINDOW}, got {window}")
+    if not model_ids:
+        return Claim(0)
+    cand = candidates_stmt(
+        engines=engines,
+        model_ids=model_ids,
+        memory_gb=memory_gb,
+        pool=pool,
+        preference=preference,
+        limit=window,
+        with_priority=True,
+    ).cte("cand")
+    max_prio = select(func.max(cand.c.priority)).scalar_subquery()
+    pick = (
+        select(*cand.c)
+        .where(cand.c.priority == max_prio)
+        .order_by(func.random())
+        .limit(1)
+        .cte("pick")
+    )
+    live = [_lit(TaskStatus.PENDING), _lit(TaskStatus.RUNNING)]
+    ins = (
         pg_insert(SubtaskAcquirement)
         .from_select(
             [
@@ -240,7 +317,7 @@ async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUI
                 "attempt",
             ],
             select(
-                literal(acquirement_id, type_=UUID(as_uuid=True)),
+                literal(uuid.uuid4(), type_=UUID(as_uuid=True)),
                 Subtask.team,
                 Subtask.project,
                 Subtask.task_name,
@@ -248,42 +325,83 @@ async def try_acquire(session: AsyncSession, c: Candidate, executor_id: uuid.UUI
                 literal(executor_id, type_=UUID(as_uuid=True)),
                 Subtask.attempt + 1,
             )
+            .select_from(pick)
+            .join(
+                Subtask,
+                and_(
+                    Subtask.team == pick.c.team,
+                    Subtask.project == pick.c.project,
+                    Subtask.task_name == pick.c.task_name,
+                    Subtask.subtask_id == pick.c.subtask_id,
+                ),
+            )
             .join(
                 Task,
                 (Task.team == Subtask.team)
                 & (Task.project == Subtask.project)
                 & (Task.task_name == Subtask.task_name),
             )
-            .where(*key, Subtask.status == SubtaskStatus.PENDING.value, Task.status.in_(live)),
+            .where(Subtask.status == _lit(SubtaskStatus.PENDING), Task.status.in_(live)),
         )
         .on_conflict_do_nothing(constraint=ACQUIREMENT_CONSTRAINT)
-        .returning(SubtaskAcquirement.acquirement_id, SubtaskAcquirement.attempt)
-    )
-    won = (await session.execute(insert)).one_or_none()
-    if won is None:
-        return None
-    # Re-check closes the race with a concurrent completion that deleted the old acquirement.
-    bumped = (
-        await session.execute(
-            update(Subtask)
-            .where(*key, Subtask.status == SubtaskStatus.PENDING.value)
-            .where(Subtask.attempt == won[1] - 1)
-            .where(exists(select(1).where(*task_key, Task.status.in_(live))))
-            .values(status=SubtaskStatus.RUNNING.value, attempt=Subtask.attempt + 1)
-            .returning(Subtask.attempt)
+        .returning(
+            SubtaskAcquirement.acquirement_id,
+            SubtaskAcquirement.attempt,
+            SubtaskAcquirement.team,
+            SubtaskAcquirement.project,
+            SubtaskAcquirement.task_name,
+            SubtaskAcquirement.subtask_id,
         )
-    ).one_or_none()
-    if bumped is None:
-        return None
-    await session.execute(pg_insert(ExecutorHeartbeat).values(acquirement_id=won[0]))
-    await session.execute(
-        update(Task)
-        .where(
-            Task.team == c.team,
-            Task.project == c.project,
-            Task.task_name == c.task_name,
-            Task.status == TaskStatus.PENDING.value,
-        )
-        .values(status=TaskStatus.RUNNING.value)
+        .cte("ins")
     )
-    return Won(won[0], won[1])
+    n = select(func.count().label("n")).select_from(cand).subquery("n")
+    stmt = (
+        select(
+            n.c.n,
+            ins.c.acquirement_id,
+            ins.c.attempt,
+            ins.c.team.label("ins_team"),
+            ins.c.project.label("ins_project"),
+            ins.c.task_name.label("ins_task_name"),
+            ins.c.subtask_id.label("ins_subtask_id"),
+            pick.c.team,
+            pick.c.project,
+            pick.c.task_name,
+            pick.c.subtask_id,
+            pick.c.model_id,
+            pick.c.input_object_key,
+            pick.c.byte_start,
+            pick.c.byte_end,
+            pick.c.record_count,
+            pick.c.output_uri,
+            pick.c.params,
+        )
+        .select_from(n)
+        .outerjoin(ins, true())
+        .outerjoin(pick, true())
+    )
+    row = (await session.execute(stmt)).one()
+    return await _claim_from_row(session, tuple(row))
+
+
+async def _claim_from_row(session: AsyncSession, row: tuple[Any, ...]) -> Claim:
+    """Turn the claim statement's row into a `Claim`; runs the post-win steps."""
+    if row[0] == 0 or row[1] is None:
+        return Claim(row[0])
+    if tuple(row[3:7]) != tuple(row[7:11]):  # inserted key != picked key: never serve the wrong one
+        raise RuntimeError("claim: inserted acquirement key differs from the picked candidate")
+    c = Candidate(
+        team=row[7],
+        project=row[8],
+        task_name=row[9],
+        subtask_id=row[10],
+        model_id=row[11],
+        input_object_key=row[12],
+        byte_start=row[13],
+        byte_end=row[14],
+        record_count=row[15],
+        output_uri=row[16],
+        params=row[17],
+    )
+    won = await _after_win(session, (c.team, c.project, c.task_name, c.subtask_id), row[1], row[2])
+    return Claim(row[0], c, won)

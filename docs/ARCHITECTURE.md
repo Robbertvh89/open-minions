@@ -344,39 +344,46 @@ default 3600; exceeding it backs off like any transient error). A claim never ha
 ```
 Executor ─POST /executor/acquire {engines, budget}─▶ Server
   (executor only calls this when governor state ≠ PAUSED)
-  candidates = SELECT pending subtasks
-               WHERE task.engine = ANY(engines)
-                 AND task.model_memory_gb <= budget.memory_gb   -- capacity admission
-                 AND (matches preference)            -- pass 1
-               ORDER BY task.priority DESC, task.created_at, subtask_id
-               LIMIT 16
-  if empty: candidates = same query without preference filter (engine, memory and allowed_pool filters stay) -- pass 2 (global FIFO)
-  for c in shuffle_head(candidates):          -- light shuffle reduces contention
-      INSERT INTO minion_subtask_acquirement (...) VALUES (...)
-        ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
-        RETURNING acquirement_id
-      if row returned:
-          UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ...  (same txn)
-          INSERT minion_executor_heartbeat(...)                           (same txn)
-          COMMIT → return assignment + presigned URLs
-  return 204   (the whole round repeats up to MAX_ROUNDS=10 when every candidate lost its insert race; then 204)
+  for pass in [preference, none]:            -- pass 2 (global FIFO) only if there is a preference;
+                                             -- engine, memory and allowed_pool filters stay in both
+    repeat up to MAX_ROUNDS=10 times:        -- one transaction and ONE statement per round (ADR-0013)
+      WITH cand AS (SELECT pending subtasks of live tasks
+                    WHERE task.engine = ANY(engines)
+                      AND task.model_memory_gb <= budget.memory_gb   -- capacity admission
+                      AND (matches pass preference)
+                    ORDER BY task.priority DESC, task.created_at, team, project, task_name, subtask_id
+                    LIMIT window),            -- MINION_ACQUIRE_WINDOW, default 16
+           pick AS (SELECT * FROM cand WHERE priority = max(priority) ORDER BY random() LIMIT 1),
+           ins  AS (INSERT INTO minion_subtask_acquirement (...)
+                      SELECT ... FROM pick JOIN subtask JOIN task
+                      WHERE subtask.status = PENDING AND task.status IN (PENDING, RUNNING)
+                    ON CONFLICT (team, project, task_name, subtask_id) DO NOTHING
+                    RETURNING acquirement_id, attempt, key)
+      SELECT count(cand), ins.*, pick.* ...
+      count = 0:  nothing in this pass -> next pass
+      no row:     lost the insert race   -> ROLLBACK, next round (fresh window)
+      row:        UPDATE minion_subtask SET status=RUNNING, attempt=attempt+1 ... (same txn, re-check)
+                  INSERT minion_executor_heartbeat(...); UPDATE task PENDING -> RUNNING (same txn)
+                  re-check failed -> ROLLBACK, next round; else COMMIT -> return assignment + presigned URLs
+  return 204   (pass 2 starts when pass 1 finds nothing or exhausts MAX_ROUNDS; exhausting every
+                round with work present is logged as `acquire_rounds_exhausted`)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
   deliberately unlocked; losing an insert race is cheap.
-- Candidate query is index-driven in two steps (TASK-7.4.2), O(16 + live tasks) regardless of queue
+- Candidate query is index-driven in two steps (TASK-7.4.2; window = MINION_ACQUIRE_WINDOW, default 16), O(window + live tasks) regardless of queue
   length: eligible live tasks are walked in queue order on the partial index
   `ix_minion_task_live_queue (priority DESC, created_at, team, project, task_name) WHERE status IN
-  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT 16` range scan runs on
+  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT window` range scan runs on
   `ix_minion_subtask_pending (team, project, task_name, subtask_id) WHERE status = 'PENDING'`; the
-  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT 16` yields exactly the FR-22 order of the old
-  single join (the task key is unique, so the order is total and the global top 16 holds at most 16
-  rows per task, each within that task's top 16). Status values are SQL literals, not bind
+  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT window` yields exactly the FR-22 order of the old
+  single join (the task key is unique, so the order is total and the global top window holds at most window
+  rows per task, each within that task's top window). Status values are SQL literals, not bind
   parameters, so asyncpg's generic plans still match the partial-index predicates. Residual cost:
   ~1 us / ~3 buffers per eligible live task that has no PENDING subtasks ahead of the first match
   (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms).
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
-  paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0002).
+  paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).
 
 ### 3.3 Execute & report
 ```
@@ -602,7 +609,7 @@ token in macOS Keychain.
 
 ## 9. ADR index
 - [ADR-0001](adr/0001-python-for-all-components.md): Python for all components — **Accepted**
-- ADR-0002: Unique-constraint acquisition over `SKIP LOCKED` *(to write)*
+- ADR-0013: Single-statement acquisition claim over a random window; unique-constraint acquisition over `SKIP LOCKED`
 - ADR-0003: Presigned URLs instead of executor S3 credentials *(to write)*
 - [ADR-0004](adr/0004-byte-range-input-slicing.md): Byte-range input slicing — **Accepted**
 - [ADR-0005](adr/0005-mlx-default-inference-engine.md): MLX as default inference engine — **Accepted**

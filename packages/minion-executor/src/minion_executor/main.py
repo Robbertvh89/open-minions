@@ -336,6 +336,7 @@ async def _run(
             governor=governor,
             presence_interval_s=settings.presence_interval_s,
             acquire_pace_s=settings.acquire_pace_s,
+            first_acquire_jitter_s=settings.first_acquire_jitter_s,
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,
             status_dir=settings.state_dir,

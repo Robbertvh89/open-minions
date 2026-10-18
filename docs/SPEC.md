@@ -196,10 +196,13 @@ Errors from the worker and engines (the full set of codes the executor reports; 
 ### 4.3 Acquisition protocol **[paper]**
 - FR-20. Ownership is claimed by inserting into `minion_subtask_acquirement`, which has a UNIQUE
   constraint on `(team, project, task_name, subtask_id)`.
-- FR-21. Exactly one insert wins; losers get no row (`ON CONFLICT DO NOTHING`) and try the next candidate.
+- FR-21. Exactly one insert wins; losers get no row (`ON CONFLICT DO NOTHING`) and re-read a fresh candidate window (ADR-0013).
 - FR-22. Dynamic task binding: if the executor has a preference, matching subtasks are dequeued first;
   otherwise (or if none match) fall back to the **global FIFO** queue (ordered by task `created_at`,
   then `subtask_id`).
+  Note (ADR-0013): among the top `MINION_ACQUIRE_WINDOW` (default 16) candidates of the highest priority
+  present the pick is random, to avoid head contention; priority is never inverted, and with window 1
+  the order is strict.
 
 ### 4.4 Fault tolerance (Watchdog)
 - FR-30. Watchdog monitors heartbeats **only for executors currently running subtasks** **[paper]**.
