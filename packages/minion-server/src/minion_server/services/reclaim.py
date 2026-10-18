@@ -14,9 +14,10 @@ import structlog
 from minion_common.enums import AttemptOutcome, SubtaskStatus
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from minion_server.repositories import completion as completion_repo
 from minion_server.repositories import reclaim as repo
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.completion import finish_failed, finish_unacknowledged
+from minion_server.services.completion import finish_failed, finish_unacknowledged, settle_in_tx
 
 log = structlog.get_logger()
 
@@ -135,3 +136,25 @@ async def sweep_cancelled(
     if total:
         log.info("cancelled_pending_swept", count=total)
     return total
+
+
+async def settle_stuck(sm: async_sessionmaker[AsyncSession], *, batch: int = 100) -> int:
+    """Backstop for ADR-0015: finish live tasks whose counters already cover every subtask.
+
+    Covers a settle lost after the owner op committed (crash, DB blip), a reclaim that failed the
+    last subtask, and a retried complete. One short transaction per task. Returns the number of
+    tasks made terminal.
+    """
+    async with sm() as s:
+        keys = await completion_repo.settleable_tasks(s, batch)
+    settled = 0
+    for key in keys:
+        try:
+            async with sm() as s, s.begin():
+                if await settle_in_tx(s, key):
+                    settled += 1
+        except Exception as exc:  # one bad task must not block the rest
+            log.error("task_settle_failed", error=type(exc).__name__)
+    if settled:
+        log.info("tasks_settled", count=settled)
+    return settled
