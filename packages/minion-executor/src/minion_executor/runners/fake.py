@@ -171,18 +171,25 @@ def _gpu_burn(seconds: float) -> None:
     reader, whatever else the host runs)."""
     import mlx.core as mx  # engine import, test hook only
 
-    a = mx.random.normal((4096, 4096), dtype=mx.float16)
-    mx.eval(a)
-    end = time.monotonic() + seconds
-    prev: list[Any] | None = None
-    while time.monotonic() < end:
-        cur = [a @ a for _ in range(2)]
-        mx.async_eval(*cur)  # type: ignore[no-untyped-call, unused-ignore]  # typed only with the mlx extra
+    old_mem = mx.set_memory_limit(1 << 30)  # bounded: a burn must never grow the host (TASK-44)
+    old_cache = mx.set_cache_limit(128 << 20)
+    try:
+        a = mx.random.normal((4096, 4096), dtype=mx.float16)
+        mx.eval(a)
+        end = time.monotonic() + seconds
+        prev: list[Any] | None = None
+        while time.monotonic() < end:
+            cur = [a @ a for _ in range(2)]
+            mx.async_eval(*cur)  # type: ignore[no-untyped-call, unused-ignore]  # typed only with the mlx extra
+            if prev is not None:
+                mx.eval(*prev)
+            prev = cur
         if prev is not None:
             mx.eval(*prev)
-        prev = cur
-    if prev is not None:
-        mx.eval(*prev)
+    finally:
+        mx.set_memory_limit(old_mem)
+        mx.set_cache_limit(old_cache)
+        mx.clear_cache()
 
 
 def _mach_lookup(name: str) -> dict[str, object]:

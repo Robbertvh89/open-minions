@@ -2,8 +2,11 @@
 
 import asyncio
 import contextlib
+import faulthandler
 import hashlib
 import http.server
+import json
+import os
 import socket
 import sys
 import threading
@@ -43,6 +46,108 @@ from sqlalchemy.ext.asyncio import (
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
+
+
+# --- memory footprint guard (TASK-44): a runaway test must die loudly, not eat the Mac ---
+
+_GB = 1024**3
+_DEFAULT_MAX_FOOTPRINT_GB = 16.0
+_SAMPLE_INTERVAL_S = 1.0
+
+
+def _check(
+    footprint: int | None, limit_bytes: int, nodeid: str, exit_fn: Callable[[int], Any]
+) -> bool:
+    """True (after reporting and calling `exit_fn(3)`) when `footprint` exceeds `limit_bytes`.
+    `limit_bytes <= 0` or an unknown footprint never trips."""
+    if footprint is None or limit_bytes <= 0 or footprint <= limit_bytes:
+        return False
+    sys.stderr.write(
+        f"\nFOOTPRINT GUARD: {nodeid} reached {footprint / _GB:.1f} GB "
+        f"(limit {limit_bytes / _GB:.1f} GB, MINION_TEST_MAX_FOOTPRINT_GB); aborting pytest\n"
+    )
+    sys.stderr.flush()
+    with contextlib.suppress(Exception):  # captured stderr has no fd: the message above stands
+        faulthandler.dump_traceback(all_threads=True)
+    exit_fn(3)
+    return True
+
+
+class _FootprintGuard:
+    def __init__(self, limit_gb: float, log_path: str | None) -> None:
+        from minion_executor.worker.footprint import process_footprint_bytes
+
+        self._read = process_footprint_bytes
+        self.limit = int(limit_gb * _GB)
+        self.log_path = log_path
+        self.nodeid = "<session>"
+        self.peak = 0
+        self._stop = threading.Event()
+        self.pid = os.getpid()
+
+    def sample(self) -> int | None:
+        fp = self._read(self.pid)
+        if fp is not None:
+            self.peak = max(self.peak, fp)
+        return fp
+
+    def _run(self) -> None:
+        while not self._stop.wait(_SAMPLE_INTERVAL_S):
+            _check(self.sample(), self.limit, self.nodeid, os._exit)
+
+    def start(self) -> None:
+        if self.sample() is None:  # unsupported OS: stay out of the way
+            return
+        threading.Thread(target=self._run, name="footprint-guard", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+_guard: _FootprintGuard | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    global _guard
+    try:
+        limit = float(os.environ.get("MINION_TEST_MAX_FOOTPRINT_GB", _DEFAULT_MAX_FOOTPRINT_GB))
+    except ValueError:
+        limit = _DEFAULT_MAX_FOOTPRINT_GB
+    log_path = os.environ.get("MINION_TEST_RSS_LOG") or None
+    if limit <= 0 and not log_path:
+        return
+    try:
+        _guard = _FootprintGuard(limit, log_path)
+    except ImportError:
+        return
+    _guard.start()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _guard is not None:
+        _guard.stop()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    g = _guard
+    if g is None:
+        return (yield)
+    start = g.sample() or 0
+    g.nodeid, g.peak = item.nodeid, start
+    try:
+        return (yield)
+    finally:
+        end = g.sample() or 0
+        if g.log_path:
+            rec = {
+                "nodeid": item.nodeid,
+                "peak_gb": round(g.peak / _GB, 3),
+                "delta_gb": round((end - start) / _GB, 3),
+            }
+            with Path(g.log_path).open("a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        g.nodeid = "<between tests>"
 
 
 @pytest.fixture(autouse=True)

@@ -155,24 +155,36 @@ def quiet_gpu() -> None:
 def test_burn_hook_saturates_the_gpu(quiet_gpu: None) -> None:
     """The rogue hook must measure far above any limit (standalone, real IOKit reader)."""
     pytest.importorskip("mlx.core")
-    import threading
+    import subprocess
+    import sys
 
-    from minion_executor.runners.fake import _gpu_burn
+    from minion_executor.worker.footprint import process_footprint_bytes
 
     read = default_gpu_reader()
     assert read is not None
-    pid = os.getpid()
-    burner = threading.Thread(target=_gpu_burn, args=(10.0,))
-    burner.start()
-    time.sleep(1)
-    shares: list[float] = []
-    for _ in range(4):  # 2 s windows: a transient host dip must not hide the saturation
-        a, t0 = sum(read().get(pid, {}).values()), time.monotonic()
-        time.sleep(2)
-        b, t1 = sum(read().get(pid, {}).values()), time.monotonic()
-        shares.append((b - a) / 1e9 / (t1 - t0))
-    burner.join()
-    assert max(shares) >= 0.8, shares
+    # A child process (TASK-44): the burn's Metal buffers must never live in the pytest process.
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from minion_executor.runners.fake import _gpu_burn; _gpu_burn(10.0)",
+        ]
+    )
+    try:
+        time.sleep(1.5)
+        shares: list[float] = []
+        peak = 0
+        for _ in range(4):  # 2 s windows: a transient host dip must not hide the saturation
+            a, t0 = sum(read().get(child.pid, {}).values()), time.monotonic()
+            time.sleep(2)
+            b, t1 = sum(read().get(child.pid, {}).values()), time.monotonic()
+            shares.append((b - a) / 1e9 / (t1 - t0))
+            peak = max(peak, process_footprint_bytes(child.pid) or 0)
+        assert max(shares) >= 0.8, shares
+        assert peak <= 2 << 30, f"burn footprint {peak / 2**30:.2f} GiB"
+    finally:
+        child.kill()
+        child.wait(10)
 
 
 class CountingReader:
