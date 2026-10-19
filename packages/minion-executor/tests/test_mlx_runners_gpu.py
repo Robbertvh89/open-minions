@@ -406,12 +406,14 @@ def _budget_for(model: ModelEntry) -> Budget:
 def _multipart_file_part(req: httpx.Request) -> bytes:
     """Assert the presigned-POST framing (TASK-19) and return the file part (the JSONL)."""
     assert req.method == "POST" and str(req.url) == "https://s3.test/out"
+    body = req.read()
+    assert int(req.headers["Content-Length"]) == len(body)
     msg = BytesParser(policy=HTTP).parsebytes(
-        b"Content-Type: " + req.headers["Content-Type"].encode() + b"\r\n\r\n" + req.read()
+        b"Content-Type: " + req.headers["Content-Type"].encode() + b"\r\n\r\n" + body
     )
     parts = list(msg.iter_parts())
     names = [p.get_param("name", header="content-disposition") for p in parts]
-    assert names[:2] == ["key", "policy"] and names[-1] == "file", names
+    assert {"key", "policy"} <= set(names) and names[-1] == "file", names  # S3: file last
     payload = parts[-1].get_payload(decode=True)
     assert isinstance(payload, bytes)
     return payload
