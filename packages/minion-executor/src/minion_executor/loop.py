@@ -186,6 +186,7 @@ class Worker(Protocol):
     def footprint_bytes(self) -> int | None: ...
     def priority_ok(self) -> bool | None: ...
     def gpu_share(self) -> float | None: ...
+    def pause_acked_at(self) -> float | None: ...
     def gpu_clients(
         self, reader: Callable[[], dict[int, dict[str, int]]]
     ) -> tuple[int, dict[str, int]] | None: ...
@@ -1003,6 +1004,8 @@ class ExecutorLoop:
             v = guard.observe_error(now)
             log.warning("gpu_meter_error", error=type(gpu).__name__)
         else:
+            if (acked := self._worker.pause_acked_at()) is not None:
+                guard.note_pause_ack(acked)
             if gpu[0] != self._gpu_pid:
                 guard.start(gpu[0], now, idle=idle)  # a new worker: load time is not charged
                 self._gpu_pid = gpu[0]

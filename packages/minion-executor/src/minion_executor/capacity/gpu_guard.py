@@ -16,11 +16,22 @@ Rules
   deadlines and cannot cause a false positive. A share is judged once the span is at least
   `min_span_frac` x window. Duty 1.0 means a limit above 1: the guard never acts.
 - Over the limit -> GATE with `stop_s` that brings the window back to the duty (not just to the
-  limit), at most `max_stop_frac` x the sampling interval. Over the limit for `kill_after_s`
-  without a clean judgement in between -> KILL.
-- Paused by the governor (after `grace_s`) or an idle warm worker: allowed is 0, so the limit is
-  `margin`; the share is measured since the quiet period began and over the limit -> KILL at once
-  (gating a paused worker to 0 is pointless).
+  limit), at most `max_stop_frac` x the sampling interval.
+- KILL on a leaky over-budget accumulator (a burn/rest sawtooth must not reset it): while the
+  share is over the limit, `acc` grows by the elapsed time; while it is under, `acc` drains by
+  `drain_frac` (0.25) x the elapsed time, floor 0. `acc >= kill_after_s` -> KILL. Chosen so that
+  any repeating pattern that is over the limit for more than `drain_frac / (1 + drain_frac)` = 20 %
+  of the time accumulates without bound (burn 24 s / rest 8 s, 30/8 and 30/10 at light and
+  balanced are over ~90 % of the time and die in about 35-40 s), while a worker that never
+  exceeds the limit never accumulates. A steady rogue still dies `kill_after_s` after its
+  first over-limit sample.
+- Paused by the governor or an idle warm worker: allowed is 0, so the limit is `margin`; the
+  share is measured since the quiet period began and over the limit -> KILL at once (gating a
+  paused worker to 0 is pointless). A paused worker may be mid-step (a long honest step ends
+  only at its next checkpoint), so the quiet period of a pause begins when the worker **acked**
+  the pause (`note_pause_ack`, + `ack_settle_s`); an unacked pause is judged only after
+  `pause_unacked_bound_s` (the pause-release bound), so an honest long step is never killed
+  for finishing.
 - More than `max_clients` distinct client ids for the pid -> KILL (a worker opening and closing
   GPU clients between samples to hide its time; an honest MLX worker has one).
 - `max_meter_errors` consecutive meter errors -> KILL with reason "meter" (fail closed, like the
@@ -46,6 +57,9 @@ class GpuGuardConfig:
     max_clients: int = 4
     max_meter_errors: int = 3
     quiet_min_span_s: float = 2.0  # judging span when paused / idle (limit is only `margin`)
+    drain_frac: float = 0.25  # over-budget accumulator drain per clean second
+    ack_settle_s: float = 1.0  # in-flight GPU work after a pause ack
+    pause_unacked_bound_s: float = 60.0  # an unacked pause is judged as quiet after this
 
 
 class GpuAction(enum.Enum):
@@ -73,6 +87,7 @@ class GpuDutyGuard:
         self._seen: dict[str, int] = {}  # last value per client id (kept while the pid is)
         self._ids: set[str] = set()  # distinct client ids of the pid
         self._ctl: list[tuple[float, float, bool]] = []  # (since, duty, paused), ascending
+        self._ack_at: float | None = None  # when the worker acked the current pause
         self._idle = False
         self._reset_window(0.0)
         self._errors = 0
@@ -83,7 +98,9 @@ class GpuDutyGuard:
         self._samples: deque[tuple[float, float]] = deque()  # (t, cumulative busy seconds)
         self._cum = 0.0
         self._primed = False
-        self._over_since: float | None = None
+        self._acc = 0.0  # leaky over-budget seconds
+        self._over_prev = False
+        self._last_judged: float | None = None
         self._started = now
 
     def start(self, pid: int, now: float, *, idle: bool = False) -> None:
@@ -118,9 +135,16 @@ class GpuDutyGuard:
         if self._ctl and self._ctl[-1][0] >= now:
             self._ctl.pop()  # same instant: the latest wins
         self._ctl.append((now, duty, paused))
+        if self._ctl[-2:-1] and self._ctl[-2][2] != paused:
+            self._ack_at = None  # a new pause / resume is not yet acked
         cutoff = now - (self.cfg.window_s + self.cfg.grace_s) * 4
         while len(self._ctl) > 1 and self._ctl[1][0] <= cutoff:
             self._ctl.pop(0)
+
+    def note_pause_ack(self, at: float) -> None:
+        """The worker acked the pause in force (control-side monotonic time of the ack)."""
+        if self._ctl and self._ctl[-1][2] and at >= self._ctl[-1][0]:
+            self._ack_at = at
 
     # -- inputs ------------------------------------------------------------------------------
 
@@ -178,8 +202,13 @@ class GpuDutyGuard:
             quiet_from = self._started
         else:
             _, paused, since = self._state_at_end()
-            if paused and now - since >= cfg.grace_s:
-                quiet_from = since + cfg.grace_s
+            if paused:
+                if self._ack_at is not None:
+                    quiet_from = self._ack_at + cfg.ack_settle_s
+                elif now - since >= cfg.pause_unacked_bound_s:
+                    quiet_from = since + cfg.pause_unacked_bound_s
+                if quiet_from is not None and quiet_from > now:
+                    quiet_from = None
         lower = now - cfg.window_s
         if quiet_from is not None:
             lower = max(lower, quiet_from)
@@ -201,19 +230,23 @@ class GpuDutyGuard:
         else:
             allowed = self._allowed(now - cfg.window_s - cfg.grace_s, now)
             if allowed >= 1.0:
-                self._over_since = None
+                self._acc, self._over_prev = 0.0, False
                 return GpuVerdict(GpuAction.OK, share, allowed + cfg.margin)
         limit = allowed + cfg.margin
+        dt = 0.0 if self._last_judged is None else min(now - self._last_judged, cfg.window_s)
+        self._last_judged = now
         if share <= limit:
-            self._over_since = None
+            self._acc = max(0.0, self._acc - cfg.drain_frac * dt)
+            self._over_prev = False
             return GpuVerdict(GpuAction.OK, share, limit)
         if quiet_from is not None:
             return GpuVerdict(
                 GpuAction.KILL, share, limit, reason="idle" if self._idle else "paused"
             )
-        if self._over_since is None:
-            self._over_since = now
-        if now - self._over_since >= cfg.kill_after_s:
+        if self._over_prev:
+            self._acc += dt
+        self._over_prev = True
+        if self._acc >= cfg.kill_after_s:
             return GpuVerdict(GpuAction.KILL, share, limit, reason="over_duty")
         cap = cfg.max_stop_frac * interval_s
         need_stop = busy / allowed - span if allowed > 0 else cap

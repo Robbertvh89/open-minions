@@ -864,6 +864,11 @@ class WorkerHandle:
         """The worker's most recent acknowledgement of a control generation (None before any)."""
         return self._ack
 
+    def pause_acked_at(self) -> float | None:
+        """Control-side monotonic time the worker acked the pause now in force, else None."""
+        ack = self._ack
+        return ack.at if ack is not None and ack.paused else None
+
     def gpu_share(self) -> float | None:
         """Busy share of wall time in the current/last run (pauses excluded); None before data."""
         usage = self._usage

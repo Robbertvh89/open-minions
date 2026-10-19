@@ -215,6 +215,7 @@ class FakeWorker:
         self.gpu_busy: float | None = None  # GPU busy share of wall time
         self.gpu_t0: float | None = None
         self.gpu_calls = 0
+        self.pause_ack: float | None = None  # when the (fake) worker acked the pause
         self.fp_calls = 0  # watcher samples taken (footprint + priority are sampled together)
 
     def ensure_model(
@@ -273,6 +274,9 @@ class FakeWorker:
 
     def gpu_share(self) -> float | None:
         return None
+
+    def pause_acked_at(self) -> float | None:
+        return self.pause_ack
 
     def gpu_clients(self, reader: Callable[[], Any]) -> tuple[int, dict[str, int]] | None:
         """Scripted control-side GPU time: `gpu_busy` x wall time since the first call."""
@@ -3768,11 +3772,13 @@ async def test_gpu_paused_rogue_is_killed_mid_subtask(tmp_path: Path) -> None:
     await sampled(worker, 5)
     assert worker.interrupts == 0
     gov.update(dec(reason=PausedReason.THERMAL))
+    await until(lambda: worker.controls[-1][1])  # the pause reached the worker
+    worker.pause_ack = time.monotonic()  # the worker acked the pause and keeps burning
     await until(lambda: "release" in client.kinds())
     loop.stop()
     await asyncio.wait_for(task, 10)
     assert client.release_codes == ["GPU_DUTY_VIOLATION"]
-    assert loop._status_snapshot().gpu_violation == "paused"
+    assert loop._status_snapshot().gpu_violation in ("paused", "over_duty")
 
 
 async def test_gpu_paused_honest_worker_is_not_killed(tmp_path: Path) -> None:

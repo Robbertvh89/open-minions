@@ -111,13 +111,59 @@ def test_paused_rogue_is_killed_after_grace() -> None:
     r = Rig(0.3)
     r.run(20, 0.3)
     r.g.note_ctl(0.3, True, r.t)
+    r.g.note_pause_ack(r.t + 1.0)  # the worker acked the pause and keeps burning
     paused_at = r.t
     vs = r.run(30, 0.8)
     kill = next(v for v in vs if v.action is GpuAction.KILL)
     assert kill.reason == "paused"
     assert kill.limit == pytest.approx(0.10)
     idx = vs.index(kill)
-    assert (idx + 1) * STEP <= 5.0 + 2.0 + 2 * STEP, paused_at
+    assert (idx + 1) * STEP <= 1.0 + 1.0 + 2.0 + 2 * STEP, paused_at
+
+
+def test_pause_mid_long_honest_step_is_not_killed() -> None:
+    """Paused during a 6 s step: the GPU stays busy until the step ends and the worker acks;
+    after the ack it is quiet. No kill, however long the step."""
+    r = Rig(0.3)
+    r.run(20, 0.3)
+    r.g.note_ctl(0.3, True, r.t)
+    assert GpuAction.KILL not in actions(r.run(6, 1.0))  # finishing the step, unacked
+    r.g.note_pause_ack(r.t)
+    assert GpuAction.KILL not in actions(r.run(60, 0.0))
+
+
+def test_unacked_pause_that_keeps_burning_is_killed() -> None:
+    r = Rig(0.3)
+    r.run(20, 0.3)
+    r.g.note_ctl(0.3, True, r.t)
+    vs = r.run(100, 0.8)  # never acks and keeps burning: the over-budget rule still bites
+    kill = next(i for i, v in enumerate(vs) if v.action is GpuAction.KILL)
+    assert (kill + 1) * STEP <= 60.0 + 2.0 + 2 * STEP
+
+
+def _sawtooth(r: Rig, burn: float, rest: float, total: float) -> float | None:
+    """Seconds until KILL for burn(100 %)/rest(0) repeating, or None."""
+    t = 0.0
+    while t < total:
+        for rate, length in ((1.0, burn), (0.0, rest)):
+            for v in r.run(length, rate):
+                t += STEP
+                if v.action is GpuAction.KILL:
+                    return t
+    return None
+
+
+@pytest.mark.parametrize("duty", [0.3, 0.5])
+@pytest.mark.parametrize("burn,rest", [(24, 8), (30, 8), (30, 10)])
+def test_sawtooth_is_killed_in_bounded_time(duty: float, burn: int, rest: int) -> None:
+    r = Rig(duty)
+    killed = _sawtooth(r, burn, rest, 600)
+    assert killed is not None and killed <= 120.0, killed
+
+
+def test_honest_just_under_the_limit_never_accumulates() -> None:
+    r = Rig(0.3)
+    assert actions(r.run(1200, 0.3 + 0.09)) == {GpuAction.OK}
 
 
 def test_paused_honest_worker_that_stops_is_ok() -> None:
