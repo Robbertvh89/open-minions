@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 import pytest
 import yaml
-from minion_common.enums import CapacityProfile, Engine
+from minion_common.enums import CapacityProfile, Engine, PausedReason
 from minion_common.schemas import (
     Assignment,
     Budget,
@@ -28,6 +28,7 @@ from minion_common.schemas import (
     ModelEntry,
     PresignedPost,
 )
+from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.gpu_guard import GpuAction, GpuGuardConfig
 from minion_executor.capacity.gpu_meter import default_gpu_reader
 from minion_executor.capacity.profiles import PROFILES, budget_for
@@ -298,8 +299,7 @@ async def test_honest_mlx_worker_is_never_killed(
 ) -> None:
     """Real Qwen inference through the paced runner for ~40 s: the guard watches (real IOKit
     meter, shipped thresholds) and never gates, kills or releases."""
-    # each subtask outlasts the guard window, so the guard judges full windows (it re-baselines
-    # per subtask)
+    # long subtasks: the guard judges full windows (the window also spans subtask boundaries)
     prompts = (PROMPTS * 40)[: RECORDS[profile]]
     body = b"".join(
         json.dumps({"id": f"r{i}", "prompt": p}).encode() + b"\n" for i, p in enumerate(prompts)
@@ -333,6 +333,87 @@ async def test_honest_mlx_worker_is_never_killed(
     assert loop._status_snapshot().gpu_violation is None
     assert reader.calls >= 5 and shares, "the guard never judged a window"
     assert max(shares) <= budget.gpu_duty_cycle + DEFAULTS.margin, shares
+
+
+class OneShotClient(Client):
+    """One assignment, then an empty queue (the loop idles with a warm worker)."""
+
+    def __init__(self, make: Any) -> None:
+        super().__init__(make)
+        self.given = False
+
+    async def acquire(self, req: Any) -> Assignment | None:
+        if self.given:
+            return None
+        self.given = True
+        return self.make()  # type: ignore[no-any-return]
+
+
+@pytest.mark.model
+async def test_honest_worker_paused_mid_batch_then_idle_is_never_killed(
+    qwen_cache: ModelCache, tmp_path: Path
+) -> None:
+    """Real Qwen: paused mid-batch (the in-flight step finishes, then the worker acks and goes
+    quiet), resumed, finished, then a warm idle worker for more than one guard window: no
+    gpu_duty_kill, no violation in status."""
+    profile = CapacityProfile.BALANCED
+    prompts = (PROMPTS * 40)[:150]
+    body = b"".join(
+        json.dumps({"id": f"r{i}", "prompt": p}).encode() + b"\n" for i, p in enumerate(prompts)
+    )
+    budget = _duty(profile)
+    client = OneShotClient(lambda: _assignment(QWEN, body, len(prompts), {"max_tokens": 48}))
+    worker = WorkerHandle(
+        [Engine.MLX], sandbox=SandboxPolicy(cache_root=CACHE_DIR),
+        tick_interval_s=0.2, step_timeout_s=300,
+    )  # fmt: skip
+    gov = FixedGovernor(budget)
+
+    def decision(paused: bool) -> Decision:
+        return Decision(
+            profile=profile, budget=budget,
+            paused_reason=PausedReason.THERMAL if paused else None,
+            release_now=False, pause_expired=False, trim=False,
+            profile_source=ProfileSource.PINNED, candidate=None, candidate_since=None,
+        )  # fmt: skip
+
+    loop = ExecutorLoop(
+        client,  # type: ignore[arg-type]
+        worker, budget, [Engine.MLX], http=_http(body), tmp_root=tmp_path,
+        model_cache=qwen_cache, governor=gov, gpu_reader=CountingReader(), gpu_guard=DEFAULTS,
+    )  # fmt: skip
+    guard = loop._gpu
+    assert guard is not None
+    kills: list[str] = []
+    observe = guard.observe
+
+    def spy(*a: Any, **kw: Any) -> Any:
+        v = observe(*a, **kw)
+        if v.action is GpuAction.KILL:
+            kills.append(v.reason)
+        return v
+
+    guard.observe = spy  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run())
+    try:
+        deadline = time.monotonic() + 120
+        while loop._batch_budget is None and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(4)  # mid-batch
+        gov.update(decision(True))
+        await asyncio.sleep(12)  # longer than a window: acked and quiet
+        gov.update(decision(False))
+        while not client.completed and time.monotonic() < deadline + 120:  # noqa: ASYNC110
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(DEFAULTS.window_s + 6)  # warm and idle for more than one window
+        loop.stop()
+        await asyncio.wait_for(task, 60)
+    finally:
+        worker.close()
+        _assert_no_children()
+    assert client.completed, "the subtask never completed"
+    assert kills == [] and client.released == [] and client.failed == []
+    assert loop._status_snapshot().gpu_violation is None
 
 
 async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path, quiet_gpu: None) -> None:
