@@ -498,6 +498,7 @@ class WorkerHandle:
         self._unsent: WorkerCtl | None = None  # newest state whose send failed (+ trim)
         self._op: str | None = None  # op of the call in flight (None: worker idle in its main loop)
         self._ack: WorkerAck | None = None
+        self._tick_at: float | None = None
         self._usage: WorkerUsage | None = None
         self._closed = False
         self._seen_gen = 0  # last generation ensure_model() reset for
@@ -644,6 +645,7 @@ class WorkerHandle:
                         self._usage = usage
                     if ack is not None:
                         self._ack = ack
+                    self._tick_at = time.monotonic()
             except _SelfTestFailedError:
                 self._reset()
                 raise _self_test_error() from None
@@ -864,6 +866,10 @@ class WorkerHandle:
         """The worker's most recent acknowledgement of a control generation (None before any)."""
         return self._ack
 
+    def last_tick_at(self) -> float | None:
+        """Control-side monotonic time of the worker's latest run tick (None before any)."""
+        return self._tick_at
+
     def pause_acked_at(self) -> float | None:
         """Control-side monotonic time the worker acked the pause now in force, else None."""
         ack = self._ack
@@ -1028,6 +1034,7 @@ class WorkerHandle:
         self._proc = self._conn = None
         self._model_id = None
         self._ack = None
+        self._tick_at = None
         with self._ctl_lock:
             self._sent_gen, self._unsent = self._ctl_gen, None  # the next run carries the state
             self._wire_gen = 0

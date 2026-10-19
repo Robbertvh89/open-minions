@@ -93,16 +93,9 @@ def test_live_parity_with_ioreg_and_no_port_leak() -> None:
         pytest.skip("no AGX user clients")
     reader = default_gpu_reader()
     assert reader is not None
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(5)"], stdout=subprocess.DEVNULL
-    )
-    try:
-        before_ioreg = gpu_meter.read_gpu_clients()
-        via_iokit = reader()
-        after_ioreg = gpu_meter.read_gpu_clients()
-    finally:
-        child.kill()
-        child.wait()
+    before_ioreg = gpu_meter.read_gpu_clients()
+    via_iokit = reader()
+    after_ioreg = gpu_meter.read_gpu_clients()
     shared = set(before_ioreg) & set(via_iokit) & set(after_ioreg)
     assert shared, "no pid seen by all reads"
     slack = 50_000_000  # 50 ms of GPU time

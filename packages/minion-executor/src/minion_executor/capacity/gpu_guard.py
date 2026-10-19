@@ -8,30 +8,39 @@ depend on the worker's cooperation (invariant 6). No clock, no I/O: callers pass
 Rules
 -----
 - Share = GPU busy time of the worker's clients over a sliding window of `window_s`, divided by the
-  window's wall time. Busy time is summed from per-client **positive deltas** (a counter that goes
-  backwards, or a client that vanishes, never produces a negative); the first reading after
-  `start()` only sets the baseline.
+  window's wall time (reporting and GATE). Busy time is summed from per-client **positive deltas**
+  (a client that vanishes never produces a negative); the first reading after `start()` only
+  sets the baseline. A live client whose counter goes **backwards** is a meter error (the
+  reading cannot be trusted), not a silent re-baseline.
 - Limit = allowed + `margin`. `allowed` is the highest duty in force over
-  [window start - `grace_s`, now], so a duty drop gets the same ack latency as the other D7
-  deadlines and cannot cause a false positive. A share is judged once the span is at least
-  `min_span_frac` x window. Duty 1.0 means a limit above 1: the guard never acts.
+  [now - `window_s` - `grace_s`, now], so a duty drop gets the same ack latency as the other D7
+  deadlines and cannot cause a false positive. Duty 1.0 means a limit above 1: the guard never acts.
 - Over the limit -> GATE with `stop_s` that brings the window back to the duty (not just to the
   limit), at most `max_stop_frac` x the sampling interval.
-- KILL on a leaky over-budget accumulator (a burn/rest sawtooth must not reset it): while the
-  share is over the limit, `acc` grows by the elapsed time; while it is under, `acc` drains by
-  `drain_frac` (0.25) x the elapsed time, floor 0. `acc >= kill_after_s` -> KILL. Chosen so that
-  any repeating pattern that is over the limit for more than `drain_frac / (1 + drain_frac)` = 20 %
-  of the time accumulates without bound (burn 24 s / rest 8 s, 30/8 and 30/10 at light and
-  balanced are over ~90 % of the time and die in about 35-40 s), while a worker that never
-  exceeds the limit never accumulates. A steady rogue still dies `kill_after_s` after its
-  first over-limit sample.
+- KILL on an **excess bucket in GPU-seconds**: every sample adds the GPU time used since the last
+  one and subtracts what the limit allows for the elapsed wall time,
+  `acc = max(0, acc + busy - limit * dt)`; `acc >= kill_budget_gpu_s` -> KILL. GPU time, not wall
+  time, because an honest worker may run one unsplittable step (an mlx-lm prefill of 8-16k tokens
+  in a single `mx.eval`, 4-25 s) at full speed and then repays it with a sleep: that burst is an
+  excess of `S * (1 - limit)` GPU-s which the repay sleep drains again. The budget is 20 GPU-s: an
+  honest unpaced step of up to 33 s at light (limit 0.4), 50 s at balanced (0.6) and any at full
+  never reaches it, while a steady rogue at light dies in 20 / (1 - 0.4) = 33 s and at balanced in
+  50 s. A burn/rest sawtooth cannot reset it (only a long enough rest drains it), and a worker
+  whose long-run share is at most the limit never accumulates (it drains at least as fast as it
+  fills): 8 s burn / 8 s rest at balanced (share = duty) stays flat.
+- The bucket is **per executor run, not per worker pid**: a new pid re-baselines the counters but
+  keeps `acc`, drained by `limit * gap` for the time without a worker, and a KILL leaves it at or
+  above the budget. A rogue that is killed and respawned therefore gets about one sample interval
+  of GPU per life, not a fresh 20 GPU-s.
 - Paused by the governor or an idle warm worker: allowed is 0, so the limit is `margin`; the
   share is measured since the quiet period began and over the limit -> KILL at once (gating a
   paused worker to 0 is pointless). A paused worker may be mid-step (a long honest step ends
   only at its next checkpoint), so the quiet period of a pause begins when the worker **acked**
-  the pause (`note_pause_ack`, + `ack_settle_s`); an unacked pause is judged only after
-  `pause_unacked_bound_s` (the pause-release bound), so an honest long step is never killed
-  for finishing.
+  the pause (`note_pause_ack`, the first ack after the pause began, + `ack_settle_s`). Unacked,
+  the pause is judged as quiet (a) from `pause_unacked_bound_s` on, or (b) from `grace_s` after
+  the pause once the worker has been seen **ticking** (`note_tick`) after that point without a
+  paused ack: a checkpoint applies pending control first, so a tick without an ack is a worker
+  ignoring the pause.
 - More than `max_clients` distinct client ids for the pid -> KILL (a worker opening and closing
   GPU clients between samples to hide its time; an honest MLX worker has one).
 - `max_meter_errors` consecutive meter errors -> KILL with reason "meter" (fail closed, like the
@@ -52,14 +61,13 @@ class GpuGuardConfig:
     min_span_frac: float = 0.8
     margin: float = 0.10
     grace_s: float = 5.0
-    kill_after_s: float = 30.0
+    kill_budget_gpu_s: float = 20.0  # excess GPU-seconds over the limit before a KILL
     max_stop_frac: float = 0.75
     max_clients: int = 4
     max_meter_errors: int = 3
     quiet_min_span_s: float = 2.0  # judging span when paused / idle (limit is only `margin`)
-    drain_frac: float = 0.25  # over-budget accumulator drain per clean second
     ack_settle_s: float = 1.0  # in-flight GPU work after a pause ack
-    pause_unacked_bound_s: float = 60.0  # an unacked pause is judged as quiet after this
+    pause_unacked_bound_s: float = 60.0  # an unacked, tick-less pause is judged as quiet after this
 
 
 class GpuAction(enum.Enum):
@@ -87,8 +95,12 @@ class GpuDutyGuard:
         self._seen: dict[str, int] = {}  # last value per client id (kept while the pid is)
         self._ids: set[str] = set()  # distinct client ids of the pid
         self._ctl: list[tuple[float, float, bool]] = []  # (since, duty, paused), ascending
-        self._ack_at: float | None = None  # when the worker acked the current pause
+        self._ack_at: float | None = None  # when the worker first acked the current pause
+        self._tick_at: float | None = None  # latest worker tick (control-side monotonic)
         self._idle = False
+        self._acc = 0.0  # excess GPU-seconds; per run, survives worker pids
+        self._acc_t: float | None = None  # when `_acc` was last advanced
+        self._last_limit = 0.0  # limit used then (drains the bucket across a worker gap)
         self._reset_window(0.0)
         self._errors = 0
 
@@ -98,20 +110,25 @@ class GpuDutyGuard:
         self._samples: deque[tuple[float, float]] = deque()  # (t, cumulative busy seconds)
         self._cum = 0.0
         self._primed = False
-        self._acc = 0.0  # leaky over-budget seconds
-        self._over_prev = False
-        self._last_judged: float | None = None
         self._started = now
 
     def start(self, pid: int, now: float, *, idle: bool = False) -> None:
         """Fresh window for `pid`. The client baseline and id set are kept when the pid is the
         same as before; the first reading only re-baselines, so GPU work between `stop` and
-        `start` is not charged."""
+        `start` is not charged. The excess bucket is kept (drained for the gap): a respawn does
+        not buy a fresh allowance."""
         if pid != self._pid:
             self._pid, self._seen, self._ids = pid, {}, set()
+        self._drain_gap(now)
         self._idle = idle
         self._errors = 0
         self._reset_window(now)
+
+    def _drain_gap(self, now: float) -> None:
+        if self._acc_t is not None and now > self._acc_t:
+            gap = min(now - self._acc_t, 3600.0)
+            self._acc = max(0.0, self._acc - self._last_limit * gap)
+        self._acc_t = now
 
     def set_idle(self, idle: bool, now: float) -> None:
         """Switch between busy and idle mode without touching the window or baselines. Entering
@@ -123,7 +140,7 @@ class GpuDutyGuard:
             self._started = now
 
     def stop(self) -> None:
-        """No live worker: forget the pid and the window."""
+        """No live worker: forget the pid and the window (the excess bucket stays)."""
         self._pid, self._seen, self._ids = None, {}, set()
         self._errors = 0
         self._reset_window(0.0)
@@ -142,9 +159,14 @@ class GpuDutyGuard:
             self._ctl.pop(0)
 
     def note_pause_ack(self, at: float) -> None:
-        """The worker acked the pause in force (control-side monotonic time of the ack)."""
-        if self._ctl and self._ctl[-1][2] and at >= self._ctl[-1][0]:
+        """The worker acked the pause in force (control-side monotonic time of the ack). Only the
+        first ack after the pause began counts: a re-sent ack must not move the quiet period."""
+        if self._ack_at is None and self._ctl and self._ctl[-1][2] and at >= self._ctl[-1][0]:
             self._ack_at = at
+
+    def note_tick(self, at: float) -> None:
+        """Latest worker tick (a checkpoint was reached)."""
+        self._tick_at = at
 
     # -- inputs ------------------------------------------------------------------------------
 
@@ -160,12 +182,16 @@ class GpuDutyGuard:
     ) -> GpuVerdict:
         """One reading of the worker pid's clients (`id -> accumulated ns`); None = no live
         worker (everything resets). `interval_s` is the sampling period (bounds the gate)."""
-        self._errors = 0
         if clients is None:
+            self._errors = 0
             self._reset_window(now)
             return _OK
         if self._samples and now <= self._samples[-1][0]:
             return _OK  # clock did not advance: nothing to learn
+        if any(cid in self._seen and v < self._seen[cid] for cid, v in clients.items()):
+            self._seen.update(clients)  # re-baseline, but a backwards counter is a bad reading
+            return self.observe_error(now)
+        self._errors = 0
         self._ids.update(clients)
         if len(self._ids) > self.cfg.max_clients:
             return GpuVerdict(GpuAction.KILL, reason="clients")
@@ -174,8 +200,10 @@ class GpuDutyGuard:
                 self._cum += max(0, value - self._seen.get(cid, 0)) / 1e9
             self._seen[cid] = value
         self._primed = True
+        prev = self._samples[-1] if self._samples else None
         self._samples.append((now, self._cum))
-        return self._judge(now, interval_s)
+        busy, dt = (self._cum - prev[1], now - prev[0]) if prev is not None else (0.0, 0.0)
+        return self._judge(now, interval_s, busy, min(dt, self.cfg.window_s))
 
     # -- judgement ---------------------------------------------------------------------------
 
@@ -193,22 +221,29 @@ class GpuDutyGuard:
                 best = max(best, duty)
         return best
 
-    def _judge(self, now: float, interval_s: float) -> GpuVerdict:
+    def _quiet_from(self, now: float) -> float | None:
+        """Start of the period in which the worker must use ~no GPU (idle, or paused and acked),
+        or None while it may still run."""
+        cfg = self.cfg
+        if self._idle:
+            return self._started
+        _, paused, since = self._state_at_end()
+        if not paused:
+            return None
+        quiet: float | None = None
+        if self._ack_at is not None:
+            quiet = self._ack_at + cfg.ack_settle_s
+        elif self._tick_at is not None and self._tick_at >= since + cfg.grace_s:
+            quiet = since + cfg.grace_s  # ticking without a paused ack: ignoring the pause
+        elif now - since >= cfg.pause_unacked_bound_s:
+            quiet = since + cfg.pause_unacked_bound_s
+        return quiet if quiet is not None and quiet <= now else None
+
+    def _judge(self, now: float, interval_s: float, busy_delta: float, dt: float) -> GpuVerdict:
         cfg = self.cfg
         if not self._ctl and not self._idle:
             return _OK  # duty unknown: nothing to enforce against
-        quiet_from: float | None = None
-        if self._idle:
-            quiet_from = self._started
-        else:
-            _, paused, since = self._state_at_end()
-            if paused:
-                if self._ack_at is not None:
-                    quiet_from = self._ack_at + cfg.ack_settle_s
-                elif now - since >= cfg.pause_unacked_bound_s:
-                    quiet_from = since + cfg.pause_unacked_bound_s
-                if quiet_from is not None and quiet_from > now:
-                    quiet_from = None
+        quiet_from = self._quiet_from(now)
         lower = now - cfg.window_s
         if quiet_from is not None:
             lower = max(lower, quiet_from)
@@ -221,33 +256,28 @@ class GpuDutyGuard:
             anchor = next((s for s in self._samples if s[0] >= quiet_from), self._samples[-1])
         span = now - anchor[0]
         need = cfg.quiet_min_span_s if quiet_from is not None else cfg.min_span_frac * cfg.window_s
+        if quiet_from is None:
+            allowed = self._allowed(now - cfg.window_s - cfg.grace_s, now)
+            limit = allowed + cfg.margin
+            self._last_limit = limit
+            if allowed < 1.0:  # the bucket: excess GPU-seconds over what the limit allows
+                self._acc = max(0.0, self._acc + busy_delta - limit * dt)
+            self._acc_t = now
+            if self._acc >= cfg.kill_budget_gpu_s:
+                return GpuVerdict(GpuAction.KILL, None, limit, reason="over_duty")
         if span < need or span <= 0:
             return _OK
         busy = self._cum - anchor[1]
         share = busy / span
         if quiet_from is not None:
-            allowed = 0.0
-        else:
-            allowed = self._allowed(now - cfg.window_s - cfg.grace_s, now)
-            if allowed >= 1.0:
-                self._acc, self._over_prev = 0.0, False
-                return GpuVerdict(GpuAction.OK, share, allowed + cfg.margin)
-        limit = allowed + cfg.margin
-        dt = 0.0 if self._last_judged is None else min(now - self._last_judged, cfg.window_s)
-        self._last_judged = now
-        if share <= limit:
-            self._acc = max(0.0, self._acc - cfg.drain_frac * dt)
-            self._over_prev = False
-            return GpuVerdict(GpuAction.OK, share, limit)
-        if quiet_from is not None:
+            limit = cfg.margin
+            if share <= limit:
+                return GpuVerdict(GpuAction.OK, share, limit)
             return GpuVerdict(
                 GpuAction.KILL, share, limit, reason="idle" if self._idle else "paused"
             )
-        if self._over_prev:
-            self._acc += dt
-        self._over_prev = True
-        if self._acc >= cfg.kill_after_s:
-            return GpuVerdict(GpuAction.KILL, share, limit, reason="over_duty")
+        if allowed >= 1.0 or share <= limit:
+            return GpuVerdict(GpuAction.OK, share, limit)
         cap = cfg.max_stop_frac * interval_s
         need_stop = busy / allowed - span if allowed > 0 else cap
         stop_s = min(max(need_stop, 0.0), cap)

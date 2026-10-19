@@ -245,10 +245,13 @@ async def test_rogue_unpaced_worker_is_killed_and_released(tmp_path: Path, quiet
     assert client.completed == [] and client.failed == []  # nothing uploaded on a verdict
     assert loop._status_snapshot().gpu_violation == "over_duty"
     assert reader.calls >= 5
-    # detection (first full window, about 10 s after the burn starts) + 30 s + two sample periods
-    assert seen["killed"] - seen["detected"] <= DEFAULTS.kill_after_s + 2 * loop._guard_s + 1.0
+    # detection (first full window, about 10 s after the burn starts), then the 20 GPU-s bucket
+    assert (
+        seen["killed"] - seen["detected"]
+        <= DEFAULTS.kill_budget_gpu_s / 0.4 + 2 * loop._guard_s + 1.0
+    )
     assert seen["detected"] - t0 <= DEFAULTS.window_s + 10.0  # spawn + first window + a sample
-    assert elapsed <= DEFAULTS.window_s + DEFAULTS.kill_after_s + 20.0, elapsed
+    assert elapsed <= DEFAULTS.window_s + DEFAULTS.kill_budget_gpu_s / 0.4 + 20.0, elapsed
 
 
 # --- (b) honest, paced worker with real MLX inference ---------------------------------------

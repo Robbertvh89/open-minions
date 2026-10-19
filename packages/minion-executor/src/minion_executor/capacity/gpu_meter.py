@@ -16,9 +16,10 @@ Two readers of the per-process counters: `read_gpu_clients` shells out to `ioreg
 about 15 ms for the child; the run-time duty guard uses it). Both return the same shape.
 
 `-r` matters: without it `-c` still walks the whole registry (about 240 ms and 7 MB on an M3 Pro
-against about 15 ms and 20 KB for the filtered form). The ioreg path runs a subprocess, so both
-readers are for the control/bench process only (the worker sandbox forbids exec and IOKit). Absent
-off macOS: `GpuMeterError`.
+against about 15 ms and 20 KB for the filtered form). The ioreg path runs a subprocess (the
+worker sandbox denies exec of `ioreg`), so it is for the control/bench process only; the sandbox
+does allow IOKit user clients, but the in-process reader is used from the control process too,
+because the guard must not depend on the worker. Absent off macOS: `GpuMeterError`.
 """
 
 from __future__ import annotations

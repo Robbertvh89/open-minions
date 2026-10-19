@@ -70,21 +70,23 @@ def test_gate_stop_below_cap_matches_formula() -> None:
     assert v.stop_s == pytest.approx(9.1 / 0.8 - 10.0)
 
 
-def test_persistent_overuse_kills_after_30s() -> None:
+def test_persistent_overuse_kills_when_the_excess_bucket_fills() -> None:
     r = Rig(0.3)
-    vs = r.run(60, 0.9)
+    vs = r.run(80, 0.9)
     kill = next(i for i, v in enumerate(vs) if v.action is GpuAction.KILL)
-    first_gate = next(i for i, v in enumerate(vs) if v.action is GpuAction.GATE)
-    assert (kill - first_gate) * STEP == pytest.approx(30.0)
     assert vs[kill].reason == "over_duty"
-    assert all(v.action is GpuAction.GATE for v in vs[first_gate:kill])
+    # excess rate 0.9 - 0.4 = 0.5 GPU-s per second against a 20 GPU-s budget: about 40 s
+    assert 36.0 <= (kill + 1) * STEP <= 46.0
+    assert GpuAction.GATE in actions(vs[:kill])
 
 
-def test_recovery_resets_the_kill_timer() -> None:
+def test_recovery_drains_the_bucket() -> None:
+    """Not a timer reset: the excess of a burst is paid back by a quiet stretch (GPU-seconds)."""
     r = Rig(0.3)
-    assert GpuAction.GATE in actions(r.run(20, 0.9))
-    assert actions(r.run(30, 0.1)[-3:]) == {GpuAction.OK}
-    assert actions(r.run(20, 0.9)) <= {GpuAction.OK, GpuAction.GATE}
+    assert GpuAction.KILL not in actions(r.run(20, 0.9))  # 10 GPU-s of excess
+    assert GpuAction.KILL not in actions(r.run(40, 0.1))  # drains 0.3 GPU-s per second
+    assert r.g._acc == pytest.approx(0.0, abs=0.5)
+    assert GpuAction.KILL not in actions(r.run(20, 0.9))  # a fresh burst starts from empty
 
 
 def test_duty_drop_has_grace_no_false_positive() -> None:
@@ -294,3 +296,158 @@ def test_new_pid_forgets_clients() -> None:
     r.counters = {"0x10": 0}
     r.g.observe(r.t, dict(r.counters), interval_s=STEP)
     assert actions(r.run(4, 0.0)) == {GpuAction.OK}
+
+
+class Sim:
+    """A piecewise-constant GPU rate timeline sampled at jittered 2 s intervals."""
+
+    def __init__(self, duty: float, pattern: list[tuple[float, float]], horizon: float) -> None:
+        import random
+
+        self.rnd = random.Random(1)  # noqa: S311
+        self.g = GpuDutyGuard()
+        self.g.note_ctl(duty, False, 0.0)
+        self.g.start(1, 0.0)
+        segs: list[tuple[float, float, float]] = []
+        t = 0.0
+        while t < horizon + 120:
+            for dur, rate in pattern:
+                segs.append((t, t + dur, rate))
+                t += dur
+        self.segs, self.horizon = segs, horizon
+
+    def cum(self, x: float) -> float:
+        c = 0.0
+        for a, b, r in self.segs:
+            if a >= x:
+                break
+            c += r * (min(b, x) - a)
+        return c
+
+    def run(self) -> tuple[float | None, float]:
+        """(kill time or None, max bucket)"""
+        t, mx = 0.0, 0.0
+        self.g.observe(t, {"a": 0}, interval_s=STEP)
+        while t < self.horizon:
+            t += STEP * self.rnd.uniform(0.75, 1.25)
+            v = self.g.observe(t, {"a": int(self.cum(t) * NS)}, interval_s=STEP)
+            mx = max(mx, self.g._acc)
+            if v.action is GpuAction.KILL:
+                return t, mx
+        return None, mx
+
+
+@pytest.mark.parametrize("duty,steps", [(0.3, (5, 10, 20, 25)), (0.5, (5, 10, 20, 30))])
+@pytest.mark.parametrize("decode_s", [0, 20])
+def test_honest_long_unsplittable_step_is_never_killed(
+    duty: float, steps: tuple[int, ...], decode_s: int
+) -> None:
+    """An mlx-lm prefill in one mx.eval runs unpaced for S seconds, then the pacer repays
+    S * (1 - duty) / duty of sleep, then paced decode. Over 30 min: no kill."""
+    for step in steps:
+        pattern = [(float(step), 1.0), (step * (1 - duty) / duty, 0.0)]
+        if decode_s:
+            pattern.append((float(decode_s), duty))
+        killed, peak = Sim(duty, pattern, 1800).run()
+        assert killed is None, (duty, step, decode_s, peak)
+        assert peak < GpuGuardConfig().kill_budget_gpu_s
+
+
+def test_burn_rest_at_the_duty_share_never_accumulates() -> None:
+    killed, peak = Sim(0.5, [(8.0, 1.0), (8.0, 0.0)], 1800).run()
+    assert killed is None and peak < 8.0, peak
+
+
+@pytest.mark.parametrize(
+    "duty,pattern,bound",
+    [
+        (0.3, [(1000.0, 1.0)], 45.0),  # steady rogue: 20 / (1 - 0.4) = 33 s
+        (0.5, [(1000.0, 1.0)], 60.0),  # 20 / (1 - 0.6) = 50 s
+        (0.3, [(24.0, 1.0), (8.0, 0.0)], 100.0),
+        (0.3, [(30.0, 1.0), (8.0, 0.0)], 100.0),
+        (0.3, [(30.0, 1.0), (10.0, 0.0)], 100.0),
+        (0.5, [(24.0, 1.0), (8.0, 0.0)], 200.0),
+        (0.5, [(30.0, 1.0), (8.0, 0.0)], 200.0),
+        (0.5, [(30.0, 1.0), (10.0, 0.0)], 200.0),
+    ],
+)
+def test_rogues_are_killed_within_bounds(
+    duty: float, pattern: list[tuple[float, float]], bound: float
+) -> None:
+    killed, _ = Sim(duty, pattern, 600).run()
+    assert killed is not None and killed <= bound, killed
+
+
+def test_respawned_rogue_does_not_get_a_fresh_allowance() -> None:
+    """Kill + respawn churn: the bucket survives the pid and drains only by the quiet gap, so a
+    rogue running flat out gets about a sample interval per life (security's churn pattern,
+    with the back-off the loop applies)."""
+    import random
+
+    rnd = random.Random(3)  # noqa: S311
+    g = GpuDutyGuard()
+    g.note_ctl(0.3, False, 0.0)
+    t, busy, pid, kills = 0.0, 0.0, 0, 0
+    while t < 3600:
+        pid += 1
+        t += 3.0  # model load
+        g.start(pid, t)
+        cum = 0.0
+        g.observe(t, {"c": 0}, interval_s=STEP)
+        while t < 3600:
+            step = STEP * rnd.uniform(0.75, 1.25)
+            t += step
+            cum += step
+            busy += step
+            if g.observe(t, {"c": int(cum * NS)}, interval_s=STEP).action is GpuAction.KILL:
+                break
+        kills += 1
+        g.stop()
+        t += min(300.0, 10.0 * 2 ** min(kills - 1, 6)) * rnd.uniform(0.5, 1.0)
+    assert busy / t <= 0.4, busy / t
+
+
+def test_first_pause_ack_is_kept() -> None:
+    r = Rig(0.3)
+    r.run(20, 0.3)
+    r.g.note_ctl(0.3, True, r.t)
+    r.g.note_pause_ack(r.t + 1.0)
+    r.g.note_pause_ack(r.t + 50.0)  # a re-sent ack of the same generation must not move it
+    assert r.g._ack_at == pytest.approx(r.t + 1.0)
+
+
+def test_ticking_without_a_paused_ack_is_killed_after_grace() -> None:
+    r = Rig(0.3)
+    r.run(20, 0.3)
+    paused_at = r.t
+    r.g.note_ctl(0.3, True, paused_at)
+    vs = r.run(8, 0.8)  # inside grace + ack window: still finishing a step
+    assert GpuAction.KILL not in actions(vs[:2])
+    r.g.note_tick(paused_at + 6.0)  # a checkpoint after grace, no paused ack
+    vs = r.run(12, 0.8)
+    assert any(v.action is GpuAction.KILL and v.reason == "paused" for v in vs)
+
+
+def test_silent_unacked_pause_is_not_killed_at_once() -> None:
+    """No ticks (a long honest step): the quiet period waits for the ack."""
+    r = Rig(0.3)
+    r.run(20, 0.3)
+    r.g.note_ctl(0.3, True, r.t)
+    assert all(v.reason != "paused" for v in r.run(12, 0.8))
+
+
+def test_counter_regression_is_a_meter_error() -> None:
+    r = Rig(0.3)
+    r.run(10, 0.3)
+    for i in range(2):
+        r.t += STEP
+        r.counters["0xa"] -= 3 * NS  # the live client's counter went backwards
+        v = r.g.observe(r.t, dict(r.counters), interval_s=STEP)
+        assert v.action is GpuAction.OK, i
+    r.t += STEP
+    r.counters["0xa"] -= 3 * NS
+    v = r.g.observe(r.t, dict(r.counters), interval_s=STEP)
+    assert v.action is GpuAction.KILL and v.reason == "meter"
+    r.t += STEP  # a normal reading clears the count
+    r.counters["0xa"] += NS
+    assert r.g.observe(r.t, dict(r.counters), interval_s=STEP).action is GpuAction.OK

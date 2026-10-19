@@ -35,7 +35,7 @@ from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.gpu_guard import GpuGuardConfig
 from minion_executor.capacity.gpu_meter import GpuMeterError
 from minion_executor.capacity.runtime import FixedGovernor
-from minion_executor.loop import ExecutorLoop, _release_code, cleanup_stale_tmp
+from minion_executor.loop import ExecutorLoop, _release_code, _Verdict, cleanup_stale_tmp
 from minion_executor.main import StartupError, resolve_gpu_reader
 from minion_executor.runners.base import Record, RunnerError
 from minion_executor.worker.process import WorkerCrashed
@@ -216,6 +216,7 @@ class FakeWorker:
         self.gpu_t0: float | None = None
         self.gpu_calls = 0
         self.gpu_hang: threading.Event | None = None
+        self.tick_at: float | None = None  # latest (fake) worker tick
         self.pause_ack: float | None = None  # when the (fake) worker acked the pause
         self.fp_calls = 0  # watcher samples taken (footprint + priority are sampled together)
 
@@ -278,6 +279,9 @@ class FakeWorker:
 
     def pause_acked_at(self) -> float | None:
         return self.pause_ack
+
+    def last_tick_at(self) -> float | None:
+        return self.tick_at
 
     def gpu_clients(self, reader: Callable[[], Any]) -> tuple[int, dict[str, int]] | None:
         """Scripted control-side GPU time: `gpu_busy` x wall time since the first call."""
@@ -3688,7 +3692,7 @@ async def test_acquire_cap_429_backs_off_for_the_retry_after(tmp_path: Path) -> 
 
 
 GPU_CFG = GpuGuardConfig(
-    window_s=0.3, min_span_frac=0.5, margin=0.1, grace_s=0.0, kill_after_s=0.05
+    window_s=0.3, min_span_frac=0.5, margin=0.1, grace_s=0.0, kill_budget_gpu_s=0.05
 )
 
 
@@ -3756,7 +3760,7 @@ async def test_gpu_meter_failures_fail_closed(tmp_path: Path) -> None:
 
 
 IDLE_CFG = GpuGuardConfig(
-    window_s=0.3, min_span_frac=0.5, margin=0.1, grace_s=0.0, kill_after_s=0.05,
+    window_s=0.3, min_span_frac=0.5, margin=0.1, grace_s=0.0, kill_budget_gpu_s=0.05,
     quiet_min_span_s=0.1,
 )  # fmt: skip
 
@@ -3815,13 +3819,13 @@ async def test_gpu_idle_rogue_is_unloaded(tmp_path: Path) -> None:
     await until(lambda: "complete" in client.kinds())
     base = worker.interrupts
     backoffs: list[int] = []
-    real = loop._back_off_after_failure
+    real = loop._gpu_kill_backoff
 
     async def counted() -> None:
         backoffs.append(1)
         await real()
 
-    loop._back_off_after_failure = counted  # type: ignore[method-assign]
+    loop._gpu_kill_backoff = counted  # type: ignore[method-assign]
     worker.gpu_busy = 1.0  # the warm worker now burns the GPU with no subtask
     await until(lambda: worker.interrupts > base)  # hard kill, not the polite unload
     assert worker.unloads == 0
@@ -3850,7 +3854,7 @@ async def test_gpu_rogue_in_many_short_subtasks_is_killed(tmp_path: Path) -> Non
     """The window spans subtask boundaries: 8 back-to-back unpaced subtasks, each too short to be
     judged alone, add up to a KILL (kill lands in a subtask -> release, or between -> unload)."""
     cfg = GpuGuardConfig(
-        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_after_s=0.05,
+        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_budget_gpu_s=0.05,
         quiet_min_span_s=5.0,
     )  # fmt: skip
     client, worker = FakeClient([assignment() for _ in range(8)]), FakeWorker()
@@ -3860,16 +3864,18 @@ async def test_gpu_rogue_in_many_short_subtasks_is_killed(tmp_path: Path) -> Non
         client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
         guard_interval_s=0.02, gpu_reader=lambda: {}, gpu_guard=cfg,
     )  # fmt: skip
-    client.on_empty = loop.stop
-    await asyncio.wait_for(loop.run(), 20)
+    task = asyncio.create_task(loop.run())
+    await until(lambda: loop._gpu_violation is not None, 20)
+    loop.stop()
+    await asyncio.wait_for(task, 20)
     assert loop._status_snapshot().gpu_violation == "over_duty"
-    # the fake ignores the kill, so it can repeat; each one is a release or an unload
-    assert "GPU_DUTY_VIOLATION" in client.release_codes or worker.unloads > 0
+    # each kill is a release (in a subtask) or a hard kill (between subtasks)
+    assert "GPU_DUTY_VIOLATION" in client.release_codes or worker.interrupts > 0
 
 
 async def test_gpu_honest_worker_in_many_short_subtasks_is_not_flagged(tmp_path: Path) -> None:
     cfg = GpuGuardConfig(
-        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_after_s=0.05,
+        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_budget_gpu_s=0.05,
         quiet_min_span_s=0.1,
     )  # fmt: skip
     client, worker = FakeClient([assignment() for _ in range(8)]), FakeWorker()
@@ -3935,3 +3941,60 @@ async def test_gpu_violation_in_status_expires(tmp_path: Path) -> None:
     assert loop._status_snapshot().gpu_violation == "over_duty"
     loop._gpu_violation = ("over_duty", loop._clock() - 3600)
     assert loop._status_snapshot().gpu_violation is None
+
+
+async def test_stale_gpu_kill_of_another_subtask_is_dropped(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
+    loop._gpu_pending = (uuid.uuid4(), _Verdict.GPU_DUTY)  # tagged with some other acquirement
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1
+    assert worker.interrupts == 0 and "release" not in client.kinds()
+
+
+async def test_gpu_kill_runs_as_the_unload_future(tmp_path: Path) -> None:
+    """ensure_model / _await_unload wait for a GPU kill exactly like for an idle unload."""
+    worker = FakeWorker()
+    release = threading.Event()
+
+    def slow_interrupt() -> None:
+        release.wait(5)
+
+    worker.interrupt = slow_interrupt  # type: ignore[method-assign]
+    loop = make_loop(FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
+    kill = asyncio.create_task(loop._kill_worker())
+    await until(lambda: loop._unload_fut is not None)
+    waiter = asyncio.create_task(loop._await_unload())
+    await asyncio.sleep(0.1)
+    assert not waiter.done()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(kill, waiter), 5)
+
+
+async def test_gpu_kills_back_off_exponentially_and_quarantine_the_engine(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    loop = make_loop(
+        FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        clock=lambda: now[0],
+    )  # fmt: skip
+    assert loop._acquirable_engines() == [Engine.MLX]
+    delays: list[float] = []
+
+    async def rec(d: float) -> None:
+        delays.append(d)
+
+    loop._sleep_fn = rec
+    for i in range(3):
+        loop._note_gpu_kill(Engine.MLX)
+        await loop._gpu_kill_backoff()
+        now[0] += 60  # a DONE in between does not reset anything
+        loop._fails = 0
+        assert loop._gpu_kill_streak() == i + 1
+    assert delays[0] < delays[1] < delays[2] or delays[2] >= 20  # exponential (with jitter)
+    assert loop._acquirable_engines() == []  # 3 kills within the hour: quarantined
+    assert loop._status_snapshot().gpu_quarantined == ["mlx"]
+    now[0] += 3600  # the window passes
+    assert loop._acquirable_engines() == [Engine.MLX]
+    assert loop._status_snapshot().gpu_quarantined == []
+    assert loop._gpu_kill_streak() == 0  # and the streak decayed after 15 min
