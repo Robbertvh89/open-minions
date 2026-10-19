@@ -27,5 +27,5 @@ minion-server-admin = "minion_server.admin:app"
 minion-common = { workspace = true }
 
 [build-system]
-requires = ["uv_build>=0.11,<0.12"]
+requires = ["uv_build>=0.11,<0.14"]
 build-backend = "uv_build"
