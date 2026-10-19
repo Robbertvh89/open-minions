@@ -139,6 +139,8 @@ class BudgetCheckResult:
     max_batch_size: int | None = None
     unpaced_share: float | None = None
     measured_share: float | None = None
+    max_window_share: float | None = None  # highest sliding GPU_GUARD_WINDOW_S share (paced phase)
+    gpu_clients: int | None = None  # distinct GPU user-client ids of the worker pid in the run
     expected_share: float | None = None
     worker_reported_share: float | None = None
     unpaced_reported_share: float | None = None
@@ -315,6 +317,34 @@ def _device_pct(samples: list[GpuSample], t0: float, t1: float) -> float | None:
     return statistics.fmean(values) if values else None
 
 
+GPU_GUARD_WINDOW_S = 10.0  # the run-time guard's window (capacity/gpu_guard.py, TASK-15)
+
+
+def max_window_share(
+    samples: list[GpuSample], start: float, end: float, window_s: float = GPU_GUARD_WINDOW_S
+) -> float | None:
+    """Highest share over any `window_s` sliding window ending at a sample inside `[start, end]`
+    (what the run-time GPU duty guard judges). None if the span is shorter than one window."""
+    best: float | None = None
+    for s in samples:
+        if s.clients is None or s.at < start + window_s or s.at > end:
+            continue
+        try:
+            v = process_gpu_share(samples, s.at - window_s, s.at)
+        except GpuMeterError:
+            continue
+        best = v if best is None else max(best, v)
+    return best
+
+
+def distinct_clients(samples: list[GpuSample]) -> int:
+    """Number of distinct GPU user-client ids seen for the worker pid (the guard's max_clients)."""
+    ids: set[str] = set()
+    for s in samples:
+        ids.update(s.clients or {})
+    return len(ids)
+
+
 def _fill_shares(
     res: BudgetCheckResult, samples: list[GpuSample], ph: _Phases, cfg: BudgetCheckConfig
 ) -> None:
@@ -323,6 +353,8 @@ def _fill_shares(
         raise GpuMeterError("the GPU sampler produced no samples")
     settle = min(SETTLE_S, cfg.duration_s / 4)
     res.measured_share = process_gpu_share(samples, ph.paced.t0 + settle, ph.paced.t1)
+    res.max_window_share = max_window_share(samples, ph.paced.t0 + settle, ph.paced.t1)
+    res.gpu_clients = distinct_clients(samples)
     res.device_paced_pct = _device_pct(samples, ph.paced.t0 + settle, ph.paced.t1)
     res.device_baseline_pct = _device_pct(samples, *ph.idle)
     if ph.unpaced is not None:
@@ -525,15 +557,17 @@ def render_budget_table(report: BudgetCheckReport) -> str:
     the device column (idle/unpaced/paced utilization, device-wide) is informational."""
     head = (
         "| model | profile | rep | status | duty | unpaced | expected | measured "
-        "| pacer-reported | device idle/unpaced/paced (info) | footprint GB | budget GB "
+        "| max 10 s window | GPU clients | pacer-reported | device idle/unpaced/paced (info) "
+        "| footprint GB | budget GB "
         "| hard (<= duty+10pp) | accuracy (+-10pp) | memory (<= 1.1x) |"
     )
-    lines = [head, "|" + "---|" * 15]
+    lines = [head, "|" + "---|" * 17]
     for r in report.results:
         status = r.status if not r.detail else f"{r.status} ({r.detail})"
         lines.append(
             f"| {r.model_id} | {r.profile} | {r.repeat} | {status} | {_pct(r.duty)} "
             f"| {_pct(r.unpaced_share)} | {_pct(r.expected_share)} | {_pct(r.measured_share)} "
+            f"| {_pct(r.max_window_share)} | {'-' if r.gpu_clients is None else r.gpu_clients} "
             f"| {_pct(r.worker_reported_share)} | {_dev(r)} | {_f(r.footprint_peak_gb)} "
             f"| {_f(r.budget_memory_gb, 1)} | {_verdict(r.hard_ok)} | {_verdict(r.accuracy_ok)} "
             f"| {_verdict(r.memory_ok)} |"

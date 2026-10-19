@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,7 +34,7 @@ from minion_executor import bench_foreground as fg_mod
 from minion_executor.capacity.config import ExecutorConfig, OnCall, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
-from minion_executor.capacity.gpu_meter import GpuMeterError
+from minion_executor.capacity.gpu_meter import GpuMeterError, default_gpu_reader
 from minion_executor.capacity.instance import AlreadyRunningError, acquire_instance_lock
 from minion_executor.capacity.profiles import (
     ProfileSpec,
@@ -105,6 +105,33 @@ NO_ENGINE_MSG = (
     "`--engines ollama`; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )
+
+
+METERED_ENGINES = frozenset({Engine.MLX, Engine.HF})  # run in the worker pid: GPU time is its own
+
+
+def resolve_gpu_reader(
+    engines: list[Engine],
+    factory: Callable[[], Callable[[], dict[int, dict[str, int]]] | None] = default_gpu_reader,
+) -> Callable[[], dict[int, dict[str, int]]] | None:
+    """The GPU meter for the duty guard, probed once. None (one log line) when no metered engine
+    (mlx, hf: their GPU work is in the worker pid) is advertised - the dev fake or Ollama only -
+    or where no reader exists (non-darwin). A reader that exists but fails its first read is a
+    StartupError (exit 2): an unmeasurable worker must not run unguarded (invariant 6)."""
+    log = structlog.get_logger("minion_executor.main")
+    reader = factory()
+    if not METERED_ENGINES.intersection(engines) or reader is None:
+        log.info(
+            "gpu_duty_guard_disabled",
+            reason="no_metered_engine" if reader is not None else "no_reader",
+        )
+        return None
+    try:
+        reader()
+    except Exception as exc:
+        log.error("gpu_meter_probe_failed", error=type(exc).__name__)
+        raise StartupError("the GPU meter is unavailable, refusing to run unguarded") from exc
+    return reader
 
 
 class StartupError(Exception):
@@ -318,6 +345,7 @@ async def _run(
             sandbox=sandbox_policy(settings, available),
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
+        gpu_reader = resolve_gpu_reader(available)
         governor = build_governor(plan) if plan is not None else None
         # fetch niceness is read per fetch (at spawn), not live; fixed only without a governor
         nice_fn = (lambda: nice_for(governor.decision.budget.cpu_priority)) if governor else None
@@ -337,6 +365,7 @@ async def _run(
             presence_interval_s=settings.presence_interval_s,
             acquire_pace_s=settings.acquire_pace_s,
             first_acquire_jitter_s=settings.first_acquire_jitter_s,
+            gpu_reader=gpu_reader,
             complete_shed_budget_s=settings.complete_shed_budget_s,
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,

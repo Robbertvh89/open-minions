@@ -4,7 +4,7 @@ title: Controller-side GPU duty enforcement (don't trust the worker's self-pacin
 status: In Progress
 assignee: []
 created_date: '2026-10-17 01:56'
-updated_date: '2026-10-19 06:58'
+updated_date: '2026-10-19 10:14'
 labels:
   - executor
   - security
@@ -178,5 +178,11 @@ class GpuDutyGuard:
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-2026-10-17 TASK-6.9 NF-7 proxy data (docs/bench/m5-foreground-apple-m3-pro.md): minilm-mlx fails the probe miss-rate criterion at light (+1.11 pp) and balanced (+1.56 pp) while within its NF-8 duty; qwen passes. Relevant to enforcement design: duty share alone does not bound foreground tail latency for short frequent steps. Follow-up TASK-24.
+Implemented (commits 2ccbeb3..a354205): capacity/gpu_meter.py in-process IOKit reader (per-client deltas, ~1 ms/read); capacity/gpu_guard.py pure guard (10 s window, duty + 10 pp, KILL after 30 s over, at once when paused/idle, >4 clients per pid KILL, 3 meter errors fail closed); loop.py one continuous guard per worker pid with +-20 % jitter; KILL -> interrupt + release GPU_DUTY_VIOLATION / GPU_METER_UNAVAILABLE (local back-off; idle warm worker unloaded); main.py startup probe (exit 2 if reader exists and first read fails; disabled off darwin / fake engine with one log line); status.json gpu_violation. Tests: test_gpu_guard.py, test_gpu_guard_gpu.py, test_gpu_meter_iokit.py, test_loop.py. Measurements: docs/bench/m-task15-gpu-guard-apple-m3-pro.{md,json}. Docs: ADR-0006 D17, SPEC 4.6 status, ARCHITECTURE 2.2/3.6, CLAUDE.md commands. Open: TASK-15.1 (SIGSTOP gating), Ollama/HF unmetered, client churn, bench file's short-subtask finding predates be3be7f.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Controller-side GPU duty guard shipped: per-worker-pid IOKit meter and pure guard enforce gpu_duty_cycle + 10 pp over 10 s (kill after 30 s over, at once when paused/idle), kill releases GPU_DUTY_VIOLATION. Measured on M3 Pro: honest worst window 22.9 % (light, limit 40 %) and 45.6 % (balanced, limit 60 %). Throttling (TASK-15.1) and Ollama/HF metering remain open.
+<!-- SECTION:FINAL_SUMMARY:END -->

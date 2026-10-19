@@ -584,8 +584,8 @@ def assertions_held_by(pids: set[int]) -> list[str]:
     """`pmset -g assertions` detail lines of the form `pid N(name): ... <Type> named: ...` whose
     pid is in `pids` and whose type keeps the Mac (or its display) awake."""
     out = subprocess.run(
-        ["/usr/bin/pmset", "-g", "assertions"], capture_output=True, text=True, check=True
-    ).stdout
+        ["/usr/bin/pmset", "-g", "assertions"], capture_output=True, check=True
+    ).stdout.decode("utf-8", errors="replace")  # other apps' assertion names are not always UTF-8
     held: list[str] = []
     for line in out.splitlines():
         m = re.match(r"\s*pid (\d+)\(", line)

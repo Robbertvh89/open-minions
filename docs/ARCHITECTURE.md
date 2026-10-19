@@ -154,6 +154,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
   `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
   if 4xx, raise (exit non-zero); if no assignment, backoff; else handle one subtask.
+- **GPU duty guard (TASK-15):** `capacity/gpu_meter.py` (in-process IOKit reader), `capacity/gpu_guard.py` (pure guard, one per worker pid), sampled in the loop's watcher (§3.6). KILL → `interrupt` + release `GPU_DUTY_VIOLATION` / `GPU_METER_UNAVAILABLE`.
 - **Per subtask** (`_execute`): ranged GET of `[byte_start, byte_end)` → parse exactly `record_count`
   records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
   temp dir → presigned POST → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
@@ -550,6 +551,8 @@ subtask; a dead governor task stops the executor (exit 1). One executor per stat
    nice needs a respawn. The control side verifies it (`WorkerHandle.priority_ok()`) and samples the worker's memory footprint
    (`worker/footprint.py`: `proc_pid_rusage` on macOS, `/proc` on Linux).
 
+**Controller-side GPU guard (TASK-15, ADR-0006 D17).** The duty above is self-paced by the worker, so the control process does not trust it. One sampler per worker pid (`loop.py`, sample times jittered ±25 %) reads that pid's `accumulatedGPUTime` through `capacity/gpu_meter.py` (in-process IOKit, about 1 ms per read) and feeds `capacity/gpu_guard.py` (a pure state machine: 10 s window, limit = allowed duty + 10 pp, KILL when an excess bucket (GPU-seconds above the limit, advanced in every mode, per run and not per pid, drained by quiet time) reaches 20 GPU-s, at once when paused (after the worker's ack) or idle, KILL above 4 GPU clients per pid). A KILL interrupts the worker and releases the subtask with `GPU_DUTY_VIOLATION`; repeated meter errors or a stalled sampler release with `GPU_METER_UNAVAILABLE`. GPU kills have their own back-off streak that a completed subtask does not reset, and 3 kills of an engine within an hour stop it being acquired (`gpu_quarantined` in status.json). This is a backstop, not a throttle: SIGSTOP gating is TASK-15.1.
+
 **Optional adaptive mode (Q5):** read total GPU utilization from IORegistry
 (`AGXAccelerator` → `PerformanceStatistics` → `Device Utilization %`, no sudo) and lower duty cycle
 when utilization from *other* processes rises (e.g. a video call). Off by default until benchmarked.
@@ -678,4 +681,4 @@ Reverse proxy and flood limits (ADR-0018): the server never reads `X-Forwarded-F
 - [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
 - [ADR-0010](adr/0010-web-ui-session-auth.md): Web UI login with an API key and a stateless session cookie; OIDC via reverse proxy — **Accepted**
 - [ADR-0012](adr/0012-in-memory-executor-rate-limits.md): In-memory per-replica rate limits on register/acquire/presence (soft state, not coordination) — **Accepted**
-- ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*
+- [ADR-0006](adr/0006-cooperative-capacity-governor.md): Cooperative capacity governor (duty cycling) for partial allocation; D17 controller-side GPU guard (TASK-15) — **Accepted**
