@@ -91,6 +91,9 @@ The watchdog takes the stale / over-lease candidates, splits them into chunks of
   If no peer succeeded the failure is systemic (a code bug, `XX000`, `25P02`, an unwell DB): nothing
   is quarantined, `reclaim_chunk_systemic` is logged, the rows are retried next tick, and later chunks
   of that call skip the row-by-row redo until one commits an expiry. A one-row chunk is never quarantined.
+  Trade-off: because proof may come from a later chunk, an unclassified DB fault that spans chunk 1's
+  redo and clears before chunk 2 can quarantine chunk 1's healthy rows for up to 600 s (a delay only,
+  nothing is lost).
   Quarantined ids are excluded in the candidate scans themselves, so they do not occupy the oldest
   `LIMIT` slots. When the quarantine is full the soonest-expiring entry is evicted
   (`reclaim_quarantine_full`, counted in `evicted_total`) instead of silently ceasing to exclude.

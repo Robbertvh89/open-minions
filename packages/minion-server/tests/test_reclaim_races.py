@@ -1232,6 +1232,40 @@ async def test_systemic_chunk_failure_quarantines_nothing(
     assert res[ReclaimResult.EXPIRED_REQUEUED] == len(got)
 
 
+async def _ordered_ids(sm: Sm, mod: Any, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Pin the scan order of stale acquirements and use 2-row chunks; returns the ids in order."""
+    from minion_server.repositories import reclaim as rrepo
+
+    ids = [
+        str(r[0])
+        for r in await _rows(
+            sm, "SELECT acquirement_id FROM minion_executor_heartbeat ORDER BY acquirement_id"
+        )
+    ]
+    monkeypatch.setattr(mod, "RECLAIM_CHUNK", 2)
+    real_stale = rrepo.stale_ids
+
+    async def ordered(*a: Any, **k: Any) -> Any:
+        found = {str(i): i for i in await real_stale(*a, **k)}
+        return [found[i] for i in ids if i in found]
+
+    monkeypatch.setattr(rrepo, "stale_ids", ordered)
+    return ids
+
+
+def _fail_by_id(mod: Any, errors: dict[str, Exception], calls: list[list[str]]) -> Any:
+    real = mod.reclaim_chunk
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        calls.append([str(i) for i in ids])
+        for i in ids:
+            if str(i) in errors:
+                raise errors[str(i)]
+        return await real(session, ids, **kw)
+
+    return flaky
+
+
 @pytest.mark.integration
 async def test_proof_from_a_later_chunk_quarantines_earlier_failures(
     env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
@@ -1242,27 +1276,16 @@ async def test_proof_from_a_later_chunk_quarantines_earlier_failures(
     sm: Sm = app.state.sessionmaker
     await _acquire_many(c, sm, 6, "xc")
     await _backdate(sm)
-    ids = [
-        str(r[0])
-        for r in await _rows(
-            sm, "SELECT acquirement_id FROM minion_executor_heartbeat ORDER BY last_seen_at, 1"
-        )
-    ]
-    monkeypatch.setattr(mod, "RECLAIM_CHUNK", 2)
-    from minion_server.repositories import reclaim as rrepo
-
-    real_stale = rrepo.stale_ids
-
-    async def ordered(*a: Any, **k: Any) -> Any:
-        found = {str(i): i for i in await real_stale(*a, **k)}
-        return [found[i] for i in ids if i in found]
-
-    monkeypatch.setattr(rrepo, "stale_ids", ordered)
-    bad = set(ids[:2])  # the whole head chunk fails, later chunks are healthy
-    monkeypatch.setattr(mod, "reclaim_chunk", _poison_one(mod, bad, RuntimeError("boom")))
+    ids = await _ordered_ids(sm, mod, monkeypatch)
+    errors: dict[str, Exception] = {
+        ids[0]: OperationalError("SELECT 1", {}, Exception("blip")),  # infrastructure: never
+        ids[1]: RuntimeError("boom"),  # the whole head chunk fails, later chunks are healthy
+    }
+    monkeypatch.setattr(mod, "reclaim_chunk", _fail_by_id(mod, errors, []))
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == 4
-    assert {str(k) for k in mod._QUARANTINE} == bad
+    assert {str(k) for k in mod._QUARANTINE} == {ids[1]}
+    assert ids[0] not in {str(k) for k in mod._QUARANTINE}
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(2,)]
 
 
@@ -1276,19 +1299,46 @@ async def test_all_chunks_failing_quarantines_nothing(
     sm: Sm = app.state.sessionmaker
     await _acquire_many(c, sm, 6, "ac")
     await _backdate(sm)
-    monkeypatch.setattr(mod, "RECLAIM_CHUNK", 2)
+    ids = await _ordered_ids(sm, mod, monkeypatch)
     real = mod.reclaim_chunk
-
-    async def broken(session: AsyncSession, ids: Any, **kw: Any) -> Any:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(mod, "reclaim_chunk", broken)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        mod, "reclaim_chunk", _fail_by_id(mod, {i: RuntimeError("boom") for i in ids}, calls)
+    )
     await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert len(calls) == 5  # chunk 1, its two single-row retries, chunks 2 and 3 without redo
     assert mod._QUARANTINE == {}
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(6,)]
     monkeypatch.setattr(mod, "reclaim_chunk", real)
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == 6
+
+
+@pytest.mark.integration
+async def test_systemic_flag_is_cleared_by_later_proof(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 8, "sf")
+    await _backdate(sm)
+    ids = await _ordered_ids(sm, mod, monkeypatch)
+    # chunks: [0,1] all bad | [2,3] mixed | [4,5] healthy | [6,7] mixed
+    bad = {ids[0], ids[1], ids[2], ids[6]}
+    monkeypatch.setattr(
+        mod, "reclaim_chunk", _fail_by_id(mod, {i: RuntimeError("boom") for i in bad}, [])
+    )
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    # chunk 2: redo skipped (systemic), so ids[3] stays acquired and ids[2] is not quarantined;
+    # chunk 3 proves, quarantining chunk 1; chunk 4's redo runs again: ids[7] expired, ids[6] bad
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 3
+    assert {str(k) for k in mod._QUARANTINE} == {ids[0], ids[1], ids[6]}
+    left = {
+        r[0] for r in await _rows(sm, "SELECT acquirement_id::text FROM minion_subtask_acquirement")
+    }
+    assert left == {ids[0], ids[1], ids[2], ids[3], ids[6]}
 
 
 @pytest.mark.integration
