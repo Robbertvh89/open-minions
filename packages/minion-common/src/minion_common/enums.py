@@ -79,3 +79,4 @@ class PausedReason(StrEnum):
     CONTROL_INVALID = "control_invalid"
     SIGNALS_UNAVAILABLE = "signals_unavailable"
     IN_CALL = "in_call"
+    GPU_VIOLATION = "gpu_violation"  # every engine stopped after repeated GPU duty kills (TASK-15)

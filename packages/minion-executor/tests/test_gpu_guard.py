@@ -451,3 +451,104 @@ def test_counter_regression_is_a_meter_error() -> None:
     r.t += STEP  # a normal reading clears the count
     r.counters["0xa"] += NS
     assert r.g.observe(r.t, dict(r.counters), interval_s=STEP).action is GpuAction.OK
+
+
+def _drive(
+    g: GpuDutyGuard,
+    segs: list[tuple[float, float]],
+    ctl: list[tuple[float, float, bool]],
+    *,
+    acks: tuple[float, ...] = (),
+    idle: tuple[tuple[float, float], ...] = (),
+) -> tuple[float | None, float]:
+    import random
+
+    rnd = random.Random(0)  # noqa: S311
+    tl, t = [], 0.0
+    for dur, rate in segs:
+        tl.append((t, t + dur, rate))
+        t += dur
+    end = t
+
+    def cum(x: float) -> float:
+        c = 0.0
+        for a, b, r in tl:
+            if a >= x:
+                break
+            c += r * (min(b, x) - a)
+        return c
+
+    t, mx = 0.0, 0.0
+    ev, ak = sorted(ctl), sorted(acks)
+    g.observe(0.0, {"a": 0}, interval_s=STEP)
+    while t < end:
+        t += STEP * rnd.uniform(0.75, 1.25)
+        while ev and ev[0][0] <= t:
+            et, du, pa = ev.pop(0)
+            g.note_ctl(du, pa, et)
+        while ak and ak[0] <= t:
+            g.note_pause_ack(ak.pop(0))
+        g.set_idle(any(a <= t < b for a, b in idle), t)
+        v = g.observe(t, {"a": int(cum(t) * NS)}, interval_s=STEP)
+        mx = max(mx, g._acc)
+        if v.action is GpuAction.KILL:
+            return t, mx
+    return None, mx
+
+
+@pytest.mark.parametrize("step", [10, 15, 20])
+def test_bucket_carry_through_pause_and_idle_is_repaid(step: int) -> None:
+    """Long step, a pause cuts its repay sleep, paused 60 s (acked), resumed, idle 10 min, next
+    long step: the quiet time drains the bucket, no kill."""
+    d = 0.3
+    repay = step * (1 - d) / d
+    g = GpuDutyGuard()
+    g.start(1, 0.0)
+    g.note_ctl(d, False, 0.0)
+    p0 = step + 2
+    segs = [(step, 1.0), (2, 0.0), (60, 0.0), (600, 0.0), (step, 1.0), (repay, 0.0)]
+    ctl = [(0.0, d, False), (p0, d, True), (p0 + 60, d, False)]
+    killed, _ = _drive(g, segs, ctl, acks=(p0 + 0.5,), idle=((p0 + 60, p0 + 660),))
+    assert killed is None
+
+
+@pytest.mark.parametrize("step", [10, 15, 20])
+def test_bucket_carry_through_full_duty_is_repaid(step: int) -> None:
+    """light -> full mid-repay (the owed sleep vanishes), 30 min at full, back to light, long
+    step: the bucket drained while the limit was above 1."""
+    d = 0.3
+    repay = step * (1 - d) / d
+    g = GpuDutyGuard()
+    g.start(1, 0.0)
+    g.note_ctl(d, False, 0.0)
+    segs = [(step, 1.0), (2, 0.0), (1800, 0.5), (30, 0.0), (step, 1.0), (repay, 0.0)]
+    ctl = [(0.0, d, False), (step + 2, 1.0, False), (step + 2 + 1800, d, False)]
+    killed, _ = _drive(g, segs, ctl)
+    assert killed is None
+
+
+def test_quiet_samples_charge_the_bucket() -> None:
+    """A gap-timed rogue: bursts that the samples only see in idle mode still fill the bucket."""
+    g = GpuDutyGuard(GpuGuardConfig(quiet_min_span_s=1000.0))  # never the quiet share rule
+    g.start(1, 0.0, idle=True)
+    t, cum = 0.0, 0.0
+    g.observe(t, {"a": 0}, interval_s=STEP)
+    killed = None
+    for _ in range(100):
+        t += STEP
+        cum += STEP  # 100 % busy while "idle"
+        v = g.observe(t, {"a": int(cum * NS)}, interval_s=STEP)
+        if v.action is GpuAction.KILL:
+            killed = t
+            break
+    assert killed is not None and killed <= 40.0  # 20 / (1 - 0.1) ~ 22 s
+
+
+def test_sampler_gap_scales_busy_with_dt() -> None:
+    g = GpuDutyGuard()
+    g.start(1, 0.0)
+    g.note_ctl(0.3, False, 0.0)
+    g.observe(0.0, {"a": 0}, interval_s=STEP)
+    # 100 s gap during which the worker was 30 % busy: not an excess once dt is capped alike
+    g.observe(100.0, {"a": int(30 * NS)}, interval_s=STEP)
+    assert g._acc == pytest.approx(0.0, abs=0.01)
