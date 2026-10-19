@@ -9,6 +9,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -44,6 +45,7 @@ _EXPIRED = frozenset(_BY_STATUS.values())
 QUARANTINE_S = 600.0  # a row that failed even alone is skipped this long
 _QUARANTINE_MAX = 1000
 _QUARANTINE: dict[uuid.UUID, float] = {}
+_quarantine_evicted = 0  # lifetime count of entries evicted because the quarantine was full
 RECLAIM_CHUNK = 100  # acquirements per transaction: bounds lock time and rollback size
 
 
@@ -82,7 +84,32 @@ def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | Recl
 
 def reset_quarantine() -> None:
     """Forget every quarantined row (tests)."""
+    global _quarantine_evicted
     _QUARANTINE.clear()
+    _quarantine_evicted = 0
+
+
+def _quarantine_add(aid: uuid.UUID, error_type: str) -> bool:
+    """Quarantine `aid`; when full, evict the soonest-expiring entry. Returns True if one was
+    evicted. Logs ids and exception class names only, never a message or payload."""
+    global _quarantine_evicted
+    evicted = False
+    if aid not in _QUARANTINE and len(_QUARANTINE) >= _QUARANTINE_MAX:
+        victim = min(_QUARANTINE, key=_QUARANTINE.__getitem__)
+        del _QUARANTINE[victim]
+        _quarantine_evicted += 1
+        evicted = True
+        log.warning(
+            "reclaim_quarantine_full", evicted_acquirement_id=str(victim), max=_QUARANTINE_MAX
+        )
+    _QUARANTINE[aid] = time.monotonic() + QUARANTINE_S  # no 101 tx/cycle
+    log.warning(
+        "reclaim_quarantined",
+        acquirement_id=str(aid),
+        until=(datetime.now(UTC) + timedelta(seconds=QUARANTINE_S)).isoformat(),
+        error_type=error_type,
+    )
+    return evicted
 
 
 # SQLSTATE classes that mean "the database is unwell", not "this row is bad": connection (08),
@@ -171,8 +198,11 @@ async def reclaim_stale(
 ) -> Counter[ReclaimResult]:
     """One transaction per chunk of RECLAIM_CHUNK; a failing chunk is retried row by row."""
     now = time.monotonic()
-    for k in [k for k, until in _QUARANTINE.items() if until <= now]:
+    lapsed = [k for k, until in _QUARANTINE.items() if until <= now]
+    for k in lapsed:
         del _QUARANTINE[k]
+    added = evicted = 0
+    systemic = False  # a chunk failed with no proof of a bad row: skip row-by-row redo this call
     skip = list(_QUARANTINE)  # excluded in SQL: they must not hold the oldest LIMIT slots
     async with sm() as s:
         ids = await repo.stale_ids(s, timeout_s, batch_size, skip)
@@ -202,19 +232,37 @@ async def reclaim_stale(
             log.error("reclaim_chunk_failed", size=len(chunk), error_type=type(exc).__name__)
             done = {}
             hits = []
-            for aid in chunk:
-                row_hits: list[repo.Finish] = []
-                try:
-                    async with sm() as s, s.begin():
-                        one = await reclaim_chunk(s, [aid], cap_hits=row_hits, **kw)
-                    done[aid] = one[aid]
-                    hits += row_hits
-                except Exception as exc2:  # one bad row must not block the rest of the batch
+            failed: list[tuple[uuid.UUID, BaseException]] = []
+            proved = False  # a peer row of this chunk committed an expiry, so the fault is a row's
+            if len(chunk) > 1 and not systemic:
+                for aid in chunk:
+                    row_hits: list[repo.Finish] = []
+                    try:
+                        async with sm() as s, s.begin():
+                            one = await reclaim_chunk(s, [aid], cap_hits=row_hits, **kw)
+                        done[aid] = one[aid]
+                        hits += row_hits
+                        proved = proved or one[aid] in _EXPIRED
+                    except Exception as exc2:  # one bad row must not block the rest of the batch
+                        log.error(
+                            "reclaim_failed",
+                            acquirement_id=str(aid),
+                            error_type=type(exc2).__name__,
+                        )
+                        failed.append((aid, exc2))
+                if failed and not proved:
+                    systemic = True
                     log.error(
-                        "reclaim_failed", acquirement_id=str(aid), error_type=type(exc2).__name__
+                        "reclaim_chunk_systemic",
+                        size=len(chunk),
+                        failed=len(failed),
+                        error_type=type(failed[0][1]).__name__,
                     )
-                    if _row_specific(exc2) and len(_QUARANTINE) < _QUARANTINE_MAX:
-                        _QUARANTINE[aid] = time.monotonic() + QUARANTINE_S  # no 101 tx/cycle
+                elif proved:
+                    for bad, err in failed:
+                        if _row_specific(err):
+                            added += 1
+                            evicted += _quarantine_add(bad, type(err).__name__)
         for f in hits:
             log.info(
                 "unacked_cap_reached",
@@ -227,6 +275,15 @@ async def reclaim_stale(
             results[res] += 1
             if res in _EXPIRED:
                 log.info("subtask_reclaimed", acquirement_id=str(aid), result=res.value)
+    if added or evicted or lapsed:
+        log.info(
+            "reclaim_quarantine",
+            size=len(_QUARANTINE),
+            added=added,
+            evicted=evicted,
+            expired=len(lapsed),
+            evicted_total=_quarantine_evicted,
+        )
     return results
 
 

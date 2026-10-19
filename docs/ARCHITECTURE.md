@@ -483,7 +483,7 @@ SKIP LOCKED + re-check (ADR-0008), not DELETE ... RETURNING:
                 UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
                 UPSERT counter shards for FAILED subtasks, pre-aggregated, shards in sorted order
     COMMIT   (if the chunk raises: ROLLBACK and redo its rows one by one, each in its own transaction;
-              a row that fails alone with a row-specific error is skipped for 10 minutes, excluded in the candidate scan; transient DB errors never quarantine. A task whose last subtask failed here is settled by the watchdog's settle_stuck)
+              a row that fails alone with a row-specific error is skipped for 10 minutes, excluded in the candidate scan, only if a peer row of the chunk succeeded (else the failure is systemic: nothing quarantined, retried next tick); a full quarantine evicts the soonest-expiring entry; logged as reclaim_quarantined / reclaim_quarantine_full / reclaim_quarantine; transient DB errors never quarantine. A task whose last subtask failed here is settled by the watchdog's settle_stuck)
 ```
 **Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
 (`fail` already counts the attempt being recorded). `EXPIRED` with code `NOT_ACKNOWLEDGED` (never-beaten
