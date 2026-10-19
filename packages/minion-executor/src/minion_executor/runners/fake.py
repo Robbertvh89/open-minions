@@ -177,7 +177,7 @@ def _gpu_burn(seconds: float) -> None:
     prev: list[Any] | None = None
     while time.monotonic() < end:
         cur = [a @ a for _ in range(2)]
-        mx.async_eval(*cur)  # type: ignore[no-untyped-call]
+        mx.async_eval(*cur)  # type: ignore[no-untyped-call, unused-ignore]  # typed only with the mlx extra
         if prev is not None:
             mx.eval(*prev)
         prev = cur
