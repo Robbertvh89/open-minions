@@ -562,11 +562,14 @@ class ExecutorLoop:
         tmp = Path(tempfile.mkdtemp(prefix=pid_prefix, dir=self._tmp_root))  # mode 0700
         gov_task: asyncio.Task[None] | None = None
         status_task: asyncio.Task[None] | None = None
+        gpu_task: asyncio.Task[None] | None = None
         try:
             await self._gov.prime()  # a real first decision before anything is acquired
             gov_task = asyncio.create_task(self._gov.run())
             if self._status_dir is not None:
                 status_task = asyncio.create_task(self._status_loop(self._status_dir))
+            if self._gpu is not None:
+                gpu_task = asyncio.create_task(self._gpu_idle_loop())
             if self._register is not None:
                 reg = self._register
                 if isinstance(reg, RegisterRequest):  # announce the primed budget, not the seed
@@ -665,7 +668,7 @@ class ExecutorLoop:
                 elif outcome is _Outcome.FAILED:
                     await self._back_off_after_failure()
         finally:
-            for bg in (status_task, gov_task):
+            for bg in (gpu_task, status_task, gov_task):
                 if bg is not None:
                     bg.cancel()
                     await asyncio.gather(bg, return_exceptions=True)
@@ -924,24 +927,57 @@ class ExecutorLoop:
                 self._ctl_key = None
                 log.warning("worker_control_failed", error=type(exc).__name__)
 
+    def _sample_gpu(self) -> tuple[int, dict[str, int]] | Exception | None:
+        """The worker's GPU clients; a failed read is returned as the exception. Off-loop."""
+        if self._gpu_reader is None:
+            return None
+        try:
+            return self._worker.gpu_clients(self._gpu_reader)
+        except Exception as exc:
+            return exc
+
+    def _jitter(self, interval_s: float) -> float:
+        """Sampling period +-25 %: a worker cannot time its GPU client churn to the samples."""
+        return interval_s * random.uniform(0.75, 1.25)  # noqa: S311
+
+    async def _gpu_idle_loop(self) -> None:
+        """Sample a loaded worker that has no subtask (idle or paused) against allowed = 0: a
+        worker burning GPU then is untrusted (invariant 6), so it is unloaded (killed)."""
+        state: list[int | None] = [None]
+        while True:
+            await asyncio.sleep(self._jitter(self._guard_s))
+            if self._current is not None or self._loaded is None:
+                state[0] = None  # a subtask owns the guard / nothing to watch: re-baseline later
+                continue
+            gpu = await asyncio.to_thread(self._sample_gpu)
+            if self._current is not None or self._loaded is None or gpu is None:
+                state[0] = None
+                continue
+            if self._judge_gpu(gpu, state, idle=True) is None:
+                continue
+            state[0] = None
+            if self._gpu is not None:
+                self._gpu.stop()
+            self._status_kick.set()
+            await self._unload_idle("gpu_duty_violation")
+
     def _sample_worker(
         self,
     ) -> tuple[int | None, bool | None, tuple[int, dict[str, int]] | Exception | None]:
         """Footprint, priority and (with a guard) the worker's GPU clients; a failed GPU read is
         returned as the exception so the watcher can count it. Runs in a thread (about 1 ms)."""
-        gpu: tuple[int, dict[str, int]] | Exception | None = None
-        if self._gpu_reader is not None:
-            try:
-                gpu = self._worker.gpu_clients(self._gpu_reader)
-            except Exception as exc:
-                gpu = exc
+        gpu = self._sample_gpu()
         try:
             return self._worker.footprint_bytes(), self._worker.priority_ok(), gpu
         except Exception:  # sampling must never take the watcher down
             return None, None, gpu
 
     def _judge_gpu(
-        self, gpu: tuple[int, dict[str, int]] | Exception | None, state: list[int | None]
+        self,
+        gpu: tuple[int, dict[str, int]] | Exception | None,
+        state: list[int | None],
+        *,
+        idle: bool = False,
     ) -> _Verdict | None:
         """Feed one GPU reading to the guard; KILL -> verdict. GATE (SIGSTOP duty gating, TASK-15.1)
         is only logged for now. `state[0]` is the worker pid the guard was started for."""
@@ -954,7 +990,9 @@ class ExecutorLoop:
             log.warning("gpu_meter_error", error=type(gpu).__name__)
         else:
             if gpu is not None and gpu[0] != state[0]:
-                guard.start(gpu[0], now)  # first batch of this worker: load is not charged
+                guard.start(
+                    gpu[0], now, idle=idle
+                )  # first batch of this worker: load is not charged
                 state[0] = gpu[0]
             v = guard.observe(now, gpu[1] if gpu is not None else None, interval_s=interval)
         if v.share is not None:
@@ -990,7 +1028,7 @@ class ExecutorLoop:
         over = 0
         downgrade_since: float | None = None
         drop_since: float | None = None  # when the live budget fell below the running batch's
-        next_sample = clock() + self._guard_s
+        next_sample = clock() + self._jitter(self._guard_s)
         gpu_state: list[int | None] = [None]  # pid the GPU guard was started for
         while True:
             if self._infer_done.is_set():
@@ -1034,7 +1072,9 @@ class ExecutorLoop:
                 drop_since = None
             sample_due = now >= next_sample
             if sample_due:
-                next_sample = now + self._guard_s  # also without a batch: no busy-spin
+                next_sample = now + self._jitter(
+                    self._guard_s
+                )  # also without a batch: no busy-spin
             if batch is not None and sample_due:
                 footprint, prio_ok, gpu = await asyncio.to_thread(self._sample_worker)
                 gpu_verdict = self._judge_gpu(gpu, gpu_state)

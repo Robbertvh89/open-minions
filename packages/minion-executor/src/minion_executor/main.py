@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,6 +105,29 @@ NO_ENGINE_MSG = (
     "`--engines ollama`; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )
+
+
+def resolve_gpu_reader(
+    engines: list[Engine],
+    factory: Callable[[], Callable[[], dict[int, dict[str, int]]] | None] = default_gpu_reader,
+) -> Callable[[], dict[int, dict[str, int]]] | None:
+    """The GPU meter for the duty guard, probed once. None (one log line) for the dev fake engine
+    or where no reader exists (non-darwin). A reader that exists but fails its first read is a
+    StartupError (exit 2): an unmeasurable worker must not run unguarded (invariant 6)."""
+    log = structlog.get_logger("minion_executor.main")
+    reader = factory()
+    if Engine.FAKE in engines or reader is None:
+        log.info(
+            "gpu_duty_guard_disabled",
+            reason="fake_engine" if Engine.FAKE in engines else "no_reader",
+        )
+        return None
+    try:
+        reader()
+    except Exception as exc:
+        log.error("gpu_meter_probe_failed", error=type(exc).__name__)
+        raise StartupError("the GPU meter is unavailable, refusing to run unguarded") from exc
+    return reader
 
 
 class StartupError(Exception):
@@ -318,13 +341,7 @@ async def _run(
             sandbox=sandbox_policy(settings, available),
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
-        gpu_reader = default_gpu_reader()
-        if Engine.FAKE in available or gpu_reader is None:
-            structlog.get_logger("minion_executor.main").info(
-                "gpu_duty_guard_disabled",
-                reason="fake_engine" if Engine.FAKE in available else "no_reader",
-            )
-            gpu_reader = None
+        gpu_reader = resolve_gpu_reader(available)
         governor = build_governor(plan) if plan is not None else None
         # fetch niceness is read per fetch (at spawn), not live; fixed only without a governor
         nice_fn = (lambda: nice_for(governor.decision.budget.cpu_priority)) if governor else None
