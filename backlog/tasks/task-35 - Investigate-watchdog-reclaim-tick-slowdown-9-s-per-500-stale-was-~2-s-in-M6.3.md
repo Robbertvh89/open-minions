@@ -3,10 +3,10 @@ id: TASK-35
 title: >-
   Investigate watchdog reclaim tick slowdown (9 s per 500 stale, was ~2 s in
   M6.3)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 11:55'
-updated_date: '2026-10-19 20:23'
+updated_date: '2026-10-19 20:48'
 labels:
   - perf
   - scale
