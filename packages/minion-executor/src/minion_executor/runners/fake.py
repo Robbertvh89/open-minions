@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -203,6 +204,7 @@ class FakeRunner:
         self.budget: Budget | None = None
         self.trims = 0
         self._fail_trim = False
+        self._burner: threading.Thread | None = None  # rogue background GPU burn (test hook)
 
     def load(
         self, model: ModelEntry, model_path: Path | None, budget: Budget, cfg: EngineConfig
@@ -240,7 +242,18 @@ class FakeRunner:
                     for _ in range(min(int(rec["sleep_steps"]), 1000)):
                         time.sleep(min(float(rec.get("step_s", 0.1)), 10.0))
                         ctl.checkpoint(len(out))
-                if rec.get("gpu_burn_s"):  # rogue: unpaced GPU loop, never calls ctl.checkpoint
+                if rec.get("gpu_burn_s") and rec.get("no_pace"):
+                    # rogue that outlives its subtasks: a background thread keeps the GPU busy
+                    # (once) while the subtask itself is short and paced like an honest one
+                    if not self._burner:
+                        self._burner = threading.Thread(
+                            target=_gpu_burn,
+                            args=(min(float(rec["gpu_burn_s"]), 600.0),),
+                            daemon=True,
+                        )
+                        self._burner.start()
+                    time.sleep(0.3)
+                elif rec.get("gpu_burn_s"):  # rogue: unpaced GPU loop, never calls ctl.checkpoint
                     _gpu_burn(min(float(rec["gpu_burn_s"]), 600.0))
                 if rec.get("fail_trim"):  # make later trim() calls raise (worker must survive)
                     self._fail_trim = True

@@ -274,6 +274,8 @@ class ExecutorLoop:
         self._gpu_reader = gpu_reader
         self._gpu: GpuDutyGuard | None = GpuDutyGuard(gpu_guard) if gpu_reader else None
         self._gpu_share: float | None = None  # last measured share of the worker (status.json)
+        self._gpu_pid: int | None = None  # worker pid the guard window belongs to
+        self._gpu_pending: _Verdict | None = None  # sampler KILL for the watcher to act on
         self._gpu_violation: str | None = None  # reason of the last GPU duty kill
         self._max_output_bytes = max_output_bytes
         self._cache = model_cache
@@ -569,7 +571,7 @@ class ExecutorLoop:
             if self._status_dir is not None:
                 status_task = asyncio.create_task(self._status_loop(self._status_dir))
             if self._gpu is not None:
-                gpu_task = asyncio.create_task(self._gpu_idle_loop())
+                gpu_task = asyncio.create_task(self._gpu_sampler())
             if self._register is not None:
                 reg = self._register
                 if isinstance(reg, RegisterRequest):  # announce the primed budget, not the seed
@@ -940,47 +942,45 @@ class ExecutorLoop:
         """Sampling period +-25 %: a worker cannot time its GPU client churn to the samples."""
         return interval_s * random.uniform(0.75, 1.25)  # noqa: S311
 
-    async def _gpu_idle_loop(self) -> None:
-        """Sample a loaded worker that has no subtask (idle or paused) against allowed = 0: a
-        worker burning GPU then is untrusted (invariant 6), so it is unloaded (killed)."""
-        state: list[int | None] = [None]
+    async def _gpu_sampler(self) -> None:
+        """One continuous GPU guard per worker pid (ADR-0006 D3): sample at the (jittered) guard
+        interval for the life of a loaded worker, whatever the loop does (subtask, between
+        subtasks, idle, paused). The window is re-baselined only on a new pid, so it spans subtask
+        boundaries; between subtasks the guard is in idle mode (judged on samples since that
+        mode began). A KILL during a subtask is handed to the watcher (`_gpu_pending`: interrupt +
+        release); otherwise the worker is unloaded here (nothing to release)."""
         while True:
             await asyncio.sleep(self._jitter(self._guard_s))
-            if self._current is not None or self._loaded is None:
-                state[0] = None  # a subtask owns the guard / nothing to watch: re-baseline later
-                continue
             gpu = await asyncio.to_thread(self._sample_gpu)
-            if self._current is not None or self._loaded is None or gpu is None:
-                state[0] = None
+            if gpu is None:  # no live worker: the next one starts a fresh window
+                if self._gpu is not None:
+                    self._gpu.stop()
+                self._gpu_pid = None
+                self._gpu_share = None
                 continue
-            if self._judge_gpu(gpu, state, idle=True) is None:
+            v = self._judge_gpu(gpu, idle=self._current is None)
+            if v is None:
                 continue
-            state[0] = None
+            if self._current is not None and not self._infer_done.is_set():
+                self._gpu_pending = v  # the watcher interrupts and releases the subtask
+                continue
             if self._gpu is not None:
                 self._gpu.stop()
+            self._gpu_pid = None
             self._status_kick.set()
             await self._unload_idle("gpu_duty_violation")
 
-    def _sample_worker(
-        self,
-    ) -> tuple[int | None, bool | None, tuple[int, dict[str, int]] | Exception | None]:
-        """Footprint, priority and (with a guard) the worker's GPU clients; a failed GPU read is
-        returned as the exception so the watcher can count it. Runs in a thread (about 1 ms)."""
-        gpu = self._sample_gpu()
+    def _sample_worker(self) -> tuple[int | None, bool | None]:
         try:
-            return self._worker.footprint_bytes(), self._worker.priority_ok(), gpu
+            return self._worker.footprint_bytes(), self._worker.priority_ok()
         except Exception:  # sampling must never take the watcher down
-            return None, None, gpu
+            return None, None
 
     def _judge_gpu(
-        self,
-        gpu: tuple[int, dict[str, int]] | Exception | None,
-        state: list[int | None],
-        *,
-        idle: bool = False,
+        self, gpu: tuple[int, dict[str, int]] | Exception, *, idle: bool
     ) -> _Verdict | None:
         """Feed one GPU reading to the guard; KILL -> verdict. GATE (SIGSTOP duty gating, TASK-15.1)
-        is only logged for now. `state[0]` is the worker pid the guard was started for."""
+        is only logged for now."""
         guard = self._gpu
         if guard is None:
             return None
@@ -989,12 +989,12 @@ class ExecutorLoop:
             v = guard.observe_error(now)
             log.warning("gpu_meter_error", error=type(gpu).__name__)
         else:
-            if gpu is not None and gpu[0] != state[0]:
-                guard.start(
-                    gpu[0], now, idle=idle
-                )  # first batch of this worker: load is not charged
-                state[0] = gpu[0]
-            v = guard.observe(now, gpu[1] if gpu is not None else None, interval_s=interval)
+            if gpu[0] != self._gpu_pid:
+                guard.start(gpu[0], now, idle=idle)  # a new worker: load time is not charged
+                self._gpu_pid = gpu[0]
+            else:
+                guard.set_idle(idle, now)
+            v = guard.observe(now, gpu[1], interval_s=interval)
         if v.share is not None:
             self._gpu_share = v.share
         if v.action is GpuAction.GATE:
@@ -1029,7 +1029,7 @@ class ExecutorLoop:
         downgrade_since: float | None = None
         drop_since: float | None = None  # when the live budget fell below the running batch's
         next_sample = clock() + self._jitter(self._guard_s)
-        gpu_state: list[int | None] = [None]  # pid the GPU guard was started for
+        self._gpu_pending = None
         while True:
             if self._infer_done.is_set():
                 await self._enforce_idle_budget()
@@ -1037,6 +1037,9 @@ class ExecutorLoop:
                 continue
             await self._push_control()
             d = gov.decision
+            if (gv := self._gpu_pending) is not None:
+                self._gpu_pending = None
+                return gv
             if d.release_now:
                 return _Verdict.MEMORY_CRITICAL
             if d.pause_expired:
@@ -1047,8 +1050,6 @@ class ExecutorLoop:
                 # OOM; just unload it when it no longer fits the budget.
                 over = 0
                 drop_since = None
-                gpu_state[0] = None  # the next batch re-baselines the GPU guard
-                self._gpu_share = None
                 loaded = self._loaded
                 if (
                     not self._ensure_started
@@ -1076,10 +1077,7 @@ class ExecutorLoop:
                     self._guard_s
                 )  # also without a batch: no busy-spin
             if batch is not None and sample_due:
-                footprint, prio_ok, gpu = await asyncio.to_thread(self._sample_worker)
-                gpu_verdict = self._judge_gpu(gpu, gpu_state)
-                if gpu_verdict is not None:
-                    return gpu_verdict
+                footprint, prio_ok = await asyncio.to_thread(self._sample_worker)
                 # the running batch started under `batch`: a budget drop only takes effect at the
                 # next batch boundary (FR-54, ADR-0006 D7), so the allowance (measure against the
                 # larger of the two budgets) lasts as long as the drop is within
@@ -1151,6 +1149,7 @@ class ExecutorLoop:
             return _Outcome.FAILED
         if self._gpu is not None and v in (_Verdict.GPU_DUTY, _Verdict.GPU_METER):
             self._gpu.stop()  # the worker is gone: the next one starts a fresh window
+            self._gpu_pid = None
         await self._release(a, bound, v.value)
         # a priority violation / crashed watcher is a local fault: back off so it cannot churn;
         # the rest is policy

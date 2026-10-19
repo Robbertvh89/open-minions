@@ -3822,3 +3822,43 @@ def test_gpu_probe_failure_is_a_startup_error() -> None:
     assert resolve_gpu_reader([Engine.MLX], lambda: None) is None  # no reader (non-darwin)
     ok = lambda: {1: {"0x1": 0}}  # noqa: E731
     assert resolve_gpu_reader([Engine.MLX], lambda: ok) is ok
+
+
+async def test_gpu_rogue_in_many_short_subtasks_is_killed(tmp_path: Path) -> None:
+    """The window spans subtask boundaries: 8 back-to-back unpaced subtasks, each too short to be
+    judged alone, add up to a KILL (kill lands in a subtask -> release, or between -> unload)."""
+    cfg = GpuGuardConfig(
+        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_after_s=0.05,
+        quiet_min_span_s=5.0,
+    )  # fmt: skip
+    client, worker = FakeClient([assignment() for _ in range(8)]), FakeWorker()
+    worker.gpu_busy = 1.0  # duty 0.5
+    worker.run_hook = lambda _n: time.sleep(0.12)  # one subtask is shorter than the 0.4 s span
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        guard_interval_s=0.02, gpu_reader=lambda: {}, gpu_guard=cfg,
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await asyncio.wait_for(loop.run(), 20)
+    assert loop._status_snapshot().gpu_violation == "over_duty"
+    # the fake ignores the kill, so it can repeat; each one is a release or an unload
+    assert "GPU_DUTY_VIOLATION" in client.release_codes or worker.unloads > 0
+
+
+async def test_gpu_honest_worker_in_many_short_subtasks_is_not_flagged(tmp_path: Path) -> None:
+    cfg = GpuGuardConfig(
+        window_s=0.5, min_span_frac=0.8, margin=0.1, grace_s=0.0, kill_after_s=0.05,
+        quiet_min_span_s=0.1,
+    )  # fmt: skip
+    client, worker = FakeClient([assignment() for _ in range(8)]), FakeWorker()
+    worker.gpu_busy = 0.3
+    worker.run_hook = lambda _n: time.sleep(0.12)
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        guard_interval_s=0.02, gpu_reader=lambda: {}, gpu_guard=cfg,
+    )  # fmt: skip
+    client.on_empty = loop.stop
+    await asyncio.wait_for(loop.run(), 20)
+    assert loop._status_snapshot().gpu_violation is None
+    assert worker.interrupts == 0 and "release" not in client.kinds()
+    assert client.kinds().count("complete") == 8

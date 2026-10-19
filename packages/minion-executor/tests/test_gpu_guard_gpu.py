@@ -281,24 +281,20 @@ async def test_honest_mlx_worker_is_never_killed(
     assert max(shares) <= budget.gpu_duty_cycle + DEFAULTS.margin, shares
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG: the GPU guard re-baselines per subtask (loop._watch gpu_state starts None, "
-        "GpuDutyGuard.start resets the window) and judges only after 0.8 x window_s = 8 s, so a "
-        "worker that burns the GPU in subtasks shorter than 8 s is never judged"
-    ),
-)
 async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path) -> None:
-    """Back-to-back ~3 s subtasks, each an unpaced GPU burn (about 70 % busy overall at light,
-    duty 0.3): the guard should still release with GPU_DUTY_VIOLATION."""
+    """Back-to-back ~1 s subtasks (honestly paced) while a background thread of the worker keeps
+    the GPU busy: no subtask is long enough to be judged alone, the guard window must span them
+    and still kill (release GPU_DUTY_VIOLATION)."""
     pytest.importorskip("mlx.core")
     model = ModelEntry(
         model_id="fake-embed", type="embedding", engine=Engine.FAKE,
         ref="o/m", revision="a" * 40, memory_gb=0.1,
     )  # fmt: skip
-    body = json.dumps({"id": "rogue", "text": "x", "gpu_burn_s": 3}).encode() + b"\n"
-    budget = _duty(CapacityProfile.LIGHT)
+    body = (
+        json.dumps({"id": "rogue", "text": "x", "gpu_burn_s": 70, "no_pace": True}).encode() + b"\n"
+    )
+    # duty 0.05 (limit 0.15): the burn measures 0.2-0.4 of the GPU, host load permitting
+    budget = _duty(CapacityProfile.LIGHT).model_copy(update={"gpu_duty_cycle": 0.05})
     client = Client(lambda: _assignment(model, body, 1, {}), deadline=time.monotonic() + 80)
     worker = WorkerHandle(
         [Engine.FAKE], test_hooks=True, sandbox=SandboxPolicy(cache_root=tmp_path),
@@ -314,4 +310,8 @@ async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path) -> None:
         await asyncio.wait_for(loop.run(), 200)
     finally:
         worker.close()
-    assert "GPU_DUTY_VIOLATION" in client.released, (client.released, len(client.completed))
+    assert "GPU_DUTY_VIOLATION" in client.released, (
+        client.released,
+        len(client.completed),
+        loop._status_snapshot().gpu_share,
+    )

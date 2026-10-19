@@ -96,6 +96,15 @@ class GpuDutyGuard:
         self._errors = 0
         self._reset_window(now)
 
+    def set_idle(self, idle: bool, now: float) -> None:
+        """Switch between busy and idle mode without touching the window or baselines. Entering
+        idle starts the quiet period at `now`: only samples since then are judged against 0."""
+        if idle == self._idle:
+            return
+        self._idle = idle
+        if idle:
+            self._started = now
+
     def stop(self) -> None:
         """No live worker: forget the pid and the window."""
         self._pid, self._seen, self._ids = None, {}, set()
