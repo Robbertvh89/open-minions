@@ -14,7 +14,6 @@ from typing import Any
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
 from sqlalchemy import (
     Select,
-    exists,
     false,
     func,
     literal,
@@ -39,7 +38,6 @@ from minion_server.repositories.completion import (
     _unacked_expiry,
     bump_counters,
     counter_shard,
-    owned,
 )
 
 
@@ -81,77 +79,6 @@ async def over_lease_ids(session: AsyncSession, max_lease_s: float, limit: int) 
     """
     rows = await session.execute(over_lease_stmt(max_lease_s, limit))
     return list(rows.scalars())
-
-
-async def lease_expired(
-    session: AsyncSession, acquirement_id: uuid.UUID, max_lease_s: float
-) -> bool:
-    """Fresh statement after the lock, like `heartbeat_stale`."""
-    return bool(
-        (
-            await session.execute(
-                select(
-                    exists().where(
-                        SubtaskAcquirement.acquirement_id == acquirement_id,
-                        SubtaskAcquirement.acquired_at < _cutoff(max_lease_s),
-                    )
-                )
-            )
-        ).scalar_one()
-    )
-
-
-async def lock_for_reclaim(session: AsyncSession, acquirement_id: uuid.UUID) -> Owned | None:
-    """Lock the acquirement; None if it is gone or an owner op / other watchdog holds the lock."""
-    row = (
-        await session.execute(
-            select(SubtaskAcquirement)
-            .where(SubtaskAcquirement.acquirement_id == acquirement_id)
-            .with_for_update(skip_locked=True)
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        return None
-    return await owned(session, row)
-
-
-async def heartbeat_stale(
-    session: AsyncSession, acquirement_id: uuid.UUID, timeout_s: float
-) -> bool:
-    """Fresh statement after the lock: under READ COMMITTED it sees a beat committed meanwhile."""
-    return bool(
-        (
-            await session.execute(
-                select(
-                    exists().where(
-                        ExecutorHeartbeat.acquirement_id == acquirement_id,
-                        ExecutorHeartbeat.last_seen_at < _cutoff(timeout_s),
-                    )
-                )
-            )
-        ).scalar_one()
-    )
-
-
-async def never_acknowledged(session: AsyncSession, acquirement_id: uuid.UUID) -> bool:
-    """True if no heartbeat landed after the claim (ADR-0014).
-
-    The claim transaction writes `acquired_at` and the first `last_seen_at` with the same `now()`;
-    any beat moves `last_seen_at` on. Caller holds the acquirement lock.
-    """
-    return bool(
-        (
-            await session.execute(
-                select(
-                    exists().where(
-                        ExecutorHeartbeat.acquirement_id == acquirement_id,
-                        SubtaskAcquirement.acquirement_id == acquirement_id,
-                        ExecutorHeartbeat.last_seen_at == SubtaskAcquirement.acquired_at,
-                    )
-                )
-            )
-        ).scalar_one()
-    )
 
 
 # --- batched reclaim (TASK-35): one transaction per chunk, a handful of statements per chunk ----

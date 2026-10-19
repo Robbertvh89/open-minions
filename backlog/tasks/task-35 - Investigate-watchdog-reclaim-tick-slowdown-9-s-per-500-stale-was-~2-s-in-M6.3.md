@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-18 11:55'
-updated_date: '2026-10-19 18:35'
+updated_date: '2026-10-19 18:48'
 labels:
   - perf
   - scale
@@ -100,3 +100,9 @@ Decision gate: if one statement dominates (e.g. a bad plan in settleable_tasks o
 ## Parallel-work footprint
 Changes: packages/minion-server/src/minion_server/repositories/reclaim.py, services/reclaim.py, optionally services/completion.py (only to delete finish_unacknowledged; can be deferred), tests test_reclaim_races.py (1 test) plus new test files, docs (ARCHITECTURE §3.4/§4, ADR-0008 addendum, bench reports). Probably no source change in packages/minion-watchdog (tick() calls reclaim_stale unchanged). No migrations, no minion-common/executor/scale code, no owner-op SQL (repositories/completion.py untouched).
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Steps 2+3 implemented (branch perf/task-35-chunked-reclaim): batched repo + chunked reclaim_stale (RECLAIM_CHUNK=100), ~5 statements per chunk instead of ~11 per row. Steps 1 and 4 (measurement on the scale stack) still open.
+<!-- SECTION:NOTES:END -->

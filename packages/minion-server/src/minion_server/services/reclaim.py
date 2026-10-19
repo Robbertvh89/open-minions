@@ -8,16 +8,18 @@ the acquire INSERT; reclaim just deletes the row under a row lock.
 import time
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from enum import StrEnum
+from typing import Any
 
 import structlog
-from minion_common.enums import AttemptOutcome, SubtaskStatus
+from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_server.repositories import completion as completion_repo
 from minion_server.repositories import reclaim as repo
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.completion import finish_failed, finish_unacknowledged, settle_in_tx
+from minion_server.services.completion import next_status, settle_in_tx
 
 log = structlog.get_logger()
 
@@ -37,6 +39,76 @@ _BY_STATUS = {
 }
 
 _EXPIRED = frozenset(_BY_STATUS.values())
+RECLAIM_CHUNK = 100  # acquirements per transaction: bounds lock time and rollback size
+
+
+def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | ReclaimResult:
+    """Pure reclaim decision for one locked, freshly classified acquirement (FR-31, ADR-0014)."""
+    o = row.owned
+    cancelled = o.task_status == TaskStatus.CANCELLED
+    if row.stale:
+        if unacked_free_cap > 0 and row.never_acked:
+            if row.unacked_used < unacked_free_cap:
+                return repo.Finish(
+                    o,
+                    AttemptOutcome.EXPIRED,
+                    SubtaskStatus.CANCELLED if cancelled else SubtaskStatus.PENDING,
+                    attempt_error={
+                        "code": completion_repo.NOT_ACKNOWLEDGED,
+                        "message": "never acknowledged after claim",
+                        "retryable": True,
+                    },
+                )
+            log.info(
+                "unacked_cap_reached",
+                acquirement_id=str(o.acquirement_id),
+                subtask_id=o.subtask_id,
+                attempt=o.attempt,
+                free_cap=unacked_free_cap,
+            )
+        code, message = "HEARTBEAT_TIMEOUT", "no heartbeat"
+    elif row.over_lease:
+        code, message = "MAX_LEASE_EXCEEDED", "max lease exceeded"
+    else:
+        return ReclaimResult.NOT_STALE
+    return repo.Finish(
+        o,
+        AttemptOutcome.EXPIRED,
+        next_status(row.budget_used + 1, o.max_attempts, retryable=True, task_cancelled=cancelled),
+        error={"code": code, "message": message, "retryable": True},
+    )
+
+
+async def reclaim_chunk(
+    session: AsyncSession,
+    ids: Sequence[uuid.UUID],
+    *,
+    timeout_s: float,
+    max_lease_s: float | None = None,
+    unacked_free_cap: int = 0,
+) -> dict[uuid.UUID, ReclaimResult]:
+    """Reclaim a chunk inside the caller's open transaction (caller commits).
+
+    Lock (sorted, SKIP LOCKED) -> classify in a fresh statement -> decide -> write per kind.
+    Reclaimed when the heartbeat is older than `timeout_s`, or (if `max_lease_s` is set) when the
+    acquirement itself is older than `max_lease_s`: an executor that keeps heartbeating but never
+    finishes cannot hold a subtask forever. Both are recorded as EXPIRED and consume budget.
+    """
+    results = {aid: ReclaimResult.SKIPPED for aid in ids}
+    locked = await repo.lock_batch(session, ids)
+    if not locked:
+        return results
+    rows = await repo.classify_locked(session, locked, timeout_s=timeout_s, max_lease_s=max_lease_s)
+    finishes: list[repo.Finish] = []
+    for row in rows:
+        d = decide(row, unacked_free_cap=unacked_free_cap)
+        if isinstance(d, ReclaimResult):
+            results[row.owned.acquirement_id] = d
+        else:
+            finishes.append(d)
+            results[row.owned.acquirement_id] = _BY_STATUS[d.subtask_status]
+    await repo.finish_reclaimed(session, finishes)
+    return results
 
 
 async def reclaim_one(
@@ -47,32 +119,15 @@ async def reclaim_one(
     max_lease_s: float | None = None,
     unacked_free_cap: int = 0,
 ) -> ReclaimResult:
-    """Reclaim one acquirement inside the caller's open transaction (caller commits).
-
-    Reclaimed when the heartbeat is older than `timeout_s`, or (if `max_lease_s` is set) when the
-    acquirement itself is older than `max_lease_s`: an executor that keeps heartbeating but never
-    finishes cannot hold a subtask forever. Both are recorded as EXPIRED and consume budget.
-    """
-    o = await repo.lock_for_reclaim(session, acquirement_id)
-    if o is None:
-        return ReclaimResult.SKIPPED
-    if await repo.heartbeat_stale(session, acquirement_id, timeout_s):
-        if unacked_free_cap > 0 and await repo.never_acknowledged(session, acquirement_id):
-            status = await finish_unacknowledged(session, o, free_cap=unacked_free_cap)
-            return _BY_STATUS[status]
-        code, message = "HEARTBEAT_TIMEOUT", "no heartbeat"
-    elif max_lease_s is not None and await repo.lease_expired(session, acquirement_id, max_lease_s):
-        code, message = "MAX_LEASE_EXCEEDED", "max lease exceeded"
-    else:
-        return ReclaimResult.NOT_STALE
-    status = await finish_failed(
+    """Reclaim one acquirement inside the caller's open transaction (a 1-id chunk)."""
+    res = await reclaim_chunk(
         session,
-        o,
-        outcome=AttemptOutcome.EXPIRED,
-        error={"code": code, "message": message, "retryable": True},
-        retryable=True,
+        [acquirement_id],
+        timeout_s=timeout_s,
+        max_lease_s=max_lease_s,
+        unacked_free_cap=unacked_free_cap,
     )
-    return _BY_STATUS[status]
+    return res[acquirement_id]
 
 
 async def reclaim_stale(
@@ -83,7 +138,7 @@ async def reclaim_stale(
     max_lease_s: float | None = None,
     unacked_free_cap: int = 0,
 ) -> Counter[ReclaimResult]:
-    """One short transaction per stale acquirement, so a slow owner op never stalls the batch."""
+    """One transaction per chunk of RECLAIM_CHUNK; a failing chunk is retried row by row."""
     async with sm() as s:
         ids = await repo.stale_ids(s, timeout_s, batch_size)
         if max_lease_s is not None:
@@ -96,23 +151,32 @@ async def reclaim_stale(
                 hits=len(over),
             )
             ids += [i for i in over if i not in seen]
+    kw: dict[str, Any] = {
+        "timeout_s": timeout_s,
+        "max_lease_s": max_lease_s,
+        "unacked_free_cap": unacked_free_cap,
+    }
     results: Counter[ReclaimResult] = Counter()
-    for aid in ids:
+    for start in range(0, len(ids), RECLAIM_CHUNK):
+        chunk = ids[start : start + RECLAIM_CHUNK]
         try:
             async with sm() as s, s.begin():
-                res = await reclaim_one(
-                    s,
-                    aid,
-                    timeout_s=timeout_s,
-                    max_lease_s=max_lease_s,
-                    unacked_free_cap=unacked_free_cap,
-                )
-        except Exception as exc:  # one bad row must not block the rest of the batch
-            log.error("reclaim_failed", acquirement_id=str(aid), error_type=type(exc).__name__)
-            continue
-        results[res] += 1
-        if res in _EXPIRED:
-            log.info("subtask_reclaimed", acquirement_id=str(aid), result=res.value)
+                done = await reclaim_chunk(s, chunk, **kw)
+        except Exception as exc:  # poisoned chunk: isolate the bad row, keep the rest
+            log.error("reclaim_chunk_failed", size=len(chunk), error_type=type(exc).__name__)
+            done = {}
+            for aid in chunk:
+                try:
+                    async with sm() as s, s.begin():
+                        done[aid] = await reclaim_one(s, aid, **kw)
+                except Exception as exc2:  # one bad row must not block the rest of the batch
+                    log.error(
+                        "reclaim_failed", acquirement_id=str(aid), error_type=type(exc2).__name__
+                    )
+        for aid, res in done.items():
+            results[res] += 1
+            if res in _EXPIRED:
+                log.info("subtask_reclaimed", acquirement_id=str(aid), result=res.value)
     return results
 
 
