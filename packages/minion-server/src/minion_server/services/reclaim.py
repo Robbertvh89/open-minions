@@ -14,6 +14,8 @@ from typing import Any
 
 import structlog
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_server.repositories import completion as completion_repo
@@ -76,6 +78,18 @@ def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | Recl
         error={"code": code, "message": message, "retryable": True},
         cap_reached=cap_reached,
     )
+
+
+def reset_quarantine() -> None:
+    """Forget every quarantined row (tests)."""
+    _QUARANTINE.clear()
+
+
+def _row_specific(exc: BaseException) -> bool:
+    """False for infrastructure errors (connection, pool, timeout, deadlock): a DB blip must not
+    quarantine healthy rows."""
+    transient = (OperationalError, InterfaceError, SATimeoutError, TimeoutError, OSError)
+    return not (isinstance(exc, transient) or getattr(exc, "connection_invalidated", False))
 
 
 async def reclaim_chunk(
@@ -141,22 +155,22 @@ async def reclaim_stale(
     unacked_free_cap: int = 0,
 ) -> Counter[ReclaimResult]:
     """One transaction per chunk of RECLAIM_CHUNK; a failing chunk is retried row by row."""
+    now = time.monotonic()
+    for k in [k for k, until in _QUARANTINE.items() if until <= now]:
+        del _QUARANTINE[k]
+    skip = list(_QUARANTINE)  # excluded in SQL: they must not hold the oldest LIMIT slots
     async with sm() as s:
-        ids = await repo.stale_ids(s, timeout_s, batch_size)
+        ids = await repo.stale_ids(s, timeout_s, batch_size, skip)
         if max_lease_s is not None:
             seen = set(ids)
             scan_started = time.monotonic()
-            over = await repo.over_lease_ids(s, max_lease_s, batch_size)
+            over = await repo.over_lease_ids(s, max_lease_s, batch_size, skip)
             log.debug(
                 "over_lease_scan",
                 scan_ms=round((time.monotonic() - scan_started) * 1000),
                 hits=len(over),
             )
             ids += [i for i in over if i not in seen]
-    now = time.monotonic()
-    for k in [k for k, until in _QUARANTINE.items() if until <= now]:
-        del _QUARANTINE[k]
-    ids = [i for i in ids if i not in _QUARANTINE]
     kw: dict[str, Any] = {
         "timeout_s": timeout_s,
         "max_lease_s": max_lease_s,
@@ -184,8 +198,8 @@ async def reclaim_stale(
                     log.error(
                         "reclaim_failed", acquirement_id=str(aid), error_type=type(exc2).__name__
                     )
-                    if len(_QUARANTINE) < _QUARANTINE_MAX:  # skip it for a while: no 101 tx/cycle
-                        _QUARANTINE[aid] = time.monotonic() + QUARANTINE_S
+                    if _row_specific(exc2) and len(_QUARANTINE) < _QUARANTINE_MAX:
+                        _QUARANTINE[aid] = time.monotonic() + QUARANTINE_S  # no 101 tx/cycle
         for f in hits:
             log.info(
                 "unacked_cap_reached",

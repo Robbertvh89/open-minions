@@ -56,6 +56,16 @@ def _isolated_executor_state_dir(
     monkeypatch.setenv("MINION_EXECUTOR_STATE_DIR", str(root / "state"))
 
 
+@pytest.fixture(autouse=True)
+def _reset_reclaim_quarantine() -> Iterator[None]:
+    """The watchdog's in-memory quarantine is process-global: never leak it between tests."""
+    from minion_server.services.reclaim import reset_quarantine
+
+    reset_quarantine()
+    yield
+    reset_quarantine()
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """`model` tests hit the real hub: skipped unless selected with `-m model`; `gpu` tests need
     an Apple GPU plus the `mlx` extra and are skipped unless selected with `-m gpu`; `macos` tests

@@ -46,39 +46,49 @@ def _cutoff(timeout_s: float) -> Any:
     return func.now() - func.make_interval(0, 0, 0, 0, 0, 0, timeout_s)
 
 
-def stale_stmt(timeout_s: float, limit: int) -> Select[uuid.UUID]:
-    """The stale-heartbeat scan; served by the `last_seen_at` index."""
-    return (
-        select(ExecutorHeartbeat.acquirement_id)
-        .where(ExecutorHeartbeat.last_seen_at < _cutoff(timeout_s))
-        .order_by(ExecutorHeartbeat.last_seen_at)
-        .limit(limit)
+def stale_stmt(
+    timeout_s: float, limit: int, exclude: Sequence[uuid.UUID] = ()
+) -> Select[uuid.UUID]:
+    """The stale-heartbeat scan; served by the `last_seen_at` index.
+
+    `exclude` (quarantined ids) is filtered in SQL so the LIMIT fills with eligible rows."""
+    stmt = select(ExecutorHeartbeat.acquirement_id).where(
+        ExecutorHeartbeat.last_seen_at < _cutoff(timeout_s)
     )
+    if exclude:
+        stmt = stmt.where(ExecutorHeartbeat.acquirement_id.not_in(list(exclude)))
+    return stmt.order_by(ExecutorHeartbeat.last_seen_at).limit(limit)
 
 
-async def stale_ids(session: AsyncSession, timeout_s: float, limit: int) -> list[uuid.UUID]:
+async def stale_ids(
+    session: AsyncSession, timeout_s: float, limit: int, exclude: Sequence[uuid.UUID] = ()
+) -> list[uuid.UUID]:
     """Unlocked scan (uses the `last_seen_at` index); each hit is re-checked under its lock."""
-    rows = await session.execute(stale_stmt(timeout_s, limit))
+    rows = await session.execute(stale_stmt(timeout_s, limit, exclude))
     return list(rows.scalars())
 
 
-def over_lease_stmt(max_lease_s: float, limit: int) -> Select[uuid.UUID]:
+def over_lease_stmt(
+    max_lease_s: float, limit: int, exclude: Sequence[uuid.UUID] = ()
+) -> Select[uuid.UUID]:
     """The max-lease scan; served by `ix_minion_subtask_acquirement_acquired_at` (0008)."""
-    return (
-        select(SubtaskAcquirement.acquirement_id)
-        .where(SubtaskAcquirement.acquired_at < _cutoff(max_lease_s))
-        .order_by(SubtaskAcquirement.acquired_at)
-        .limit(limit)
+    stmt = select(SubtaskAcquirement.acquirement_id).where(
+        SubtaskAcquirement.acquired_at < _cutoff(max_lease_s)
     )
+    if exclude:
+        stmt = stmt.where(SubtaskAcquirement.acquirement_id.not_in(list(exclude)))
+    return stmt.order_by(SubtaskAcquirement.acquired_at).limit(limit)
 
 
-async def over_lease_ids(session: AsyncSession, max_lease_s: float, limit: int) -> list[uuid.UUID]:
+async def over_lease_ids(
+    session: AsyncSession, max_lease_s: float, limit: int, exclude: Sequence[uuid.UUID] = ()
+) -> list[uuid.UUID]:
     """Acquirements older than the max lease, however fresh their heartbeat (unlocked scan).
 
     Uses `ix_minion_subtask_acquirement_acquired_at` (range scan on `acquired_at`), so cost
     follows the number of expired rows, not the table size.
     """
-    rows = await session.execute(over_lease_stmt(max_lease_s, limit))
+    rows = await session.execute(over_lease_stmt(max_lease_s, limit, exclude))
     return list(rows.scalars())
 
 

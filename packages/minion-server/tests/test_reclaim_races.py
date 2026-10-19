@@ -26,6 +26,7 @@ from minion_server.services.reclaim import (
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import TEST_MODELS_FILE, S3Env, _auth, _req, make_executors, seed_task
@@ -932,15 +933,6 @@ async def test_chunked_reclaim_statement_count_is_bounded(env: tuple[AsyncClient
     assert len(seen) <= 1 + chunks * 6, len(seen)
 
 
-@pytest.fixture(autouse=True)
-def _clear_quarantine() -> Any:
-    import minion_server.services.reclaim as mod
-
-    mod._QUARANTINE.clear()
-    yield
-    mod._QUARANTINE.clear()
-
-
 def _record_chunks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     import minion_server.services.reclaim as mod
 
@@ -1095,3 +1087,85 @@ async def test_failing_row_is_quarantined_for_next_cycles(
     seen.clear()
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert not res and seen == []  # quarantined: not retried (and nothing else is stale)
+
+
+@pytest.mark.integration
+async def test_quarantined_rows_do_not_hold_the_scan_slots(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uuid
+
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 4, "qs")
+    ids = [a["acquirement_id"] for a, _ in got]
+    async with sm() as s, s.begin():  # the three oldest are quarantined, one newer is stale
+        for i, aid in enumerate(ids):
+            await s.execute(
+                text(
+                    "UPDATE minion_executor_heartbeat SET last_seen_at ="
+                    " now() - make_interval(hours => 5 - :i) WHERE acquirement_id = :a"
+                ),
+                {"i": i, "a": aid},
+            )
+    for aid in ids[:3]:
+        mod._QUARANTINE[uuid.UUID(aid)] = 10**12
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=3)  # LIMIT == quarantined count
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 1
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(3,)]
+
+
+@pytest.mark.integration
+async def test_transient_errors_never_quarantine(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 3, "tr")
+    await _backdate(sm)
+
+    async def down(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        raise OperationalError("SELECT 1", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(mod, "reclaim_chunk", down)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert mod._QUARANTINE == {}
+
+
+@pytest.mark.integration
+async def test_quarantine_expires_and_is_capped(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "ex")
+    await _backdate(sm)
+    real = mod.reclaim_chunk
+    poison = True
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        if poison:
+            raise RuntimeError("boom")
+        return await real(session, ids, **kw)
+
+    monkeypatch.setattr(mod, "reclaim_chunk", flaky)
+    monkeypatch.setattr(mod, "_QUARANTINE_MAX", 2)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert len(mod._QUARANTINE) == 2  # the cap holds
+    # time passes: the quarantine lapses and the rows are reclaimed again
+    import time
+    from types import SimpleNamespace
+
+    clock = time.monotonic() + mod.QUARANTINE_S + 1
+
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock))
+    poison = False
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == len(got)
+    assert mod._QUARANTINE == {}
