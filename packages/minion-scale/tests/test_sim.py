@@ -184,7 +184,10 @@ async def test_sims_drain_a_queue_over_rest_only(lv: Live) -> None:
     # only 409 a fault-free drain may see (TASK-40).
     hb_409 = rec.statuses.get("heartbeat", Counter())[409]
     assert rec.conflicts_409 == hb_409, rec.statuses  # none on acquire/complete/release/fail
-    assert hb_409 <= rec.events["completed"]  # at most one racing beat per completion
+    # Lost ownership shows up as a complete 409 (and breaks completed == 12 / the outcomes).
+    # The bound and discarded_stale only document expectations at these timings: one heartbeater
+    # per assignment stops at its first 409, and no beat is sent during the 0.05 s work phase.
+    assert hb_409 <= rec.events["completed"]
     assert "complete_409" not in rec.events and "discarded_stale" not in rec.events
     assert {"acquire_assigned", "acquire_empty", "heartbeat", "complete", "output_put"} >= set(
         rec.latency
