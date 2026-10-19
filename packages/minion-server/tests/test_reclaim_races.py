@@ -1136,39 +1136,292 @@ async def test_transient_errors_never_quarantine(
     assert mod._QUARANTINE == {}
 
 
+def _poison_one(mod: Any, poisoned: set[str], exc: Exception) -> Any:
+    """Patch `reclaim_chunk` so any call containing a poisoned id raises `exc`."""
+    real = mod.reclaim_chunk
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        if any(str(i) in poisoned for i in ids):
+            raise exc
+        return await real(session, ids, **kw)
+
+    return flaky
+
+
 @pytest.mark.integration
-async def test_quarantine_expires_and_is_capped(
+async def test_quarantine_expires(
     env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import time
+    from types import SimpleNamespace
+
     import minion_server.services.reclaim as mod
 
     c, app = env
     sm: Sm = app.state.sessionmaker
     got = await _acquire_many(c, sm, 3, "ex")
     await _backdate(sm)
-    real = mod.reclaim_chunk
-    poison = True
-
-    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
-        if poison:
-            raise RuntimeError("boom")
-        return await real(session, ids, **kw)
-
-    monkeypatch.setattr(mod, "reclaim_chunk", flaky)
-    monkeypatch.setattr(mod, "_QUARANTINE_MAX", 2)
-    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
-    assert len(mod._QUARANTINE) == 2  # the cap holds
-    # time passes: the quarantine lapses and the rows are reclaimed again
-    import time
-    from types import SimpleNamespace
-
+    poisoned = got[0][0]["acquirement_id"]
+    monkeypatch.setattr(mod, "reclaim_chunk", _poison_one(mod, {poisoned}, RuntimeError("boom")))
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 2
+    assert [str(k) for k in mod._QUARANTINE] == [poisoned]
+    # time passes: the quarantine lapses and the row is reclaimed again
     clock = time.monotonic() + mod.QUARANTINE_S + 1
-
+    monkeypatch.undo()  # unpoison
     monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock))
-    poison = False
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 1
+    assert mod._QUARANTINE == {}
+
+
+def test_full_quarantine_evicts_soonest_expiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+    import uuid
+
+    import minion_server.services.reclaim as mod
+    from structlog.testing import capture_logs
+
+    monkeypatch.setattr(mod, "_QUARANTINE_MAX", 3)
+    base = time.monotonic() + 10_000
+    ids = [uuid.uuid4() for _ in range(3)]
+    for i, k in enumerate([ids[1], ids[0], ids[2]]):  # ids[1] expires first
+        mod._QUARANTINE[k] = base + i
+    new = uuid.uuid4()
+    with capture_logs() as logs:
+        assert mod._quarantine_add(new, "RuntimeError") is True
+    assert len(mod._QUARANTINE) == 3 and new in mod._QUARANTINE
+    assert ids[1] not in mod._QUARANTINE
+    assert mod._quarantine_evicted == 1
+    full = [e for e in logs if e["event"] == "reclaim_quarantine_full"]
+    assert full and full[0]["evicted_acquirement_id"] == str(ids[1]) and full[0]["max"] == 3
+    # re-adding a present id never evicts
+    with capture_logs():
+        assert mod._quarantine_add(new, "RuntimeError") is False
+    assert mod._quarantine_evicted == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), AttributeError("boom")])
+async def test_systemic_chunk_failure_quarantines_nothing(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    import minion_server.services.reclaim as mod
+    from structlog.testing import capture_logs
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "sy")
+    await _backdate(sm)
+    real = mod.reclaim_chunk
+
+    async def broken(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(mod, "reclaim_chunk", broken)
+    with capture_logs() as logs:
+        await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert mod._QUARANTINE == {}
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(3,)]
+    systemic = [e for e in logs if e["event"] == "reclaim_chunk_systemic"]
+    assert len(systemic) == 1 and systemic[0]["failed"] == 3
+    assert systemic[0]["error_type"] == type(exc).__name__
+    # the code bug is fixed: the very next tick reclaims everything
+    monkeypatch.setattr(mod, "reclaim_chunk", real)
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == len(got)
+
+
+async def _ordered_ids(sm: Sm, mod: Any, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Pin the scan order of stale acquirements and use 2-row chunks; returns the ids in order."""
+    from minion_server.repositories import reclaim as rrepo
+
+    ids = [
+        str(r[0])
+        for r in await _rows(
+            sm, "SELECT acquirement_id FROM minion_executor_heartbeat ORDER BY acquirement_id"
+        )
+    ]
+    monkeypatch.setattr(mod, "RECLAIM_CHUNK", 2)
+    real_stale = rrepo.stale_ids
+
+    async def ordered(*a: Any, **k: Any) -> Any:
+        found = {str(i): i for i in await real_stale(*a, **k)}
+        return [found[i] for i in ids if i in found]
+
+    monkeypatch.setattr(rrepo, "stale_ids", ordered)
+    return ids
+
+
+def _fail_by_id(mod: Any, errors: dict[str, Exception], calls: list[list[str]]) -> Any:
+    real = mod.reclaim_chunk
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        calls.append([str(i) for i in ids])
+        for i in ids:
+            if str(i) in errors:
+                raise errors[str(i)]
+        return await real(session, ids, **kw)
+
+    return flaky
+
+
+@pytest.mark.integration
+async def test_proof_from_a_later_chunk_quarantines_earlier_failures(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 6, "xc")
+    await _backdate(sm)
+    ids = await _ordered_ids(sm, mod, monkeypatch)
+    errors: dict[str, Exception] = {
+        ids[0]: OperationalError("SELECT 1", {}, Exception("blip")),  # infrastructure: never
+        ids[1]: RuntimeError("boom"),  # the whole head chunk fails, later chunks are healthy
+    }
+    monkeypatch.setattr(mod, "reclaim_chunk", _fail_by_id(mod, errors, []))
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 4
+    assert {str(k) for k in mod._QUARANTINE} == {ids[1]}
+    assert ids[0] not in {str(k) for k in mod._QUARANTINE}
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(2,)]
+
+
+@pytest.mark.integration
+async def test_all_chunks_failing_quarantines_nothing(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 6, "ac")
+    await _backdate(sm)
+    ids = await _ordered_ids(sm, mod, monkeypatch)
+    real = mod.reclaim_chunk
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        mod, "reclaim_chunk", _fail_by_id(mod, {i: RuntimeError("boom") for i in ids}, calls)
+    )
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert len(calls) == 5  # chunk 1, its two single-row retries, chunks 2 and 3 without redo
     assert mod._QUARANTINE == {}
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(6,)]
+    monkeypatch.setattr(mod, "reclaim_chunk", real)
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 6
+
+
+@pytest.mark.integration
+async def test_systemic_flag_is_cleared_by_later_proof(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 8, "sf")
+    await _backdate(sm)
+    ids = await _ordered_ids(sm, mod, monkeypatch)
+    # chunks: [0,1] all bad | [2,3] mixed | [4,5] healthy | [6,7] mixed
+    bad = {ids[0], ids[1], ids[2], ids[6]}
+    monkeypatch.setattr(
+        mod, "reclaim_chunk", _fail_by_id(mod, {i: RuntimeError("boom") for i in bad}, [])
+    )
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    # chunk 2: redo skipped (systemic), so ids[3] stays acquired and ids[2] is not quarantined;
+    # chunk 3 proves, quarantining chunk 1; chunk 4's redo runs again: ids[7] expired, ids[6] bad
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 3
+    assert {str(k) for k in mod._QUARANTINE} == {ids[0], ids[1], ids[6]}
+    left = {
+        r[0] for r in await _rows(sm, "SELECT acquirement_id::text FROM minion_subtask_acquirement")
+    }
+    assert left == {ids[0], ids[1], ids[2], ids[3], ids[6]}
+
+
+@pytest.mark.integration
+async def test_quarantine_log_has_no_payload(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+    from structlog.testing import capture_logs
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "lg")
+    await _backdate(sm)
+    poisoned = got[0][0]["acquirement_id"]
+    monkeypatch.setattr(mod, "reclaim_chunk", _poison_one(mod, {poisoned}, RuntimeError("SECRET")))
+    with capture_logs() as logs:
+        await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert "SECRET" not in repr(logs)
+    q = [e for e in logs if e["event"] == "reclaim_quarantined"]
+    assert len(q) == 1
+    assert {k for k in q[0] if k not in ("event", "log_level")} == {
+        "acquirement_id",
+        "until",
+        "error_type",
+    }
+    assert q[0]["acquirement_id"] == poisoned and q[0]["error_type"] == "RuntimeError"
+    summary = [e for e in logs if e["event"] == "reclaim_quarantine_summary"]
+    assert len(summary) == 1 and summary[0]["size"] == 1 and summary[0]["added"] == 1
+
+
+@pytest.mark.integration
+async def test_lock_timeout_55p03_is_not_quarantined(
+    env: tuple[AsyncClient, Any], fresh_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real DB: a row lock held elsewhere + lock_timeout raises 55P03 -> not row-specific."""
+    import minion_server.services.reclaim as mod
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "lt")
+    await _backdate(sm)
+    victim = got[0][0]["acquirement_id"]
+    (victim_subtask,) = (
+        await _rows(
+            sm,
+            "SELECT subtask_id FROM minion_subtask_acquirement WHERE acquirement_id = :a",
+            a=victim,
+        )
+    )[0]
+    eng = create_async_engine(fresh_url, connect_args={"server_settings": {"lock_timeout": "300"}})
+    sm2: Sm = async_sessionmaker(eng, expire_on_commit=False)
+    seen: list[tuple[type[BaseException], Any]] = []
+    real_rs = mod._row_specific
+
+    def spy(exc: BaseException) -> bool:
+        orig = exc.orig if isinstance(exc, DBAPIError) else None
+        seen.append((type(exc), getattr(orig, "sqlstate", None)))
+        return real_rs(exc)
+
+    monkeypatch.setattr(mod, "_row_specific", spy)
+    try:
+        async with sm() as blocker:
+            await blocker.execute(
+                text("SELECT 1 FROM minion_subtask WHERE subtask_id = :s FOR UPDATE"),
+                {"s": victim_subtask},
+            )
+            res = await reclaim_stale(sm2, timeout_s=TIMEOUT, batch_size=100)
+            await blocker.rollback()
+        assert res[ReclaimResult.EXPIRED_REQUEUED] == 2
+        assert mod._QUARANTINE == {}
+        assert await _rows(
+            sm,
+            "SELECT count(*) FROM minion_subtask_acquirement WHERE acquirement_id = :a",
+            a=victim,
+        ) == [(1,)]
+        assert seen and all(t is not OperationalError and st == "55P03" for t, st in seen)
+        assert all(issubclass(t, DBAPIError) for t, _ in seen)
+        res = await reclaim_stale(sm2, timeout_s=TIMEOUT, batch_size=100)
+        assert res[ReclaimResult.EXPIRED_REQUEUED] == 1
+    finally:
+        await eng.dispose()
 
 
 class _PgError(Exception):
@@ -1200,12 +1453,13 @@ async def test_sqlstate_classifies_quarantine(
 
     c, app = env
     sm: Sm = app.state.sessionmaker
-    await _acquire_many(c, sm, 2, "ss")
+    got = await _acquire_many(c, sm, 3, "ss")
     await _backdate(sm)
-
-    async def fail(session: AsyncSession, ids: Any, **kw: Any) -> Any:
-        raise DBAPIError("stmt", {}, _PgError(sqlstate))
-
-    monkeypatch.setattr(mod, "reclaim_chunk", fail)
+    poisoned = got[0][0]["acquirement_id"]
+    monkeypatch.setattr(
+        mod,
+        "reclaim_chunk",
+        _poison_one(mod, {poisoned}, DBAPIError("stmt", {}, _PgError(sqlstate))),
+    )
     await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
-    assert (len(mod._QUARANTINE) == 2) is quarantined
+    assert len(mod._QUARANTINE) == (1 if quarantined else 0)

@@ -4,7 +4,7 @@ title: Reclaim quarantine hardening (TASK-35 follow-ups)
 status: In Progress
 assignee: []
 created_date: '2026-10-19 20:35'
-updated_date: '2026-10-19 23:03'
+updated_date: '2026-10-19 23:11'
 labels:
   - watchdog
   - reliability
@@ -20,8 +20,14 @@ TASK-35 security LOWs + review NIT: (1) services/reclaim.py:95-107 any non-trans
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Systemic failure (every row of a chunk fails) quarantines nothing
-- [ ] #2 Full quarantine evicts soonest-expiring and is counted
-- [ ] #3 Quarantine entry logged without payloads; size observable
-- [ ] #4 Real-DB 55P03 test passes
+- [x] #1 Systemic failure (every row of a chunk fails) quarantines nothing
+- [x] #2 Full quarantine evicts soonest-expiring and is counted
+- [x] #3 Quarantine entry logged without payloads; size observable
+- [x] #4 Real-DB 55P03 test passes
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in services/reclaim.py: quarantine only when a peer row of the chunk committed an expiry, else reclaim_chunk_systemic (error) and retry next tick; full quarantine evicts soonest-expiring (reclaim_quarantine_full, evicted_total); logs reclaim_quarantined (acquirement_id, until, error_type) + per-call reclaim_quarantine summary (size observable via structlog only; watchdog has no /metrics). Tests in test_reclaim_races.py incl. real-DB 55P03 (lock_timeout + held row lock). ADR-0008 + ARCHITECTURE updated.
+<!-- SECTION:NOTES:END -->
