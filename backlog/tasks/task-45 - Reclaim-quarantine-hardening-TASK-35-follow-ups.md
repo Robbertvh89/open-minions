@@ -1,9 +1,10 @@
 ---
 id: TASK-45
 title: Reclaim quarantine hardening (TASK-35 follow-ups)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-19 20:35'
+updated_date: '2026-10-19 23:03'
 labels:
   - watchdog
   - reliability
