@@ -154,6 +154,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
 - **Control loop** (`ExecutorLoop.run`): one private temp dir (`mkdtemp`, mode 0700, removed in
   `finally`). Optional register, then repeat: `acquire` → if transport error or 5xx, backoff and retry;
   if 4xx, raise (exit non-zero); if no assignment, backoff; else handle one subtask.
+- **GPU duty guard (TASK-15):** `capacity/gpu_meter.py` (in-process IOKit reader), `capacity/gpu_guard.py` (pure guard, one per worker pid), sampled in the loop's watcher (§3.6). KILL → `interrupt` + release `GPU_DUTY_VIOLATION` / `GPU_METER_UNAVAILABLE`.
 - **Per subtask** (`_execute`): ranged GET of `[byte_start, byte_end)` → parse exactly `record_count`
   records → `ensure_model` + `run` in batches of `budget.max_batch_size` (worker) → write JSONL to the
   temp dir → presigned POST → `complete` with `record_count`, `byte_size`, `sha256`. In/out files are
@@ -549,6 +550,8 @@ subtask; a dead governor task stops the executor (exit 1). One executor per stat
    seen). Raising niceness and toggling background QoS work live, also inside the sandbox; lowering
    nice needs a respawn. The control side verifies it (`WorkerHandle.priority_ok()`) and samples the worker's memory footprint
    (`worker/footprint.py`: `proc_pid_rusage` on macOS, `/proc` on Linux).
+
+**Controller-side GPU guard (TASK-15, ADR-0006 D17).** The duty above is self-paced by the worker, so the control process does not trust it. One sampler per worker pid (`loop.py`, sample times jittered ±20 %) reads that pid's `accumulatedGPUTime` through `capacity/gpu_meter.py` (in-process IOKit, about 1 ms per read) and feeds `capacity/gpu_guard.py` (a pure state machine: 10 s window, limit = allowed duty + 10 pp, KILL after 30 s over the limit, at once when paused or idle, KILL above 4 GPU clients per pid). A KILL interrupts the worker and releases the subtask with `GPU_DUTY_VIOLATION`; repeated meter errors release with `GPU_METER_UNAVAILABLE`. This is a backstop, not a throttle: SIGSTOP gating is TASK-15.1.
 
 **Optional adaptive mode (Q5):** read total GPU utilization from IORegistry
 (`AGXAccelerator` → `PerformanceStatistics` → `Device Utilization %`, no sudo) and lower duty cycle

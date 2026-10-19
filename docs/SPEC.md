@@ -257,6 +257,7 @@ macOS has no GPU partitioning or GPU quota API, so the executor enforces the bud
   | `gpu_duty_cycle` | 10–100 % | Governor pauses between generation steps / embedding batches so GPU busy-time ≈ target share |
   | `max_batch_size` | records | Caps batch size → caps KV-cache growth and per-step GPU burst length |
   | `cpu_priority` | `background` \| `low` \| `normal` | Worker runs with background QoS (`taskpolicy -b`) / `nice`; tokenizer & I/O threads capped |
+**Status (TASK-15):** the control process enforces `gpu_duty_cycle` without trusting the worker. It meters each worker pid's GPU time itself (IOKit `accumulatedGPUTime`) and judges a 10 s window against duty + 10 pp. Over the limit for 30 s, or at once while paused or idle, the worker is killed and the subtask released with `GPU_DUTY_VIOLATION` (then the normal local failure back-off); repeated meter errors release with `GPU_METER_UNAVAILABLE`. `status.json` reports the last kill as `gpu_violation`. Off darwin and under the fake engine the guard is disabled (one log line); on darwin a meter that exists but fails its startup read stops `run` (exit 2). The kill rung enforces the budget without worker cooperation; the throttle rung (SIGSTOP gating) is TASK-15.1 and not implemented. Ollama and HF/MPS are not metered (ADR-0006 D17).
 - FR-51. **Profiles.** Built-in profiles; all values overridable in `~/.config/minion/executor.toml`:
   | Profile | memory | GPU duty | max batch | CPU | Intended use |
   |---|---|---|---|---|---|

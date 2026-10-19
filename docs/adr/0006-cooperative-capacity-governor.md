@@ -349,6 +349,27 @@ DVFS-robust). It does not replace the human study
 ([docs/usability/nf7-video-call-protocol.md](../usability/nf7-video-call-protocol.md)), which stays
 open. Procedure: docs/bench/governor-measurements.md.
 
+**D17 GPU duty guard (amendment, TASK-15).** D3 made the worker's own pacing the only GPU duty control and reported `busy_s/wall_s` as advisory. A worker that skips pacing (a compromised or buggy one, SPEC §8) could exceed the owner's `gpu_duty_cycle`. The control process now measures each worker pid's GPU time itself and enforces the duty without worker cooperation:
+- **Meter.** `capacity/gpu_meter.py` reads the per-process `accumulatedGPUTime` in-process over IOKit and CoreFoundation (ctypes, about 1 ms per read; `ioreg` remains for `bench`). Shares use per-client positive deltas, because summing values per pid gives negative shares.
+- **Guard.** `capacity/gpu_guard.py` is a pure state machine. Window 10 s, judged once the span is at least 8 s. Limit = allowed duty + 10 pp (NF-8); after a duty drop the old duty stays allowed for a 5 s grace. Over the limit for 30 s continuously → KILL. While paused or idle, allowed = 0 and judging uses a 2 s quiet span, so the verdict is immediate. More than 4 distinct GPU clients for one worker pid → KILL (evasion by client churn). Three consecutive meter errors → fail closed.
+- **One sampler per worker pid.** `loop.py` runs one continuous guard per worker pid with jittered sample times (±20 %), so the window spans subtask boundaries (a per-subtask window let back-to-back short subtasks escape, fixed in be3be7f).
+- **Enforcement.** KILL → `interrupt()` and release with `GPU_DUTY_VIOLATION` (or `GPU_METER_UNAVAILABLE` for the meter), handled as a local fault with the normal failure back-off. An idle warm worker is unloaded (`gpu_duty_violation`) with the same back-off. Logs carry numbers only; `status.json` gains `gpu_violation` (the reason of the last kill).
+- **Startup.** `run` reads the meter once. A reader that exists but fails its first read → exit 2. No reader (off darwin) or the fake engine → one log line, guard disabled.
+- **Not done.** SIGSTOP/SIGCONT duty gating (a throttle rung before the kill) is TASK-15.1. Until then a violation is a kill, not a slowdown.
+
+**Rejected:** a QoS clamp (`setpriority(PRIO_DARWIN_GPU)` returns EPERM without privileges, and there is no public GPU priority API); a budget downgrade or IPC pause (an uncooperative worker ignores both).
+
+**Numbers** (`docs/bench/m-task15-gpu-guard-apple-m3-pro.md`, M3 Pro, mlx 0.32.4, `bench --budget-check`, 3 repeats): the worst honest 10 s window was 22.9 % at light (limit 40 %) and 45.6 % at balanced (limit 60 %); full (duty 100 %) never acts. Every honest row had exactly 1 GPU client. Real-worker rogue (`gpu_burn_s` hook, light): killed and released `GPU_DUTY_VIOLATION`; first over-limit verdict about 10 s after the burn started, kill 30 s later, about 49 s in total.
+
+**Residual risks.**
+- Client churn: a worker that opens and closes GPU clients between samples can hide share from per-client deltas. The cap of 4 clients per pid kills above that, but short-lived clients inside one sample interval are not seen individually.
+- Ollama: its GPU time belongs to the daemon, not the worker pid, so the guard reads about 0 (ADR-0009 caveat; Ollama is opt-in).
+- HF/MPS: not measured on this Mac. The defaults were measured on MLX only.
+- No gating yet: a rogue with a deep command queue keeps running until the 30 s kill, and committed command buffers keep draining while stopped (TASK-15.1 spike).
+- Host GPU busy: the rogue `gpu` tests skip (they do not fail) when another process keeps the GPU busy, so they give no evidence on such a host.
+- The bench numbers were taken at f1a07d0, before the per-pid continuous guard (be3be7f); the bench file's "short subtasks blind spot" finding is therefore superseded by the code, not by new measurements.
+
+
 ## Measurements
 
 > M3 Pro (36 GB, macOS 27.0.1), TASK-5.6: docs/bench/m4-governor-apple-m3-pro.{json,md} (NF-8, NF-9 CI) and docs/bench/m4-governor-cpu-apple-m3-pro.json (NF-4). The first per-process run found a pacing bug (mlx-lm async_eval work running during the pacer sleep: qwen balanced 74–76 % at duty 50 %), fixed by quantum pacing; see the .md for the history.
