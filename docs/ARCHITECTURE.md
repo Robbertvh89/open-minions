@@ -681,4 +681,4 @@ Reverse proxy and flood limits (ADR-0018): the server never reads `X-Forwarded-F
 - [ADR-0009](adr/0009-offline-sandboxed-inference-worker.md): Offline, sandboxed inference worker with a pinned, verified model fetch — **Accepted**
 - [ADR-0010](adr/0010-web-ui-session-auth.md): Web UI login with an API key and a stateless session cookie; OIDC via reverse proxy — **Accepted**
 - [ADR-0012](adr/0012-in-memory-executor-rate-limits.md): In-memory per-replica rate limits on register/acquire/presence (soft state, not coordination) — **Accepted**
-- ADR-0006: Cooperative capacity governor (duty cycling) for partial allocation *(to write)*
+- [ADR-0006](adr/0006-cooperative-capacity-governor.md): Cooperative capacity governor (duty cycling) for partial allocation; D17 controller-side GPU guard (TASK-15) — **Accepted**

@@ -71,3 +71,7 @@ All 18 rows pass the NF-8 verdicts (hard, accuracy, memory).
   judged only after 0.8 x 10 s = 8 s. A worker that burns the GPU in back-to-back subtasks shorter than 8 s is
   never judged (8 subtasks of 3 s each ran at about 70 % busy without a verdict). The same blind spot hides the
   between-subtask gaps unless the idle guard fires. Honest workers are unaffected.
+  **Fixed after this measurement** (one continuous guard window per worker pid, a single sampler across
+  subtasks, idle and pause; the watcher is kicked on a pending kill): the test is no longer xfail and passes on
+  a quiet GPU. The honest-worker numbers above were measured before the fix; the fix does not change how an
+  honest steady batch is sampled.
