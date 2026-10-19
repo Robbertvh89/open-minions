@@ -21,11 +21,13 @@ During TASK-38 verification minion-executor run failed repeatedly with 'error: w
 <!-- AC:BEGIN -->
 - [x] #1 Probe survives a slow worker start (configurable or adaptive timeout, tested)
 - [x] #2 Error message names the likely cause
-- [x] #3 Large-RSS pytest source identified or ruled out
+- [ ] #3 Large-RSS pytest source identified or ruled out
 <!-- AC:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
 Probe timeout now MINION_EXECUTOR_PROBE_TIMEOUT_S (default 90, 10..900), tripled under warn/critical memory pressure (logged engine_probe_waiting_for_memory), timeout error names memory pressure + knob; shared by service install. RSS: no repro (mlx extra not installed in worktree, gpu tests skipped). Prime suspect by inspection: test_gpu_guard_gpu.py::test_burn_hook_saturates_the_gpu runs fake._gpu_burn in a thread of the pytest process with no mx memory/cache limit, plus module-scoped in-process MLX runner fixtures in test_mlx_runners_gpu.py; fix proposed as follow-up (run burn in a subprocess / set mx limits).
+
+AC#3 not reproduced (no mlx extra in worktree); suspects moved to TASK-44.
 <!-- SECTION:NOTES:END -->
