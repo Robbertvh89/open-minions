@@ -53,7 +53,7 @@ docs/                # SPEC.md, ARCHITECTURE.md, ADRs in docs/adr/
 
 ```bash
 uv sync                                   # install workspace
-uv sync --package minion-executor --extra mlx --extra hf  # optional engines: mlx, hf (Apple Silicon; extras are per package)
+uv sync --all-packages --extra mlx --extra hf  # optional engines: mlx, hf (Apple Silicon); --all-packages keeps the other CLIs (--package alone removes them)
 cp .env.example .env                      # dev settings (database_url is required)
 docker compose -f deploy/compose.yml up -d  # postgres + s3 (seaweedfs) + grafana (infra only)
 docker compose -f deploy/compose.yml --profile app up -d --build  # + migrate (one-shot alembic), server, watchdog in the hardened image (deploy/Dockerfile); server on 127.0.0.1:${MINION_SERVER_HOST_PORT:-8080}; API keys from ${MINION_SECRETS_DIR:-./secrets}/api-keys.yaml (chmod 600, dir mounted read-only); MINION_UI_SESSION_SECRET / MINION_METRICS_TOKEN read from the shell or deploy/.env (compose project dir is deploy/, not the repo-root .env); Linux hosts: chown the secrets dir and file to uid 10001

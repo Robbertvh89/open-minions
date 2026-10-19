@@ -94,7 +94,7 @@ def _gpu_skip_reason(selected: str) -> str:
     try:
         import mlx.core  # noqa: F401
     except ImportError:
-        return "install the mlx extra: uv sync --package minion-executor --extra mlx"
+        return "install the mlx extra: uv sync --all-packages --extra mlx"
     return ""
 
 

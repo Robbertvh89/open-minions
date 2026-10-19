@@ -2,7 +2,7 @@
 
 How the numbers in [ADR-0006](../adr/0006-cooperative-capacity-governor.md) "Measurements" are
 produced. CI covers the logic with the fake engine; the GPU, `ioreg` and real signals need a Mac.
-Prepare: on AC power, close heavy apps, `uv sync --package minion-executor --extra mlx --extra hf`,
+Prepare: on AC power, close heavy apps, `uv sync --all-packages --extra mlx --extra hf`,
 models cached once (`bench` downloads them on first use, network). Nothing here needs a server.
 
 Result files for the M3 Pro run: `docs/bench/m4-governor-apple-m3-pro.json` (budget check, from
