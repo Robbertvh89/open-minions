@@ -57,7 +57,7 @@ class ExecutorSettings(BaseSettings):
 
     # Seconds the startup engine probe (worker start + importing mlx/torch) may take. Starting the
     # sandboxed worker is slow while macOS swaps; raise this on a loaded Mac. Under warn/critical
-    # memory pressure the probe gets 3x this (capped at the maximum).
+    # memory pressure the probe gets 2x this, capped at 300 s (never below the set value).
     probe_timeout_s: float = Field(
         default=DEFAULT_PROBE_TIMEOUT_S, ge=10, le=900, allow_inf_nan=False
     )

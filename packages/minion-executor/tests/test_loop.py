@@ -2139,7 +2139,9 @@ async def test_second_sigterm_during_blocking_probe_exits_cleanly(
     monkeypatch.setattr(m, "restrict_environ", lambda: None)
     started = threading.Event()
 
-    def blocking_probe(requested: list[Engine], sandbox: object = None) -> list[Engine]:
+    def blocking_probe(
+        requested: list[Engine], sandbox: object = None, **_kw: object
+    ) -> list[Engine]:
         started.set()
         if not m._probe_cancelled.wait(10):  # only a cancel (second signal) ends it
             raise AssertionError("probe was never cancelled")

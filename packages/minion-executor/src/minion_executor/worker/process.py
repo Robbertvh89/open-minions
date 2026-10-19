@@ -90,6 +90,10 @@ class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
     """The worker process died or its pipe closed unexpectedly."""
 
 
+class WorkerTimeout(WorkerCrashed):
+    """A worker call exceeded its timeout (the worker was alive but too slow)."""
+
+
 def env_allowed(name: str) -> bool:
     return name in _ALLOWED_NAMES or name.startswith(_ALLOWED_PREFIXES)
 
@@ -605,7 +609,7 @@ class WorkerHandle:
                                 raise _SelfTestFailedError
                             raise WorkerCrashed(f"worker exited with code {proc.exitcode}")
                         if time.monotonic() > deadline:
-                            raise WorkerCrashed("worker timed out")
+                            raise WorkerTimeout("worker timed out")
                         if hard_deadline is not None and time.monotonic() > hard_deadline:
                             raise WorkerCrashed("worker exceeded its deadline")
                         continue

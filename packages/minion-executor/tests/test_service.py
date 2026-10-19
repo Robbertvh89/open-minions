@@ -93,6 +93,11 @@ def test_no_secret_in_plist_even_when_set() -> None:
         assert secret.encode() not in data
 
 
+def test_probe_timeout_knob_is_carried_into_the_plist() -> None:
+    doc = plistlib.loads(render(env={"MINION_EXECUTOR_PROBE_TIMEOUT_S": "240"}))
+    assert doc["EnvironmentVariables"]["MINION_EXECUTOR_PROBE_TIMEOUT_S"] == "240"
+
+
 def test_example_plist_equals_render() -> None:
     assert EXAMPLE.read_bytes() == render()
 

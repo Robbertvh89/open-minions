@@ -37,6 +37,7 @@ log = structlog.get_logger()
 
 SCHEMA_VERSION = 1
 GIB = 1024**3
+# Bench probes keep a fixed 90 s (a hand-run dev tool; not MINION_EXECUTOR_PROBE_TIMEOUT_S).
 PROBE_TIMEOUT_S = 90.0
 DEFAULT_RECORDS = 256
 DEFAULT_BATCH_SIZES = (1, 8, 32)
