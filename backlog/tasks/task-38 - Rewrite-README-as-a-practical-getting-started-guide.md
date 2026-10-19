@@ -1,9 +1,10 @@
 ---
 id: TASK-38
 title: Rewrite README as a practical getting-started guide
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 18:18'
+updated_date: '2026-10-19 12:33'
 labels:
   - docs
 dependencies: []

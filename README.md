@@ -3,476 +3,401 @@
 Open-source implementation of *Minions: A Dynamic and Distributed Virtual GPU Cloud Built on Idle
 Apple Silicon Devices* (Li et al., [arXiv:2610.12970](https://arxiv.org/abs/2610.12970)).
 
-Idle Apple Silicon Macs run an **executor** that *pulls* batch inference subtasks (embeddings, LLM
-completions) from a central **server**, runs them on the local GPU with [MLX](https://github.com/ml-explore/mlx)
-and writes the results to S3. The owner of the Mac chooses a **capacity budget** (memory, GPU duty
-cycle, batch size, CPU priority), and the executor yields to them: it pauses under memory pressure,
-thermal stress or low battery, stops cleanly on SIGTERM and never keeps the Mac awake.
-
-There is no central scheduler. Coordination happens through PostgreSQL (behind a REST API) and a
-unique-constraint acquisition protocol: whichever executor inserts the row into
-`minion_subtask_acquirement` first owns the subtask. A **watchdog** reclaims subtasks from executors
-that stop sending heartbeats. Large payloads never pass through the server: executors only hold
-short-lived presigned S3 URLs and never talk to PostgreSQL.
+- Idle Apple Silicon Macs run an **executor** that *pulls* batch inference jobs (embeddings, LLM
+  completions) from a central **server**, runs them on the local GPU with
+  [MLX](https://github.com/ml-explore/mlx) and writes the results to S3.
+- The Mac's owner sets a **capacity budget** and the executor yields to them: it pauses under memory
+  pressure, thermal stress or low battery, and never keeps the Mac awake.
+- There is no central scheduler: coordination is PostgreSQL behind a REST API, and a **watchdog**
+  takes work back from executors that go silent.
 
 ```
- submitter (minion CLI / web UI / REST)
-        |  HTTPS + user API key              uploads input JSONL, downloads results
-        v                                         |
-  +-------------+   SQL   +------------+          v
-  | server/API  |<------->| PostgreSQL |     +---------+
-  | (FastAPI)   |         +------------+     |   S3    |
-  +------+------+              ^             +----+----+
-         ^                     | SQL              ^
-         | REST + executor     |                  | presigned GET / POST
-         | token (pull)   +----+-------+          |
-         |                | watchdog   |          |
-         |                | (reclaim)  |          |
-   +-----+----------------+------------+----------+-----+
-   |  executor (Mac)   executor (Mac)   executor (Mac)  ...
-   |  poll -> acquire -> run in sandboxed worker -> upload -> report
-   +-----------------------------------------------------+
+ you: minion CLI / web UI --> server (FastAPI) <--> PostgreSQL        S3 (inputs, results)
+                                  ^                                       ^
+                                  | REST + executor token (pull)          | presigned URLs
+                                  +------------ executor on a Mac -------+
+                                  watchdog: requeues work from silent executors
 ```
 
-Docs: [Specification](docs/SPEC.md) (what it must do) | [Architecture](docs/ARCHITECTURE.md) (how it
-is built) | [Decision records](docs/adr/).
+**Status.** Milestones M0 to M5 are implemented and tested; read [Known limitations](#known-limitations)
+before running it on people's work laptops.
 
-## Status and limitations
+## Requirements
 
-Milestones M0 to M5 (protocol, fault tolerance, real engines, capacity governor, ops usability and
-the `minion` submitter CLI) are implemented and tested, except the human NF-7 study (see below). The scale test and a menu-bar app (M6) are
-not. Some things are measured only on one Mac, or not at all; read [Known limitations](#known-limitations)
-before you rely on it, in particular if you plan to run it on people's work laptops.
+| What | Why |
+|---|---|
+| An Apple Silicon Mac (M1 or later) | the executor and MLX need it (the server side also runs on Linux) |
+| [`uv`](https://docs.astral.sh/uv/) | installs Python 3.12 and all packages |
+| Docker with Compose v2 | PostgreSQL, S3 (SeaweedFS), Grafana, server, watchdog |
+| A few GB of free disk and network | images, plus a small model download on first use |
 
-## Quick start (local, about 10 minutes, no GPU needed)
+## Quick start: everything on one Mac (about 15 minutes)
 
-This runs the whole stack on one machine: PostgreSQL, S3 (SeaweedFS), Grafana, the server and the
-watchdog in Docker, and one executor natively with the **fake engine** (deterministic, no model, no
-GPU). You can follow it on Linux or macOS; real engines need an Apple Silicon Mac
-([next section](#using-real-models-on-a-mac)).
+You will start the server stack in Docker, run an executor natively on your Mac with a real MLX
+model, submit two small jobs and look at the results. Run the commands from the repository root, in
+**one terminal** (the `export`s matter), unless a step says otherwise.
 
-**Prerequisites:** Docker with Compose v2, [`uv`](https://docs.astral.sh/uv/), Python 3.12+ (uv
-installs it), git. Free host ports 8080 (server), 5432, 9000 and 3000. If one is taken, set
-`MINION_SERVER_HOST_PORT`, `MINION_PG_PORT`, `MINION_S3_PORT` or `MINION_GRAFANA_PORT` (for example
-`export MINION_SERVER_HOST_PORT=18080`) and use that port below. If you change the S3 port, set
-`MINION_CLI_S3_ENDPOINT_URL` (step 8) to match.
+**Ports.** The stack listens on `127.0.0.1` ports `8080` (server), `5432` (PostgreSQL), `9000` (S3)
+and `3000` (Grafana). If one is taken, set `MINION_SERVER_HOST_PORT`, `MINION_PG_PORT`,
+`MINION_S3_PORT` or `MINION_GRAFANA_PORT` before step 3 and use that port wherever this guide says
+`8080`, `9000` or `3000`. To keep this stack apart from other open-minions containers and volumes,
+add `-p some-name` right after `docker compose` in every command.
 
-**1. Clone and install**
+### 1. Install
 
 ```bash
 git clone https://github.com/Robbertvh89/open-minions.git && cd open-minions
-uv sync
+uv sync --all-packages --extra mlx --extra hf
 ```
 
-**2. Create an API key and the secrets directory.** The key is printed once; the keys file only
-holds its hash.
+`--all-packages` installs the server, CLI and admin tools next to the executor; `--extra mlx` is the
+default inference engine and `--extra hf` the fallback engine. Plain `uv sync` leaves both engines
+out, and `uv sync --package minion-executor ...` removes the other packages, so use the line above.
+
+### 2. Create an API key (and the web UI secret)
+
+The API key is what *you* use to submit work. It is printed once; the keys file keeps only its hash.
 
 ```bash
 mkdir -p deploy/secrets && chmod 700 deploy/secrets
-out=$(uv run minion-server-admin generate-api-key --name demo --teams demo)
+out=$(uv run minion-server-admin generate-api-key --name me --teams demo)
 export MINION_API_KEY=$(printf '%s\n' "$out" | sed -n 's/^api key (shown once): //p')
 printf '%s\n' "$out" | sed -n '/^keys:/,$p' > deploy/secrets/api-keys.yaml
 chmod 600 deploy/secrets/api-keys.yaml
+export "$(uv run minion-server-admin generate-ui-secret)"    # optional: turns on the web UI at /ui
 ```
 
-On **Linux** the server runs as uid 10001 and refuses a keys file owned by anyone else: it fails to
-start (restart loop, `up --wait` fails, and `docker compose logs server` shows the ownership error).
-Give it the files:
-`sudo chown -R 10001:10001 deploy/secrets`. (Alternative: keep them `root:root`, directory 0755 and
-file 0644.) On macOS Docker Desktop this is not needed.
-
-**3. Optional: enable the web UI.** The UI is off (404) unless a session secret is set before the
-server starts.
+### 3. Start the stack
 
 ```bash
-export "$(uv run minion-server-admin generate-ui-secret)"
+docker compose -f deploy/compose.yml --profile app up -d --build --wait
+curl -sf http://localhost:8080/healthz        # {"status":"ok"}
 ```
 
-**4. Start the stack** with the dev override, which adds the models `fake-embed` and
-`fake-complete` to the server's model allow-list (never use that file in production):
+The first run builds the server image (a few minutes). This starts PostgreSQL, S3, Grafana, a
+one-shot database migration, the server and the watchdog. The server only accepts the models in
+[`deploy/models.yaml`](deploy/models.yaml): `bge-small-en` (embeddings) and
+`qwen2.5-0.5b-instruct` (completions), both on MLX, plus `-hf` variants for the fallback engine.
+
+### 4. Issue an executor token and put it in the Keychain
+
+The executor has its own credential, separate from your API key. It is printed once.
 
 ```bash
-docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app up -d --build --wait
-curl -sf http://localhost:8080/healthz
+docker compose -f deploy/compose.yml --profile app exec -T server \
+  minion-server-admin issue-executor-token --owner me
+security add-generic-password -s open-minions-executor -a "$USER" -w
 ```
 
-The first build takes a few minutes. `up --wait` returns when postgres, S3, the server and the
-watchdog are healthy.
+The second command asks for the password: paste the token (the `token (shown once): ...` line of the
+first command). The executor reads the Keychain item `open-minions-executor` by itself.
 
-**5. Issue an executor token** (printed once; the server stores only a hash):
+### 5. Run the executor
+
+Open a **second terminal** in the repository and start it:
 
 ```bash
-docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app exec -T server \
-  minion-server-admin issue-executor-token --owner demo
+uv run minion-executor run --server http://localhost:8080 --profile light
 ```
 
-The command prints `executor_id: ...` and `token (shown once): ...`. Export the token without
-putting it in your shell history: run this, paste the token (nothing is echoed), press Enter:
+It probes its engines in the sandbox (`engines: mlx,hf`) and then waits for work. Leave it running.
+Models download on first use, so the first job is slow.
 
-```bash
-read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN
-```
+> **Nothing happens? Run `uv run minion-executor status` first.** On battery power, at a macOS
+> memory-pressure warning, at a serious thermal state or in Low Power Mode the executor pauses by
+> design, and `status` shows `paused (<reason>)`. For the quick start, plug in the charger and quit
+> heavy apps. See [Troubleshooting](#troubleshooting).
 
-**6. Run a dev executor with the fake engine** (in a second terminal, in the repo, with
-`MINION_EXECUTOR_TOKEN` exported there too). `MINION_EXECUTOR_DEV=1` is what allows the `fake`
-engine. On a Mac the fake engine runs in the normal Seatbelt sandbox (checked). The executor
-pauses on battery power and under memory pressure by default, so on a laptop plug in the charger or
-submit will wait forever (see Troubleshooting below).
+### 6. Submit a job
 
-```bash
-MINION_EXECUTOR_DEV=1 uv run minion-executor run --server http://localhost:8080 --engines fake
-```
-
-On Linux there is no Seatbelt sandbox; the worker skips it for the fake engine only (any other engine
-fails closed), so no extra flag is needed. The Linux path is untested.
-
-`MINION_EXECUTOR_DEV=1` and `MINION_EXECUTOR_SANDBOX=0` are for local development only. Never set
-them on a machine that runs real tasks.
-
-**7. Create sample input.** One JSON object per line. Embedding input needs `id` and `text`:
-
-```bash
-cat > embed.jsonl <<'EOF'
-{"id": "a1", "text": "The quick brown fox jumps over the lazy dog."}
-{"id": "a2", "text": "Idle laptops make a cheap GPU cloud."}
-{"id": "a3", "text": "Embeddings turn text into vectors."}
-EOF
-```
-
-Completion input needs `id` and either `prompt` or `messages` (chat turns):
-
-```bash
-cat > complete.jsonl <<'EOF'
-{"id": "c1", "prompt": "Write a haiku about idle laptops."}
-{"id": "c2", "messages": [{"role": "user", "content": "Name three prime numbers."}]}
-{"id": "c3", "prompt": "Translate 'good morning' to French."}
-EOF
-```
-
-**8. Submit.** The CLI is configured through `MINION_CLI_*` variables. The S3 values below are the
-dev stack's loopback defaults; a real deployment uses `https` and scoped credentials
-([Submitters](#submitters)).
+Back in the first terminal. The CLI needs the server, your team and the S3 location (these are the
+local stack's defaults; a real deployment gives you scoped credentials):
 
 ```bash
 export MINION_CLI_SERVER=http://localhost:8080 MINION_CLI_TEAM=demo
 export MINION_CLI_S3_ENDPOINT_URL=http://localhost:9000 MINION_CLI_S3_BUCKET=minion
 export MINION_CLI_S3_ACCESS_KEY=minion MINION_CLI_S3_SECRET_KEY=minion-secret
-uv run minion submit --type embedding --model fake-embed embed.jsonl -o out-embed --name demo-embed
-uv run minion submit --type completion --model fake-complete complete.jsonl -o out-complete --name demo-complete
+
+uv run minion submit --type embedding --model bge-small-en examples/embeddings.jsonl -o out-embed --name my-embeddings
+uv run minion submit --type completion --model qwen2.5-0.5b-instruct examples/completions.jsonl -o out-complete --name my-completions
 ```
 
-`submit` uploads the file to S3, creates the task, waits for it and downloads the results. Look at
-what you got (`head` shows record content, so only do this with data you can see):
+`submit` uploads the file to S3, creates the task, waits for it and downloads the results into
+`-o DIR`. The samples are [`examples/embeddings.jsonl`](examples/embeddings.jsonl) (5 sentences) and
+[`examples/completions.jsonl`](examples/completions.jsonl) (3 prompts).
+
+### 7. Look at the results
 
 ```bash
-ls -a out-embed               # results.jsonl  manifest.json  parts/  .minion.lock
-head -n 3 out-embed/results.jsonl
+ls -a out-embed                       # results.jsonl  manifest.json  parts/  .minion.lock
+head -c 200 out-embed/results.jsonl   # {"id":"e1","embedding":[-0.10,...
+cat out-complete/results.jsonl
+uv run minion status my-embeddings    # SUCCEEDED, subtasks 1/1 done
 ```
 
-Each line is `{"id", "embedding" | "completion", "model", "model_revision", ...}`. The fake engine
-returns an 8-dimensional hash vector and echoes the prompt.
+Every result line has the record `id`, the `embedding` or `completion`, and the `model` and
+`model_revision` that produced it.
 
-**9. Follow up** (these work for any task by name, also after Ctrl-C of `submit`, which never
-cancels):
+### 8. Web UI and Grafana
+
+- **Web UI:** <http://localhost:8080/ui>. Log in with your API key from step 2. You see your tasks and
+  subtasks and can create and cancel tasks. A 404 means the UI secret was not set when the server
+  started: export it as in step 2 and run step 3 again.
+- **Grafana:** <http://localhost:3000>, user `admin`, password `admin` (dev default). The dashboards
+  `open-minions: tasks` and `open-minions: fleet` show task progress and executor activity.
+
+### 9. Stop
+
+Press Ctrl-C in the executor terminal; it finishes or releases the current subtask first. Then:
 
 ```bash
-uv run minion status demo-embed       # status and subtask counts; exit code follows the status
-uv run minion fetch demo-embed -o out-embed    # re-download; finished parts are skipped
-uv run minion submit --type embedding --model fake-embed embed.jsonl --no-wait --name demo-two
-uv run minion cancel demo-two         # the only way to cancel
+docker compose -f deploy/compose.yml --profile app down        # stop; keeps database, S3 data, Grafana
+docker compose -f deploy/compose.yml --profile app down -v     # stop and DELETE that data
+rm -rf out-embed out-complete deploy/secrets
+security delete-generic-password -s open-minions-executor      # remove the token from the Keychain
 ```
 
-The instant fake engine may finish `demo-two` before you cancel; `cancel` then says `TASK_FINISHED`
-(`409`, exit 2). To see a cancel, stop the executor first (Ctrl-C), submit, cancel, then restart it.
+## Day to day as a Mac owner
 
-**10. Look around.** Web UI: <http://localhost:8080/ui> (log in with the API key from step 2; you
-see the task list, details, the create form and cancel). Grafana: <http://localhost:3000>, login
-`admin` / `admin` (dev default), dashboards `open-minions: tasks` and `open-minions: fleet`.
+You run the executor on your own Mac and keep working. This is how you stay in control.
 
-**11. Tear down.** Stop the executor with Ctrl-C in its terminal (it finishes or releases the
-current subtask first).
+### Run it as a background service
 
-```bash
-docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app down
-rm -rf embed.jsonl complete.jsonl out-embed out-complete
-rm -rf deploy/secrets      # on Linux after the chown: sudo rm -rf deploy/secrets
-```
-
-`down` keeps the data volumes, so old tasks survive and an executor (FIFO) would process these
-leftovers first next time. For a clean slate use `down -v` instead (this **deletes** all dev
-data: database, S3 objects, Grafana).
-
-**Troubleshooting.** `submit` waits and nothing happens: run `uv run minion-executor status`; it
-prints `state: paused (<reason>)`. On battery the executor is paused by default (`on_battery`; with
-`allow_on_battery = true` it pauses as `low_battery` once the charge is under the minimum): plug in,
-or set `allow_on_battery = true` in `~/.config/minion/executor.toml` ([Mac owners](#mac-owners)) and
-restart the executor, which reads that file only at start. It also pauses at a memory-pressure
-warning.
-
-## Using real models on a Mac
-
-On an Apple Silicon Mac, reuse Quick start steps 2, 5 and 8, but start the stack **without**
-`compose.dev.yml` (the stock model allow-list, no fake models), and in step 8 submit with
-`--model bge-small-en` or `--model qwen2.5-0.5b-instruct`. Start the stack and issue the token with:
-
-```bash
-docker compose -f deploy/compose.yml --profile app up -d --build --wait
-docker compose -f deploy/compose.yml --profile app exec -T server \
-  minion-server-admin issue-executor-token --owner <name>
-```
-
-Then install the engines and run without the dev flags (if you changed a host port, use it in
-`--server` and the `MINION_CLI_*` values):
-
-```bash
-uv sync --package minion-executor --extra mlx --extra hf     # mlx: default engine; hf: fallback
-read -rs MINION_EXECUTOR_TOKEN && export MINION_EXECUTOR_TOKEN   # paste the token, Enter (no echo)
-# or use the Keychain (recommended, see Mac owners)
-uv run minion-executor run --server http://localhost:8080 --profile light
-```
-
-The first subtask loads the model: a few seconds with the weights cached (see
-[`docs/bench/m3-apple-m3-pro.md`](docs/bench/m3-apple-m3-pro.md)), longer when it must download first.
-
-- `--engines auto` (the default) probes `mlx` and `hf` in a sandboxed worker subprocess and
-  advertises what works (exit 2 if none). Ollama is opt-in (`--engines ollama`, see
-  [ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)). `fake` needs `MINION_EXECUTOR_DEV=1`.
-- The server only accepts models from its allow-list, [`deploy/models.yaml`](deploy/models.yaml):
-  `qwen2.5-0.5b-instruct` (completion, mlx), `bge-small-en` (embedding, mlx) and their `-hf` variants.
-  Each entry pins a revision. Models are downloaded on first use into the model cache by a pinned,
-  sha256-verified subprocess, so the first subtask on a Mac is slow and needs network access to the
-  Hugging Face hub.
-- Profiles `light` (25 % of RAM, 30 % GPU duty, batch 4), `balanced` (40 %, 50 %, 8), `full`
-  (70 %, 100 %, 32) and `custom`. Omit `--profile` for adaptive mode ([Mac owners](#mac-owners)).
-- Measure your own Mac: `uv run minion-executor bench --models deploy/bench-models.yaml --model <id>`
-  (`uv run minion-executor bench --help` lists all modes). Results from an M3 Pro: [`docs/bench/`](docs/bench/m3-apple-m3-pro.md).
-  Measurement procedures: [`docs/bench/governor-measurements.md`](docs/bench/governor-measurements.md).
-
-## Guides
-
-### Operators
-
-You run the server, database, S3, watchdog, Grafana and hand out keys and tokens.
-
-**Deploy.** `deploy/compose.yml` is a dev stack (default passwords, no TLS, loopback ports). For
-production use managed PostgreSQL 16, an S3 bucket, at least two server replicas and one or two
-watchdogs, one deployment per team or organisation for isolation. The container image
-(`deploy/Dockerfile`) runs `migrate`, `minion-server` and `minion-watchdog`. Run the server behind a
-reverse proxy that terminates **TLS** (required outside local dev, S-6), forwards `Host` with the port
-and applies per-key/per-IP rate limits on `/api/v1/tasks`, `/api/v1/executors` and `POST /ui/login`
-(S-12, S-13). Run `migrate` as the schema owner and the server as a non-superuser DML-only role. All
-settings are `MINION_*` environment variables; the documented list is [`.env.example`](.env.example).
-Details: [ARCHITECTURE §6](docs/ARCHITECTURE.md).
-
-**API keys** (user credentials) live in a YAML file named by `MINION_API_KEYS_FILE`, no database
-table ([ADR-0007](docs/adr/0007-api-keys-config-file.md)):
-
-```bash
-uv run minion-server-admin generate-api-key --name <who> --teams a,b [--operator] [--expires-days N]
-```
-
-It prints the key once and the entry (a SHA-256 hash) to add under `keys:`. `--operator` grants the
-fleet view (`GET /executors`, `/ui/fleet`); `--expires-days` (1..3650) sets an expiry. The file is
-re-read when it changes (`MINION_API_KEYS_RELOAD_S`, 5 s), so deleting an entry revokes the key
-within that interval. Replace the file atomically (temp file plus rename); it must be on local disk,
-owned by root or the server user and not group/world-writable, else the server refuses it and fails
-closed. Per-team pool policy (`default_pool`, `allowed_pools`) is described in SPEC S-1.
-
-**Executor tokens** (per-executor, hashed, revocable, 90 days by default):
-
-```bash
-uv run minion-server-admin issue-executor-token --owner <name> [--pool default] [--ttl-days 1..365]
-uv run minion-server-admin list-executors            # never prints token hashes
-uv run minion-server-admin rotate-executor-token --executor-id <uuid> [--ttl-days N]   # same id, new token once
-uv run minion-server-admin revoke-executor-token --executor-id <uuid>
-```
-
-In the compose stack run these with `docker compose ... exec -T server minion-server-admin ...` as in
-the quick start. A revoked or expired token gets `401` on its next request. Pools restrict which
-executors may run a task (`allowed_pool`), the control for confidential data.
-
-**Web UI.** Set `MINION_UI_SESSION_SECRET` (at least 32 bytes; make it with
-`uv run minion-server-admin generate-ui-secret`) and, in production, `MINION_UI_ALLOWED_HOSTS`
-(DNS-rebinding guard). Users log in with their API key; the session lasts `MINION_UI_SESSION_TTL_S`
-(8 h). See [ADR-0010](docs/adr/0010-web-ui-session-auth.md).
-
-**Grafana and observability.** Dashboards are provisioned from `deploy/grafana/dashboards/`. Grafana
-connects as `minion_grafana`, a member of `minion_readonly`, which can only `SELECT` from the
-`minion_ro` views (no token hashes, params or object keys). Set `MINION_GRAFANA_DB_PASSWORD` and
-`GF_SECURITY_ADMIN_PASSWORD` outside dev. The fleet dashboard shows per-owner activity: keep Grafana
-operator-only, and point it at a read replica in production (the role cannot stop a hostile Grafana
-user from exhausting CPU or memory). `/healthz` is always on; Prometheus `/metrics` is off unless
-`MINION_METRICS_ENABLED=true`, and with `MINION_METRICS_TOKEN` (32+ chars) it requires
-`Authorization: Bearer <token>`. Logs never contain payload content.
-
-**Rate limits.** Executor endpoints are rate-limited in memory per replica (`429` with
-`Retry-After`); the intervals and defaults are in [`.env.example`](.env.example) and
-[ADR-0012](docs/adr/0012-in-memory-executor-rate-limits.md). Put per-IP limits at the proxy.
-
-**Storage and S3 policy.** Executors only get presigned URLs (default TTL 900 s); give each team's
-submitters their **own** scoped credentials, never the server's, and add lifecycle rules and a
-bucket quota. The exact policy is in [SPEC S-14](docs/SPEC.md) and S-2.
-
-**Watchdog.** `uv run minion-watchdog` (DB access only, no S3) reclaims subtasks whose heartbeat is
-older than `MINION_HEARTBEAT_TIMEOUT_S` (900 s) or whose lease exceeds `MINION_MAX_LEASE_S` (6 h),
-and sweeps stragglers of cancelled tasks. Keep the timeout at 2 to 3 times the executor heartbeat
-interval (300 s default). The compose healthcheck uses a liveness file. See
-[ADR-0008](docs/adr/0008-fault-tolerance-reclaim-and-cancel.md).
-
-**Not covered here:** database backups and restore, S3 replication, Postgres high availability.
-Plan for them yourself.
-
-### Mac owners
-
-You donate idle capacity and keep working. Full install notes:
-[`docs/ops/executor-install.md`](docs/ops/executor-install.md).
-
-**Menu-bar app:** `uv run minion-executor menubar` shows a status item to pause, resume and pick
-the profile without a terminal. Launch it at login with `uv run minion-executor menubar install`
-(`--dry-run` previews the plist; `menubar uninstall` removes it; independent of the executor service).
-
-**Install as a background service** (per-user LaunchAgent, [ADR-0011](docs/adr/0011-launchd-user-agent.md)).
-Install a non-editable copy (launchd cannot read `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud
-Drive, and `service install` refuses an install that references them), put the token in the Keychain
-and install:
+The service is a per-user launchd agent. launchd cannot read `~/Documents`, `~/Desktop`,
+`~/Downloads` or iCloud Drive, so install a copy of the executor with `uv tool` instead of using the
+repository's `.venv`. The token must be in the Keychain (quick start step 4).
 
 ```bash
 uv tool install './packages/minion-executor[mlx]'
-security add-generic-password -s open-minions-executor -a "$USER" -w     # paste the token when asked
-minion-executor service install --server https://minions.example.com --dry-run   # print the plist
-minion-executor service install --server https://minions.example.com
+minion-executor service install --server http://localhost:8080 --dry-run   # print the plist, change nothing
+minion-executor service install --server http://localhost:8080             # write the plist and load it
 minion-executor service status
 ```
 
-To remove it again: `minion-executor service uninstall`.
+`--server` must be `https://...` for anything but localhost. Other options: `--profile`, `--engines`,
+`--label`, `--no-load`. After you update the checkout, re-run `uv tool install --reinstall ...`. The
+log is `~/Library/Logs/open-minions/executor.log`. Remove the service with `minion-executor service
+uninstall`. If `minion-executor` is not found after `uv tool install`, add `~/.local/bin` to your `PATH`. Details: [`docs/ops/executor-install.md`](docs/ops/executor-install.md).
 
-Options: `--profile`, `--engines`, `--label`, `--no-load`. For real use keep the token in the Keychain
-(launchd cannot see `$MINION_EXECUTOR_TOKEN`, so the service needs the Keychain item anyway). The log is
-`~/Library/Logs/open-minions/executor.log`.
-
-**Profiles.** `--profile light|balanced|full|custom` pins a profile. Without `--profile` the
-executor is **adaptive**: it starts on `active_profile` from `executor.toml` (default `light`) and
-switches to `idle_profile` (default `full`) when you have been away for `idle_after_min` (10) on AC
-power. Memory use is capped at 75 % of RAM for every profile.
+### Menu-bar app
 
 ```bash
-uv run minion-executor pause [--for 1h]            # no new subtasks; the current one finishes or is released
-uv run minion-executor resume
-uv run minion-executor profile <light|balanced|full|custom|auto>   # auto = back to the run's pin, or adaptive
-uv run minion-executor status                      # profile, budget, paused reason, current subtask, signals
+minion-executor menubar                 # run it now: status, pause 30m/1h/2h/until resume, profile
+minion-executor menubar install         # start it at every login (--dry-run previews the plist)
+minion-executor menubar status
+minion-executor menubar uninstall
 ```
 
-The commands talk to the running executor through `control.json` and `status.json` in
-`$MINION_EXECUTOR_STATE_DIR` (default `~/Library/Application Support/open-minions`); use the same
-variable as at install. `status` exits 1 if no executor is running.
+### Pause, resume, profile, status
 
-**Automatic pauses.** No new work, and the running subtask is released after 60 s (at once under
-critical memory pressure), on: memory pressure, serious/critical thermal state, battery power (unless
-`allow_on_battery = true`, then below 30 %), Low Power Mode, an unusable `control.json`, or signals
-that cannot be read (`signals_unavailable`). Stop it
-any time with SIGTERM or `launchctl bootout`; the in-flight subtask finishes within
-`MINION_EXECUTOR_STOP_GRACE_S` (30) or is released.
-
-**`executor.toml`** at `~/.config/minion/executor.toml` (or `$MINION_EXECUTOR_CONFIG`): owner-only
-permissions, unknown keys are an error (exit 2). Keys: `active_profile`, `idle_profile`,
-`idle_after_min`, `allow_on_battery`, `min_battery_percent`, `on_call`, `[profiles.<name>]`
-overrides, `[profiles.custom]`, `[[schedule]]` (profile, `HH:MM` start/end, days).
-
-**`on_call` and privacy.** The governor can notice that a microphone or camera is in use and cap or
-pause the executor (`on_call = auto|light|pause|ignore`); no device is opened. The server learns
-your profile, memory budget and pause reason, which can reveal when you are idle or on a call;
-keyboard idle time and mic/camera state are never sent. Details and how to opt out: [SPEC
-S-11](docs/SPEC.md). Prefer a task or team with
-`minion-executor prefer --server URL (--team T [--project P] [--task-name N] | --clear)`; it is a
-hint, not a filter.
-
-**What stays on your Mac.** The executor downloads one input slice per subtask, runs it, uploads the
-output and deletes the local files (S-4). It never logs payload content and never writes it into
-`status.json`. Submitters' data is processed on your machine, so only join a pool that the operator
-and your organisation have agreed on, and expect the operator to restrict confidential tasks to
-trusted pools (S-1).
-
-**Sandbox and model cache.** Inference runs in a worker subprocess in a macOS Seatbelt sandbox with no
-network, no process exec and no access to your home directory (S-10, ADR-0009). Models are fetched by
-a separate sandboxed, pinned and checksum-verified process into
-`MINION_EXECUTOR_MODEL_CACHE_DIR` (default `~/Library/Caches/open-minions/models`), LRU-capped at
-`MINION_EXECUTOR_MODEL_CACHE_GB` (50). Only one executor may run per state directory. The idle worker
-unloads its model after `MINION_EXECUTOR_IDLE_UNLOAD_S` (600).
-
-### Submitters
-
-You send JSONL in and get JSONL out. Your operator gives you a server URL, a team, an API key and
-S3 credentials scoped to your team.
-
-**CLI.** `uv run minion` (or the `minion` script):
+These talk to the running executor (foreground or service) through files in
+`~/Library/Application Support/open-minions` (`$MINION_EXECUTOR_STATE_DIR`). Use the same state
+directory as the executor you want to control.
 
 ```bash
-minion submit --type embedding|completion --model <id> FILE... [-o DIR] [--name N] [--server URL] \
-  [--team T] [--project P] [--no-wait] [--timeout S] [--records-per-subtask N] [--priority N] \
-  [--pool P] [--params JSON]
-minion status NAME [--server URL] [--team T] [--project P]
-minion fetch NAME [-o DIR] [--wait] [--timeout S] [--server URL] [--team T] [--project P]
-minion cancel NAME [--server URL] [--team T] [--project P]
+minion-executor status                  # profile, budget, paused reason, current subtask, signals
+minion-executor pause --for 1h          # no new work; the current subtask finishes or is released
+minion-executor resume
+minion-executor profile balanced        # light | balanced | full | custom | auto
 ```
 
-`FILE...` are input JSONL files, in output order. `--params` takes a JSON object (completion:
-`temperature` 0..2, `top_p`, `max_tokens` 1..4096, `seed`, `system`; embedding: `normalize`; unknown
-keys are rejected with 422). Results land in `-o DIR` (default `./NAME`): `results.jsonl`,
-`manifest.json`, `parts/` and a `.minion.lock`. Re-running `fetch` resumes; a directory that belongs
-to another task is refused.
+| Profile | Memory | GPU duty cycle | Batch |
+|---|---|---|---|
+| `light` | 25 % of RAM | 30 % | 4 |
+| `balanced` | 40 % | 50 % | 8 |
+| `full` | 70 % | 100 % | 32 |
 
-Configuration is the environment (there is no config file):
+Memory use is capped at 75 % of RAM for every profile. Without `--profile` the executor is
+**adaptive**: it starts on `light` and switches to `full` after 10 minutes of you being away on AC
+power. `profile auto` goes back to that. `status` exits 1 if no executor is running.
+
+### What pauses it automatically
+
+No new work starts, and the running subtask is released after 60 s (at once under critical memory
+pressure), on: memory pressure, serious or critical thermal state, battery power (unless you allow it),
+Low Power Mode, an unusable `control.json`, or unreadable signals. SIGTERM, Ctrl-C and `service
+uninstall` stop it cleanly: the running subtask finishes within 30 s or is released.
+
+### `executor.toml`
+
+Optional settings file at `~/.config/minion/executor.toml` (or `$MINION_EXECUTOR_CONFIG`), owner-only
+permissions (`chmod 600`). It is read at start, so restart the executor after editing. Unknown keys
+are an error.
+
+```toml
+active_profile = "light"        # profile while you are around
+idle_profile = "full"           # profile after idle_after_min minutes away on AC power
+idle_after_min = 10
+allow_on_battery = false        # true: run on battery too, pausing below min_battery_percent
+min_battery_percent = 30
+on_call = "auto"                # auto | light | pause | ignore: back off when mic/camera is in use
+```
+
+`[profiles.<name>]` overrides and `[[schedule]]` time windows are described in
+[SPEC §4.6](docs/SPEC.md). To favour a team's work: `minion-executor prefer --server URL --team T`
+(a hint, not a filter; `--clear` removes it).
+
+### Privacy and safety
+
+- Inference runs in a worker subprocess inside a macOS Seatbelt sandbox: no network, no process exec,
+  no access to your home directory. Models are fetched by a separate pinned, checksum-verified
+  process into `~/Library/Caches/open-minions/models` (capped at 50 GB, least recently used first).
+- The executor downloads one input slice per subtask, runs it, uploads the result and deletes the
+  local files. It never logs payload contents.
+- The server learns your profile, memory budget and pause reason (so, roughly, when you are idle or
+  on a call). It never learns keyboard activity or mic/camera state. See [SPEC S-11](docs/SPEC.md).
+- Only join a pool that your operator and organisation agreed on: submitters' data is processed on
+  your Mac.
+
+## Submitting work
+
+You send JSONL in and get JSONL out. You need a server URL, a team, an API key and S3 access scoped
+to your team (the quick start shows the local values).
+
+### Input format
+
+One JSON object per line. Embeddings: `{"id": "a1", "text": "..."}`. Completions:
+`{"id": "c1", "prompt": "..."}` or `{"id": "c2", "messages": [{"role": "user", "content": "..."}]}`.
+A record that cannot be processed (for example a prompt that is too long) comes back as
+`{"id": ..., "error": "PROMPT_TOO_LONG", ...}` and does not fail the rest.
+
+### Command line
+
+```bash
+uv run minion submit --type embedding|completion --model <id> FILE... -o DIR --name NAME
+uv run minion status NAME          # status and subtask counts
+uv run minion fetch NAME -o DIR    # (re-)download results; finished parts are skipped
+uv run minion cancel NAME          # the only way to cancel; Ctrl-C of submit never cancels
+```
+
+Useful `submit` options: `--no-wait` (return after submitting, then `status` and `fetch --wait`),
+`--timeout S`, `--project P`, `--params '{"max_tokens": 64, "temperature": 0.2}'` (completion:
+`temperature`, `top_p`, `max_tokens`, `seed`, `system`; embedding: `normalize`),
+`--records-per-subtask N` (default 500), `--priority N`, `--pool P`. Several `FILE`s make one task,
+joined in order. `uv run minion submit --help` lists everything.
+
+Configuration is environment only:
 
 | Variable | Meaning |
 |---|---|
 | `MINION_API_KEY` | your API key; or the Keychain item `open-minions-api-key` (`security add-generic-password -s open-minions-api-key -a "$USER" -w`) |
-| `MINION_CLI_SERVER` | server URL (`https`, or `http` to loopback) |
-| `MINION_CLI_TEAM`, `MINION_CLI_PROJECT` | team (required, must be in your key's teams) and project (default `default`) |
-| `MINION_CLI_S3_ENDPOINT_URL` | S3 endpoint (`https`, or `http` to loopback); unset = AWS default |
-| `MINION_CLI_S3_BUCKET`, `MINION_CLI_S3_REGION` | bucket (`minion`), region (`us-east-1`) |
-| `MINION_CLI_S3_ACCESS_KEY`, `MINION_CLI_S3_SECRET_KEY` | your team-scoped credentials; unset = boto3 default chain |
-| `MINION_CLI_INPUT_PREFIX`, `MINION_CLI_OUTPUT_PREFIX` | `inputs/`, `outputs/` |
+| `MINION_CLI_SERVER` | server URL (`https`, or `http` to localhost) |
+| `MINION_CLI_TEAM`, `MINION_CLI_PROJECT` | team (must be one of your key's teams) and project (default `default`) |
+| `MINION_CLI_S3_ENDPOINT_URL`, `_BUCKET`, `_REGION` | S3 location; endpoint unset = AWS |
+| `MINION_CLI_S3_ACCESS_KEY`, `_SECRET_KEY` | your team-scoped S3 credentials; unset = the boto3 default chain |
 
-**Exit codes**
+Exit codes of `minion`:
 
 | Code | Meaning |
 |---|---|
-| 0 | task `SUCCEEDED` |
-| 1 | task `FAILED` or `CANCELLED` |
+| 0 | `SUCCEEDED` |
+| 1 | `FAILED` or `CANCELLED` |
 | 2 | usage, config, auth or other 4xx error |
-| 3 | task `PARTIAL` (some subtasks failed; fetch what succeeded) |
-| 4 | timeout, or server (also 5xx) or S3 unreachable |
-| 130 | Ctrl-C (the task keeps running; `minion cancel` is the only way to cancel) |
+| 3 | `PARTIAL`: some subtasks failed; `fetch` gets what succeeded |
+| 4 | timeout, or server or S3 unreachable |
+| 130 | Ctrl-C (the task keeps running) |
 
-**Input and output.** Embedding input: `{"id", "text"}`. Completion input: `{"id", "prompt"}` or
-`{"id", "messages": [{"role", "content"}]}`. Output lines carry `id`, `embedding` (plus `tokens`) or
-`completion` (plus `finish_reason`, `prompt_tokens`, `completion_tokens`), and always `model` and
-`model_revision`. A record that cannot be processed yields `{"id", "error": "PROMPT_TOO_LONG", ...}`
-instead of failing the subtask. Input is split by record count (`--records-per-subtask`, default 500);
-`results.jsonl` joins the parts in order. Spec: [SPEC §4.1](docs/SPEC.md).
+### Web UI
 
-**REST API** under `/api/v1`, JSON, `Authorization: Bearer <api key>`. Task create takes S3
-*prefixes* (the CLI uploads for you; with the raw API you upload first). This example reuses the
-input that `minion submit` uploaded for `demo-embed` in the quick start; `params` is optional:
+`http://<server>/ui` (when the operator enabled it): log in with your API key, list and inspect your
+team's tasks, create a task, cancel one. For big files use the CLI, which uploads straight to S3.
 
-```bash
-curl -s -H "Authorization: Bearer $MINION_API_KEY" -H 'Content-Type: application/json' \
-  -X POST http://localhost:8080/api/v1/tasks -d '{
-    "team": "demo", "project": "default", "task_name": "api-demo", "type": "embedding",
-    "model": "fake-embed", "input_uri": "s3://minion/inputs/demo/default/demo-embed/",
-    "output_uri": "s3://minion/outputs/demo/default/api-demo/"}'
-curl -s -H "Authorization: Bearer $MINION_API_KEY" \
-  http://localhost:8080/api/v1/tasks/demo/default/api-demo
-```
+### REST API
 
-The response is the task (`202`, status `SPLITTING`, later `PENDING`, `RUNNING`, `SUCCEEDED`).
+JSON under `/api/v1` with `Authorization: Bearer <api key>`: `POST /tasks`, `GET /tasks`,
+`GET /tasks/{team}/{project}/{name}`, `.../subtasks`, `POST .../cancel`. Payloads never go through
+the API: you upload to S3 first and pass prefixes. See [SPEC §6](docs/SPEC.md).
 
-Other endpoints: `GET /tasks`, `GET /tasks/{team}/{project}/{task_name}/subtasks`,
-`POST /tasks/{team}/{project}/{task_name}/cancel`, and (operator keys) `GET /executors`. Errors are
-`{"detail": {"code", "message"}}`. Full reference: [SPEC §6](docs/SPEC.md).
+## Troubleshooting
 
-**Web UI.** `/ui` (when the operator enabled it): log in with your API key, list and inspect tasks,
-create and cancel them. It is team-scoped like the API.
+**`submit` waits and nothing runs.** Run `minion-executor status`. If it says `paused (...)`:
+
+| Reason | What to do |
+|---|---|
+| `on_battery`, `low_battery` | plug in, or set `allow_on_battery = true` in `executor.toml` and restart the executor |
+| `memory_pressure` | macOS reports a memory warning (`sysctl kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical). Quit heavy apps; it resumes by itself |
+| `thermal` | the Mac is hot; it resumes when it cools down |
+| `low_power_mode` | turn Low Power Mode off |
+| `user_paused` | `minion-executor resume` |
+| `in_call` | the Mac thinks a mic or camera is in use (`on_call`); set `on_call = "ignore"` or `"light"` in `executor.toml` |
+| `control_invalid`, `signals_unavailable` | `control.json` or the macOS signals cannot be read; see the log |
+
+If `status` exits 1 (nothing running), the executor is not started; check its terminal or
+`~/Library/Logs/open-minions/executor.log`.
+
+**Executor exit codes.** `minion-executor run` exits **2** on a configuration error and does not
+retry: a missing token (put it in the Keychain, or export `MINION_EXECUTOR_TOKEN`), an `http://`
+server URL that is not localhost (use `https://`), another executor already using the state
+directory (`executor.lock`), no usable engine (`--engines auto` found neither mlx nor hf: redo
+step 1 with `--extra mlx`), or a failed sandbox self-test. It exits **1** if its capacity governor
+died. `MINION_EXECUTOR_DEV=1` and `MINION_EXECUTOR_SANDBOX=0` are for development only: never set
+them on a machine that runs real tasks.
+
+**`error: server answered 401 UNAUTHORIZED` (executor exits 1).** The token is wrong, expired or
+revoked (as a service it is logged as `permanent_failure` and not retried). Issue a new one (step 4),
+replace the Keychain item with `security add-generic-password -U -s open-minions-executor -a
+"$USER" -w`, and start the executor (service: `launchctl kickstart gui/$(id -u)/<label>`).
+
+**`error: worker timed out` at start.** The sandboxed engine probe has 90 s. On a Mac that is
+swapping heavily (check `sysctl vm.swapusage`), importing MLX can take longer; quit memory-hungry
+apps and start again, or probe only one engine with `--engines mlx`.
+
+**`401` or `403` from `minion`.** Wrong or expired API key, or `MINION_CLI_TEAM` is not one of your
+key's teams. A key you add to the keys file works within 5 s.
+
+**`429` and `503` (`SERVER_BUSY`, `TOO_MANY_ACQUIREMENTS`, `ACQUIRE_DEADLINE`).** The server is
+protecting itself. The executor waits for the `Retry-After` and retries by itself, so this only needs
+action if it never ends. `minion` reports an unreachable server as exit 4.
+
+**The server container keeps restarting (Linux).** The server runs as uid 10001 and refuses a keys
+file owned by someone else: `sudo chown -R 10001:10001 deploy/secrets` (not tested here). macOS
+does not need this.
+
+**The first job is very slow.** The model is downloading from the Hugging Face hub; it is cached
+afterwards.
+
+**A subtask failed or the worker crashed.** The control loop survives a worker crash (out of memory,
+Metal error) and releases the subtask so another attempt can run. After repeated failures the task
+ends as `FAILED` or `PARTIAL`. See `minion status NAME` and the executor log.
+
+### Day-2 operations
+
+- **Logs:** `docker compose -f deploy/compose.yml --profile app logs -f server watchdog`; executor:
+  `~/Library/Logs/open-minions/executor.log` (service) or its terminal.
+- **API keys:** `uv run minion-server-admin generate-api-key --name <who> --teams a,b
+  [--operator] [--expires-days N]`; add the entry to the keys file (live-reloaded within 5 s); delete
+  the entry to revoke.
+- **Executor tokens** (through `docker compose ... exec -T server` when the server runs in Docker):
+  `minion-server-admin issue-executor-token --owner NAME [--pool P] [--ttl-days N]`,
+  `list-executors`, `rotate-executor-token --executor-id UUID`,
+  `revoke-executor-token --executor-id UUID`. A revoked token gets 401 on its next request.
+- **Health:** `curl http://localhost:8080/healthz`. The watchdog requeues subtasks whose executor
+  stopped sending heartbeats (after 900 s by default).
+- **Update:** `git pull`, `uv sync --all-packages --extra mlx --extra hf`, then
+  `docker compose -f deploy/compose.yml --profile app up -d --build --wait` (migrations run
+  automatically), and `uv tool install --reinstall './packages/minion-executor[mlx]'` for the service.
+- **Backups:** not covered. Back up the PostgreSQL volume and the S3 bucket yourself.
+- **Benchmark your Mac:** `uv run minion-executor bench --models deploy/bench-models.yaml --model
+  qwen2.5-0.5b-mlx` (see `bench --help`; M3 Pro results in [`docs/bench/`](docs/bench/)).
+
+## Multi-Mac and team setup (preview)
+
+Running one server for several Macs and people (TLS reverse proxy, managed PostgreSQL and S3,
+per-team S3 credentials, pools for confidential data, an install guide for colleagues) is **not
+documented as a guide yet**: it is tracked as TASK-37 (colleague pilot, on hold). The compose stack in
+`deploy/compose.yml` is a development stack (default passwords, no TLS) and must not be exposed as
+is. Until the guide exists, start from [ARCHITECTURE §6-7](docs/ARCHITECTURE.md), the threat model in
+[SPEC §8](docs/SPEC.md) and [`docs/ops/executor-install.md`](docs/ops/executor-install.md).
+
+## Documentation
+
+- [`docs/SPEC.md`](docs/SPEC.md): what the system must do (requirements, API, data model, threat model)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): components, flows, decisions
+- [`docs/adr/`](docs/adr/): architecture decision records (MLX default engine, capacity governor,
+  sandboxed worker, launchd agent, ...)
+- [`docs/ops/executor-install.md`](docs/ops/executor-install.md): executor service install notes
+- [`docs/bench/`](docs/bench/): measurements on real hardware
+- [`.env.example`](.env.example): every `MINION_*` setting
 
 ## Development
 
@@ -483,13 +408,14 @@ packages/
   minion-executor/   macOS agent: governor, worker subprocess, runners (mlx, hf, ollama, fake), CLI
   minion-watchdog/   heartbeat monitor; requeues orphaned subtasks
   minion-cli/        `minion` submitter CLI
+  minion-scale/      dev-only scale harness
 migrations/          Alembic
 deploy/              docker-compose, Dockerfile, models, Grafana, launchd
-docs/                SPEC, ARCHITECTURE, ADRs (docs/adr), ops, bench, usability
+docs/                SPEC, ARCHITECTURE, ADRs, ops, bench, usability
 ```
 
 ```bash
-uv sync
+uv sync --all-packages
 cp .env.example .env
 docker compose -f deploy/compose.yml up -d         # postgres + s3 + grafana only
 uv run alembic upgrade head
@@ -499,9 +425,17 @@ uv run pytest                                      # all tests; integration need
 uv run ruff check . && uv run ruff format --check . && uv run mypy packages migrations conftest.py
 ```
 
+To try the system without a model or GPU, use the dev override (adds the models `fake-embed` and
+`fake-complete`; never in production) and the `fake` engine:
+
+```bash
+docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app up -d --build --wait
+MINION_EXECUTOR_DEV=1 uv run minion-executor run --server http://localhost:8080 --engines fake
+```
+
 Test markers: `integration` (Docker: Postgres and S3 via testcontainers, including the acquisition
-race), `macos` (Seatbelt sandbox tests, skipped elsewhere), `gpu` (real MLX models; `pytest -m "gpu or model"`),
-`model` (downloads a tiny real model; opt in), `ollama` (needs a live daemon; opt in).
+race), `macos` (Seatbelt sandbox tests), `gpu` (real MLX models), `model` (downloads a tiny real
+model), `ollama` (needs a live daemon).
 
 Invariants you must not break (details in [CLAUDE.md](CLAUDE.md)): executors never talk to
 PostgreSQL; ownership is decided only by the `INSERT ... ON CONFLICT DO NOTHING` into
@@ -510,44 +444,35 @@ PostgreSQL; ownership is decided only by the `INSERT ... ON CONFLICT DO NOTHING`
 executor yields to the user; inference runs in a worker subprocess.
 
 Workflow: every change starts with a [Backlog.md](backlog/) task, one branch and PR per change,
-Conventional Commits, done by a pipeline of project subagents (`.claude/agents/`) as described in
-CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that deviate from the paper get an ADR in
-`docs/adr/`. Performance claims about engines need a `minion-executor bench` result
-([`docs/bench/`](docs/bench/)).
+Conventional Commits, as described in CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that
+deviate from the paper get an ADR in `docs/adr/`.
 
 ## Known limitations
 
 - **NF-7 (no visible harm during video calls) is not met everywhere.** The synthetic foreground
-  proxy ([`docs/bench/m5-foreground-apple-m3-pro.md`](docs/bench/m5-foreground-apple-m3-pro.md)) fails for the
-  `minilm` embedding model at `light` (+1.11 percentage points of missed frames) and `balanced`
-  (+1.56 pp); the completion model passes. `minilm` is a bench-only model; the served embedding
-  model `bge-small-en` was not measured. The proxy is confounded by GPU clock scaling (DVFS: a
-  probe frame takes about 22 ms on an idle GPU and 9.5 ms under full load). Tracked in TASK-24.
+  proxy ([`docs/bench/m5-foreground-apple-m3-pro.md`](docs/bench/m5-foreground-apple-m3-pro.md)) fails
+  for the `minilm` embedding model at `light` (+1.11 percentage points of missed frames) and
+  `balanced` (+1.56 pp); the completion model passes. `minilm` is a bench-only model; the served
+  embedding model `bge-small-en` was not measured. Tracked in TASK-24.
 - **The human NF-7 study has not been run.** [`docs/usability/nf7-video-call-protocol.md`](docs/usability/nf7-video-call-protocol.md)
   needs at least 8 people on their own Macs. Until then, do not claim calls are unaffected.
 - **Real microphone/camera call detection is not verified on hardware** (`on_call`); it is covered by
   tests with injected signals only. Screen sharing is not detected.
 - **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15):
-a misbehaving or compromised worker can exceed it.
-  Measured on one Mac (Apple M3 Pro, [`docs/bench/`](docs/bench/)); other chips are untested.
-- **Output size is capped by the S3 policy, not the quota.** The presigned POST refuses a body above
-  `MINION_MAX_OUTPUT_BYTES`, but attempts accumulate under `_attempts/`: use a bucket quota and
-  lifecycle rules (S-2, [ADR-0017](docs/adr/0017-presigned-post-output-uploads.md)). Executors older
-  than this release are refused with `426 EXECUTOR_OUTDATED`.
+  a misbehaving or compromised worker can exceed it. Measured on one Mac (Apple M3 Pro); other chips
+  are untested.
+- **Output size is capped by the S3 policy, not the quota.** Use a bucket quota and lifecycle rules
+  (SPEC S-2, [ADR-0017](docs/adr/0017-presigned-post-output-uploads.md)).
 - **Signed `Range` reads are not verified on SeaweedFS** (the dev S3); AWS S3 and MinIO enforce them.
-  A `check-storage` admin command is planned (TASK-20).
-- **Server logs are plain, not JSON** (the watchdog's are structured; TASK-17). Task list/detail
-  aggregate subtask counts per request (TASK-16); rate-limit the read endpoints at the proxy.
+- **Server logs are plain, not JSON** (the watchdog's are structured; TASK-17).
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
-  capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)).
-- **Not built yet:** the scale test (TASK-7), timer-based split-lease renewal for very
-large single-object inputs (TASK-11).
+  capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)). Ollama
+  completions silently truncate long prompts (TASK-12).
 - **Hardening gaps (TASK-9):** no absolute per-batch wall-clock cap, no server cap on
-  `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state dir or
+  `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state directory or
   `executor.toml` (mode bits only).
-- **Ollama completions** silently truncate long prompts instead of returning `PROMPT_TOO_LONG` (TASK-12).
-- **Operations gaps:** no backup guidance, no code-signed executor build, the compose stack is
-  dev only. The web UI has no SSO (put an OIDC proxy in front).
+- **Operations gaps:** no backup guidance, no code-signed executor build, the compose stack is dev
+  only, the web UI has no SSO (put an OIDC proxy in front).
 
 Open items live in `backlog/tasks/`.
 
