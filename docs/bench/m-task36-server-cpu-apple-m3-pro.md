@@ -13,14 +13,16 @@ the scripts that produced the tables are not committed. Measured on 2026-10-19/2
 ## Verdict
 
 **ADR-0001 stands. The server-rewrite trigger is not met.** The rule in the task (all of A, B, C) fails
-on C: the throughput loss with more workers coincides with a 5x to 15x rise of the PostgreSQL claim
-query time and of claim attempts per win, so it is not "unexplained Python CPU".
+on C: the throughput shortfall with more workers coincides with the PostgreSQL claim query mean rising
+5x to 15x (W=4 to 8) and claim calls per win rising 1.6x (1.06 to 1.73), so the rule attributes it to
+PostgreSQL claim contention. This is a rule outcome, not proof that the Python cost is fine: server CPU
+per subtask grows 2.3x by W=8 and most of it is SQLAlchemy statement building (see below).
 
 | | Condition | Measured | Result |
 |---|---|---|---|
 | A | P_py >= 0.50 in P1 and P2, and C_srv >= 2 x C_pg | P_py 0.67 (P1) and 0.80 (P2); C_srv / C_pg = 4.4 (W=4), 4.1 (W=8) | met |
 | B | some W <= W_hr with E(W) < 0.70, or C_srv(W) > 1.3 x C_srv(1) | W_hr = 8; E(4) = 0.57, E(8) = 0.32; C_srv(4) = 23.4 ms = 1.62 x 14.4 ms | met |
-| C | not explained otherwise: PostgreSQL < 3 cores, claim mean ms <= 2 x W=1, generator lag p99 <= 20 ms, shed > 0 in S-sat | PostgreSQL 1.44 cores max for W <= 8 (ok); **claim mean 3.6 ms (W=4), 10.7 ms (W=8) vs 0.73 ms at W=1, limit 1.46 ms (fails)**; lag p99 <= 5 ms at W <= 8 (ok); shed 13 to 28 % (ok) | **not met** |
+| C | not explained otherwise: PostgreSQL < 3 cores, claim mean ms <= 2 x W=1, generator lag p99 <= 20 ms, shed > 0 in S-sat | PostgreSQL 1.44 cores max for W <= 8 (ok); **claim mean 3.6 ms (W=4), 10.7 ms (W=8) vs 0.73 ms at W=1, limit 1.46 ms (fails)**; lag p99 <= 5 ms at W <= 8 (ok); shed 13 to 28 % of requests (24 to 44 % of acquire attempts) (ok) | **not met** |
 
 What this means in practice:
 
@@ -29,21 +31,27 @@ What this means in practice:
   Python-level categories, and SQLAlchemy statement construction and execution alone is about 40 to
   48 % of self time (see profiles).
 - Adding workers does not scale linearly: 70, 103, 160, 176, 178, 164 completes/s at W = 1, 2, 4, 6, 8,
-  12. Server CPU per subtask rises with W (14.4 to 42.5 ms), and so does the claim query mean
-  (0.73 to 20.6 ms) and the number of claim attempts per win (1.06 to 2.19). The claim query gets
-  slower under concurrent claimers although PostgreSQL still uses only 1.4 cores at W=8, which points
-  at contention on the shared top-of-queue candidates (ADR-0013 window = 16), not at interpreter speed.
-  Evidence for that reading (not proof): at W=8 with `MINION_ACQUIRE_WINDOW=64` the claims per win fall
-  from 1.73 to 1.14, the claim mean from 10.7 to 4.0 ms and goodput rises 11 % (178 to 198/s).
+  12. The ceiling is (server cores used) / C_srv. C_srv grows with W (14.4 to 33.4 ms at W=8, 2.3x;
+  42.5 ms at W=12), and the cores used grow less than W (3.75 at W=4, 6.01 at W=8 = 0.94 and 0.75 per
+  worker). Going from W=4 to W=8 the shortfall from a doubling (1.12x instead of 2x) is a 1.43x higher
+  C_srv and a 1.25x lower core count than 8 workers at the W=4 rate: roughly 60 % cost growth and 40 %
+  fewer cores per worker.
+- Where C_srv goes: mostly Python, SQLAlchemy statement building and execution (40 to 48 % self, `sql/`
+  alone 21 to 26 %). Claim contention is a measured part of the growth, not the explanation: the claim
+  query mean rises 0.73 to 10.7 ms and claim calls per win 1.06 to 1.73, but the claim wait is async and
+  uses no server CPU. With `MINION_ACQUIRE_WINDOW=64` at W=8 calls per win fall to 1.14 (the W=2 level),
+  the claim mean to 4.0 ms and goodput rises 11 % (178 to 198/s), yet C_srv only falls 33.4 to 30.0 ms
+  (W=2: 17.2). So collisions account for about 10 % of C_srv at W=8 (about 18 % of its rise since W=1);
+  the rest is unattributed (efficiency-core spill, host and Docker VM contention, the W=1 no-multiprocess
+  metrics mode). The profile does not separate these.
 - The curve stops at about 178/s (W = 6 to 8) with the load generator, PostgreSQL, S3 and the Docker VM
   on the same 6 performance + 6 efficiency cores; H = 0.83 at W=8 and 0.93 at W=12, so the Mac itself is
   close to full. Higher W is not judged (W=12 is informational, H >= 0.85).
-- The CPU split is therefore: Python work per request is real and reducible (cheap wins below), but
-  throughput beyond W=4 is limited by claim contention and by the shared Mac, not by a Python
-  scaling wall. A different language would not remove the claim contention.
+- Python work per request is real and reducible (cheap wins below); the verdict is the pre-registered
+  rule's, and a rerun after TASK-46/47 (statements built once, fewer claim collisions) re-judges it.
 - NF-5 (stateless server, add hosts): **not measured** (one Mac). C_srv is not flat across W, so a
-  constant cost per subtask cannot be assumed, and the extra cost is claim contention against a single
-  PostgreSQL, which more hosts would share too.
+  constant cost per subtask cannot be assumed; any claim-contention part is against a single PostgreSQL,
+  which more hosts would share too.
 
 ## Configuration
 
@@ -89,7 +97,7 @@ Goodput X is completed subtasks per second over the whole run (it includes the 5
 E(W) = X(W) / (W x X(1)); E2(W) = 2 X(W) / (W x X(2)) (W=1 has a different metrics mode). Latencies
 are harness (client) bucket upper bounds.
 
-| Mix | W | n | X min / **med** / max (completes/s) | E | E2 | Server cores | X per server core | C_srv ms/subtask | C_pg ms/subtask | Postgres cores | H | client acquire / complete p99 | shed 503 % | claim calls per win | claim mean ms |
+| Mix | W | n | X min / **med** / max (completes/s) | E | E2 | Server cores | X per server core | C_srv ms/subtask | C_pg ms/subtask | Postgres cores | H | client acquire / complete p99 | shed 503 % (of acquire + complete requests) | claim calls per win | claim mean ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | S-sat | 1 | 3 | 68.6 / **69.6** / 70.4 | 1.00 | 1.35 | 1.00 | 69.3 | 14.4 | 3.2 | 0.22 | 0.17 | 500 ms / 500 ms | 28 | 1.06 | 0.7 |
 | S-sat | 2 | 3 | 102.9 / **103.3** / 103.5 | 0.74 | 1.00 | 1.78 | 58.0 | 17.2 | 3.7 | 0.38 | 0.26 | 500 ms / 500 ms | 22 | 1.14 | 1.7 |
@@ -110,16 +118,18 @@ are harness (client) bucket upper bounds.
 - Window experiment (config only, W=8, S-sat, n=2): `MINION_ACQUIRE_WINDOW=64` gives X = 197.3 and
   199.5 (median 198.4, +11 % over 178.3), claim calls per win 1.15 and 1.14, claim mean 4.0 and 3.8 ms,
   C_srv 30.0 ms (was 33.4), H 0.83. Throughput is still far from linear in W.
-- Profiler overhead: runs with py-spy attached for 120 s of 240 s lost goodput against the unprofiled
-  runs of the same config: W=4 stress 156.4 (100 Hz) and 157.3 (50 Hz) vs 169.8 (-7.4 %), W=8 sat 163.4
-  (100 Hz) and 167.4 (50 Hz) vs 178.3 (-6 to -8 %), W=1 sat 71.4 vs 69.6 (none). Halving the rate did
-  not help, and category shares at 100 and 50 Hz agree within 1.5 points (below). The shape is taken
+- Profiler overhead: profile runs last 241 s (py-spy attached for 120 s) and are compared with the
+  unprofiled curve runs. Only W=4 stress has a like-for-like baseline (241 s): 156.4 (100 Hz) and 157.3
+  (50 Hz) vs 169.8, i.e. -7.9 % and -7.4 % over the whole run. The S-sat baselines are 121 s runs, where
+  the ramp-up weighs more, so the profiled 241 s runs are favoured: W=8 sat 163.4 (100 Hz) and 167.4
+  (50 Hz) vs 178.3 (-6 to -8 %, understated) and W=1 sat 71.4 vs 69.6 ("none" may be a ramp-up artefact).
+  Halving the rate did not help, and category shares at 100 and 50 Hz agree within 2 points (below). The shape is taken
   under about 15 % lower throughput during the sampling window.
 
 ## Profiles (AC#1)
 
 py-spy `--nonblocking` (a sample of a busy thread may be dropped: 18 to 31 % of the ticks were
-"errors", so counts are partial but evenly spread). Samples are worker processes only (the supervisor
+"errors", so counts are partial; the dropped ticks are assumed unbiased). Samples are worker processes only (the supervisor
 is idle). py-spy marks threads blocked in a syscall as idle only in part, so samples whose leaf is a
 known wait are removed here: the thread-pool queue wait (`concurrent/futures/thread.py _worker`) and
 the S3 socket read/send inside botocore, 16 to 22 % of the non-idle samples. Self category: from the
@@ -229,27 +239,29 @@ libc (mostly socket writes).
 Rule as written in the task: rewrite only if all of (A), (B), (C) hold. The numbers are in the Verdict
 table. (A) and (B) hold; (C) fails because the claim mean at W = 2 to 8 is 2.3 to 14.6 times the W=1 value
 (limit 2x), with PostgreSQL below 3 cores, generator lag within limit and sheds present. Therefore
-ADR-0001 stands, no ADR-0020 is opened, and the stress ceiling is treated as sizing plus claim
-contention plus cheap Python savings. SPEC §9 NF-1 text is unchanged (the verdict does not change it).
+ADR-0001 stands and no ADR-0020 is opened. This is the outcome of the rule fixed in the TASK-36 plan
+before the runs (it applies ADR-0001's "Python CPU time, not Postgres" wording as: claim mean > 2x the
+W=1 value means Postgres-side contention explains the shortfall); it is not proof that the Python
+cost is fine. A rerun after TASK-46/47 re-judges it. SPEC §9 NF-1 text is unchanged (the verdict does not change it).
 
 The curve is judged for W <= W_hr = 8 (H < 0.85). H was 0.52 at W=4 and 0.83 at W=8, so the
 conclusion for W <= 4 is not confounded by host saturation; W=6 to 8 partly is.
 
 ## Cheap wins (self >= 5 %)
 
-Each is a proposed follow-up, not done here.
+Each is a follow-up task, not done here.
 
-1. **SQLAlchemy statement construction and cache-key generation** (`sqlalchemy/sql/*`: 21 to 26 % of
+1. **SQLAlchemy statement construction and cache-key generation** (TASK-46; `sqlalchemy/sql/*`: 21 to 26 % of
    non-idle samples, `_generate_cache_key` alone 3.5 to 4.6 %, `coercions.expect`, `schema.__init__`
    and `elements.__init__` next): the hot acquire/complete statements (`WITH cand`, claim INSERT,
    counters) are rebuilt on every call (`candidates_stmt`). Build them once (module-level statements
    with bind parameters, or Core/`text` for the claim path).
-2. **Claim collisions at W > 1** (1.73 claim calls per win at W=8, each a full round trip plus
+2. **Claim collisions at W > 1** (TASK-47; 1.73 claim calls per win at W=8, each a full round trip plus
    statement work): the window experiment above gave +11 % goodput and 10 % less server CPU per
    subtask. Tune or make the window adapt to the worker count.
-3. **asyncpg round trips** (9 to 12 % self; `complete` is 15 to 30 % asyncpg): fewer statements per
+3. **asyncpg round trips** (TASK-48; 9 to 12 % self; `complete` is 15 to 30 % asyncpg): fewer statements per
    acquire/complete (merge the per-complete SELECT/UPDATE/INSERT sequence).
-4. **S3 promote at complete** (presign/boto 2.6 % at W=4, 4.9 to 6.5 % at W=8, in the thread pool):
+4. **S3 promote at complete** (TASK-49; presign/boto 2.6 % at W=4, 4.9 to 6.5 % at W=8, in the thread pool):
    one HEAD plus one copy per complete; a shared client or fewer calls. Mind invariant 5 (idempotent
    outputs).
 
@@ -261,11 +273,11 @@ Not worth chasing: pydantic (0.4 to 0.7 %), metrics (0.3 to 0.6 %), auth (0.3 to
 - One Mac; the generator, Docker VM, PostgreSQL, S3 and the server share 12 cores (6 performance, 6
   efficiency). Efficiency E(W) mixes software effects with core heterogeneity and host contention;
   H is the guard (W <= 8). Multi-host (NF-5) was not measured.
-- S-sat is a closed loop of 500 sims with fail-fast shedding (13 to 28 % of acquire attempts shed and
+- S-sat is a closed loop of 500 sims with fail-fast shedding (13 to 28 % of acquire + complete requests, 24 to 44 % of acquire attempts, shed and
   the sims back off); X is goodput under shedding, not a pure capacity at 0 % shed.
 - py-spy overhead of about 15 % while sampling; nonblocking mode drops samples; the native split is
   one worker for 60 s at 50 Hz and has unresolved extension frames; route attribution misses the SQL
-  done in a greenlet. Category shares at two sample rates agree within 1.5 points.
+  done in a greenlet. Category shares at two sample rates agree within 2 points.
 - P4 first ran with `--subprocesses --native` (no output) and `--nonblocking --native` (rejected by
   py-spy); the reported P4 is a later run of the same config on a fresh W=4 stack.
 - Per-W stacks were rebuilt and reseeded; PENDING never fell below 782k in the matrix, so the claim query stayed on

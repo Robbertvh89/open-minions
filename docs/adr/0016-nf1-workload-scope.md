@@ -60,10 +60,13 @@ one core of twelve), with the load generator on the same cores.
   profile shows Python interpreter work dominating the acquire/complete path and adding workers or
   hosts does not scale throughput roughly linearly; if throughput scales with workers, the Python
   server stays and the gap is a sizing question.
-  **TASK-36 decided: the trigger is not met and ADR-0001 stands.** Python work is 67 to 80 % of
-  non-idle worker samples and scaling is sub-linear, but the loss coincides with claim-query contention
-  (5x to 15x slower claims at W=4 to 8 with PostgreSQL at 1.4 cores), so the rule's "not explained
-  otherwise" condition fails. Follow-ups: cheaper SQLAlchemy statement handling, fewer claim collisions at
-  W > 1.
-- Revisit if the observed production acquire rate approaches the stress rate, or if TASK-36 finds
-  server CPU per acquire that can be cut cheaply.
+  **TASK-36 decided: the trigger is not met and ADR-0001 stands.** Both clauses of the rule above hold
+  (Python-level work is 67 % of non-idle worker samples in P1 and 80 % in P2; efficiency E(4) = 0.57), but
+  the verdict rests on the condition fixed in the TASK-36 plan before the runs, which applies ADR-0001's
+  "not Postgres" wording: if the claim query mean exceeds 2x its W=1 value (3.6 ms at W=4, 10.7 ms at
+  W=8 vs 0.73 ms), the shortfall is attributed to PostgreSQL claim contention (see the Decision section of
+  the [report](../bench/m-task36-server-cpu-apple-m3-pro.md)). This is a rule outcome, not proof that the
+  Python cost is fine: server CPU per subtask grows 2.3x by W=8. A rerun after TASK-46 (statements built
+  once) and TASK-47 (fewer claim collisions) re-judges it.
+- Revisit if the observed production acquire rate approaches the stress rate. (TASK-36 did find server
+  CPU per acquire that can be cut cheaply: follow-ups TASK-46 to TASK-49.)

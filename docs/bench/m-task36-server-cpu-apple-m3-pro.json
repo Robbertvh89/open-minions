@@ -4035,7 +4035,6 @@
  "profiles": [
   {
    "bad_lines": 0,
-   "pids": 1,
    "samples_all": 36775,
    "samples_wait_excluded": 7514,
    "samples": 28612,
@@ -4269,11 +4268,13 @@
    "rate_hz": 100,
    "duration_s": 120,
    "mode": "nonblocking",
-   "run": "prof-P1-w4"
+   "run": "prof-P1-w4",
+   "pyspy_target_pids": 1,
+   "pyspy_error_ticks": 13243,
+   "pyspy_error_tick_pct": 26.5
   },
   {
    "bad_lines": 0,
-   "pids": 1,
    "samples_all": 18620,
    "samples_wait_excluded": 3668,
    "samples": 14577,
@@ -4507,11 +4508,13 @@
    "rate_hz": 50,
    "duration_s": 120,
    "mode": "nonblocking",
-   "run": "prof-P1b-w4"
+   "run": "prof-P1b-w4",
+   "pyspy_target_pids": 1,
+   "pyspy_error_ticks": 6339,
+   "pyspy_error_tick_pct": 25.4
   },
   {
    "bad_lines": 1,
-   "pids": 2,
    "samples_all": 87698,
    "samples_wait_excluded": 19267,
    "samples": 65752,
@@ -4745,11 +4748,13 @@
    "rate_hz": 100,
    "duration_s": 120,
    "mode": "nonblocking",
-   "run": "prof-P2-w8"
+   "run": "prof-P2-w8",
+   "pyspy_target_pids": 2,
+   "pyspy_error_ticks": 20021,
+   "pyspy_error_tick_pct": 18.6
   },
   {
    "bad_lines": 1,
-   "pids": 1,
    "samples_all": 44074,
    "samples_wait_excluded": 9614,
    "samples": 33020,
@@ -4983,11 +4988,13 @@
    "rate_hz": 50,
    "duration_s": 120,
    "mode": "nonblocking",
-   "run": "prof-P2b-w8"
+   "run": "prof-P2b-w8",
+   "pyspy_target_pids": 1,
+   "pyspy_error_ticks": 10001,
+   "pyspy_error_tick_pct": 18.5
   },
   {
    "bad_lines": 1,
-   "pids": 1,
    "samples_all": 8383,
    "samples_wait_excluded": 1319,
    "samples": 6885,
@@ -5217,7 +5224,10 @@
    "rate_hz": 100,
    "duration_s": 120,
    "mode": "nonblocking",
-   "run": "prof-P3-w1"
+   "run": "prof-P3-w1",
+   "pyspy_target_pids": 1,
+   "pyspy_error_ticks": 3799,
+   "pyspy_error_tick_pct": 31.2
   },
   {
    "samples_main_thread": 1122,
@@ -5306,7 +5316,9 @@
    "rate_hz": 50,
    "duration_s": 60,
    "mode": "blocking, --native, one uvicorn worker (main thread only)",
-   "run": "prof-P4b-w4"
+   "run": "prof-P4b-w4",
+   "pyspy_error_ticks": 1421,
+   "pyspy_error_tick_pct": 31.7
   }
  ],
  "decision": {
