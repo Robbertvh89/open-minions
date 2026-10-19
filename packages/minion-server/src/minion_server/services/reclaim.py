@@ -39,6 +39,9 @@ _BY_STATUS = {
 }
 
 _EXPIRED = frozenset(_BY_STATUS.values())
+QUARANTINE_S = 600.0  # a row that failed even alone is skipped this long
+_QUARANTINE_MAX = 1000
+_QUARANTINE: dict[uuid.UUID, float] = {}
 RECLAIM_CHUNK = 100  # acquirements per transaction: bounds lock time and rollback size
 
 
@@ -46,6 +49,7 @@ def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | Recl
     """Pure reclaim decision for one locked, freshly classified acquirement (FR-31, ADR-0014)."""
     o = row.owned
     cancelled = o.task_status == TaskStatus.CANCELLED
+    cap_reached = False
     if row.stale:
         if unacked_free_cap > 0 and row.never_acked:
             if row.unacked_used < unacked_free_cap:
@@ -59,13 +63,7 @@ def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | Recl
                         "retryable": True,
                     },
                 )
-            log.info(
-                "unacked_cap_reached",
-                acquirement_id=str(o.acquirement_id),
-                subtask_id=o.subtask_id,
-                attempt=o.attempt,
-                free_cap=unacked_free_cap,
-            )
+            cap_reached = True
         code, message = "HEARTBEAT_TIMEOUT", "no heartbeat"
     elif row.over_lease:
         code, message = "MAX_LEASE_EXCEEDED", "max lease exceeded"
@@ -76,6 +74,7 @@ def decide(row: repo.ReclaimRow, *, unacked_free_cap: int) -> repo.Finish | Recl
         AttemptOutcome.EXPIRED,
         next_status(row.budget_used + 1, o.max_attempts, retryable=True, task_cancelled=cancelled),
         error={"code": code, "message": message, "retryable": True},
+        cap_reached=cap_reached,
     )
 
 
@@ -86,6 +85,7 @@ async def reclaim_chunk(
     timeout_s: float,
     max_lease_s: float | None = None,
     unacked_free_cap: int = 0,
+    cap_hits: list[repo.Finish] | None = None,
 ) -> dict[uuid.UUID, ReclaimResult]:
     """Reclaim a chunk inside the caller's open transaction (caller commits).
 
@@ -106,6 +106,8 @@ async def reclaim_chunk(
             results[row.owned.acquirement_id] = d
         else:
             finishes.append(d)
+            if d.cap_reached and cap_hits is not None:
+                cap_hits.append(d)
             results[row.owned.acquirement_id] = _BY_STATUS[d.subtask_status]
     await repo.finish_reclaimed(session, finishes)
     return results
@@ -151,6 +153,10 @@ async def reclaim_stale(
                 hits=len(over),
             )
             ids += [i for i in over if i not in seen]
+    now = time.monotonic()
+    for k in [k for k, until in _QUARANTINE.items() if until <= now]:
+        del _QUARANTINE[k]
+    ids = [i for i in ids if i not in _QUARANTINE]
     kw: dict[str, Any] = {
         "timeout_s": timeout_s,
         "max_lease_s": max_lease_s,
@@ -159,20 +165,35 @@ async def reclaim_stale(
     results: Counter[ReclaimResult] = Counter()
     for start in range(0, len(ids), RECLAIM_CHUNK):
         chunk = ids[start : start + RECLAIM_CHUNK]
+        hits: list[repo.Finish] = []
         try:
             async with sm() as s, s.begin():
-                done = await reclaim_chunk(s, chunk, **kw)
+                done = await reclaim_chunk(s, chunk, cap_hits=hits, **kw)
         except Exception as exc:  # poisoned chunk: isolate the bad row, keep the rest
             log.error("reclaim_chunk_failed", size=len(chunk), error_type=type(exc).__name__)
             done = {}
+            hits = []
             for aid in chunk:
+                row_hits: list[repo.Finish] = []
                 try:
                     async with sm() as s, s.begin():
-                        done[aid] = await reclaim_one(s, aid, **kw)
+                        one = await reclaim_chunk(s, [aid], cap_hits=row_hits, **kw)
+                    done[aid] = one[aid]
+                    hits += row_hits
                 except Exception as exc2:  # one bad row must not block the rest of the batch
                     log.error(
                         "reclaim_failed", acquirement_id=str(aid), error_type=type(exc2).__name__
                     )
+                    if len(_QUARANTINE) < _QUARANTINE_MAX:  # skip it for a while: no 101 tx/cycle
+                        _QUARANTINE[aid] = time.monotonic() + QUARANTINE_S
+        for f in hits:
+            log.info(
+                "unacked_cap_reached",
+                acquirement_id=str(f.owned.acquirement_id),
+                subtask_id=f.owned.subtask_id,
+                attempt=f.owned.attempt,
+                free_cap=unacked_free_cap,
+            )
         for aid, res in done.items():
             results[res] += 1
             if res in _EXPIRED:

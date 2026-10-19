@@ -17,7 +17,6 @@ from sqlalchemy import (
     false,
     func,
     literal,
-    null,
     select,
     tuple_,
     update,
@@ -33,11 +32,13 @@ from minion_server.db.models import (
     Task,
 )
 from minion_server.repositories.completion import (
-    BUDGET_OUTCOMES,
     Owned,
-    _unacked_expiry,
+    attempt_row,
+    budget_attempt,
     bump_counters,
     counter_shard,
+    subtask_values,
+    unacked_expiry,
 )
 
 
@@ -105,6 +106,7 @@ class Finish:
     subtask_status: SubtaskStatus
     error: dict[str, Any] | None = None
     attempt_error: dict[str, Any] | None = None
+    cap_reached: bool = False  # free NOT_ACKNOWLEDGED budget used up: logged after the commit
 
 
 async def lock_batch(session: AsyncSession, ids: Sequence[uuid.UUID]) -> list[uuid.UUID]:
@@ -146,16 +148,8 @@ async def classify_locked(
         & (at.task_name == a.task_name)
         & (at.subtask_id == a.subtask_id)
     )
-    budget = (
-        select(func.count())
-        .where(
-            same_subtask,
-            at.outcome.in_(BUDGET_OUTCOMES),
-            ~func.coalesce(_unacked_expiry(), false()),
-        )
-        .scalar_subquery()
-    )
-    unacked = select(func.count()).where(same_subtask, _unacked_expiry()).scalar_subquery()
+    budget = select(func.count()).where(same_subtask, budget_attempt()).scalar_subquery()
+    unacked = select(func.count()).where(same_subtask, unacked_expiry()).scalar_subquery()
     over_lease = a.acquired_at < _cutoff(max_lease_s) if max_lease_s is not None else literal(False)
     stmt = (
         select(
@@ -226,21 +220,7 @@ async def finish_reclaimed(session: AsyncSession, items: Sequence[Finish]) -> No
         return
     await session.execute(
         pg_insert(SubtaskAttempt).values(
-            [
-                {
-                    "team": f.owned.team,
-                    "project": f.owned.project,
-                    "task_name": f.owned.task_name,
-                    "subtask_id": f.owned.subtask_id,
-                    "attempt": f.owned.attempt,
-                    "acquirement_id": f.owned.acquirement_id,
-                    "executor_id": f.owned.executor_id,
-                    "outcome": f.outcome.value,
-                    "started_at": f.owned.acquired_at,
-                    "error": (f.error if f.error is not None else f.attempt_error) or null(),
-                }
-                for f in items
-            ]
+            [attempt_row(f.owned, f.outcome, f.error, f.attempt_error) for f in items]
         )
     )
     await session.execute(
@@ -251,18 +231,18 @@ async def finish_reclaimed(session: AsyncSession, items: Sequence[Finish]) -> No
     groups: dict[tuple[str, str], list[Finish]] = defaultdict(list)
     for f in items:
         groups[(f.subtask_status.value, json.dumps(f.error, sort_keys=True))].append(f)
-    for (status, _), fs in sorted(groups.items()):
+    for _gk, fs in sorted(groups.items()):
         await session.execute(
             update(Subtask)
             .where(
                 tuple_(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id).in_(
-                    sorted(
+                    [
                         (f.owned.team, f.owned.project, f.owned.task_name, f.owned.subtask_id)
                         for f in fs
-                    )
+                    ]
                 )
             )
-            .values(status=status, error=fs[0].error if fs[0].error is not None else null())
+            .values(**subtask_values(fs[0].subtask_status, fs[0].error))
         )
     shards: dict[tuple[str, str, str, int], list[Owned]] = defaultdict(list)
     for f in items:

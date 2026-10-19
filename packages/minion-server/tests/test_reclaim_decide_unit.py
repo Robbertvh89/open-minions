@@ -87,3 +87,10 @@ def test_decide_not_stale() -> None:
     assert decide(_row(stale=False, never_acked=True), unacked_free_cap=2) == (
         ReclaimResult.NOT_STALE
     )
+
+
+def test_decide_flags_cap_reached_only_at_the_cap() -> None:
+    at_cap = decide(_row(never_acked=True, unacked_used=2), unacked_free_cap=2)
+    below = decide(_row(never_acked=True, unacked_used=1), unacked_free_cap=2)
+    assert isinstance(at_cap, Finish) and at_cap.cap_reached
+    assert isinstance(below, Finish) and not below.cap_reached
