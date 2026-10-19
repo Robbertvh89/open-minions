@@ -47,7 +47,8 @@ _CREATOR_VALUE = re.compile(r"pid (\d{1,10})(?!\d),")
 IOKIT_PATH = "/System/Library/Frameworks/IOKit.framework/IOKit"
 CF_PATH = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
 MAX_IOKIT_CLIENTS = 100_000  # clients walked per read
-MAX_USAGE_ENTRIES = 1_000  # AppUsage entries read per client
+MAX_USAGE_ENTRIES = 1_000  # AppUsage entries per client; more fails the read
+_WALK_ATTEMPTS = 3  # registry walks tried before the read fails
 _CF_UTF8 = 0x08000100
 _CF_NUMBER_SINT64 = 4
 _CREATOR_BUF = 256
@@ -323,7 +324,9 @@ class _IokitApi:
         io.IORegistryEntryGetChildIterator.argtypes = [u32, ctypes.c_char_p, ctypes.POINTER(u32)]
         io.IORegistryEntryGetChildIterator.restype = ctypes.c_int
         io.IOObjectConformsTo.argtypes = [u32, ctypes.c_char_p]
-        io.IOObjectConformsTo.restype = ctypes.c_bool
+        io.IOObjectConformsTo.restype = ctypes.c_int  # boolean_t, not a C bool
+        io.IOIteratorIsValid.argtypes = [u32]
+        io.IOIteratorIsValid.restype = ctypes.c_int
         io.IORegistryEntryCreateCFProperty.argtypes = [u32, vp, vp, u32]
         io.IORegistryEntryCreateCFProperty.restype = vp
         cf.CFStringCreateWithCString.argtypes = [vp, ctypes.c_char_p, u32]
@@ -388,7 +391,9 @@ class _IokitApi:
             if not self._is(usage, self.t_array):
                 return ()
             times: list[int] = []
-            for i in range(min(self.cf.CFArrayGetCount(usage), MAX_USAGE_ENTRIES)):
+            if self.cf.CFArrayGetCount(usage) > MAX_USAGE_ENTRIES:
+                raise GpuMeterError("IOKit reader: AppUsage has too many entries")
+            for i in range(self.cf.CFArrayGetCount(usage)):
                 item = self.cf.CFArrayGetValueAtIndex(usage, i)  # borrowed
                 if not self._is(item, self.t_dict):
                     continue
@@ -409,6 +414,26 @@ class _IokitApi:
         return RawClient(rid.value, self._creator(entry), self._gpu_times(entry))
 
     def read(self) -> list[RawClient]:
+        """One consistent walk. The registry changes under us (a client opens or closes); an
+        iterator that became invalid during the walk may have skipped entries, so the walk is
+        repeated (bounded) and, if it never completes cleanly, the read fails (fail closed)."""
+        for _ in range(_WALK_ATTEMPTS):
+            out: list[RawClient] = []
+            if self._walk(out):
+                return out
+        raise GpuMeterError("IOKit reader: the registry kept changing during the walk")
+
+    def _next(self, it: int, visited: list[int]) -> int:
+        """IOIteratorNext, counted: every entry visited (not only the matching ones) is capped."""
+        entry = int(self.iokit.IOIteratorNext(it))
+        if entry:
+            visited[0] += 1
+            if visited[0] > MAX_IOKIT_CLIENTS:
+                self.iokit.IOObjectRelease(entry)
+                raise GpuMeterError("IOKit reader: too many registry entries")
+        return entry
+
+    def _walk(self, out: list[RawClient]) -> bool:
         io = self.iokit
         acc_iter = ctypes.c_uint32()
         matching = io.IOServiceMatching(b"IOAccelerator")  # consumed by the call below
@@ -416,44 +441,41 @@ class _IokitApi:
             raise GpuMeterError("IOKit reader: IOServiceMatching failed")
         if io.IOServiceGetMatchingServices(0, matching, ctypes.byref(acc_iter)) != 0:
             raise GpuMeterError("IOKit reader: no IOAccelerator service (no Apple GPU?)")
-        out: list[RawClient] = []
+        visited = [0]
+        valid = True
         try:
-            while len(out) < MAX_IOKIT_CLIENTS:
-                accel = io.IOIteratorNext(acc_iter.value)
-                if not accel:
-                    break
+            while accel := self._next(acc_iter.value, visited):
                 try:
-                    self._walk_children(accel, out)
+                    valid = self._walk_children(accel, out, visited) and valid
                 finally:
                     io.IOObjectRelease(accel)
+            return bool(io.IOIteratorIsValid(acc_iter.value)) and valid
         finally:
             io.IOObjectRelease(acc_iter.value)
-        return out
 
-    def _walk_children(self, accel: int, out: list[RawClient]) -> None:
+    def _walk_children(self, accel: int, out: list[RawClient], visited: list[int]) -> bool:
+        """Append the accelerator's user clients; False if the child iterator went stale."""
         io = self.iokit
         children = ctypes.c_uint32()
         if io.IORegistryEntryGetChildIterator(accel, b"IOService", ctypes.byref(children)) != 0:
-            return
+            return True
         try:
-            while len(out) < MAX_IOKIT_CLIENTS:
-                entry = io.IOIteratorNext(children.value)
-                if not entry:
-                    break
+            while entry := self._next(children.value, visited):
                 try:
-                    if io.IOObjectConformsTo(entry, b"AGXDeviceUserClient"):
+                    if io.IOObjectConformsTo(entry, b"AGXDeviceUserClient") != 0:
                         client = self._client(entry)
                         if client is not None:
                             out.append(client)
                 finally:
                     io.IOObjectRelease(entry)
+            return bool(io.IOIteratorIsValid(children.value))
         finally:
             io.IOObjectRelease(children.value)
 
 
 class IokitGpuReader:
-    """In-process equivalent of `read_gpu_clients`. Not thread-safe for concurrent first use, but
-    reads are serialised by a lock so one instance can be shared with `asyncio.to_thread`."""
+    """In-process equivalent of `read_gpu_clients`. Reads are serialised by a lock, so one
+    instance can be shared with `asyncio.to_thread`."""
 
     def __init__(self, raw_reader: Callable[[], list[RawClient]] | None = None) -> None:
         self._raw = raw_reader

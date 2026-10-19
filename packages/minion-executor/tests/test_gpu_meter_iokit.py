@@ -97,15 +97,23 @@ def test_live_parity_with_ioreg_and_no_port_leak() -> None:
         [sys.executable, "-c", "import time; time.sleep(5)"], stdout=subprocess.DEVNULL
     )
     try:
-        via_ioreg = gpu_meter.read_gpu_clients()
+        before_ioreg = gpu_meter.read_gpu_clients()
         via_iokit = reader()
+        after_ioreg = gpu_meter.read_gpu_clients()
     finally:
         child.kill()
         child.wait()
-    shared = set(via_ioreg) & set(via_iokit)
-    assert shared, "no pid seen by both readers"
+    shared = set(before_ioreg) & set(via_iokit) & set(after_ioreg)
+    assert shared, "no pid seen by all reads"
+    slack = 50_000_000  # 50 ms of GPU time
     for pid in shared:
-        assert all(c.startswith("0x") for c in via_iokit[pid])
+        lo, hi = before_ioreg[pid], after_ioreg[pid]
+        ids = set(via_iokit[pid])
+        # clients present in both ioreg reads must be there, none may come from nowhere
+        assert set(lo) & set(hi) <= ids <= set(lo) | set(hi)
+        for cid in ids & set(lo) & set(hi):
+            # counters only grow: the in-process read sits between the two ioreg reads
+            assert lo[cid] - slack <= via_iokit[pid][cid] <= hi[cid] + slack
     for _ in range(5):
         reader()
     before = _mach_ports()
@@ -124,3 +132,88 @@ def _mach_ports() -> int:
         ["/usr/bin/lsmp", "-p", str(os.getpid())], capture_output=True, text=True, timeout=30
     ).stdout
     return sum(1 for line in out.splitlines() if line.strip().startswith("0x"))
+
+
+class _StubIO:
+    """A scripted IOKit: one accelerator with `n` AGX children. `valid` lists the answers of
+    successive IOIteratorIsValid calls (then True)."""
+
+    def __init__(self, n: int, valid: list[bool]) -> None:
+        self.n, self.valid = n, list(valid)
+        self.pos: dict[int, int] = {}
+        self.released: list[int] = []
+
+    def IOServiceMatching(self, name: bytes) -> int:  # noqa: N802
+        return 1
+
+    def IOServiceGetMatchingServices(self, port: int, match: int, ref: object) -> int:  # noqa: N802
+        ref._obj.value = 100  # type: ignore[attr-defined]
+        self.pos[100] = 0
+        return 0
+
+    def IORegistryEntryGetChildIterator(self, e: int, plane: bytes, ref: object) -> int:  # noqa: N802
+        ref._obj.value = 200  # type: ignore[attr-defined]
+        self.pos[200] = 0
+        return 0
+
+    def IOIteratorNext(self, it: int) -> int:  # noqa: N802
+        limit = 1 if it == 100 else self.n
+        if self.pos[it] >= limit:
+            return 0
+        self.pos[it] += 1
+        return 1000 + self.pos[it]
+
+    def IOIteratorIsValid(self, it: int) -> int:  # noqa: N802
+        return int(self.valid.pop(0)) if self.valid else 1
+
+    def IOObjectConformsTo(self, e: int, cls: bytes) -> int:  # noqa: N802
+        return 1
+
+    def IOObjectRelease(self, e: int) -> int:  # noqa: N802
+        self.released.append(e)
+        return 0
+
+
+def _api(io: _StubIO) -> gpu_meter._IokitApi:
+    api = gpu_meter._IokitApi.__new__(gpu_meter._IokitApi)
+    api.iokit = io  # type: ignore[assignment]
+    api._client = lambda e: RawClient(e, "pid 1, x", (1,))  # type: ignore[method-assign,assignment]
+    return api
+
+
+def test_walk_retries_when_the_iterator_went_stale() -> None:
+    io = _StubIO(3, [False, True, True])  # first children walk stale, second clean
+    assert len(_api(io).read()) == 3
+
+
+def test_walk_that_never_settles_fails_closed() -> None:
+    io = _StubIO(3, [False] * 20)
+    with pytest.raises(GpuMeterError, match="kept changing"):
+        _api(io).read()
+
+
+def test_every_visited_entry_counts_toward_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_meter, "MAX_IOKIT_CLIENTS", 5)
+    with pytest.raises(GpuMeterError, match="too many"):
+        _api(_StubIO(50, [])).read()
+
+
+def test_too_many_usage_entries_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CF:
+        def CFArrayGetCount(self, ref: int) -> int:  # noqa: N802
+            return gpu_meter.MAX_USAGE_ENTRIES + 1
+
+        def CFGetTypeID(self, ref: int) -> int:  # noqa: N802
+            return 7
+
+        def CFRelease(self, ref: int) -> None:  # noqa: N802
+            pass
+
+    class IO:
+        def IORegistryEntryCreateCFProperty(self, *a: object) -> int:  # noqa: N802
+            return 5
+
+    api = gpu_meter._IokitApi.__new__(gpu_meter._IokitApi)
+    api.cf, api.iokit, api.t_array, api.k_usage = CF(), IO(), 7, 1  # type: ignore[assignment]
+    with pytest.raises(GpuMeterError, match="too many entries"):
+        api._gpu_times(1)

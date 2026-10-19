@@ -107,19 +107,23 @@ NO_ENGINE_MSG = (
 )
 
 
+METERED_ENGINES = frozenset({Engine.MLX, Engine.HF})  # run in the worker pid: GPU time is its own
+
+
 def resolve_gpu_reader(
     engines: list[Engine],
     factory: Callable[[], Callable[[], dict[int, dict[str, int]]] | None] = default_gpu_reader,
 ) -> Callable[[], dict[int, dict[str, int]]] | None:
-    """The GPU meter for the duty guard, probed once. None (one log line) for the dev fake engine
+    """The GPU meter for the duty guard, probed once. None (one log line) when no metered engine
+    (mlx, hf: their GPU work is in the worker pid) is advertised - the dev fake or Ollama only -
     or where no reader exists (non-darwin). A reader that exists but fails its first read is a
     StartupError (exit 2): an unmeasurable worker must not run unguarded (invariant 6)."""
     log = structlog.get_logger("minion_executor.main")
     reader = factory()
-    if Engine.FAKE in engines or reader is None:
+    if not METERED_ENGINES.intersection(engines) or reader is None:
         log.info(
             "gpu_duty_guard_disabled",
-            reason="fake_engine" if Engine.FAKE in engines else "no_reader",
+            reason="no_metered_engine" if reader is not None else "no_reader",
         )
         return None
     try:

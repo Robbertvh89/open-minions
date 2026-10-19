@@ -3838,6 +3838,9 @@ def test_gpu_probe_failure_is_a_startup_error() -> None:
     with pytest.raises(StartupError):
         resolve_gpu_reader([Engine.MLX], lambda: broken)
     assert resolve_gpu_reader([Engine.FAKE], lambda: broken) is None  # dev fake: never probed
+    assert resolve_gpu_reader([Engine.OLLAMA], lambda: broken) is None  # not in the worker pid
+    with pytest.raises(StartupError):  # a metered engine next to the fake still needs the meter
+        resolve_gpu_reader([Engine.FAKE, Engine.HF], lambda: broken)
     assert resolve_gpu_reader([Engine.MLX], lambda: None) is None  # no reader (non-darwin)
     ok = lambda: {1: {"0x1": 0}}  # noqa: E731
     assert resolve_gpu_reader([Engine.MLX], lambda: ok) is ok
