@@ -25,3 +25,8 @@ build/
 deploy/data/
 deploy/secrets/
 *.jsonl.tmp
+
+# README quick-start outputs
+/out-embed/
+/out-complete/
+/out-fake/

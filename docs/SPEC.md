@@ -99,7 +99,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
     error is a retryable `OOM`. The MLX runner keeps `mx.set_memory_limit` at the memory budget and
     resets the wired limit to `min(budget, recommended)` after `BatchGenerator` raised it. All
     records of a subtask are processed in batches sized by the capacity budget; the pacer runs
-    after every generation step. Install with `uv sync --package minion-executor --extra mlx`.
+    after every generation step. Install with `uv sync --all-packages --extra mlx`.
     BERT encoders only (`model_type: bert`): XLM-R is `MODEL_UNSUPPORTED` (its position ids differ),
     as is `mean_sqrt_len` pooling. The prompt limit is the smaller of the executor's
     `max_prompt_tokens` and the model's `max_position_embeddings`.

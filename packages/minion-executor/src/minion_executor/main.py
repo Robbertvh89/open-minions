@@ -101,7 +101,7 @@ AUTO_ENGINES = [Engine.MLX, Engine.HF]
 MAX_KEEP_ALIVE_S = 300
 NO_ENGINE_MSG = (
     "no inference engine available (on Apple Silicon install the MLX extra: "
-    "`uv sync --package minion-executor --extra mlx` (or `--extra hf`), or start Ollama and pass "
+    "`uv sync --all-packages --extra mlx` (or `--extra hf`), or start Ollama and pass "
     "`--engines ollama`; "
     "use --engines fake with MINION_EXECUTOR_DEV=1 for development)"
 )

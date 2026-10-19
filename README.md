@@ -19,7 +19,7 @@ Apple Silicon Devices* (Li et al., [arXiv:2610.12970](https://arxiv.org/abs/2610
                                   watchdog: requeues work from silent executors
 ```
 
-**Status.** Milestones M0 to M5 are implemented and tested; read [Known limitations](#known-limitations)
+**Status.** Milestones M0 to M6 (scale harness and menu-bar app included) are implemented and tested; the GPU duty guard is coming with TASK-15; read [Known limitations](#known-limitations)
 before running it on people's work laptops.
 
 ## Requirements
@@ -36,6 +36,8 @@ before running it on people's work laptops.
 You will start the server stack in Docker, run an executor natively on your Mac with a real MLX
 model, submit two small jobs and look at the results. Run the commands from the repository root, in
 **one terminal** (the `export`s matter), unless a step says otherwise.
+
+**Commands.** `minion` and `minion-executor` below mean `uv run minion ...` / `uv run minion-executor ...` from the checkout, or the bare commands after `uv tool install` (see the service section).
 
 **Ports.** The stack listens on `127.0.0.1` ports `8080` (server), `5432` (PostgreSQL), `9000` (S3)
 and `3000` (Grafana). If one is taken, set `MINION_SERVER_HOST_PORT`, `MINION_PG_PORT`,
@@ -61,11 +63,16 @@ The API key is what *you* use to submit work. It is printed once; the keys file 
 ```bash
 mkdir -p deploy/secrets && chmod 700 deploy/secrets
 out=$(uv run minion-server-admin generate-api-key --name me --teams demo)
-export MINION_API_KEY=$(printf '%s\n' "$out" | sed -n 's/^api key (shown once): //p')
+printf '%s\n' "$out" | sed -n 's/^api key (shown once): //p'          # show the key once
 printf '%s\n' "$out" | sed -n '/^keys:/,$p' > deploy/secrets/api-keys.yaml
 chmod 600 deploy/secrets/api-keys.yaml
 export "$(uv run minion-server-admin generate-ui-secret)"    # optional: turns on the web UI at /ui
+security add-generic-password -s open-minions-api-key -a "$USER" -w   # paste the API key when asked
 ```
+
+The last command stores the key in the Keychain item `open-minions-api-key`, which `minion` reads by
+itself, also after you close the terminal. To read it back (for the web UI login in step 8):
+`security find-generic-password -s open-minions-api-key -w`.
 
 ### 3. Start the stack
 
@@ -89,8 +96,8 @@ docker compose -f deploy/compose.yml --profile app exec -T server \
 security add-generic-password -s open-minions-executor -a "$USER" -w
 ```
 
-The second command asks for the password: paste the token (the `token (shown once): ...` line of the
-first command). The executor reads the Keychain item `open-minions-executor` by itself.
+The second command asks for the password: paste only the value after `token (shown once): ` from the
+first command. The executor reads the Keychain item `open-minions-executor` by itself.
 
 ### 5. Run the executor
 
@@ -140,7 +147,7 @@ Every result line has the record `id`, the `embedding` or `completion`, and the 
 
 ### 8. Web UI and Grafana
 
-- **Web UI:** <http://localhost:8080/ui>. Log in with your API key from step 2. You see your tasks and
+- **Web UI:** <http://localhost:8080/ui>. Log in with your API key (read it back with the `security find-generic-password` command from step 2). You see your tasks and
   subtasks and can create and cancel tasks. A 404 means the UI secret was not set when the server
   started: export it as in step 2 and run step 3 again.
 - **Grafana:** <http://localhost:3000>, user `admin`, password `admin` (dev default). The dashboards
@@ -154,6 +161,8 @@ Press Ctrl-C in the executor terminal; it finishes or releases the current subta
 docker compose -f deploy/compose.yml --profile app down        # stop; keeps database, S3 data, Grafana
 docker compose -f deploy/compose.yml --profile app down -v     # stop and DELETE that data
 rm -rf out-embed out-complete deploy/secrets
+rm -rf ~/Library/Caches/open-minions/models "$HOME/Library/Application Support/open-minions"   # optional: model cache and executor state
+security delete-generic-password -s open-minions-api-key       # remove the API key too
 security delete-generic-password -s open-minions-executor      # remove the token from the Keychain
 ```
 
@@ -165,7 +174,8 @@ You run the executor on your own Mac and keep working. This is how you stay in c
 
 The service is a per-user launchd agent. launchd cannot read `~/Documents`, `~/Desktop`,
 `~/Downloads` or iCloud Drive, so install a copy of the executor with `uv tool` instead of using the
-repository's `.venv`. The token must be in the Keychain (quick start step 4).
+repository's `.venv`. The token must be in the Keychain (quick start step 4). Stop a foreground
+executor (Ctrl-C) first: only one executor may use the state directory.
 
 ```bash
 uv tool install './packages/minion-executor[mlx]'
@@ -175,9 +185,10 @@ minion-executor service status
 ```
 
 `--server` must be `https://...` for anything but localhost. Other options: `--profile`, `--engines`,
-`--label`, `--no-load`. After you update the checkout, re-run `uv tool install --reinstall ...`. The
+`--label`, `--no-load`. After you update the checkout, re-run `uv tool install --reinstall ...` and then `launchctl kickstart -k gui/$(id -u)/com.open-minions.executor`. The
 log is `~/Library/Logs/open-minions/executor.log`. Remove the service with `minion-executor service
-uninstall`. If `minion-executor` is not found after `uv tool install`, add `~/.local/bin` to your `PATH`. Details: [`docs/ops/executor-install.md`](docs/ops/executor-install.md).
+uninstall`. If `minion-executor` is not found after `uv tool install`, add `~/.local/bin` to your `PATH`.
+Details: [`docs/ops/executor-install.md`](docs/ops/executor-install.md).
 
 ### Menu-bar app
 
@@ -209,7 +220,7 @@ minion-executor profile balanced        # light | balanced | full | custom | aut
 
 Memory use is capped at 75 % of RAM for every profile. Without `--profile` the executor is
 **adaptive**: it starts on `light` and switches to `full` after 10 minutes of you being away on AC
-power. `profile auto` goes back to that. `status` exits 1 if no executor is running.
+power. `profile auto` returns to the run's `--profile` pin, or to adaptive mode if there is none. `status` exits 1 if no executor is running.
 
 ### What pauses it automatically
 
@@ -240,12 +251,14 @@ on_call = "auto"                # auto | light | pause | ignore: back off when m
 ### Privacy and safety
 
 - Inference runs in a worker subprocess inside a macOS Seatbelt sandbox: no network, no process exec,
-  no access to your home directory. Models are fetched by a separate pinned, checksum-verified
+  and no access to your home directory except the model cache and the Python install. Models are fetched by a separate pinned, checksum-verified
   process into `~/Library/Caches/open-minions/models` (capped at 50 GB, least recently used first).
 - The executor downloads one input slice per subtask, runs it, uploads the result and deletes the
   local files. It never logs payload contents.
 - The server learns your profile, memory budget and pause reason (so, roughly, when you are idle or
-  on a call). It never learns keyboard activity or mic/camera state. See [SPEC S-11](docs/SPEC.md).
+  on a call). It never learns keyboard activity or mic/camera state. With `on_call = "pause"` it sees
+  `paused_reason=in_call`, and adaptive profile switching reveals when you are away. To reveal
+  less, pin a profile (`--profile`) and set `on_call = "ignore"`. See [SPEC S-11](docs/SPEC.md).
 - Only join a pool that your operator and organisation agreed on: submitters' data is processed on
   your Mac.
 
@@ -329,7 +342,7 @@ If `status` exits 1 (nothing running), the executor is not started; check its te
 retry: a missing token (put it in the Keychain, or export `MINION_EXECUTOR_TOKEN`), an `http://`
 server URL that is not localhost (use `https://`), another executor already using the state
 directory (`executor.lock`), no usable engine (`--engines auto` found neither mlx nor hf: redo
-step 1 with `--extra mlx`), or a failed sandbox self-test. It exits **1** if its capacity governor
+step 1: `uv sync --all-packages --extra mlx`), or a failed sandbox self-test. It exits **1** if its capacity governor
 died. `MINION_EXECUTOR_DEV=1` and `MINION_EXECUTOR_SANDBOX=0` are for development only: never set
 them on a machine that runs real tasks.
 
@@ -370,7 +383,8 @@ ends as `FAILED` or `PARTIAL`. See `minion status NAME` and the executor log.
 - **Executor tokens** (through `docker compose ... exec -T server` when the server runs in Docker):
   `minion-server-admin issue-executor-token --owner NAME [--pool P] [--ttl-days N]`,
   `list-executors`, `rotate-executor-token --executor-id UUID`,
-  `revoke-executor-token --executor-id UUID`. A revoked token gets 401 on its next request.
+  `revoke-executor-token --executor-id UUID`. A revoked token is refused at once for acquire, register, presence and heartbeat, and within 10 s
+  (`MINION_EXECUTOR_AUTH_CACHE_TTL_S`) for complete, fail and release.
 - **Health:** `curl http://localhost:8080/healthz`. The watchdog requeues subtasks whose executor
   stopped sending heartbeats (after 900 s by default).
 - **Update:** `git pull`, `uv sync --all-packages --extra mlx --extra hf`, then
@@ -431,6 +445,7 @@ To try the system without a model or GPU, use the dev override (adds the models 
 ```bash
 docker compose -f deploy/compose.yml -f deploy/compose.dev.yml --profile app up -d --build --wait
 MINION_EXECUTOR_DEV=1 uv run minion-executor run --server http://localhost:8080 --engines fake
+uv run minion submit --type embedding --model fake-embed examples/embeddings.jsonl -o out-fake --name fake-run
 ```
 
 Test markers: `integration` (Docker: Postgres and S3 via testcontainers, including the acquisition
@@ -468,9 +483,6 @@ deviate from the paper get an ADR in `docs/adr/`.
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
   capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)). Ollama
   completions silently truncate long prompts (TASK-12).
-- **Hardening gaps (TASK-9):** no absolute per-batch wall-clock cap, no server cap on
-  `records_per_subtask` x `max_tokens`, and macOS ACLs are not checked on the state directory or
-  `executor.toml` (mode bits only).
 - **Operations gaps:** no backup guidance, no code-signed executor build, the compose stack is dev
   only, the web UI has no SSO (put an OIDC proxy in front).
 

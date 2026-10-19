@@ -18,7 +18,7 @@ Evidence for TASK-4.4 AC#1 and the "Revisit" outcome of
 Two runs, merged into the one JSON (the `records` column and `config.records_by_type` give the count):
 
 ```bash
-uv sync --package minion-executor --extra mlx --extra hf
+uv sync --all-packages --extra mlx --extra hf
 # completions: 256 records per row
 uv run minion-executor bench --models deploy/bench-models.yaml \
   --model qwen2.5-0.5b-mlx --model qwen2.5-0.5b-hf \
