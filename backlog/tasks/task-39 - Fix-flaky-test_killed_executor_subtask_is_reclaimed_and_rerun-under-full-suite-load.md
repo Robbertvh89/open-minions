@@ -3,10 +3,10 @@ id: TASK-39
 title: >-
   Fix flaky test_killed_executor_subtask_is_reclaimed_and_rerun under full-suite
   load
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 20:49'
-updated_date: '2026-10-19 12:35'
+updated_date: '2026-10-19 14:16'
 labels:
   - test
 dependencies: []
