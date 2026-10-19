@@ -22,7 +22,7 @@ per subtask grows 2.3x by W=8 and most of it is SQLAlchemy statement building (s
 |---|---|---|---|
 | A | P_py >= 0.50 in P1 and P2, and C_srv >= 2 x C_pg | P_py 0.67 (P1) and 0.80 (P2); C_srv / C_pg = 4.4 (W=4), 4.1 (W=8) | met |
 | B | some W <= W_hr with E(W) < 0.70, or C_srv(W) > 1.3 x C_srv(1) | W_hr = 8; E(4) = 0.57, E(8) = 0.32; C_srv(4) = 23.4 ms = 1.62 x 14.4 ms | met |
-| C | not explained otherwise: PostgreSQL < 3 cores, claim mean ms <= 2 x W=1, generator lag p99 <= 20 ms, shed > 0 in S-sat | PostgreSQL 1.44 cores max for W <= 8 (ok); **claim mean 3.6 ms (W=4), 10.7 ms (W=8) vs 0.73 ms at W=1, limit 1.46 ms (fails)**; lag p99 <= 5 ms at W <= 8 (ok); shed 13 to 28 % of requests (24 to 44 % of acquire attempts) (ok) | **not met** |
+| C | not explained otherwise: PostgreSQL < 3 cores, claim mean ms <= 2 x W=1, generator lag p99 <= 20 ms, shed > 0 in S-sat | PostgreSQL 1.44 cores max for W <= 8 (ok); **claim mean 3.6 ms (W=4), 10.7 ms (W=8) vs 0.73 ms at W=1, limit 1.46 ms (fails)**; lag p99 <= 5 ms at W <= 8 (ok); shed 13 to 28 % of requests (23 to 44 % of acquire attempts) (ok) | **not met** |
 
 What this means in practice:
 
@@ -273,7 +273,7 @@ Not worth chasing: pydantic (0.4 to 0.7 %), metrics (0.3 to 0.6 %), auth (0.3 to
 - One Mac; the generator, Docker VM, PostgreSQL, S3 and the server share 12 cores (6 performance, 6
   efficiency). Efficiency E(W) mixes software effects with core heterogeneity and host contention;
   H is the guard (W <= 8). Multi-host (NF-5) was not measured.
-- S-sat is a closed loop of 500 sims with fail-fast shedding (13 to 28 % of acquire + complete requests, 24 to 44 % of acquire attempts, shed and
+- S-sat is a closed loop of 500 sims with fail-fast shedding (13 to 28 % of acquire + complete requests, 23 to 44 % of acquire attempts, shed and
   the sims back off); X is goodput under shedding, not a pure capacity at 0 % shed.
 - py-spy overhead of about 15 % while sampling; nonblocking mode drops samples; the native split is
   one worker for 60 s at 50 Hz and has unresolved extension frames; route attribution misses the SQL
