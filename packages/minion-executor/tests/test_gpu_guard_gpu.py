@@ -123,6 +123,57 @@ def _http(body: bytes) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(s3))
 
 
+def _assert_no_children() -> None:
+    """Every test tears its worker (and the burn thread inside it) down."""
+    import multiprocessing
+
+    deadline = time.monotonic() + 5
+    while multiprocessing.active_children() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert multiprocessing.active_children() == []
+
+
+@pytest.fixture
+def quiet_gpu() -> None:
+    """Rogue tests need a GPU the host is not using (a video wallpaper or a busy WindowServer
+    time-slices it and caps the burn's measured share): skip, never flake, on a busy host."""
+    read = default_gpu_reader()
+    assert read is not None
+    me = os.getpid()
+
+    def others() -> float:
+        return float(sum(sum(c.values()) for pid, c in read().items() if pid != me))
+
+    a, t0 = others(), time.monotonic()
+    time.sleep(3)
+    busy = (others() - a) / 1e9 / (time.monotonic() - t0)
+    if busy > 0.15:
+        pytest.skip(f"host GPU is busy ({busy:.0%} used by other processes)")
+
+
+def test_burn_hook_saturates_the_gpu(quiet_gpu: None) -> None:
+    """The rogue hook must measure far above any limit (standalone, real IOKit reader)."""
+    pytest.importorskip("mlx.core")
+    import threading
+
+    from minion_executor.runners.fake import _gpu_burn
+
+    read = default_gpu_reader()
+    assert read is not None
+    pid = os.getpid()
+    burner = threading.Thread(target=_gpu_burn, args=(10.0,))
+    burner.start()
+    time.sleep(1)
+    shares: list[float] = []
+    for _ in range(4):  # 2 s windows: a transient host dip must not hide the saturation
+        a, t0 = sum(read().get(pid, {}).values()), time.monotonic()
+        time.sleep(2)
+        b, t1 = sum(read().get(pid, {}).values()), time.monotonic()
+        shares.append((b - a) / 1e9 / (t1 - t0))
+    burner.join()
+    assert max(shares) >= 0.8, shares
+
+
 class CountingReader:
     """The real IOKit reader, counting calls (proves the guard was watching)."""
 
@@ -144,7 +195,7 @@ def _duty(profile: CapacityProfile) -> Budget:
 # --- (a) rogue worker ---------------------------------------------------------------------------
 
 
-async def test_rogue_unpaced_worker_is_killed_and_released(tmp_path: Path) -> None:
+async def test_rogue_unpaced_worker_is_killed_and_released(tmp_path: Path, quiet_gpu: None) -> None:
     """A hook that ignores pacing burns the GPU at light (duty 0.3): the control side kills the
     worker and releases the subtask with GPU_DUTY_VIOLATION within detection + 30 s."""
     pytest.importorskip("mlx.core")
@@ -186,7 +237,9 @@ async def test_rogue_unpaced_worker_is_killed_and_released(tmp_path: Path) -> No
         await asyncio.wait_for(loop.run(max_subtasks=1), 120)
     finally:
         worker.close()
+        _assert_no_children()
     elapsed = time.monotonic() - t0
+    print(f"GPUTIMES detect={seen['detected'] - t0:.1f} kill={seen['killed'] - t0:.1f}")
     assert client.released == ["GPU_DUTY_VIOLATION"], (client.released, client.failed)
     assert client.completed == [] and client.failed == []  # nothing uploaded on a verdict
     assert loop._status_snapshot().gpu_violation == "over_duty"
@@ -274,6 +327,7 @@ async def test_honest_mlx_worker_is_never_killed(
         done = await asyncio.wait_for(loop.run(), 300)
     finally:
         worker.close()
+        _assert_no_children()
     assert client.failed == [] and client.released == [], (client.failed, client.released)
     assert done >= 1 and len(client.completed) == done
     assert loop._status_snapshot().gpu_violation is None
@@ -281,7 +335,7 @@ async def test_honest_mlx_worker_is_never_killed(
     assert max(shares) <= budget.gpu_duty_cycle + DEFAULTS.margin, shares
 
 
-async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path) -> None:
+async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path, quiet_gpu: None) -> None:
     """Back-to-back ~1 s subtasks (honestly paced) while a background thread of the worker keeps
     the GPU busy: no subtask is long enough to be judged alone, the guard window must span them
     and still kill (release GPU_DUTY_VIOLATION)."""
@@ -293,8 +347,7 @@ async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path) -> None:
     body = (
         json.dumps({"id": "rogue", "text": "x", "gpu_burn_s": 70, "no_pace": True}).encode() + b"\n"
     )
-    # duty 0.05 (limit 0.15): the burn measures 0.2-0.4 of the GPU, host load permitting
-    budget = _duty(CapacityProfile.LIGHT).model_copy(update={"gpu_duty_cycle": 0.05})
+    budget = _duty(CapacityProfile.LIGHT)
     client = Client(lambda: _assignment(model, body, 1, {}), deadline=time.monotonic() + 80)
     worker = WorkerHandle(
         [Engine.FAKE], test_hooks=True, sandbox=SandboxPolicy(cache_root=tmp_path),
@@ -310,6 +363,7 @@ async def test_rogue_in_short_subtasks_is_killed(tmp_path: Path) -> None:
         await asyncio.wait_for(loop.run(), 200)
     finally:
         worker.close()
+        _assert_no_children()
     assert "GPU_DUTY_VIOLATION" in client.released, (
         client.released,
         len(client.completed),

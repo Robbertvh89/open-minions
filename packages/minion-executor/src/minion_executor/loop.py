@@ -275,6 +275,7 @@ class ExecutorLoop:
         self._gpu: GpuDutyGuard | None = GpuDutyGuard(gpu_guard) if gpu_reader else None
         self._gpu_share: float | None = None  # last measured share of the worker (status.json)
         self._gpu_pid: int | None = None  # worker pid the guard window belongs to
+        self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         self._gpu_pending: _Verdict | None = None  # sampler KILL for the watcher to act on
         self._gpu_violation: str | None = None  # reason of the last GPU duty kill
         self._max_output_bytes = max_output_bytes
@@ -460,6 +461,18 @@ class ExecutorLoop:
             await self._enforce_idle_budget()
             if self._gov.decision.paused:
                 break
+
+    async def _wait_watch(self, version: int, timeout_s: float) -> int:
+        """The watcher's wait: a governor change, a GPU guard kill, or `timeout_s`."""
+        change = asyncio.ensure_future(self._gov.wait_change(version, timeout_s))
+        kick = asyncio.ensure_future(self._gpu_kick.wait())
+        try:
+            await asyncio.wait({change, kick}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            change.cancel()
+            kick.cancel()
+            await asyncio.gather(change, kick, return_exceptions=True)
+        return self._gov.version
 
     async def _wait_gov(self, version: int, timeout_s: float) -> int:
         """Wait for a governor change, the first stop signal or `timeout_s`; returns the version."""
@@ -963,6 +976,7 @@ class ExecutorLoop:
                 continue
             if self._current is not None and not self._infer_done.is_set():
                 self._gpu_pending = v  # the watcher interrupts and releases the subtask
+                self._gpu_kick.set()
                 continue
             if self._gpu is not None:
                 self._gpu.stop()
@@ -1030,6 +1044,7 @@ class ExecutorLoop:
         drop_since: float | None = None  # when the live budget fell below the running batch's
         next_sample = clock() + self._jitter(self._guard_s)
         self._gpu_pending = None
+        self._gpu_kick.clear()
         while True:
             if self._infer_done.is_set():
                 await self._enforce_idle_budget()
@@ -1039,6 +1054,7 @@ class ExecutorLoop:
             d = gov.decision
             if (gv := self._gpu_pending) is not None:
                 self._gpu_pending = None
+                self._gpu_kick.clear()
                 return gv
             if d.release_now:
                 return _Verdict.MEMORY_CRITICAL
@@ -1110,7 +1126,7 @@ class ExecutorLoop:
                     left = since + self._downgrade_batch_s - clock()
                     if left > 0:
                         wake = min(wake, left)
-            version = await gov.wait_change(version, max(0.01, wake))
+            version = await self._wait_watch(version, max(0.01, wake))
 
     async def _on_verdict(
         self, a: Assignment, work: asyncio.Task[CompleteRequest], v: _Verdict, bound: Any

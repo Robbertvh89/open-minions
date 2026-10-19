@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from minion_common.enums import TaskType
 from minion_common.schemas import Budget, CompletionParams, EmbeddingParams, ModelEntry, TaskParams
@@ -165,14 +166,23 @@ def _mlx_matmul(n: int) -> dict[str, object]:
 
 
 def _gpu_burn(seconds: float) -> None:
-    """Test hook (a rogue worker that ignores pacing): back-to-back MLX matmuls for `seconds`."""
+    """Test hook (a rogue worker that ignores pacing): saturates the GPU for `seconds` with large
+    fp16 matmuls, two command buffers always in flight (measured ~0.85 share with the IOKit
+    reader, whatever else the host runs)."""
     import mlx.core as mx  # engine import, test hook only
 
-    a = mx.random.normal((2048, 2048))
+    a = mx.random.normal((4096, 4096), dtype=mx.float16)
     mx.eval(a)
     end = time.monotonic() + seconds
+    prev: list[Any] | None = None
     while time.monotonic() < end:
-        mx.eval(a @ a)
+        cur = [a @ a for _ in range(2)]
+        mx.async_eval(*cur)  # type: ignore[no-untyped-call]
+        if prev is not None:
+            mx.eval(*prev)
+        prev = cur
+    if prev is not None:
+        mx.eval(*prev)
 
 
 def _mach_lookup(name: str) -> dict[str, object]:
