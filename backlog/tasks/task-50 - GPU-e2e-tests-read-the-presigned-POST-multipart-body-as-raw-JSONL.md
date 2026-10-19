@@ -4,7 +4,7 @@ title: GPU e2e tests read the presigned-POST multipart body as raw JSONL
 status: In Progress
 assignee: []
 created_date: '2026-10-19 23:45'
-updated_date: '2026-10-19 23:46'
+updated_date: '2026-10-19 23:47'
 labels:
   - test
   - executor
@@ -20,6 +20,6 @@ test_mlx_runners_gpu.py and test_hf_runners_gpu.py test_e2e_{completion,embeddin
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 All 4 e2e GPU tests pass on this Mac with the mlx and hf extras
-- [ ] #2 Stub asserts multipart form fields and file part
+- [x] #1 All 4 e2e GPU tests pass on this Mac with the mlx and hf extras
+- [x] #2 Stub asserts multipart form fields and file part
 <!-- AC:END -->
