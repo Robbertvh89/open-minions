@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-18 11:55'
-updated_date: '2026-10-19 18:48'
+updated_date: '2026-10-19 20:23'
 labels:
   - perf
   - scale
@@ -22,8 +22,8 @@ TASK-7.4.7 scenario C: tick 8.8-9.3 s for 500-705 stale rows; DB execution ~0.4 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Root cause identified with numbers
-- [ ] #2 Tick for 500 stale back to <= M6.3 (2.4 s) or ADR
+- [x] #1 Root cause identified with numbers
+- [x] #2 Tick for 500 stale back to <= M6.3 (2.4 s) or ADR
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -105,4 +105,6 @@ Changes: packages/minion-server/src/minion_server/repositories/reclaim.py, servi
 
 <!-- SECTION:NOTES:BEGIN -->
 Steps 2+3 implemented (branch perf/task-35-chunked-reclaim): batched repo + chunked reclaim_stale (RECLAIM_CHUNK=100), ~5 statements per chunk instead of ~11 per row. Steps 1 and 4 (measurement on the scale stack) still open.
+
+Steps 1 and 4 measured 2026-10-19 (docs/bench/m-task35-reclaim-apple-m3-pro.md): 1M PENDING, 500 stale, n=3. Root cause: per-row design = ~12 round trips + 1 commit per row (4,006 client statements/500 rows) times the per-trip latency of the host to Docker-VM path; not the ADR-0014 statement (RELEASE_LIMIT=0 still 7-9 s), not fsync (synchronous_commit=off unchanged), not DB work (0.1-0.4 s). BEFORE host 8.2 s median (2.6-9.2, bimodal host state), in network 1.27 s. AFTER host 0.19 s (max 0.20), network 0.12 s; statements 4,006 -> 31, commits 501 -> 6. 100k chaos drain + minion-scale verify PASS (NF-2/NF-3). M6.4 'settle, counter select' explanation corrected.
 <!-- SECTION:NOTES:END -->

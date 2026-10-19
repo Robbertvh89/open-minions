@@ -96,5 +96,9 @@ The watchdog takes the stale / over-lease candidates, splits them into chunks of
   fresh row.
 
 Not a deviation from the paper, so an addendum rather than a new ADR. The expected tick improvement
-is not measured yet (TASK-35 steps 1 and 4).
+was measured on the scale stack (1M PENDING, 500 stale rows, n=3, same setup before and after,
+[m-task35-reclaim-apple-m3-pro.md](../bench/m-task35-reclaim-apple-m3-pro.md)): host tick 8.2 s median
+(2.6 to 9.2 s) before, 0.19 s (max 0.2 s) after; in the compose network 1.27 s before, 0.12 s after; client
+statements 4,006 to 31, commits 501 to 6. A 100k chaos drain with `minion-scale verify` passes NF-2/NF-3
+with the chunked path (1,594 expiries reclaimed, 0 double completions).
 
