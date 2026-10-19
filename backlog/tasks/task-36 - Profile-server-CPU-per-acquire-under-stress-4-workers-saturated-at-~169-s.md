@@ -1,10 +1,10 @@
 ---
 id: TASK-36
 title: Profile server CPU per acquire under stress (4 workers saturated at ~169/s)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 11:55'
-updated_date: '2026-10-19 23:02'
+updated_date: '2026-10-19 23:11'
 labels:
   - perf
   - scale
