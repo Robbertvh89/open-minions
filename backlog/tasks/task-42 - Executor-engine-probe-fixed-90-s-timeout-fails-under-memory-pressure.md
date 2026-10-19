@@ -1,9 +1,10 @@
 ---
 id: TASK-42
 title: 'Executor engine probe: fixed 90 s timeout fails under memory pressure'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-19 14:11'
+updated_date: '2026-10-19 18:32'
 labels:
   - bug
 dependencies: []
@@ -18,7 +19,15 @@ During TASK-38 verification minion-executor run failed repeatedly with 'error: w
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Probe survives a slow worker start (configurable or adaptive timeout, tested)
-- [ ] #2 Error message names the likely cause
+- [x] #1 Probe survives a slow worker start (configurable or adaptive timeout, tested)
+- [x] #2 Error message names the likely cause
 - [ ] #3 Large-RSS pytest source identified or ruled out
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Probe timeout now MINION_EXECUTOR_PROBE_TIMEOUT_S (default 90, 10..900), doubled, capped at 300 s, never below the set value, under warn/critical memory pressure (logged engine_probe_timeout_extended), timeout error names memory pressure + knob; shared by service install. RSS: no repro (mlx extra not installed in worktree, gpu tests skipped). Prime suspect by inspection: test_gpu_guard_gpu.py::test_burn_hook_saturates_the_gpu runs fake._gpu_burn in a thread of the pytest process with no mx memory/cache limit, plus module-scoped in-process MLX runner fixtures in test_mlx_runners_gpu.py; fix proposed as follow-up (run burn in a subprocess / set mx limits).
+
+AC#3 moved to TASK-44 (not reproduced here: no mlx extra in worktree).
+<!-- SECTION:NOTES:END -->

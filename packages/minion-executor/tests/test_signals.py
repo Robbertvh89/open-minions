@@ -19,6 +19,7 @@ from minion_executor.capacity.signals import (
     default_source,
     power_from_iops,
     pressure_from_sysctl,
+    read_memory_pressure,
     read_with_timeout,
     thermal_from_ns,
 )
@@ -412,3 +413,24 @@ def test_async_call_probe_recovers_after_a_hung_read_finishes() -> None:
         time.sleep(0.01)
     assert p.value() is True  # a new read started and returned its value
     assert r.calls == 2
+
+
+def test_read_memory_pressure_from_the_fake_signals_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    p = _file(tmp_path, {"memory_pressure": "warning"})
+    assert read_memory_pressure(p) is MemPressure.WARNING
+
+
+def test_read_memory_pressure_unreadable_or_invalid_file_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINION_EXECUTOR_DEV", "1")
+    assert read_memory_pressure(tmp_path / "missing.json") is None
+    assert read_memory_pressure(_file(tmp_path, "{not json")) is None
+
+
+def test_read_memory_pressure_is_none_off_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    assert read_memory_pressure() is None

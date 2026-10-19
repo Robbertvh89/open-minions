@@ -48,6 +48,7 @@ ENV_ALLOW_LIST: tuple[str, ...] = (
     "MINION_EXECUTOR_IDLE_UNLOAD_S",
     "MINION_EXECUTOR_MIN_FREE_DISK_GB",
     "MINION_EXECUTOR_DOWNLOAD_TIMEOUT_S",
+    "MINION_EXECUTOR_PROBE_TIMEOUT_S",
 )
 GRACE_ENV = "MINION_EXECUTOR_STOP_GRACE_S"
 EXIT_TIMEOUT_ENV = "MINION_EXECUTOR_LAUNCHD_EXIT_TIMEOUT_S"
@@ -340,7 +341,12 @@ def probe_engines(requested: list[Engine], settings: ExecutorSettings) -> list[E
     """Which of `requested` work here, in a sandboxed worker subprocess (as `run` does)."""
     from minion_executor.main import probe_available, sandbox_policy
 
-    return probe_available(requested, sandbox_policy(settings, requested))
+    return probe_available(
+        requested,
+        sandbox_policy(settings, requested),
+        timeout_s=settings.probe_timeout_s,
+        fake_signals=settings.fake_signals,
+    )
 
 
 def is_our_plist(doc: Mapping[str, object] | None) -> bool:

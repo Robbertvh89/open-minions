@@ -406,6 +406,35 @@ class AsyncCallProbe:
 _CF_RETAINED: dict[str, Any] = {"retval": {"already_cfretained": True}}
 
 
+def _sysctl_memory_pressure(libc: Any) -> MemPressure:
+    val = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    rc = libc.sysctlbyname(
+        b"kern.memorystatus_vm_pressure_level",
+        ctypes.byref(val),
+        ctypes.byref(size),
+        None,
+        ctypes.c_size_t(0),
+    )
+    if rc != 0:
+        raise SignalError("memory pressure unreadable")
+    return pressure_from_sysctl(val.value)
+
+
+def read_memory_pressure(fake_signals: Path | None = None) -> MemPressure | None:
+    """Only the memory-pressure level (one sysctl; no IOKit, no call probe). With a dev signals
+    file, that file's level. None when unreadable or not on macOS: callers treat it as unknown."""
+    try:
+        if fake_signals is not None:
+            return FileSignals(fake_signals).read().memory_pressure
+        if sys.platform != "darwin":
+            return None
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        return _sysctl_memory_pressure(libc)
+    except Exception:  # best effort
+        return None
+
+
 class MacSignals:
     """Real macOS readers. Raises SignalError at construction if a framework is unusable."""
 
@@ -491,18 +520,7 @@ class MacSignals:
         return power_from_iops(providing, descs)
 
     def _memory_pressure(self) -> MemPressure:
-        val = ctypes.c_int(0)
-        size = ctypes.c_size_t(ctypes.sizeof(val))
-        rc = self._libc.sysctlbyname(
-            b"kern.memorystatus_vm_pressure_level",
-            ctypes.byref(val),
-            ctypes.byref(size),
-            None,
-            ctypes.c_size_t(0),
-        )
-        if rc != 0:
-            raise SignalError("memory pressure unreadable")
-        return pressure_from_sysctl(val.value)
+        return _sysctl_memory_pressure(self._libc)
 
     def _call_begin(self) -> tuple[threading.Event | None, float] | None:
         if not self._want_call:
