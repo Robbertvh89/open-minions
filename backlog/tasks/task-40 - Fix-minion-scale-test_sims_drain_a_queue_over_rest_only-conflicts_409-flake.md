@@ -1,10 +1,10 @@
 ---
 id: TASK-40
 title: Fix minion-scale test_sims_drain_a_queue_over_rest_only conflicts_409 flake
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 21:55'
-updated_date: '2026-10-19 12:35'
+updated_date: '2026-10-19 13:53'
 labels:
   - test
   - scale
