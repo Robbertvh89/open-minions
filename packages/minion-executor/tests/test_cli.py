@@ -967,7 +967,7 @@ def test_probe_timeout_extended_under_memory_pressure(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(structlog, "get_logger", lambda *_a, **_k: FakeLog())
     m.probe_available([Engine.MLX], timeout_s=100.0)
-    assert seen["timeout"] == 200.0 and events == ["engine_probe_waiting_for_memory"]
+    assert seen["timeout"] == 200.0 and events == ["engine_probe_timeout_extended"]
     assert m.probe_timeout_s(200.0, MemPressure.CRITICAL) == 300.0  # capped
     assert m.probe_timeout_s(600.0, MemPressure.WARNING) == 600.0  # never below the operator value
     assert m.probe_timeout_s(100.0, MemPressure.NORMAL) == 100.0

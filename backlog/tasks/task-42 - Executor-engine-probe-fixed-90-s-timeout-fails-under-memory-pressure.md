@@ -27,7 +27,7 @@ During TASK-38 verification minion-executor run failed repeatedly with 'error: w
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Probe timeout now MINION_EXECUTOR_PROBE_TIMEOUT_S (default 90, 10..900), tripled under warn/critical memory pressure (logged engine_probe_waiting_for_memory), timeout error names memory pressure + knob; shared by service install. RSS: no repro (mlx extra not installed in worktree, gpu tests skipped). Prime suspect by inspection: test_gpu_guard_gpu.py::test_burn_hook_saturates_the_gpu runs fake._gpu_burn in a thread of the pytest process with no mx memory/cache limit, plus module-scoped in-process MLX runner fixtures in test_mlx_runners_gpu.py; fix proposed as follow-up (run burn in a subprocess / set mx limits).
+Probe timeout now MINION_EXECUTOR_PROBE_TIMEOUT_S (default 90, 10..900), doubled, capped at 300 s, never below the set value, under warn/critical memory pressure (logged engine_probe_timeout_extended), timeout error names memory pressure + knob; shared by service install. RSS: no repro (mlx extra not installed in worktree, gpu tests skipped). Prime suspect by inspection: test_gpu_guard_gpu.py::test_burn_hook_saturates_the_gpu runs fake._gpu_burn in a thread of the pytest process with no mx memory/cache limit, plus module-scoped in-process MLX runner fixtures in test_mlx_runners_gpu.py; fix proposed as follow-up (run burn in a subprocess / set mx limits).
 
-AC#3 not reproduced (no mlx extra in worktree); suspects moved to TASK-44.
+AC#3 moved to TASK-44 (not reproduced here: no mlx extra in worktree).
 <!-- SECTION:NOTES:END -->

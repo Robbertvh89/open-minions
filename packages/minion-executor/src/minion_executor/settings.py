@@ -46,6 +46,8 @@ def state_dir_from_env(environ: Mapping[str, str] | None = None) -> Path:
 
 
 DEFAULT_PROBE_TIMEOUT_S = 90.0
+PROBE_TIMEOUT_MIN_S = 10.0
+PROBE_TIMEOUT_MAX_S = 900.0
 
 
 class ExecutorSettings(BaseSettings):
@@ -59,7 +61,10 @@ class ExecutorSettings(BaseSettings):
     # sandboxed worker is slow while macOS swaps; raise this on a loaded Mac. Under warn/critical
     # memory pressure the probe gets 2x this, capped at 300 s (never below the set value).
     probe_timeout_s: float = Field(
-        default=DEFAULT_PROBE_TIMEOUT_S, ge=10, le=900, allow_inf_nan=False
+        default=DEFAULT_PROBE_TIMEOUT_S,
+        ge=PROBE_TIMEOUT_MIN_S,
+        le=PROBE_TIMEOUT_MAX_S,
+        allow_inf_nan=False,
     )
 
     # FR-17: seconds an in-flight subtask may keep running after SIGTERM/SIGINT before the worker

@@ -71,7 +71,12 @@ from minion_executor.service import (
     service_app,
     service_mode,
 )
-from minion_executor.settings import DEFAULT_PROBE_TIMEOUT_S, ExecutorSettings
+from minion_executor.settings import (
+    DEFAULT_PROBE_TIMEOUT_S,
+    PROBE_TIMEOUT_MAX_S,
+    PROBE_TIMEOUT_MIN_S,
+    ExecutorSettings,
+)
 from minion_executor.worker.process import (
     WorkerCrashed,
     WorkerHandle,
@@ -191,7 +196,6 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
 
 
 PROBE_TIMEOUT_S = DEFAULT_PROBE_TIMEOUT_S  # default; MINION_EXECUTOR_PROBE_TIMEOUT_S overrides
-PROBE_TIMEOUT_MAX_S = 900.0
 PROBE_PRESSURE_FACTOR = 2.0  # timeout multiplier while memory pressure is warn/critical
 PROBE_PRESSURE_MAX_S = 300.0  # ... but never extended beyond this (invariant 6)
 PROBE_TIMEOUT_ENV = "MINION_EXECUTOR_PROBE_TIMEOUT_S"
@@ -257,7 +261,7 @@ def probe_available(
     timeout_s = probe_timeout_s(base_s, pressure)
     if timeout_s != base_s:
         structlog.get_logger("minion_executor.main").warning(
-            "engine_probe_waiting_for_memory",
+            "engine_probe_timeout_extended",
             memory_pressure=pressure.value if pressure else None,
             timeout_s=timeout_s,
         )
@@ -273,7 +277,7 @@ def probe_available(
                 f"engine probe timed out after {timeout_s:g}s: starting the worker and importing "
                 "the engine is slow, most likely because the Mac is under memory pressure "
                 "(swapping) or this is the first import after boot; close other apps, or raise "
-                f"{PROBE_TIMEOUT_ENV} (10..900 s)"
+                f"{PROBE_TIMEOUT_ENV} ({PROBE_TIMEOUT_MIN_S:g}..{PROBE_TIMEOUT_MAX_S:g} s)"
             ) from exc
     finally:
         _active_probe = None
