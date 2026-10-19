@@ -19,7 +19,7 @@ Apple Silicon Devices* (Li et al., [arXiv:2610.12970](https://arxiv.org/abs/2610
                                   watchdog: requeues work from silent executors
 ```
 
-**Status.** Milestones M0 to M6 (scale harness and menu-bar app included) are implemented and tested; the GPU duty guard is coming with TASK-15; read [Known limitations](#known-limitations)
+**Status.** Milestones M0 to M6 (scale harness and menu-bar app included) are implemented and tested; the GPU duty guard (the executor measures the worker's GPU use itself) is in; read [Known limitations](#known-limitations)
 before running it on people's work laptops.
 
 ## Requirements
@@ -222,6 +222,17 @@ Memory use is capped at 75 % of RAM for every profile. Without `--profile` the e
 **adaptive**: it starts on `light` and switches to `full` after 10 minutes of you being away on AC
 power. `profile auto` returns to the run's `--profile` pin, or to adaptive mode if there is none. `status` exits 1 if no executor is running.
 
+**GPU guard.** The profile's duty cycle is not left to the worker's good behaviour: the executor
+itself measures how much GPU the worker process uses and stops a worker that stays above the
+profile's duty plus 10 percentage points (for example 40 % at `light`). The subtask is released
+for another attempt and the worker restarts after a back-off. `status.json` (and `status`) then
+shows `gpu_violation` for 10 minutes, and `gpu_quarantined` lists an engine that was stopped 3
+times within an hour and is not used until that hour has passed. The reason also reaches the server as
+presence `paused_reason=gpu_violation`. If the GPU meter cannot be read at startup, `run` exits 2.
+Honest workers stay well under the limit (worst 10 s window measured: 23 % at `light`, 46 % at
+`balanced`, see [ADR-0006](docs/adr/0006-cooperative-capacity-governor.md) D17). The guard stops a
+worker; it does not yet slow one down (SIGSTOP gating: TASK-15.1).
+
 ### What pauses it automatically
 
 No new work starts, and the running subtask is released after 60 s (at once under critical memory
@@ -333,7 +344,17 @@ the API: you upload to S3 first and pass prefixes. See [SPEC §6](docs/SPEC.md).
 | `low_power_mode` | turn Low Power Mode off |
 | `user_paused` | `minion-executor resume` |
 | `in_call` | the Mac thinks a mic or camera is in use (`on_call`); set `on_call = "ignore"` or `"light"` in `executor.toml` |
+| `gpu_violation` | the worker used more GPU than the profile allows and was stopped (`GPU_DUTY_VIOLATION` release). It retries after a back-off; if it recurs, check the executor log and report the model/engine |
 | `control_invalid`, `signals_unavailable` | `control.json` or the macOS signals cannot be read; see the log |
+
+**GPU guard messages.** `GPU_DUTY_VIOLATION` (subtask released): the worker exceeded the profile's
+duty plus 10 pp; the next acquire waits 10 s, doubling per repeat. `status` showing
+`gpu_quarantined: [engine]`: that engine was stopped 3 times within an hour and is skipped for the
+rest of the hour (with no other engine the executor idles; restarting does not clear it, switching
+`--engines` may help). `GPU_METER_UNAVAILABLE` (subtask released): the GPU meter failed three reads in
+a row, so the worker was stopped rather than trusted. `gpu_meter_probe_failed` and exit 2 at start:
+the meter exists but its first read failed; the executor does not start without it. See the log
+line for the error type.
 
 If `status` exits 1 (nothing running), the executor is not started; check its terminal or
 `~/Library/Logs/open-minions/executor.log`.
@@ -473,9 +494,11 @@ deviate from the paper get an ADR in `docs/adr/`.
   needs at least 8 people on their own Macs. Until then, do not claim calls are unaffected.
 - **Real microphone/camera call detection is not verified on hardware** (`on_call`); it is covered by
   tests with injected signals only. Screen sharing is not detected.
-- **GPU duty cycle is enforced by the worker pacing itself**, not by the control process (TASK-15):
-  a misbehaving or compromised worker can exceed it. Measured on one Mac (Apple M3 Pro); other chips
-  are untested.
+- **GPU duty cycle:** the control process measures the worker's GPU use and kills a worker above
+  duty + 10 pp, but it cannot slow one down first; SIGSTOP gating is open (TASK-15.1). A rogue worker
+  can use up to about 49 s of excess before it is stopped. Measured on one Mac (Apple M3 Pro); other
+  chips are untested, and engines that run outside the worker process (Ollama, the dev fake) are not
+  metered.
 - **Output size is capped by the S3 policy, not the quota.** Use a bucket quota and lifecycle rules
   (SPEC S-2, [ADR-0017](docs/adr/0017-presigned-post-output-uploads.md)).
 - **Signed `Range` reads are not verified on SeaweedFS** (the dev S3); AWS S3 and MinIO enforce them.
