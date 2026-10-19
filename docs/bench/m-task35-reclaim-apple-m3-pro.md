@@ -7,7 +7,9 @@ committed: it wraps `minion_watchdog.main.tick` with SQLAlchemy cursor events, a
 asyncpg commit and `pg_stat_statements` / `pg_stat_wal` deltas). Run on 2026-10-19, Mac otherwise idle.
 
 BEFORE = `origin/main` (3295544), AFTER = branch `perf/task-35-chunked-reclaim` (06fc70b, one transaction
-per chunk of 100 acquirements, about 5 statements per chunk).
+per chunk of 100 acquirements, about 5 statements per chunk). Later commit 48e7678 changed only the
+quarantine exclusion clause (one `uuid[]` bind) and error classification; the quarantine was empty in every
+bench tick, so the measured statements are the same.
 
 ## Setup
 
@@ -48,11 +50,11 @@ Per 500 stale rows (median of the runs; the JSON has all of them):
 | | BEFORE host | BEFORE net | AFTER host | AFTER net |
 |---|---|---|---|---|
 | Client statements | 4,006 (8 per row) | 4,006 to 4,487 | 31 | 31 |
-| Server calls incl. BEGIN/COMMIT/ROLLBACK (excl. FK trigger internals) | 6,106 | 6,026 to 6,516 | 71 to 91 | 71 |
+| Server calls incl. BEGIN/COMMIT/ROLLBACK (excl. FK trigger internals) | 6,106 | 6,026 to 6,516 | 71 to 91 (excl. run 1: 1,075, debug logging on) | 71 |
 | Commits | 501 | 501 | 6 | 6 |
 | Server execution total (`pg_stat_statements`) | 323 / 374 / 93 ms | 62 to 74 ms | 36 to 39 ms | 22 ms |
-| Commit time (client) | 600 / 680 / 196 ms (1.2 / 1.4 / 0.4 ms each) | 73 to 77 ms (0.15 ms each) | 4 to 5 ms | 2 ms |
-| `wal_sync` count / `wal_sync_time` | 501 / 193 to 221 ms | 500 / 45 to 49 ms | 6 / 2 to 3 ms | 6 / 2 ms |
+| Commit time (client) | 600 / 680 / 196 ms (1.2 / 1.4 / 0.4 ms each) | 72 to 77 ms (0.15 ms each) | 4 to 5 ms | 2 ms |
+| `wal_sync` count / `wal_sync_time` | 501 / 193 to 221 ms (slow runs; 67 ms in the fast run) | 500 / 45 to 49 ms | 6 / 2 to 3 ms | 6 / 2 ms |
 | Tick | 8,158 / 9,230 / 2,574 ms | 1.1 to 1.3 s | 187 to 196 ms | 116 to 121 ms |
 
 The 8 statements per row are: lock+owned join, heartbeat_stale, never_acknowledged, unacknowledged
@@ -82,7 +84,7 @@ network 0.46 and 1.12 ms (0.09 ms per extra statement). That predicts about 1.8 
 
 **Open: a slow host mode.** With identical code and an idle machine, 9 of 11 BEFORE host runs took 7.0 to
 9.2 s and 2 took 2.6 to 3.0 s. In the slow runs everything on the same statements is 3x to 4x slower, including
-the server's own execution time (323 to 399 ms against 93 to 114 ms) and the commit time, so the whole
+the server's own execution time (272 to 400 ms over all slow BEFORE runs, against 93 to 114 ms in the fast ones) and the commit time, so the whole
 host plus Docker VM path is in a slower state; it is not a property of one statement. This is the M6.4
 9 s: the M6.3 1.7 to 2.4 s is the fast state. I could not tell from these measurements what switches the state
 (Docker Desktop VM scheduling or host power state are candidates; not investigated). The in-network runs
