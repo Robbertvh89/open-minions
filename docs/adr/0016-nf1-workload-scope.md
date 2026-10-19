@@ -34,10 +34,14 @@ one core of twelve), with the load generator on the same cores.
   cap and acquire deadline answer `503 SERVER_BUSY` / `ACQUIRE_DEADLINE` with `Retry-After`, which the
   executor honours like a 429 (TASK-7.4.4, ARCHITECTURE §3.2 overload paragraph; ADR-0014 covers only the ack heartbeat and ghost acquirements). Under the stress mix this gave 0 5xx,
   0 transport errors, 0 FAILED subtasks and 0 ghost acquirements.
-- Expectation, not measured: stress capacity should grow with `MINION_SERVER_WORKERS` and with server
-  hosts (NF-5: the server is stateless), because server CPU is the apparent limit, not Postgres. Not
-  measured: more than 4 workers, or server and generator on separate hosts (the 12 cores were shared
-  with the load generator). The scaling curve is TASK-36.
+- **Measured (TASK-36,** [report](../bench/m-task36-server-cpu-apple-m3-pro.md)**):** capacity does not
+  grow linearly with `MINION_SERVER_WORKERS` on one Mac. S-sat goodput (500 sims, 0.25 s work, 1M PENDING,
+  median of 3) is 69.6, 103.3, 159.7, 175.5, 178.3 and 164.3 completes/s for W = 1, 2, 4, 6, 8, 12
+  (efficiency 1.00, 0.74, 0.57, 0.42, 0.32, 0.20; the host is at H = 0.83 at W=8 and 0.93 at W=12). The
+  stress mix reaches 170/s at W=4 and 194/s at W=8 (near its ~200/s demand). Server CPU per subtask rises
+  from 14.4 to 33.4 ms (W=1 to 8) together with the claim query mean (0.73 to 10.7 ms) and claim calls per
+  win (1.06 to 1.73); `MINION_ACQUIRE_WINDOW=64` at W=8 gave +11 % goodput. Server and generator on
+  separate hosts (NF-5) remain not measured.
 - **No `FOR UPDATE SKIP LOCKED`.** Ownership stays decided solely by the unique-constraint
   `INSERT ... ON CONFLICT DO NOTHING` (invariant 2). The claim now costs 1.26 calls per win and
   2.97 ms mean under stress, so the contention is reduced from 19.4 INSERT attempts per win (M6.3) to 1.26.
@@ -56,5 +60,13 @@ one core of twelve), with the load generator on the same cores.
   profile shows Python interpreter work dominating the acquire/complete path and adding workers or
   hosts does not scale throughput roughly linearly; if throughput scales with workers, the Python
   server stays and the gap is a sizing question.
-- Revisit if the observed production acquire rate approaches the stress rate, or if TASK-36 finds
-  server CPU per acquire that can be cut cheaply.
+  **TASK-36 decided: the trigger is not met and ADR-0001 stands.** Both clauses of the rule above hold
+  (Python-level work is 67 % of non-idle worker samples in P1 and 80 % in P2; efficiency E(4) = 0.57), but
+  the verdict rests on the condition fixed in the TASK-36 plan before the runs, which applies ADR-0001's
+  "not Postgres" wording: if the claim query mean exceeds 2x its W=1 value (3.6 ms at W=4, 10.7 ms at
+  W=8 vs 0.73 ms), the shortfall is attributed to PostgreSQL claim contention (see the Decision section of
+  the [report](../bench/m-task36-server-cpu-apple-m3-pro.md)). This is a rule outcome, not proof that the
+  Python cost is fine: server CPU per subtask grows 2.3x by W=8. A rerun after TASK-46 (statements built
+  once) and TASK-47 (fewer claim collisions) re-judges it.
+- Revisit if the observed production acquire rate approaches the stress rate. (TASK-36 did find server
+  CPU per acquire that can be cut cheaply: follow-ups TASK-46 to TASK-49.)
