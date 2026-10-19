@@ -266,6 +266,16 @@ async def _inflight(lv: Live, n: int = 1) -> bool:
     return bool((await lv.rows("SELECT count(*) FROM minion_subtask_acquirement"))[0][0] == n)
 
 
+async def _acked(lv: Live) -> bool:
+    """ADR-0014 ack landed: a beat moved last_seen_at off the claim's acquired_at."""
+    r = await lv.rows(
+        "SELECT count(*) FROM minion_executor_heartbeat h"
+        " JOIN minion_subtask_acquirement a USING (acquirement_id)"
+        " WHERE h.last_seen_at <> a.acquired_at"
+    )
+    return bool(r[0][0] == 1)
+
+
 async def _spawn_executor(lv: Live, tmp: Path, owner: str) -> asyncio.subprocess.Process:
     env = {
         **os.environ,
@@ -336,6 +346,9 @@ async def test_killed_executor_subtask_is_reclaimed_and_rerun(
     b_loop: ExecutorLoop | None = None
     try:
         await eventually(lambda: _inflight(live))
+        # Kill only after the ack heartbeat, so the reclaim is HEARTBEAT_TIMEOUT (the
+        # NOT_ACKNOWLEDGED path is covered in the watchdog and reclaim-race tests).
+        await eventually(lambda: _acked(live), 30)
         a.send_signal(signal.SIGKILL)  # no release, no complete: only the watchdog can recover
         assert await asyncio.wait_for(a.wait(), 10) == -signal.SIGKILL
 
@@ -344,6 +357,9 @@ async def test_killed_executor_subtask_is_reclaimed_and_rerun(
             return [r[0] for r in rows] == ["EXPIRED"]
 
         await eventually(expired, 30)
+        # Its job is done; it must not expire B's attempt under load. This deliberately gives up
+        # the watchdog's settle_stuck backstop (ADR-0015): B's own complete settles the task.
+        await _reap(wd)
         b_client, b_loop = _in_process_loop(
             live, await live.token("exec-b"), WorkerHandle([Engine.FAKE]), tmp_path
         )
@@ -365,8 +381,8 @@ async def test_killed_executor_subtask_is_reclaimed_and_rerun(
     att = await live.rows(
         "SELECT attempt, outcome, error->>'code' FROM minion_subtask_attempt ORDER BY attempt"
     )
-    assert [(r[0], r[1]) for r in att] == [(1, "EXPIRED"), (2, "SUCCEEDED")]
-    assert att[0][2] == "HEARTBEAT_TIMEOUT"
+    assert [(r[0], r[1]) for r in att] == [(1, "EXPIRED"), (2, "SUCCEEDED")], att
+    assert att[0][2] == "HEARTBEAT_TIMEOUT", att
     ids = sorted(r["id"] for r in _out_rows(live, "kill"))
     assert ids == sorted(["slow0", *(f"k{i}" for i in range(4))])
     assert _final_keys(live, "kill") == ["outputs/e2e/kill/000000.jsonl"]
