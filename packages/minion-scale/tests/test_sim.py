@@ -7,6 +7,7 @@ import random
 import subprocess
 import sys
 import types
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -177,7 +178,14 @@ async def test_sims_drain_a_queue_over_rest_only(lv: Live) -> None:
     await seed_task(lv.sm, "happy", 12, engine=Engine.FAKE)
     rec = await _run(lv, lambda r: r.events["completed"] >= 12, sims=3)
     assert rec.events["completed"] == 12
-    assert rec.server_errors_5xx == 0 and rec.conflicts_409 == 0
+    assert rec.server_errors_5xx == 0
+    # The heartbeater keeps beating through upload + complete (executor parity): a beat queued
+    # behind its own complete's row lock gets 409 once the complete commits. Harmless, and the
+    # only 409 a fault-free drain may see (TASK-40).
+    hb_409 = rec.statuses.get("heartbeat", Counter())[409]
+    assert rec.conflicts_409 == hb_409, rec.statuses  # none on acquire/complete/release/fail
+    assert hb_409 <= rec.events["completed"]  # at most one racing beat per completion
+    assert "complete_409" not in rec.events and "discarded_stale" not in rec.events
     assert {"acquire_assigned", "acquire_empty", "heartbeat", "complete", "output_put"} >= set(
         rec.latency
     ) - {"register"}
