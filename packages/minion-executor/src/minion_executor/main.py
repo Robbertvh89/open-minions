@@ -45,7 +45,12 @@ from minion_executor.capacity.profiles import (
 )
 from minion_executor.capacity.runtime import GovernorRuntime
 from minion_executor.capacity.safefile import SafeFileError, ensure_private_dir
-from minion_executor.capacity.signals import SignalSource, default_source
+from minion_executor.capacity.signals import (
+    MacSignals,
+    MemPressure,
+    SignalSource,
+    default_source,
+)
 from minion_executor.capacity.status import STATUS_FILE, read_status, running
 from minion_executor.capacity.status import render as render_status
 from minion_executor.heartbeat import check_interval
@@ -65,7 +70,7 @@ from minion_executor.service import (
     service_app,
     service_mode,
 )
-from minion_executor.settings import ExecutorSettings
+from minion_executor.settings import DEFAULT_PROBE_TIMEOUT_S, ExecutorSettings
 from minion_executor.worker.process import WorkerCrashed, WorkerHandle, restrict_environ
 from minion_executor.worker.sandbox import SANDBOX_FAILED, SandboxPolicy
 
@@ -179,7 +184,10 @@ def _requested_engines(engines: str, runner: str | None) -> list[Engine]:
     return out
 
 
-PROBE_TIMEOUT_S = 90.0
+PROBE_TIMEOUT_S = DEFAULT_PROBE_TIMEOUT_S  # default; MINION_EXECUTOR_PROBE_TIMEOUT_S overrides
+PROBE_TIMEOUT_MAX_S = 900.0
+PROBE_PRESSURE_FACTOR = 3.0  # timeout multiplier while memory pressure is warn/critical
+PROBE_TIMEOUT_ENV = "MINION_EXECUTOR_PROBE_TIMEOUT_S"
 
 
 def keep_alive_s(idle_unload_s: float) -> int:
@@ -209,19 +217,61 @@ def kill_active_probe() -> None:
         handle.kill(reap=False)
 
 
+def _probe_memory_pressure() -> MemPressure | None:
+    """Current macOS memory pressure; None when it cannot be read (not macOS, sysctl failure)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        return MacSignals(want_call=False).read().memory_pressure
+    except Exception:  # best effort: the probe must not fail because of this read
+        return None
+
+
+def probe_timeout_s(base_s: float, pressure: MemPressure | None) -> float:
+    """The probe timeout: `base_s`, tripled (capped) under warn/critical memory pressure.
+
+    We extend rather than wait for the pressure to clear: it may never clear on a busy Mac, a
+    wait delays startup for nothing when the probe would have fit, and a longer deadline needs no
+    extra interruption path (the probe is already killed by the stop signals).
+    """
+    if pressure in (MemPressure.WARNING, MemPressure.CRITICAL):
+        return min(base_s * PROBE_PRESSURE_FACTOR, PROBE_TIMEOUT_MAX_S)
+    return base_s
+
+
 def probe_available(requested: list[Engine], sandbox: SandboxPolicy | None = None) -> list[Engine]:
     """Ask a worker subprocess which of `requested` work here (engines are never imported in
     the control process, invariant 7). Call after `restrict_environ()` so the probe worker
     inherits no secrets. The probe worker is sandboxed like a real one, so a broken sandbox
     surfaces here as `SANDBOX_FAILED` (the CLI exits 2) and engine imports are proven to work
-    under the profile."""
+    under the profile. The timeout is `MINION_EXECUTOR_PROBE_TIMEOUT_S`, extended under memory
+    pressure; a timeout is reported with its likely cause and that knob."""
     global _active_probe
+    base_s = ExecutorSettings().probe_timeout_s
+    pressure = _probe_memory_pressure()
+    timeout_s = probe_timeout_s(base_s, pressure)
+    if timeout_s != base_s:
+        structlog.get_logger("minion_executor.main").warning(
+            "engine_probe_waiting_for_memory",
+            memory_pressure=pressure.value if pressure else None,
+            timeout_s=timeout_s,
+        )
     handle = WorkerHandle(requested, sandbox=sandbox)
     _active_probe = handle
     try:
         if _probe_cancelled.is_set():  # cancelled before we got here: never spawn
             handle.kill()
-        found = handle.probe(PROBE_TIMEOUT_S)
+        try:
+            found = handle.probe(timeout_s)
+        except WorkerCrashed as exc:
+            if str(exc) != "worker timed out":
+                raise
+            raise WorkerCrashed(
+                f"engine probe timed out after {timeout_s:g}s: starting the worker and importing "
+                "the engine is slow, most likely because the Mac is under memory pressure "
+                "(swapping) or this is the first import after boot; close other apps, or raise "
+                f"{PROBE_TIMEOUT_ENV} (10..900 s)"
+            ) from exc
     finally:
         _active_probe = None
     return [e for e in requested if found.get(e.value)]

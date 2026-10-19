@@ -239,7 +239,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   on an insecure server URL (`require_secure_url`, localhost excepted), an unknown profile, or a
   missing token or unknown runner. The token is removed from `os.environ` right after loading, before
   any child process. `--engines auto` (default; probes mlx and hf, Ollama is opt-in) or a list such as `mlx,ollama`: after the environ is
-  restricted, a short-lived worker subprocess (90 s timeout) probes which engines work (only engines
+  restricted, a short-lived worker subprocess (90 s timeout by default, `MINION_EXECUTOR_PROBE_TIMEOUT_S` 10..900, tripled while memory pressure is warn/critical) probes which engines work (only engines
   `create_runner` implements, see `runners.SUPPORTED`) and the executor registers with those; none
   available or a probe failure exits 2. `fake` is never implicit: `--engines fake` (or hidden
   `--runner fake`) needs `MINION_EXECUTOR_DEV=1`. Subtasks whose engine/memory is not admissible, or

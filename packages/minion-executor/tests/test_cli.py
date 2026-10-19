@@ -2,10 +2,12 @@ import os
 from pathlib import Path
 
 import pytest
+import structlog
 from minion_common.enums import CapacityProfile, CpuPriority, Engine
 from minion_common.schemas import Budget
 from minion_executor.capacity.control import OwnerControl
 from minion_executor.main import app
+from minion_executor.worker.process import WorkerCrashed
 from typer.testing import CliRunner
 
 runner = CliRunner()
@@ -155,6 +157,7 @@ def _no_restrict(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     order: list[str] = []
     monkeypatch.setattr(m, "restrict_environ", lambda: order.append("restrict"))
+    monkeypatch.setattr(m, "_probe_memory_pressure", lambda: None)  # not the host's real pressure
     return order
 
 
@@ -857,3 +860,94 @@ def test_prefer_sends_put_to_the_preference_endpoint() -> None:
     assert (req.method, req.url.path) == ("PUT", "/api/v1/executor/preference")
     assert req.headers["authorization"] == "Bearer tok"
     assert req.read() == b'{"team":"nlp","project":null,"task_name":null}'
+
+
+def _probe_fixture(
+    monkeypatch: pytest.MonkeyPatch, pressure: object, reply: str | dict[str, str | None]
+) -> dict[str, float]:
+    import minion_executor.main as m
+
+    seen: dict[str, float] = {}
+
+    class FakeProbe:
+        def __init__(self, engines: list[Engine], **_kw: object) -> None:
+            pass
+
+        def probe(self, timeout_s: float) -> dict[str, str | None]:
+            seen["timeout"] = timeout_s
+            if isinstance(reply, str):
+                raise WorkerCrashed(reply)
+            return reply
+
+        def kill(self, reap: bool = True) -> None:
+            pass
+
+    monkeypatch.setattr(m, "WorkerHandle", FakeProbe)
+    monkeypatch.setattr(m, "_probe_memory_pressure", lambda: pressure)
+    return seen
+
+
+def test_probe_timeout_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.setenv("MINION_EXECUTOR_PROBE_TIMEOUT_S", "240")
+    seen = _probe_fixture(monkeypatch, None, {"mlx": "1"})
+    assert m.probe_available([Engine.MLX]) == [Engine.MLX]
+    assert seen["timeout"] == 240.0
+
+
+def test_probe_timeout_default_is_90(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    monkeypatch.delenv("MINION_EXECUTOR_PROBE_TIMEOUT_S", raising=False)
+    seen = _probe_fixture(monkeypatch, None, {"mlx": "1"})
+    m.probe_available([Engine.MLX])
+    assert seen["timeout"] == 90.0
+
+
+@pytest.mark.parametrize("bad", ["9", "901", "nan", "inf", "abc"])
+def test_probe_timeout_setting_is_bounded(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    from minion_executor.settings import ExecutorSettings
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("MINION_EXECUTOR_PROBE_TIMEOUT_S", bad)
+    with pytest.raises(ValidationError):
+        ExecutorSettings()
+
+
+def test_probe_timeout_extended_under_memory_pressure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+    from minion_executor.capacity.signals import MemPressure
+
+    monkeypatch.setenv("MINION_EXECUTOR_PROBE_TIMEOUT_S", "100")
+    seen = _probe_fixture(monkeypatch, MemPressure.WARNING, {"mlx": "1"})
+    events: list[str] = []
+
+    class FakeLog:
+        def warning(self, event: str, **_kw: object) -> None:
+            events.append(event)
+
+    monkeypatch.setattr(structlog, "get_logger", lambda *_a, **_k: FakeLog())
+    m.probe_available([Engine.MLX])
+    assert seen["timeout"] == 300.0 and events == ["engine_probe_waiting_for_memory"]
+    assert m.probe_timeout_s(500.0, MemPressure.CRITICAL) == 900.0  # capped
+    assert m.probe_timeout_s(100.0, MemPressure.NORMAL) == 100.0
+    assert m.probe_timeout_s(100.0, None) == 100.0
+
+
+def test_probe_timeout_error_names_cause_and_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    _probe_fixture(monkeypatch, None, "worker timed out")
+    with pytest.raises(WorkerCrashed) as ei:
+        m.probe_available([Engine.MLX])
+    msg = str(ei.value)
+    assert "memory pressure" in msg and "MINION_EXECUTOR_PROBE_TIMEOUT_S" in msg and "90s" in msg
+
+
+def test_probe_other_crash_text_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.main as m
+
+    _probe_fixture(monkeypatch, None, "worker exited with code 9")
+    with pytest.raises(WorkerCrashed, match="exited with code 9"):
+        m.probe_available([Engine.MLX])

@@ -45,12 +45,22 @@ def state_dir_from_env(environ: Mapping[str, str] | None = None) -> Path:
     return normalize_state_dir(raw)
 
 
+DEFAULT_PROBE_TIMEOUT_S = 90.0
+
+
 class ExecutorSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MINION_EXECUTOR_", extra="ignore")
 
     # Seconds without work before the worker is unloaded to free model memory (invariant 6).
     # 0 disables idle unload.
     idle_unload_s: float = Field(default=600.0, ge=0, allow_inf_nan=False)
+
+    # Seconds the startup engine probe (worker start + importing mlx/torch) may take. Starting the
+    # sandboxed worker is slow while macOS swaps; raise this on a loaded Mac. Under warn/critical
+    # memory pressure the probe gets 3x this (capped at the maximum).
+    probe_timeout_s: float = Field(
+        default=DEFAULT_PROBE_TIMEOUT_S, ge=10, le=900, allow_inf_nan=False
+    )
 
     # FR-17: seconds an in-flight subtask may keep running after SIGTERM/SIGINT before the worker
     # is killed and the subtask released. 0 = stop at once. A second signal stops immediately.
