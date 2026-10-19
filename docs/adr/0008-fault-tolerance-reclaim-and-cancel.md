@@ -66,3 +66,32 @@ acquirements. That is enough for silent executors, but the M2 review found five 
   monotonic, so inserts hit the rightmost leaf page and stay cheap.
 - Operators must keep `MINION_HEARTBEAT_TIMEOUT_S` at least 2x (recommended 3x) the executor
   heartbeat interval, or live executors are reclaimed between beats.
+
+## Addendum (TASK-35): reclaim in chunks of 100
+
+Reclaim no longer opens one transaction per acquirement (about 11 round trips and a commit each).
+The watchdog takes the stale / over-lease candidates, splits them into chunks of `RECLAIM_CHUNK`
+= 100 (a constant, not a setting) and handles each chunk in one transaction:
+
+- `SELECT ... FOR UPDATE SKIP LOCKED` on the chunk's ids, sorted by `acquirement_id`. SKIP LOCKED
+  keeps the guarantee that reclaim never waits on an owner op or another replica, and the sorted
+  order plus no waiting means two replicas cannot deadlock.
+- The re-check stays a separate statement after the lock, so it takes a new snapshot and sees a
+  heartbeat committed before the lock (a later one is impossible: beat locks the acquirement first).
+  One query returns the flags and attempt counts for the whole chunk.
+- Reclaim has its own batched writer (one INSERT, one DELETE, one UPDATE per outcome group, counter
+  shards pre-aggregated and bumped in sorted order) instead of the owner-op `finish_*` helpers; the
+  shared builders in `repositories/completion.py` keep the attempt/budget semantics in one place.
+  Lock order is unchanged (acquirement, heartbeat, subtask, counter shard). Reclaim semantics
+  (reasons, budget, ADR-0014 free expiries, settle by `settle_stuck`) are unchanged.
+- A chunk that raises is rolled back and retried row by row, each in its own transaction, so one bad
+  row still cannot block the batch. A row that also fails alone is skipped for 10 minutes (in-memory,
+  per process) so it does not cost 101 transactions per tick.
+- Cost: a chunk holds up to 100 acquirement locks for a few milliseconds; an owner op on one of them
+  waits that long and then gets 409, as it would if reclaim had won the race row by row. `now()` is
+  the transaction start, so cutoffs are a few ms older than per row: conservative, never reclaims a
+  fresh row.
+
+Not a deviation from the paper, so an addendum rather than a new ADR. The expected tick improvement
+is not measured yet (TASK-35 steps 1 and 4).
+

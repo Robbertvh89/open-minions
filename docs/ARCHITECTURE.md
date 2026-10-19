@@ -466,18 +466,24 @@ then sweeps PENDING subtasks of recently cancelled tasks to CANCELLED). Implemen
 SKIP LOCKED + re-check (ADR-0008), not DELETE ... RETURNING:
   candidates = unlocked scan: heartbeat rows WHERE last_seen_at < now() - heartbeat_timeout
                ∪ acquirements WHERE acquired_at < now() - max_lease
-  FOR each candidate:
+  FOR each chunk of RECLAIM_CHUNK = 100 candidates:        -- ADR-0008 addendum (TASK-35)
     BEGIN
-      SELECT ... FROM minion_subtask_acquirement WHERE acquirement_id = $1 FOR UPDATE SKIP LOCKED
-      -- no row (gone) or locked by an owner op / other replica → SKIPPED
-      re-check: heartbeat still stale? else max lease exceeded? else → NOT_STALE
-      -- stale heartbeat with last_seen_at = acquired_at (never acknowledged) and fewer than
-      -- MINION_RELEASE_LIMIT earlier NOT_ACKNOWLEDGED expiries: code NOT_ACKNOWLEDGED, not budget-counted
-      finish_failed: INSERT minion_subtask_attempt(outcome=EXPIRED, code NOT_ACKNOWLEDGED | HEARTBEAT_TIMEOUT | MAX_LEASE_EXCEEDED)
-                     DELETE acquirement (cascades heartbeat row)
-                     UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
-      UPSERT counter shard when the subtask ended FAILED
-    COMMIT   (a task whose last subtask failed here is settled by the watchdog's settle_stuck)
+      lock:     SELECT acquirement_id FROM minion_subtask_acquirement WHERE acquirement_id = ANY($ids)
+                ORDER BY acquirement_id FOR UPDATE SKIP LOCKED
+                -- gone, or locked by an owner op / other replica → SKIPPED (never waits)
+      classify: ONE new statement after the lock (fresh READ COMMITTED snapshot): acquirement ⋈ subtask ⋈ task
+                ⟕ heartbeat, with stale / never-acknowledged / over-lease flags and the budget and
+                NOT_ACKNOWLEDGED attempt counts. Neither stale nor over lease → NOT_STALE.
+      decide (pure, per row): stale heartbeat with last_seen_at = acquired_at (never acknowledged) and fewer than
+                MINION_RELEASE_LIMIT earlier NOT_ACKNOWLEDGED expiries: code NOT_ACKNOWLEDGED, not budget-counted;
+                else HEARTBEAT_TIMEOUT / MAX_LEASE_EXCEEDED (budget-counted)
+      write, one statement per kind for the whole chunk:
+                INSERT minion_subtask_attempt (outcome=EXPIRED, code ...) ... VALUES (...), (...)
+                DELETE acquirement WHERE acquirement_id = ANY(...)   (cascades heartbeat rows)
+                UPDATE minion_subtask: FAILED if budget spent, CANCELLED if task cancelled, else PENDING
+                UPSERT counter shards for FAILED subtasks, pre-aggregated, shards in sorted order
+    COMMIT   (if the chunk raises: ROLLBACK and redo its rows one by one, each in its own transaction;
+              a row that fails alone is skipped for 10 minutes. A task whose last subtask failed here is settled by the watchdog's settle_stuck)
 ```
 **Retry budget.** It is the number of `FAILED` + `EXPIRED` attempts in `minion_subtask_attempt`
 (`fail` already counts the attempt being recorded). `EXPIRED` with code `NOT_ACKNOWLEDGED` (never-beaten
@@ -569,7 +575,7 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Two executors acquire same subtask | UNIQUE constraint on acquirement; only one INSERT returns a row |
 | Watchdog reclaims while owner completes | Both paths lock the same acquirement row (`FOR UPDATE`; reclaim uses `SKIP LOCKED`, so a busy row is skipped); reclaim re-checks staleness under the lock; loser sees 0 rows → no-op / 409 |
 | Reclaimed owner uploads late | Writes go to attempt-scoped key; promotion only on accepted `/complete` |
-| Two watchdog replicas | `SKIP LOCKED` per row + re-check under the lock; a skipped row is handled on the next tick |
+| Two watchdog replicas | `SKIP LOCKED` per chunk (ids locked in sorted order, never waits) + a fresh classify statement under the locks; a skipped row is handled on the next tick; counter shards are bumped in sorted order, so no lock cycle |
 | Cancel of a large task | Lazy two-phase: txn 1 task only; txn 2 in batches of 10 000 PENDING rows; RUNNING owners learn via `heartbeat.cancel`; watchdog sweep heals stragglers |
 | Live executor reclaimed between beats | `MINION_HEARTBEAT_TIMEOUT_S` ≥ 2–3× heartbeat interval (checked only when the timeout is exported to the executor); 429 keeps beats bounded |
 | Server crash mid-split | Splitter is resumable: subtasks inserted with deterministic ids + `ON CONFLICT DO NOTHING` |
