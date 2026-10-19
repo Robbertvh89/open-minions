@@ -1169,3 +1169,43 @@ async def test_quarantine_expires_and_is_capped(
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == len(got)
     assert mod._QUARANTINE == {}
+
+
+class _PgError(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("sqlstate", "quarantined"),
+    [
+        ("40P01", False),  # deadlock
+        ("40001", False),  # serialization failure
+        ("57014", False),  # statement_timeout
+        ("55P03", False),  # lock_not_available
+        ("53300", False),  # too_many_connections
+        ("57P03", False),  # cannot_connect_now
+        ("08006", False),  # connection failure
+        ("23505", True),  # unique violation: about the row
+        ("22P02", True),  # invalid text representation: about the row
+    ],
+)
+async def test_sqlstate_classifies_quarantine(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch, sqlstate: str, quarantined: bool
+) -> None:
+    import minion_server.services.reclaim as mod
+    from sqlalchemy.exc import DBAPIError
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 2, "ss")
+    await _backdate(sm)
+
+    async def fail(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        raise DBAPIError("stmt", {}, _PgError(sqlstate))
+
+    monkeypatch.setattr(mod, "reclaim_chunk", fail)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert (len(mod._QUARANTINE) == 2) is quarantined

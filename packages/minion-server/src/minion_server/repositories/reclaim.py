@@ -14,6 +14,7 @@ from typing import Any
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
 from sqlalchemy import (
     Select,
+    all_,
     false,
     func,
     literal,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +48,11 @@ def _cutoff(timeout_s: float) -> Any:
     return func.now() - func.make_interval(0, 0, 0, 0, 0, 0, timeout_s)
 
 
+def _uuid_array(ids: Sequence[uuid.UUID]) -> Any:
+    """One array bind (stable prepared statement) instead of an expanding IN list."""
+    return literal(list(ids), ARRAY(UUID(as_uuid=True)))
+
+
 def stale_stmt(
     timeout_s: float, limit: int, exclude: Sequence[uuid.UUID] = ()
 ) -> Select[uuid.UUID]:
@@ -56,7 +63,7 @@ def stale_stmt(
         ExecutorHeartbeat.last_seen_at < _cutoff(timeout_s)
     )
     if exclude:
-        stmt = stmt.where(ExecutorHeartbeat.acquirement_id.not_in(list(exclude)))
+        stmt = stmt.where(ExecutorHeartbeat.acquirement_id != all_(_uuid_array(exclude)))
     return stmt.order_by(ExecutorHeartbeat.last_seen_at).limit(limit)
 
 
@@ -76,7 +83,7 @@ def over_lease_stmt(
         SubtaskAcquirement.acquired_at < _cutoff(max_lease_s)
     )
     if exclude:
-        stmt = stmt.where(SubtaskAcquirement.acquirement_id.not_in(list(exclude)))
+        stmt = stmt.where(SubtaskAcquirement.acquirement_id != all_(_uuid_array(exclude)))
     return stmt.order_by(SubtaskAcquirement.acquired_at).limit(limit)
 
 

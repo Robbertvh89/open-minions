@@ -14,7 +14,7 @@ from typing import Any
 
 import structlog
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -85,11 +85,26 @@ def reset_quarantine() -> None:
     _QUARANTINE.clear()
 
 
+# SQLSTATE classes that mean "the database is unwell", not "this row is bad": connection (08),
+# transaction rollback incl. deadlock / serialization (40), insufficient resources incl. too many
+# connections (53), operator intervention incl. statement timeout / cannot connect now (57), and
+# lock_not_available (55P03).
+_TRANSIENT_SQLSTATE_PREFIXES = ("08", "40", "53", "57")
+
+
 def _row_specific(exc: BaseException) -> bool:
     """False for infrastructure errors (connection, pool, timeout, deadlock): a DB blip must not
     quarantine healthy rows."""
     transient = (OperationalError, InterfaceError, SATimeoutError, TimeoutError, OSError)
-    return not (isinstance(exc, transient) or getattr(exc, "connection_invalidated", False))
+    if isinstance(exc, transient) or getattr(exc, "connection_invalidated", False):
+        return False
+    if isinstance(exc, DBAPIError):
+        state = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        if isinstance(state, str) and (
+            state.startswith(_TRANSIENT_SQLSTATE_PREFIXES) or state == "55P03"
+        ):
+            return False
+    return True
 
 
 async def reclaim_chunk(

@@ -88,8 +88,11 @@ The watchdog takes the stale / over-lease candidates, splits them into chunks of
   row still cannot block the batch. A row that also fails alone with a row-specific error is
   skipped for 10 minutes (in-memory, per process, at most 1000 ids) so it does not cost 101
   transactions per tick. Quarantined ids are excluded in the candidate scans themselves, so they do
-  not occupy the oldest `LIMIT` slots. Transient infrastructure errors (connection, pool or
-  statement timeouts, deadlocks) never quarantine: a DB blip must not park healthy rows.
+  not occupy the oldest `LIMIT` slots. Transient infrastructure errors never quarantine: connection
+  and pool errors, timeouts, `OperationalError`/`InterfaceError`, and any driver error whose SQLSTATE
+  is in class 08 (connection), 40 (rollback: deadlock 40P01, serialization 40001), 53 (resources,
+  e.g. too many connections), 57 (operator intervention: statement timeout 57014, cannot connect
+  now 57P03) or is 55P03 (lock not available); a DB blip must not park healthy rows.
 - Cost: a chunk holds up to 100 acquirement locks for a few milliseconds; an owner op on one of them
   waits that long and then gets 409, as it would if reclaim had won the race row by row. `now()` is
   the transaction start, so cutoffs are a few ms older than per row: conservative, never reclaims a
