@@ -84,6 +84,7 @@ class StatusFile(_Model):
     paused_reason: PausedReason | None = None
     subtask: StatusSubtask | None = None
     gpu_share: float | None = None
+    gpu_violation: str | None = None  # reason of the last GPU duty kill (over_duty, paused, ...)
     signals: StatusSignals | None = None
     today: StatusToday
 
@@ -262,6 +263,8 @@ def render(st: StatusFile, now: datetime | None = None) -> str:
         lines.append("state:     idle")
     if st.gpu_share is not None:
         lines.append(f"gpu share: {st.gpu_share:.0%} of wall time (current run)")
+    if st.gpu_violation is not None:
+        lines.append(f"gpu guard: worker killed for exceeding its GPU duty ({st.gpu_violation})")
     if st.signals is not None:
         g = st.signals
         power = "AC" if g.on_ac else "battery"

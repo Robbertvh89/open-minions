@@ -32,6 +32,8 @@ from minion_common.schemas import (
     PresignedPost,
 )
 from minion_executor.capacity.governor import Decision, ProfileSource
+from minion_executor.capacity.gpu_guard import GpuGuardConfig
+from minion_executor.capacity.gpu_meter import GpuMeterError
 from minion_executor.capacity.runtime import FixedGovernor
 from minion_executor.loop import ExecutorLoop, _release_code, cleanup_stale_tmp
 from minion_executor.runners.base import Record, RunnerError
@@ -209,6 +211,9 @@ class FakeWorker:
         self.gate: threading.Event | None = None  # run() waits here (a batch in flight)
         self.run_hook: Callable[[int], None] | None = None  # worker thread, at each run() start
         self.footprint_fn: Callable[[], int | None] | None = None
+        self.gpu_busy: float | None = None  # GPU busy share of wall time
+        self.gpu_t0: float | None = None
+        self.gpu_calls = 0
         self.fp_calls = 0  # watcher samples taken (footprint + priority are sampled together)
 
     def ensure_model(
@@ -267,6 +272,16 @@ class FakeWorker:
 
     def gpu_share(self) -> float | None:
         return None
+
+    def gpu_clients(self, reader: Callable[[], Any]) -> tuple[int, dict[str, int]] | None:
+        """Scripted control-side GPU time: `gpu_busy` x wall time since the first call."""
+        self.gpu_calls += 1
+        reader()
+        if self.gpu_busy is None:
+            return None
+        now = time.monotonic()
+        self.gpu_t0 = self.gpu_t0 if self.gpu_t0 is not None else now
+        return 4242, {"0x1": int(self.gpu_busy * (now - self.gpu_t0) * 1e9)}
 
     def kill(self) -> None:
         self.killed = True
@@ -3662,3 +3677,71 @@ async def test_acquire_cap_429_backs_off_for_the_retry_after(tmp_path: Path) -> 
     client.on_empty = loop.stop
     await loop.run()
     assert 30.0 <= sleeps[0] <= 36.0
+
+
+GPU_CFG = GpuGuardConfig(
+    window_s=0.3, min_span_frac=0.5, margin=0.1, grace_s=0.0, kill_after_s=0.05
+)
+
+
+def _gpu_loop(
+    client: FakeClient, worker: FakeWorker, tmp_path: Path, reader: Any = lambda: {}, **kw: Any
+) -> ExecutorLoop:
+    return make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        guard_interval_s=0.02, gpu_reader=reader, gpu_guard=GPU_CFG, **kw,
+    )  # fmt: skip
+
+
+async def test_gpu_rogue_over_duty_is_killed_and_released(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    worker.gpu_busy = 1.0  # duty is 0.5 (+ 0.1 margin)
+    loop = _gpu_loop(client, worker, tmp_path)
+    client.on_empty = loop.stop
+    await asyncio.wait_for(loop.run(), 10)
+    assert worker.interrupts == 1
+    assert client.release_codes == ["GPU_DUTY_VIOLATION"]
+    assert "complete" not in client.kinds()  # nothing uploaded on a verdict
+    assert loop._status_snapshot().gpu_violation == "over_duty"
+
+
+async def test_gpu_honest_worker_completes(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = 0.3
+    worker.gate = threading.Event()
+    loop = _gpu_loop(client, worker, tmp_path)
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.started.is_set())
+    await sampled(worker, 40)  # more than a full guard window
+    worker.gate.set()
+    assert await asyncio.wait_for(task, 10) == 1
+    assert worker.interrupts == 0 and "release" not in client.kinds()
+    assert loop._status_snapshot().gpu_violation is None
+
+
+async def test_gpu_reader_unavailable_disables_the_guard(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = 1.0  # would be killed if anything watched it
+    worker.gate = threading.Event()
+    loop = make_loop(
+        client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        guard_interval_s=0.02, gpu_reader=None, gpu_guard=GPU_CFG,
+    )  # fmt: skip
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.started.is_set())
+    await sampled(worker, 40)
+    worker.gate.set()
+    assert await asyncio.wait_for(task, 10) == 1
+    assert worker.gpu_calls == 0 and worker.interrupts == 0
+
+
+async def test_gpu_meter_failures_fail_closed(tmp_path: Path) -> None:
+    def broken() -> Any:
+        raise GpuMeterError("no clients")
+
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    worker.gpu_busy = 0.0
+    loop = _gpu_loop(client, worker, tmp_path, reader=broken)
+    client.on_empty = loop.stop
+    await asyncio.wait_for(loop.run(), 10)
+    assert client.release_codes == ["GPU_METER_UNAVAILABLE"]

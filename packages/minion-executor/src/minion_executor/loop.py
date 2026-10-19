@@ -49,6 +49,7 @@ from pydantic import ValidationError
 
 from minion_executor import io
 from minion_executor.capacity.governor import Decision
+from minion_executor.capacity.gpu_guard import GpuAction, GpuDutyGuard, GpuGuardConfig
 from minion_executor.capacity.profiles import GIB
 from minion_executor.capacity.runtime import FixedGovernor, Governor
 from minion_executor.capacity.safefile import SafeFileError
@@ -109,6 +110,8 @@ class _Verdict(enum.Enum):
     DOWNGRADE_TIMEOUT = "BUDGET_DOWNGRADE"  # batch overran the 60 s bound after a downgrade
     OOM = "OOM"  # worker footprint > 1.1 x budget twice (D7): retryable failure
     PRIORITY = "PRIORITY_VIOLATION"  # worker less throttled than its budget (D8): respawn
+    GPU_DUTY = "GPU_DUTY_VIOLATION"  # control-side GPU time over duty + margin (TASK-15): kill
+    GPU_METER = "GPU_METER_UNAVAILABLE"  # the GPU meter failed repeatedly: fail closed, kill
     WATCHER_FAILED = "WATCHER_FAILED"  # the watcher itself crashed: fail closed, release
 
 
@@ -183,6 +186,9 @@ class Worker(Protocol):
     def footprint_bytes(self) -> int | None: ...
     def priority_ok(self) -> bool | None: ...
     def gpu_share(self) -> float | None: ...
+    def gpu_clients(
+        self, reader: Callable[[], dict[int, dict[str, int]]]
+    ) -> tuple[int, dict[str, int]] | None: ...
     def unload(self) -> None: ...
     def interrupt(self) -> None: ...
     def kill(self) -> None: ...
@@ -261,7 +267,14 @@ class ExecutorLoop:
         acquire_pace_s: float = 0.0,
         first_acquire_jitter_s: float = 0.0,
         max_output_bytes: int = MAX_OUTPUT_BYTES_DEFAULT,
+        gpu_reader: Callable[[], dict[int, dict[str, int]]] | None = None,
+        gpu_guard: GpuGuardConfig | None = None,
     ) -> None:
+        # control-side GPU duty guard (ADR-0006 D3); inert without a reader (non-darwin, dev fake)
+        self._gpu_reader = gpu_reader
+        self._gpu: GpuDutyGuard | None = GpuDutyGuard(gpu_guard) if gpu_reader else None
+        self._gpu_share: float | None = None  # last measured share of the worker (status.json)
+        self._gpu_violation: str | None = None  # reason of the last GPU duty kill
         self._max_output_bytes = max_output_bytes
         self._cache = model_cache
         self._acquire_pace_s = acquire_pace_s  # min gap between acquire calls; 0 disables
@@ -898,6 +911,8 @@ class ExecutorLoop:
         async with self._ctl_lock:
             d = self._gov.decision
             key = (d.budget.gpu_duty_cycle, d.paused)
+            if self._gpu is not None:
+                self._gpu.note_ctl(key[0], key[1], self._clock())
             trim = d.trim and not self._trim_pushed
             self._trim_pushed = d.trim
             if key == self._ctl_key and not trim:
@@ -909,11 +924,48 @@ class ExecutorLoop:
                 self._ctl_key = None
                 log.warning("worker_control_failed", error=type(exc).__name__)
 
-    def _sample_worker(self) -> tuple[int | None, bool | None]:
+    def _sample_worker(
+        self,
+    ) -> tuple[int | None, bool | None, tuple[int, dict[str, int]] | Exception | None]:
+        """Footprint, priority and (with a guard) the worker's GPU clients; a failed GPU read is
+        returned as the exception so the watcher can count it. Runs in a thread (about 1 ms)."""
+        gpu: tuple[int, dict[str, int]] | Exception | None = None
+        if self._gpu_reader is not None:
+            try:
+                gpu = self._worker.gpu_clients(self._gpu_reader)
+            except Exception as exc:
+                gpu = exc
         try:
-            return self._worker.footprint_bytes(), self._worker.priority_ok()
+            return self._worker.footprint_bytes(), self._worker.priority_ok(), gpu
         except Exception:  # sampling must never take the watcher down
-            return None, None
+            return None, None, gpu
+
+    def _judge_gpu(
+        self, gpu: tuple[int, dict[str, int]] | Exception | None, state: list[int | None]
+    ) -> _Verdict | None:
+        """Feed one GPU reading to the guard; KILL -> verdict. GATE (SIGSTOP duty gating, TASK-15.1)
+        is only logged for now. `state[0]` is the worker pid the guard was started for."""
+        guard = self._gpu
+        if guard is None:
+            return None
+        now, interval = self._clock(), self._guard_s
+        if isinstance(gpu, Exception):
+            v = guard.observe_error(now)
+            log.warning("gpu_meter_error", error=type(gpu).__name__)
+        else:
+            if gpu is not None and gpu[0] != state[0]:
+                guard.start(gpu[0], now)  # first batch of this worker: load is not charged
+                state[0] = gpu[0]
+            v = guard.observe(now, gpu[1] if gpu is not None else None, interval_s=interval)
+        if v.share is not None:
+            self._gpu_share = v.share
+        if v.action is GpuAction.GATE:
+            log.warning("gpu_duty_over", share=v.share, limit=v.limit, stop_s=v.stop_s)
+        elif v.action is GpuAction.KILL:
+            log.error("gpu_duty_kill", share=v.share, limit=v.limit, reason=v.reason)
+            self._gpu_violation = v.reason
+            return _Verdict.GPU_METER if v.reason == "meter" else _Verdict.GPU_DUTY
+        return None
 
     async def _watch(self, a: Assignment) -> _Verdict:
         """Beside the work: keep the worker in step with the governor and decide when the
@@ -939,6 +991,7 @@ class ExecutorLoop:
         downgrade_since: float | None = None
         drop_since: float | None = None  # when the live budget fell below the running batch's
         next_sample = clock() + self._guard_s
+        gpu_state: list[int | None] = [None]  # pid the GPU guard was started for
         while True:
             if self._infer_done.is_set():
                 await self._enforce_idle_budget()
@@ -956,6 +1009,8 @@ class ExecutorLoop:
                 # OOM; just unload it when it no longer fits the budget.
                 over = 0
                 drop_since = None
+                gpu_state[0] = None  # the next batch re-baselines the GPU guard
+                self._gpu_share = None
                 loaded = self._loaded
                 if (
                     not self._ensure_started
@@ -981,7 +1036,10 @@ class ExecutorLoop:
             if sample_due:
                 next_sample = now + self._guard_s  # also without a batch: no busy-spin
             if batch is not None and sample_due:
-                footprint, prio_ok = await asyncio.to_thread(self._sample_worker)
+                footprint, prio_ok, gpu = await asyncio.to_thread(self._sample_worker)
+                gpu_verdict = self._judge_gpu(gpu, gpu_state)
+                if gpu_verdict is not None:
+                    return gpu_verdict
                 # the running batch started under `batch`: a budget drop only takes effect at the
                 # next batch boundary (FR-54, ADR-0006 D7), so the allowance (measure against the
                 # larger of the two budgets) lasts as long as the drop is within
@@ -1051,10 +1109,17 @@ class ExecutorLoop:
             err = _FailureError(True, "OOM", "worker memory exceeded the budget")
             await self._report_failure(a, err, bound)
             return _Outcome.FAILED
+        if self._gpu is not None and v in (_Verdict.GPU_DUTY, _Verdict.GPU_METER):
+            self._gpu.stop()  # the worker is gone: the next one starts a fresh window
         await self._release(a, bound, v.value)
         # a priority violation / crashed watcher is a local fault: back off so it cannot churn;
         # the rest is policy
-        local = v in (_Verdict.PRIORITY, _Verdict.WATCHER_FAILED)
+        local = v in (
+            _Verdict.PRIORITY,
+            _Verdict.WATCHER_FAILED,
+            _Verdict.GPU_DUTY,
+            _Verdict.GPU_METER,
+        )
         return _Outcome.FAILED if local else _Outcome.RELEASED
 
     def _roll_today(self) -> tuple[date, int, int]:
@@ -1075,10 +1140,12 @@ class ExecutorLoop:
         sig = self._gov.snapshot
         cur = self._current
         day, subtasks, records = self._today  # read only: rolled on the event loop
-        try:
-            share = self._worker.gpu_share()
-        except Exception:
-            share = None
+        share = self._gpu_share
+        if share is None:  # no measurement: the worker's own figure is the fallback
+            try:
+                share = self._worker.gpu_share()
+            except Exception:
+                share = None
         return StatusFile(
             pid=os.getpid(),
             started_at=self._started_at,
@@ -1103,6 +1170,7 @@ class ExecutorLoop:
                 else None
             ),
             gpu_share=share,
+            gpu_violation=self._gpu_violation,
             signals=(
                 StatusSignals(
                     on_ac=sig.on_ac,

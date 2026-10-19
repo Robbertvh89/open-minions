@@ -885,6 +885,22 @@ class WorkerHandle:
                 return value
         return None
 
+    def gpu_clients(
+        self, reader: Callable[[], dict[int, dict[str, int]]]
+    ) -> tuple[int, dict[str, int]] | None:
+        """`(pid, {client id: accumulated GPU ns})` of the live worker, or None without one.
+        Same sample-then-verify as `footprint_bytes`: a reaped child discards the sample. The
+        reader's `GpuMeterError` propagates (the caller counts it)."""
+        proc = self._proc
+        pid = proc.pid if proc is not None else None
+        if proc is None or pid is None:
+            return None
+        clients = reader().get(pid, {})
+        with contextlib.suppress(ValueError, AssertionError):
+            if proc.is_alive():
+                return pid, clients
+        return None
+
     def priority_ok(self) -> bool | None:
         """Control-side check that the worker honours the CPU priority of the budget in force:
         its nice is at least the target and, for `background` on macOS, Darwin background QoS is

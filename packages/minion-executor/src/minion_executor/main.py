@@ -34,7 +34,7 @@ from minion_executor import bench_foreground as fg_mod
 from minion_executor.capacity.config import ExecutorConfig, OnCall, load_config, resolve_profiles
 from minion_executor.capacity.control import CONTROL_FILE, parse_duration, update_control
 from minion_executor.capacity.governor import GovernorTiming
-from minion_executor.capacity.gpu_meter import GpuMeterError
+from minion_executor.capacity.gpu_meter import GpuMeterError, default_gpu_reader
 from minion_executor.capacity.instance import AlreadyRunningError, acquire_instance_lock
 from minion_executor.capacity.profiles import (
     ProfileSpec,
@@ -318,6 +318,13 @@ async def _run(
             sandbox=sandbox_policy(settings, available),
             engine_config=EngineConfig(keep_alive_s=keep_alive_s(settings.idle_unload_s)),
         )
+        gpu_reader = default_gpu_reader()
+        if Engine.FAKE in available or gpu_reader is None:
+            structlog.get_logger("minion_executor.main").info(
+                "gpu_duty_guard_disabled",
+                reason="fake_engine" if Engine.FAKE in available else "no_reader",
+            )
+            gpu_reader = None
         governor = build_governor(plan) if plan is not None else None
         # fetch niceness is read per fetch (at spawn), not live; fixed only without a governor
         nice_fn = (lambda: nice_for(governor.decision.budget.cpu_priority)) if governor else None
@@ -337,6 +344,7 @@ async def _run(
             presence_interval_s=settings.presence_interval_s,
             acquire_pace_s=settings.acquire_pace_s,
             first_acquire_jitter_s=settings.first_acquire_jitter_s,
+            gpu_reader=gpu_reader,
             complete_shed_budget_s=settings.complete_shed_budget_s,
             downgrade_batch_s=settings.downgrade_batch_s,
             guard_interval_s=settings.signal_poll_s,
