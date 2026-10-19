@@ -4083,7 +4083,8 @@ async def test_gpu_meter_kill_backs_off_but_never_quarantines(tmp_path: Path) ->
     worker = FakeWorker()
     loop = make_loop(FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
     loop._loaded = ModelEntry.model_validate(MODEL)
-    for _ in range(4):
+    for i in range(4):
+        worker.fake_pid = 5000 + i  # a fresh worker each time
         await loop._gpu_kill_idle(_Verdict.GPU_METER)
     assert worker.interrupts == 4 and len(loop._gpu_streak) == 4
     assert loop._gpu_kills == {} and loop._acquirable_engines() == [Engine.MLX]
@@ -4141,3 +4142,17 @@ async def test_gpu_pending_kill_surviving_the_subtask_runs_the_idle_kill_path(
     assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1
     assert worker.interrupts == 1 and loop._gpu_pending is None
     assert len(loop._gpu_streak) == 1 and loop._gpu_violation is not None
+
+
+async def test_gpu_kill_of_an_already_killed_pid_is_not_repeated(tmp_path: Path) -> None:
+    """interrupt() leaves the dead pid in the handle: a hung read must not re-kill / re-count."""
+    worker = FakeWorker()
+    loop = make_loop(FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
+    loop._gpu_pending = (uuid.uuid4(), _Verdict.GPU_DUTY)
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
+    assert worker.interrupts == 1 and len(loop._gpu_streak) == 1
+    assert loop._gpu_pending is None
+    worker.fake_pid = 4243  # a respawned worker is killable again
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
+    assert worker.interrupts == 2

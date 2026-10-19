@@ -289,6 +289,7 @@ class ExecutorLoop:
         self._gpu: GpuDutyGuard | None = GpuDutyGuard(gpu_guard) if gpu_reader else None
         self._gpu_share: float | None = None  # last measured share of the worker (status.json)
         self._gpu_pid: int | None = None  # worker pid the guard window belongs to
+        self._gpu_killed_pid: int | None = None  # last worker pid killed by the guard
         self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         # sampler KILL for the watcher of that acquirement (tagged: a stale one is dropped)
         self._gpu_pending: tuple[Any, _Verdict] | None = None
@@ -1012,8 +1013,11 @@ class ExecutorLoop:
         if self._gpu is not None:
             self._gpu.stop()
         self._gpu_pid = None
-        if pid is None:
-            return
+        self._gpu_pending = None
+        self._gpu_kick.clear()
+        if pid is None or pid == self._gpu_killed_pid:
+            return  # no worker, or the one already killed (a dead pid can linger in the handle)
+        self._gpu_killed_pid = pid
         meter = v is _Verdict.GPU_METER
         self._gpu_violation = (
             self._gpu_reason or ("meter" if meter else "over_duty"),
@@ -1068,11 +1072,12 @@ class ExecutorLoop:
         drop what depends on it. Runs as `_unload_fut`, so `ensure_model` / `_await_unload` wait
         for it exactly like for an idle unload."""
         unloaded_path = self._loaded_path
-        self._forget_loaded()
-        self._unloaded = True
         await self._await_unload()
         if pid is not None and self._worker.pid != pid:
+            log.info("gpu_kill_skipped", reason="worker_changed")
             return  # the worker we meant to kill is gone (a new one may already run): leave it
+        self._forget_loaded()
+        self._unloaded = True
         fut = asyncio.ensure_future(asyncio.to_thread(self._worker.interrupt))
         self._unload_fut = fut
 
@@ -1351,6 +1356,7 @@ class ExecutorLoop:
             return _Outcome.FAILED
         if self._gpu is not None and v in (_Verdict.GPU_DUTY, _Verdict.GPU_METER):
             self._gpu_violation = (self._gpu_reason or "over_duty", self._clock())
+            self._gpu_killed_pid = self._worker.pid
             self._note_gpu_kill(a.model.engine, quarantine=v is not _Verdict.GPU_METER)
             self._gpu.stop()  # the worker is gone: the next one starts a fresh window
             self._gpu_pid = None

@@ -29,8 +29,17 @@ Rules
   whose long-run share is at most the limit never accumulates (it drains at least as fast as it
   fills): 8 s burn / 8 s rest at balanced (share = duty) stays flat.
 - The bucket advances in every mode: in quiet mode (idle, paused-acked) the busy time is charged
-  against the margin (`limit = margin`), at duty 1.0 (limit above 1) it only drains. A worker that
-  is paused or idle after a long step repays it at `margin` GPU-s per second.
+  against the margin (`limit = margin`); a sample that straddles the busy -> quiet edge (the edge
+  is recorded when it happens, `set_idle`) is allowed the limit in force before the edge for the
+  part before it and the margin for the rest, so the busy-mode GPU time of a 1.5-2 s subtask is
+  never charged against the idle margin. (The mirror, idle -> busy, is allowed the busy limit
+  for the whole sample: lenient by at most one interval.) At duty 1.0 the busy limit is above 1
+  and the bucket only drains, except for quiet samples, which still charge against the margin.
+  A worker that is paused or idle after a long step repays it at `margin` GPU-s per second; a
+  gap without a worker drains at the last busy limit.
+  Caveat: an unacked pause is judged as busy mode until `window_s + grace_s` have passed (the
+  duty in force before the pause stays allowed), then at the margin: a long uncheckpointed
+  step under a pause can be killed after about 28 s at light and 37 s at full.
 - The bucket is **per executor run, not per worker pid**: a new pid re-baselines the counters but
   keeps `acc`, drained by `limit * gap` for the time without a worker, and a KILL leaves it at or
   above the budget. A rogue that is killed and respawned therefore gets about one sample interval
@@ -209,7 +218,7 @@ class GpuDutyGuard:
         if dt > self.cfg.window_s:  # a sampler gap: cap dt and scale the busy time with it
             busy *= self.cfg.window_s / dt
             dt = self.cfg.window_s
-        return self._judge(now, interval_s, busy, dt)
+        return self._judge(now, interval_s, busy, dt, prev[0] if prev is not None else now)
 
     # -- judgement ---------------------------------------------------------------------------
 
@@ -245,7 +254,9 @@ class GpuDutyGuard:
             quiet = since + cfg.pause_unacked_bound_s
         return quiet if quiet is not None and quiet <= now else None
 
-    def _judge(self, now: float, interval_s: float, busy_delta: float, dt: float) -> GpuVerdict:
+    def _judge(
+        self, now: float, interval_s: float, busy_delta: float, dt: float, prev_t: float
+    ) -> GpuVerdict:
         cfg = self.cfg
         if not self._ctl and not self._idle:
             return _OK  # duty unknown: nothing to enforce against
@@ -270,8 +281,19 @@ class GpuDutyGuard:
         # the bucket: excess GPU-seconds over what the limit allows. It advances in every mode
         # (quiet samples charge their busy time against the margin, a gap-timed rogue cannot
         # escape; at duty 1.0 the limit is above 1 and the bucket only drains).
-        self._last_limit = limit
-        self._acc = max(0.0, self._acc + busy_delta - limit * dt)
+        allow = limit * dt
+        if quiet_from is None:
+            self._last_limit = limit  # a gap without a worker drains at the duty in force
+        elif prev_t < quiet_from:
+            # the sample straddles the busy -> quiet edge: the part before the edge was busy mode
+            # and is allowed at the limit in force then, only the rest at the margin
+            pre = min(quiet_from, now) - max(prev_t, now - dt)
+            if pre > 0:
+                busy_limit = (
+                    self._allowed(quiet_from - cfg.window_s - cfg.grace_s, quiet_from) + cfg.margin
+                )
+                allow = busy_limit * pre + limit * (dt - pre)
+        self._acc = max(0.0, self._acc + busy_delta - allow)
         self._acc_t = now
         if self._acc >= cfg.kill_budget_gpu_s:
             return GpuVerdict(GpuAction.KILL, None, limit, reason="over_duty")
