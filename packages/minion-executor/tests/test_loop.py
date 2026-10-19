@@ -215,6 +215,7 @@ class FakeWorker:
         self.gpu_busy: float | None = None  # GPU busy share of wall time
         self.gpu_t0: float | None = None
         self.gpu_calls = 0
+        self.gpu_hang: threading.Event | None = None
         self.pause_ack: float | None = None  # when the (fake) worker acked the pause
         self.fp_calls = 0  # watcher samples taken (footprint + priority are sampled together)
 
@@ -281,6 +282,8 @@ class FakeWorker:
     def gpu_clients(self, reader: Callable[[], Any]) -> tuple[int, dict[str, int]] | None:
         """Scripted control-side GPU time: `gpu_busy` x wall time since the first call."""
         self.gpu_calls += 1
+        if self.gpu_hang is not None:
+            self.gpu_hang.wait(5)  # a stuck IOKit read
         reader()
         if self.gpu_busy is None:
             return None
@@ -3810,10 +3813,20 @@ async def test_gpu_idle_rogue_is_unloaded(tmp_path: Path) -> None:
     )  # fmt: skip
     task = asyncio.create_task(loop.run())
     await until(lambda: "complete" in client.kinds())
-    base = worker.unloads
+    base = worker.interrupts
+    backoffs: list[int] = []
+    real = loop._back_off_after_failure
+
+    async def counted() -> None:
+        backoffs.append(1)
+        await real()
+
+    loop._back_off_after_failure = counted  # type: ignore[method-assign]
     worker.gpu_busy = 1.0  # the warm worker now burns the GPU with no subtask
-    await until(lambda: worker.unloads > base)
+    await until(lambda: worker.interrupts > base)  # hard kill, not the polite unload
+    assert worker.unloads == 0
     assert loop._status_snapshot().gpu_violation == "idle"
+    await until(lambda: bool(backoffs))  # churn is not free: back off before the next acquire
     loop.stop()
     await asyncio.wait_for(task, 10)
 
@@ -3868,3 +3881,54 @@ async def test_gpu_honest_worker_in_many_short_subtasks_is_not_flagged(tmp_path:
     assert loop._status_snapshot().gpu_violation is None
     assert worker.interrupts == 0 and "release" not in client.kinds()
     assert client.kinds().count("complete") == 8
+
+
+async def test_gpu_sampler_death_stops_the_executor(tmp_path: Path) -> None:
+    from minion_executor.loop import GpuGuardStoppedError
+
+    client, worker = FakeClient([]), FakeWorker()
+    worker.gpu_busy = 0.0
+    loop = _gpu_loop(client, worker, tmp_path)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("sampler bug")
+
+    loop._judge_gpu = boom  # type: ignore[method-assign]
+    with pytest.raises(GpuGuardStoppedError):
+        await asyncio.wait_for(loop.run(), 10)
+
+
+async def test_gpu_read_that_hangs_counts_as_meter_errors(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    worker.gpu_busy = 0.0
+    worker.gpu_hang = threading.Event()
+    loop = _gpu_loop(client, worker, tmp_path)
+    client.on_empty = loop.stop
+    try:
+        await asyncio.wait_for(loop.run(), 10)
+    finally:
+        worker.gpu_hang.set()
+    assert client.release_codes == ["GPU_METER_UNAVAILABLE"]
+    assert worker.gpu_calls == 1  # reads are never stacked behind a stuck one
+
+
+async def test_gpu_sampler_stall_while_a_subtask_runs_fails_closed(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker(block=True)
+    loop = _gpu_loop(client, worker, tmp_path)
+
+    async def stalls() -> None:
+        loop._gpu_last_ok = loop._clock()  # one sample, then nothing
+        await asyncio.sleep(3600)
+
+    loop._gpu_sampler = stalls  # type: ignore[method-assign]
+    client.on_empty = loop.stop
+    await asyncio.wait_for(loop.run(), 10)
+    assert client.release_codes == ["GPU_METER_UNAVAILABLE"]
+
+
+async def test_gpu_violation_in_status_expires(tmp_path: Path) -> None:
+    loop = _gpu_loop(FakeClient([]), FakeWorker(), tmp_path)
+    loop._gpu_violation = ("over_duty", loop._clock())
+    assert loop._status_snapshot().gpu_violation == "over_duty"
+    loop._gpu_violation = ("over_duty", loop._clock() - 3600)
+    assert loop._status_snapshot().gpu_violation is None

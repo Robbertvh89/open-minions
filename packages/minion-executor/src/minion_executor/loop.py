@@ -120,12 +120,19 @@ class GovernorStoppedError(RuntimeError):
     (invariant 6) instead of running on a frozen decision."""
 
 
+class GpuGuardStoppedError(GovernorStoppedError):
+    """The GPU duty sampler ended: nothing meters the worker any more, so the executor stops
+    (invariant 6) instead of running unguarded."""
+
+
 class _DowngradeError(Exception):
     """The memory budget fell below the loaded model at a batch boundary (FR-54)."""
 
 
 MEMORY_GUARD_FACTOR = 1.10  # D7: footprint over budget x 1.10 on two consecutive samples
 MEMORY_GUARD_SAMPLES = 2
+GPU_VIOLATION_SHOW_S = 600.0  # how long status.json reports the last GPU duty kill
+GPU_STALL_MIN_S = 1.0  # floor of the no-GPU-sample-for-3x-interval bound
 
 
 def _is_shed(exc: Exception) -> bool:
@@ -278,7 +285,11 @@ class ExecutorLoop:
         self._gpu_pid: int | None = None  # worker pid the guard window belongs to
         self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         self._gpu_pending: _Verdict | None = None  # sampler KILL for the watcher to act on
-        self._gpu_violation: str | None = None  # reason of the last GPU duty kill
+        self._gpu_violation: tuple[str, float] | None = None  # (reason, clock) of the last kill
+        self._gpu_reason = ""  # reason of the latest KILL verdict
+        self._gpu_backoff = False  # the sampler killed an idle worker: back off before acquiring
+        self._gpu_last_ok = 0.0  # clock of the last completed GPU sample
+        self._gpu_task: asyncio.Task[None] | None = None
         self._max_output_bytes = max_output_bytes
         self._cache = model_cache
         self._acquire_pace_s = acquire_pace_s  # min gap between acquire calls; 0 disables
@@ -585,7 +596,7 @@ class ExecutorLoop:
             if self._status_dir is not None:
                 status_task = asyncio.create_task(self._status_loop(self._status_dir))
             if self._gpu is not None:
-                gpu_task = asyncio.create_task(self._gpu_sampler())
+                gpu_task = self._gpu_task = asyncio.create_task(self._gpu_sampler())
             if self._register is not None:
                 reg = self._register
                 if isinstance(reg, RegisterRequest):  # announce the primed budget, not the seed
@@ -596,6 +607,10 @@ class ExecutorLoop:
                 # Spread a fleet that restarts together off the queue head (ADR-0013 D5).
                 await self._pause(random.uniform(0, self._first_acquire_jitter_s))  # noqa: S311
             while not self.stopping and (max_subtasks is None or done < max_subtasks):
+                if gpu_task is not None and gpu_task.done():
+                    exc = None if gpu_task.cancelled() else gpu_task.exception()
+                    log.error("gpu_sampler_ended", error=type(exc).__name__ if exc else "returned")
+                    raise GpuGuardStoppedError("the GPU duty sampler stopped")
                 if gov_task.done():  # nothing steers the budget any more: stop, do not acquire
                     exc = None if gov_task.cancelled() else gov_task.exception()
                     log.error(
@@ -605,6 +620,9 @@ class ExecutorLoop:
                 if self._gov.decision.paused:  # FR-53: no acquires while paused (presence only)
                     await self._paused_cycle()
                     continue
+                if self._gpu_backoff:  # the guard killed an idle worker: churn must not be free
+                    self._gpu_backoff = False
+                    await self._back_off_after_failure()
                 self._presence_key = None
                 version = self._gov.version
                 if (until := self._rate_limited_until) is not None:
@@ -910,6 +928,8 @@ class ExecutorLoop:
                     self._cache.release_in_use()
             return await self._complete(a, result, bound)
         finally:
+            self._gpu_pending = None  # a kill for this subtask dies with it
+            self._gpu_kick.clear()
             stopper.cancel()
             beat.cancel()  # also during _complete: the lease is kept alive until we return
             watch.cancel()  # the governor only steers a running subtask, not its completion
@@ -962,10 +982,24 @@ class ExecutorLoop:
         subtasks, idle, paused). The window is re-baselined only on a new pid, so it spans subtask
         boundaries; between subtasks the guard is in idle mode (judged on samples since that
         mode began). A KILL during a subtask is handed to the watcher (`_gpu_pending`: interrupt +
-        release); otherwise the worker is unloaded here (nothing to release)."""
+        release); otherwise the worker is killed here (nothing to release) and the main loop
+        backs off before the next acquire.
+
+        The IOKit read runs in a thread and is awaited for at most one guard interval; a read that
+        has not returned counts as a meter error (3 in a row = KILL, fail closed) and is never
+        stacked: the next tick waits for the same read."""
+        read: asyncio.Future[Any] | None = None
         while True:
             await asyncio.sleep(self._jitter(self._guard_s))
-            gpu = await asyncio.to_thread(self._sample_gpu)
+            if read is None:
+                read = asyncio.ensure_future(asyncio.to_thread(self._sample_gpu))
+            done, _ = await asyncio.wait({read}, timeout=self._guard_s)
+            gpu: tuple[int, dict[str, int]] | Exception | None
+            if done:
+                gpu, read = read.result(), None
+                self._gpu_last_ok = self._clock()
+            else:
+                gpu = TimeoutError("gpu read overran the guard interval")
             if gpu is None:  # no live worker: the next one starts a fresh window
                 if self._gpu is not None:
                     self._gpu.stop()
@@ -982,8 +1016,38 @@ class ExecutorLoop:
             if self._gpu is not None:
                 self._gpu.stop()
             self._gpu_pid = None
+            self._gpu_violation = (self._gpu_reason or "over_duty", self._clock())
+            self._gpu_backoff = True
             self._status_kick.set()
-            await self._unload_idle("gpu_duty_violation")
+            await self._kill_worker()
+
+    async def _kill_worker(self) -> None:
+        """Hard-kill the worker (no graceful reset: that is up to seconds of unmetered GPU) and
+        drop what depends on it."""
+        self._forget_loaded()
+        self._unloaded = True
+        await asyncio.to_thread(self._worker.interrupt)
+        if self._cache is not None:
+            self._cache.release_in_use()
+        log.warning("worker_killed", reason="gpu_duty_violation")
+
+    def _gpu_stalled(self) -> str:
+        """Non-empty when the GPU sampler is dead or has produced no sample for 3x the interval
+        (floor 1 s) while this subtask runs: the worker is unmetered, fail closed."""
+        task = self._gpu_task
+        if task is not None and task.done():
+            return "meter"
+        limit = max(3 * self._guard_s * 1.25, GPU_STALL_MIN_S)
+        if self._gpu_last_ok and self._clock() - self._gpu_last_ok > limit:
+            return "meter"
+        return ""
+
+    def _visible_gpu_violation(self) -> str | None:
+        """The last GPU kill's reason while it is recent (status.json is not a permanent record)."""
+        bad = self._gpu_violation
+        if bad is None or self._clock() - bad[1] > GPU_VIOLATION_SHOW_S:
+            return None
+        return bad[0]
 
     def _sample_worker(self) -> tuple[int | None, bool | None]:
         try:
@@ -1014,11 +1078,17 @@ class ExecutorLoop:
             v = guard.observe(now, gpu[1], interval_s=interval)
         if v.share is not None:
             self._gpu_share = v.share
+            if (
+                v.action is GpuAction.OK
+                and (bad := self._gpu_violation) is not None
+                and now - bad[1] > 2 * guard.cfg.window_s
+            ):
+                self._gpu_violation = None  # a clean window since the kill
         if v.action is GpuAction.GATE:
             log.warning("gpu_duty_over", share=v.share, limit=v.limit, stop_s=v.stop_s)
         elif v.action is GpuAction.KILL:
             log.error("gpu_duty_kill", share=v.share, limit=v.limit, reason=v.reason)
-            self._gpu_violation = v.reason
+            self._gpu_reason = v.reason
             return _Verdict.GPU_METER if v.reason == "meter" else _Verdict.GPU_DUTY
         return None
 
@@ -1046,8 +1116,6 @@ class ExecutorLoop:
         downgrade_since: float | None = None
         drop_since: float | None = None  # when the live budget fell below the running batch's
         next_sample = clock() + self._jitter(self._guard_s)
-        self._gpu_pending = None
-        self._gpu_kick.clear()
         while True:
             if self._infer_done.is_set():
                 await self._enforce_idle_budget()
@@ -1055,6 +1123,9 @@ class ExecutorLoop:
                 continue
             await self._push_control()
             d = gov.decision
+            if self._gpu is not None and (stall := self._gpu_stalled()):
+                self._gpu_reason = stall
+                return _Verdict.GPU_METER
             if (gv := self._gpu_pending) is not None:
                 self._gpu_pending = None
                 self._gpu_kick.clear()
@@ -1167,6 +1238,7 @@ class ExecutorLoop:
             await self._report_failure(a, err, bound)
             return _Outcome.FAILED
         if self._gpu is not None and v in (_Verdict.GPU_DUTY, _Verdict.GPU_METER):
+            self._gpu_violation = (self._gpu_reason or "over_duty", self._clock())
             self._gpu.stop()  # the worker is gone: the next one starts a fresh window
             self._gpu_pid = None
         await self._release(a, bound, v.value)
@@ -1228,7 +1300,7 @@ class ExecutorLoop:
                 else None
             ),
             gpu_share=share,
-            gpu_violation=self._gpu_violation,
+            gpu_violation=self._visible_gpu_violation(),
             signals=(
                 StatusSignals(
                     on_ac=sig.on_ac,
