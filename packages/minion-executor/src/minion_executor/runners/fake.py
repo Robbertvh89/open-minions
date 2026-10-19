@@ -163,6 +163,17 @@ def _mlx_matmul(n: int) -> dict[str, object]:
     }
 
 
+def _gpu_burn(seconds: float) -> None:
+    """Test hook (a rogue worker that ignores pacing): back-to-back MLX matmuls for `seconds`."""
+    import mlx.core as mx  # engine import, test hook only
+
+    a = mx.random.normal((2048, 2048))
+    mx.eval(a)
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        mx.eval(a @ a)
+
+
 def _mach_lookup(name: str) -> dict[str, object]:
     """`bootstrap_look_up(bootstrap_port, name)`; KERN_SUCCESS (0) = reachable."""
     import ctypes
@@ -229,6 +240,8 @@ class FakeRunner:
                     for _ in range(min(int(rec["sleep_steps"]), 1000)):
                         time.sleep(min(float(rec.get("step_s", 0.1)), 10.0))
                         ctl.checkpoint(len(out))
+                if rec.get("gpu_burn_s"):  # rogue: unpaced GPU loop, never calls ctl.checkpoint
+                    _gpu_burn(min(float(rec["gpu_burn_s"]), 600.0))
                 if rec.get("fail_trim"):  # make later trim() calls raise (worker must survive)
                     self._fail_trim = True
                 if (

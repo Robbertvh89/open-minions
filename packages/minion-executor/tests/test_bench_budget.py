@@ -601,3 +601,32 @@ def test_watch_reactions_rejects_out(tmp_path: Path) -> None:
         app, ["bench", "--watch-reactions", "--duration", "5", "--out", str(tmp_path / "x.json")]
     )
     assert r.exit_code == 2 and "--out" in r.output
+
+
+def _clients_samples(per_s_ns: list[int], ids: list[str] | None = None) -> list[Any]:
+    """One sample per second; client c0 accumulates `per_s_ns[i]` ns during second i."""
+    out, total = [], 0
+    for i in range(len(per_s_ns) + 1):
+        out.append(gpu_meter.GpuSample(float(i), 0.0, {"c0": total, **dict.fromkeys(ids or [], 0)}))
+        if i < len(per_s_ns):
+            total += per_s_ns[i]
+    return out
+
+
+def test_max_window_share_finds_the_burst_window() -> None:
+    # 30 s at 20 % busy with a 10 s burst at 60 % starting at t=12
+    busy = [200_000_000] * 30
+    for i in range(12, 22):
+        busy[i] = 600_000_000
+    s = _clients_samples(busy)
+    assert bb.max_window_share(s, 0.0, 30.0) == pytest.approx(0.6)
+    assert bb.max_window_share(s, 0.0, 30.0, window_s=30.0) == pytest.approx(10 / 30)
+    assert bb.max_window_share(s, 25.0, 30.0) is None  # shorter than one window
+    assert bb.max_window_share([], 0.0, 30.0) is None
+
+
+def test_distinct_clients_counts_ids_over_the_run() -> None:
+    s = _clients_samples([1, 1], ids=["c1", "c2"])
+    s.append(gpu_meter.GpuSample(9.0, 0.0, None))
+    assert bb.distinct_clients(s) == 3
+    assert bb.distinct_clients([]) == 0
