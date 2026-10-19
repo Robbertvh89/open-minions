@@ -357,7 +357,9 @@ async def test_killed_executor_subtask_is_reclaimed_and_rerun(
             return [r[0] for r in rows] == ["EXPIRED"]
 
         await eventually(expired, 30)
-        await _reap(wd)  # its job is done; it must not expire B's attempt under load
+        # Its job is done; it must not expire B's attempt under load. This deliberately gives up
+        # the watchdog's settle_stuck backstop (ADR-0015): B's own complete settles the task.
+        await _reap(wd)
         b_client, b_loop = _in_process_loop(
             live, await live.token("exec-b"), WorkerHandle([Engine.FAKE]), tmp_path
         )
