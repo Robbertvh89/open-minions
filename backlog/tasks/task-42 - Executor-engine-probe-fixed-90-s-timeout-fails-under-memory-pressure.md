@@ -1,10 +1,10 @@
 ---
 id: TASK-42
 title: 'Executor engine probe: fixed 90 s timeout fails under memory pressure'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-19 14:11'
-updated_date: '2026-10-19 18:32'
+updated_date: '2026-10-19 18:58'
 labels:
   - bug
 dependencies: []
