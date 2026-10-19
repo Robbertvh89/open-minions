@@ -1,0 +1,5399 @@
+{
+ "schema": "minion-task36-server-cpu/1",
+ "task": "TASK-36",
+ "date": "2026-10-19/20",
+ "commit": "fe631c9",
+ "setup": {
+  "host": "Apple M3 Pro 12 cores (6P+6E), Docker VM 12 CPUs / 7.75 GiB",
+  "compose": "open-minions-scale (deploy/compose.yml + deploy/compose.scale.yml)",
+  "server_env": "pool 8 + overflow 4 per worker, MINION_ACQUIRE_CONCURRENCY=8, MINION_ACQUIRE_WINDOW=16 (64 in the window runs), MINION_MAX_OPEN_ACQUIREMENTS=64",
+  "generator": "minion-scale run --sims 500 --procs 8, same Mac",
+  "profiler": "py-spy 0.4.2 sidecar (SYS_PTRACE on the sidecar only), python:3.12.15-slim"
+ },
+ "runs": [
+  {
+   "name": "prof-P1-w4",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.093,
+   "completed": 37717,
+   "assigned": 38118,
+   "goodput_per_s": 156.442,
+   "shed_503": 7726,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 38118,
+     "per_s": 158.1,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 38118
+     }
+    },
+    "acquire_error": {
+     "count": 7726,
+     "per_s": 32.05,
+     "p50_s": 0.1,
+     "p99_s": 0.5,
+     "shed_503": 7726,
+     "statuses": {
+      "503": 7726
+     }
+    },
+    "complete": {
+     "count": 37717,
+     "per_s": 156.44,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 37717
+     }
+    },
+    "output_put": {
+     "count": 37717,
+     "per_s": 156.44,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 37717
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 2.07,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 401,
+     "per_s": 1.66,
+     "p50_s": 0.5,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 401
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 46219,
+     "mean_exec_ms": 2.7246,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 37717,
+     "mean_exec_ms": 0.2574,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 37717,
+     "mean_exec_ms": 0.1371,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 38118,
+     "mean_exec_ms": 0.1127,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 37717,
+     "mean_exec_ms": 0.1024,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.213,
+   "claim_mean_exec_ms": 2.7246,
+   "cgroup_cpu_s": {
+    "server": 867.81,
+    "postgres": 219.02,
+    "s3": 122.4,
+    "watchdog": 0.66
+   },
+   "generator_cpu_s": 238.85,
+   "server_cpu_ms_per_subtask": 23.008,
+   "postgres_cpu_ms_per_subtask": 5.807,
+   "H": 0.501,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P1b-w4",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.126,
+   "completed": 37925,
+   "assigned": 38287,
+   "goodput_per_s": 157.283,
+   "shed_503": 7692,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 41,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 38287,
+     "per_s": 158.78,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 38287
+     }
+    },
+    "acquire_error": {
+     "count": 7654,
+     "per_s": 31.74,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7654,
+     "statuses": {
+      "503": 7654
+     }
+    },
+    "complete": {
+     "count": 37925,
+     "per_s": 157.28,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 37925
+     }
+    },
+    "output_put": {
+     "count": 37925,
+     "per_s": 157.28,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 37925
+     }
+    },
+    "register": {
+     "count": 579,
+     "per_s": 2.4,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 38,
+     "statuses": {
+      "0": 41,
+      "200": 500,
+      "503": 38
+     }
+    },
+    "release": {
+     "count": 362,
+     "per_s": 1.5,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 362
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 45876,
+     "mean_exec_ms": 2.5996,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 37925,
+     "mean_exec_ms": 0.2669,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 38287,
+     "mean_exec_ms": 0.1382,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 37925,
+     "mean_exec_ms": 0.1303,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 37925,
+     "mean_exec_ms": 0.1221,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.198,
+   "claim_mean_exec_ms": 2.5996,
+   "cgroup_cpu_s": {
+    "server": 859.67,
+    "postgres": 216.0,
+    "s3": 120.65,
+    "watchdog": 0.64
+   },
+   "generator_cpu_s": 236.57,
+   "server_cpu_ms_per_subtask": 22.668,
+   "postgres_cpu_ms_per_subtask": 5.695,
+   "H": 0.495,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P2-w8",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.277,
+   "completed": 39427,
+   "assigned": 39536,
+   "goodput_per_s": 163.409,
+   "shed_503": 12769,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 105,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 39536,
+     "per_s": 163.86,
+     "p50_s": 0.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 39536
+     }
+    },
+    "acquire_empty": {
+     "count": 7,
+     "per_s": 0.03,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 7
+     }
+    },
+    "acquire_error": {
+     "count": 12769,
+     "per_s": 52.92,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 12769,
+     "statuses": {
+      "503": 12769
+     }
+    },
+    "complete": {
+     "count": 39427,
+     "per_s": 163.41,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 39427
+     }
+    },
+    "output_put": {
+     "count": 39427,
+     "per_s": 163.41,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 39427
+     }
+    },
+    "register": {
+     "count": 605,
+     "per_s": 2.51,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 105,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 109,
+     "per_s": 0.45,
+     "p50_s": 0.1,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 109
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 68090,
+     "mean_exec_ms": 11.5803,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 39427,
+     "mean_exec_ms": 0.956,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 39427,
+     "mean_exec_ms": 0.1941,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 39536,
+     "mean_exec_ms": 0.1812,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 39427,
+     "mean_exec_ms": 0.1466,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.722,
+   "claim_mean_exec_ms": 11.5803,
+   "cgroup_cpu_s": {
+    "server": 1301.2,
+    "postgres": 308.95,
+    "s3": 152.53,
+    "watchdog": 0.71
+   },
+   "generator_cpu_s": 395.13,
+   "server_cpu_ms_per_subtask": 33.003,
+   "postgres_cpu_ms_per_subtask": 7.836,
+   "H": 0.746,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P2b-w8",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.313,
+   "completed": 40407,
+   "assigned": 40524,
+   "goodput_per_s": 167.447,
+   "shed_503": 13111,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 42,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 40524,
+     "per_s": 167.93,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 40524
+     }
+    },
+    "acquire_empty": {
+     "count": 11,
+     "per_s": 0.05,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 11
+     }
+    },
+    "acquire_error": {
+     "count": 13107,
+     "per_s": 54.32,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 13107,
+     "statuses": {
+      "503": 13107
+     }
+    },
+    "complete": {
+     "count": 40407,
+     "per_s": 167.45,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 40407
+     }
+    },
+    "output_put": {
+     "count": 40407,
+     "per_s": 167.45,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 40407
+     }
+    },
+    "register": {
+     "count": 546,
+     "per_s": 2.26,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 4,
+     "statuses": {
+      "0": 42,
+      "200": 500,
+      "503": 4
+     }
+    },
+    "release": {
+     "count": 117,
+     "per_s": 0.48,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 117
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 70909,
+     "mean_exec_ms": 11.7929,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 40407,
+     "mean_exec_ms": 0.9913,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 40524,
+     "mean_exec_ms": 0.2621,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 40407,
+     "mean_exec_ms": 0.2402,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 40407,
+     "mean_exec_ms": 0.1933,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    }
+   ],
+   "claim_calls_per_win": 1.75,
+   "claim_mean_exec_ms": 11.7929,
+   "cgroup_cpu_s": {
+    "server": 1390.51,
+    "postgres": 331.51,
+    "s3": 160.18,
+    "watchdog": 0.68
+   },
+   "generator_cpu_s": 407.14,
+   "server_cpu_ms_per_subtask": 34.413,
+   "postgres_cpu_ms_per_subtask": 8.204,
+   "H": 0.791,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P3-w1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 240.802,
+   "completed": 17200,
+   "assigned": 17231,
+   "goodput_per_s": 71.428,
+   "shed_503": 12519,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 1,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 17231,
+     "per_s": 71.56,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 17231
+     }
+    },
+    "acquire_error": {
+     "count": 12520,
+     "per_s": 51.99,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 12519,
+     "statuses": {
+      "0": 1,
+      "503": 12519
+     }
+    },
+    "complete": {
+     "count": 17200,
+     "per_s": 71.43,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 17200
+     }
+    },
+    "output_put": {
+     "count": 17200,
+     "per_s": 71.43,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 17200
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 2.08,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 31,
+     "per_s": 0.13,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 31
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 18191,
+     "mean_exec_ms": 0.6739,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 17200,
+     "mean_exec_ms": 0.0734,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 17231,
+     "mean_exec_ms": 0.0722,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 17200,
+     "mean_exec_ms": 0.0637,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 17231,
+     "mean_exec_ms": 0.0499,
+     "query": "UPDATE minion_executor SET engines=$1::VARCHAR(16)[], profil"
+    }
+   ],
+   "claim_calls_per_win": 1.056,
+   "claim_mean_exec_ms": 0.6739,
+   "cgroup_cpu_s": {
+    "server": 244.04,
+    "postgres": 53.92,
+    "s3": 37.97,
+    "watchdog": 0.46
+   },
+   "generator_cpu_s": 134.06,
+   "server_cpu_ms_per_subtask": 14.188,
+   "postgres_cpu_ms_per_subtask": 3.135,
+   "H": 0.163,
+   "mix": "S-sat",
+   "W": 1,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P4-w4",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.06,
+   "completed": 39381,
+   "assigned": 39757,
+   "goodput_per_s": 163.366,
+   "shed_503": 7312,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 152,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 39757,
+     "per_s": 164.93,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 39757
+     }
+    },
+    "acquire_error": {
+     "count": 7312,
+     "per_s": 30.33,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7312,
+     "statuses": {
+      "503": 7312
+     }
+    },
+    "complete": {
+     "count": 39381,
+     "per_s": 163.37,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 39381
+     }
+    },
+    "output_put": {
+     "count": 39381,
+     "per_s": 163.37,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 39381
+     }
+    },
+    "register": {
+     "count": 652,
+     "per_s": 2.7,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 152,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 376,
+     "per_s": 1.56,
+     "p50_s": 0.5,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 376
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 47679,
+     "mean_exec_ms": 2.528,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 39381,
+     "mean_exec_ms": 0.248,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 39381,
+     "mean_exec_ms": 0.1367,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 39757,
+     "mean_exec_ms": 0.1066,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 39381,
+     "mean_exec_ms": 0.1052,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.199,
+   "claim_mean_exec_ms": 2.528,
+   "cgroup_cpu_s": {
+    "server": 898.33,
+    "postgres": 225.92,
+    "s3": 128.05,
+    "watchdog": 0.67
+   },
+   "generator_cpu_s": 248.95,
+   "server_cpu_ms_per_subtask": 22.811,
+   "postgres_cpu_ms_per_subtask": 5.737,
+   "H": 0.519,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "profile-run"
+  },
+  {
+   "name": "prof-P4b-w4",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.179,
+   "completed": 38253,
+   "assigned": 38598,
+   "goodput_per_s": 158.609,
+   "shed_503": 7603,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 38598,
+     "per_s": 160.04,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 38598
+     }
+    },
+    "acquire_error": {
+     "count": 7546,
+     "per_s": 31.29,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7546,
+     "statuses": {
+      "503": 7546
+     }
+    },
+    "complete": {
+     "count": 38253,
+     "per_s": 158.61,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 38253
+     }
+    },
+    "output_put": {
+     "count": 38253,
+     "per_s": 158.61,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 38253
+     }
+    },
+    "register": {
+     "count": 557,
+     "per_s": 2.31,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 57,
+     "statuses": {
+      "200": 500,
+      "503": 57
+     }
+    },
+    "release": {
+     "count": 345,
+     "per_s": 1.43,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 345
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 46465,
+     "mean_exec_ms": 2.6991,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 38253,
+     "mean_exec_ms": 0.2778,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 38598,
+     "mean_exec_ms": 0.136,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 38253,
+     "mean_exec_ms": 0.1289,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 38253,
+     "mean_exec_ms": 0.1217,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.204,
+   "claim_mean_exec_ms": 2.6991,
+   "cgroup_cpu_s": {
+    "server": 872.99,
+    "postgres": 218.1,
+    "s3": 122.56,
+    "watchdog": 0.61
+   },
+   "generator_cpu_s": 239.34,
+   "server_cpu_ms_per_subtask": 22.822,
+   "postgres_cpu_ms_per_subtask": 5.702,
+   "H": 0.502,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "profile-run"
+  },
+  {
+   "name": "sat-w1-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.609,
+   "completed": 8279,
+   "assigned": 8310,
+   "goodput_per_s": 68.643,
+   "shed_503": 6524,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 56,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 8310,
+     "per_s": 68.9,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8310
+     }
+    },
+    "acquire_error": {
+     "count": 6334,
+     "per_s": 52.52,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 6334,
+     "statuses": {
+      "503": 6334
+     }
+    },
+    "complete": {
+     "count": 8279,
+     "per_s": 68.64,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8279
+     }
+    },
+    "output_put": {
+     "count": 8279,
+     "per_s": 68.64,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 8279
+     }
+    },
+    "register": {
+     "count": 746,
+     "per_s": 6.19,
+     "p50_s": 1.0,
+     "p99_s": 5.0,
+     "shed_503": 190,
+     "statuses": {
+      "0": 56,
+      "200": 500,
+      "503": 190
+     }
+    },
+    "release": {
+     "count": 31,
+     "per_s": 0.26,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 31
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 8865,
+     "mean_exec_ms": 0.942,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 8310,
+     "mean_exec_ms": 0.1291,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 8279,
+     "mean_exec_ms": 0.1021,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 8279,
+     "mean_exec_ms": 0.0741,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 8310,
+     "mean_exec_ms": 0.0732,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 1.067,
+   "claim_mean_exec_ms": 0.942,
+   "cgroup_cpu_s": {
+    "server": 120.85,
+    "postgres": 28.81,
+    "s3": 18.36,
+    "watchdog": 0.22
+   },
+   "generator_cpu_s": 72.52,
+   "server_cpu_ms_per_subtask": 14.597,
+   "postgres_cpu_ms_per_subtask": 3.48,
+   "H": 0.166,
+   "mix": "S-sat",
+   "W": 1,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w1-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.62,
+   "completed": 8400,
+   "assigned": 8427,
+   "goodput_per_s": 69.64,
+   "shed_503": 6492,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 8427,
+     "per_s": 69.86,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8427
+     }
+    },
+    "acquire_error": {
+     "count": 6492,
+     "per_s": 53.82,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 6492,
+     "statuses": {
+      "503": 6492
+     }
+    },
+    "complete": {
+     "count": 8400,
+     "per_s": 69.64,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8400
+     }
+    },
+    "output_put": {
+     "count": 8400,
+     "per_s": 69.64,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 8400
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.15,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 27,
+     "per_s": 0.22,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 27
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 8891,
+     "mean_exec_ms": 0.7283,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 8427,
+     "mean_exec_ms": 0.0745,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 8400,
+     "mean_exec_ms": 0.0747,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 8400,
+     "mean_exec_ms": 0.0629,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 8400,
+     "mean_exec_ms": 0.0565,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    }
+   ],
+   "claim_calls_per_win": 1.055,
+   "claim_mean_exec_ms": 0.7283,
+   "cgroup_cpu_s": {
+    "server": 121.22,
+    "postgres": 27.04,
+    "s3": 18.46,
+    "watchdog": 0.22
+   },
+   "generator_cpu_s": 72.96000000000001,
+   "server_cpu_ms_per_subtask": 14.431,
+   "postgres_cpu_ms_per_subtask": 3.219,
+   "H": 0.166,
+   "mix": "S-sat",
+   "W": 1,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w1-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.62,
+   "completed": 8490,
+   "assigned": 8527,
+   "goodput_per_s": 70.386,
+   "shed_503": 6557,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 8527,
+     "per_s": 70.69,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8527
+     }
+    },
+    "acquire_error": {
+     "count": 6557,
+     "per_s": 54.36,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 6557,
+     "statuses": {
+      "503": 6557
+     }
+    },
+    "complete": {
+     "count": 8490,
+     "per_s": 70.39,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 8490
+     }
+    },
+    "output_put": {
+     "count": 8490,
+     "per_s": 70.39,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 8490
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.15,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 37,
+     "per_s": 0.31,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 37
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 9012,
+     "mean_exec_ms": 0.6918,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 8490,
+     "mean_exec_ms": 0.0753,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 8527,
+     "mean_exec_ms": 0.0709,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 8490,
+     "mean_exec_ms": 0.0632,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 8527,
+     "mean_exec_ms": 0.0499,
+     "query": "UPDATE minion_executor SET engines=$1::VARCHAR(16)[], profil"
+    }
+   ],
+   "claim_calls_per_win": 1.057,
+   "claim_mean_exec_ms": 0.6918,
+   "cgroup_cpu_s": {
+    "server": 121.18,
+    "postgres": 26.98,
+    "s3": 18.78,
+    "watchdog": 0.22
+   },
+   "generator_cpu_s": 73.76,
+   "server_cpu_ms_per_subtask": 14.273,
+   "postgres_cpu_ms_per_subtask": 3.178,
+   "H": 0.166,
+   "mix": "S-sat",
+   "W": 1,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w12-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.274,
+   "completed": 19836,
+   "assigned": 19968,
+   "goodput_per_s": 163.564,
+   "shed_503": 6001,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 94,
+   "event_loop_lag_p99_s": 0.01,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 19968,
+     "per_s": 164.65,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19968
+     }
+    },
+    "acquire_empty": {
+     "count": 62,
+     "per_s": 0.51,
+     "p50_s": 2.5,
+     "p99_s": 5.0,
+     "shed_503": 0,
+     "statuses": {
+      "204": 62
+     }
+    },
+    "acquire_error": {
+     "count": 5999,
+     "per_s": 49.47,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 5999,
+     "statuses": {
+      "503": 5999
+     }
+    },
+    "complete": {
+     "count": 19836,
+     "per_s": 163.56,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19836
+     }
+    },
+    "output_put": {
+     "count": 19836,
+     "per_s": 163.56,
+     "p50_s": 0.01,
+     "p99_s": 0.05,
+     "shed_503": 0,
+     "statuses": {
+      "204": 19836
+     }
+    },
+    "register": {
+     "count": 596,
+     "per_s": 4.91,
+     "p50_s": 0.5,
+     "p99_s": 2.5,
+     "shed_503": 2,
+     "statuses": {
+      "0": 94,
+      "200": 500,
+      "503": 2
+     }
+    },
+    "release": {
+     "count": 132,
+     "per_s": 1.09,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 132
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 44380,
+     "mean_exec_ms": 20.935,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 19836,
+     "mean_exec_ms": 2.3501,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 19968,
+     "mean_exec_ms": 0.363,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 19836,
+     "mean_exec_ms": 0.3389,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 19968,
+     "mean_exec_ms": 0.2611,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 2.223,
+   "claim_mean_exec_ms": 20.935,
+   "cgroup_cpu_s": {
+    "server": 842.6,
+    "postgres": 214.21,
+    "s3": 82.73,
+    "watchdog": 0.36
+   },
+   "generator_cpu_s": 214.76999999999998,
+   "server_cpu_ms_per_subtask": 42.478,
+   "postgres_cpu_ms_per_subtask": 10.799,
+   "H": 0.931,
+   "mix": "S-sat",
+   "W": 12,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w12-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.238,
+   "completed": 20075,
+   "assigned": 20220,
+   "goodput_per_s": 165.584,
+   "shed_503": 6132,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 1,
+   "event_loop_lag_p99_s": 0.01,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 20220,
+     "per_s": 166.78,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 20220
+     }
+    },
+    "acquire_empty": {
+     "count": 42,
+     "per_s": 0.35,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 42
+     }
+    },
+    "acquire_error": {
+     "count": 6133,
+     "per_s": 50.59,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6132,
+     "statuses": {
+      "0": 1,
+      "503": 6132
+     }
+    },
+    "complete": {
+     "count": 20075,
+     "per_s": 165.58,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 20075
+     }
+    },
+    "output_put": {
+     "count": 20075,
+     "per_s": 165.58,
+     "p50_s": 0.01,
+     "p99_s": 0.05,
+     "shed_503": 0,
+     "statuses": {
+      "204": 20075
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.12,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 145,
+     "per_s": 1.2,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 145
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 44321,
+     "mean_exec_ms": 20.6372,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 20075,
+     "mean_exec_ms": 2.556,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 20075,
+     "mean_exec_ms": 0.2529,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 20220,
+     "mean_exec_ms": 0.203,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 20075,
+     "mean_exec_ms": 0.1702,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 2.192,
+   "claim_mean_exec_ms": 20.6372,
+   "cgroup_cpu_s": {
+    "server": 850.9,
+    "postgres": 203.55,
+    "s3": 83.34,
+    "watchdog": 0.36
+   },
+   "generator_cpu_s": 215.62,
+   "server_cpu_ms_per_subtask": 42.386,
+   "postgres_cpu_ms_per_subtask": 10.14,
+   "H": 0.931,
+   "mix": "S-sat",
+   "W": 12,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w12-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.268,
+   "completed": 19921,
+   "assigned": 20057,
+   "goodput_per_s": 164.273,
+   "shed_503": 6100,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 85,
+   "event_loop_lag_p99_s": 0.01,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 20057,
+     "per_s": 165.39,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 20057
+     }
+    },
+    "acquire_empty": {
+     "count": 44,
+     "per_s": 0.36,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 44
+     }
+    },
+    "acquire_error": {
+     "count": 6100,
+     "per_s": 50.3,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 6100,
+     "statuses": {
+      "503": 6100
+     }
+    },
+    "complete": {
+     "count": 19921,
+     "per_s": 164.27,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19921
+     }
+    },
+    "output_put": {
+     "count": 19921,
+     "per_s": 164.27,
+     "p50_s": 0.01,
+     "p99_s": 0.05,
+     "shed_503": 0,
+     "statuses": {
+      "204": 19921
+     }
+    },
+    "register": {
+     "count": 585,
+     "per_s": 4.82,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 85,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 136,
+     "per_s": 1.12,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 136
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 43878,
+     "mean_exec_ms": 20.6194,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 19921,
+     "mean_exec_ms": 2.5498,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 19921,
+     "mean_exec_ms": 0.2548,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 20057,
+     "mean_exec_ms": 0.1939,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 20057,
+     "mean_exec_ms": 0.1704,
+     "query": "INSERT INTO minion_executor_heartbeat (acquirement_id) VALUE"
+    }
+   ],
+   "claim_calls_per_win": 2.188,
+   "claim_mean_exec_ms": 20.6194,
+   "cgroup_cpu_s": {
+    "server": 846.79,
+    "postgres": 205.01,
+    "s3": 83.35,
+    "watchdog": 0.39
+   },
+   "generator_cpu_s": 215.16000000000003,
+   "server_cpu_ms_per_subtask": 42.507,
+   "postgres_cpu_ms_per_subtask": 10.291,
+   "H": 0.928,
+   "mix": "S-sat",
+   "W": 12,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w2-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.632,
+   "completed": 12409,
+   "assigned": 12453,
+   "goodput_per_s": 102.866,
+   "shed_503": 7255,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 12453,
+     "per_s": 103.23,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12453
+     }
+    },
+    "acquire_error": {
+     "count": 7060,
+     "per_s": 58.53,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7060,
+     "statuses": {
+      "503": 7060
+     }
+    },
+    "complete": {
+     "count": 12409,
+     "per_s": 102.87,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12409
+     }
+    },
+    "output_put": {
+     "count": 12409,
+     "per_s": 102.87,
+     "p50_s": 0.005,
+     "p99_s": 0.005,
+     "shed_503": 0,
+     "statuses": {
+      "204": 12409
+     }
+    },
+    "register": {
+     "count": 695,
+     "per_s": 5.76,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 195,
+     "statuses": {
+      "200": 500,
+      "503": 195
+     }
+    },
+    "release": {
+     "count": 44,
+     "per_s": 0.36,
+     "p50_s": 0.25,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 44
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 14150,
+     "mean_exec_ms": 1.8017,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 12453,
+     "mean_exec_ms": 0.1405,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 12409,
+     "mean_exec_ms": 0.1152,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 12409,
+     "mean_exec_ms": 0.1138,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 12453,
+     "mean_exec_ms": 0.0828,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 1.136,
+   "claim_mean_exec_ms": 1.8017,
+   "cgroup_cpu_s": {
+    "server": 214.88,
+    "postgres": 48.35,
+    "s3": 29.65,
+    "watchdog": 0.25
+   },
+   "generator_cpu_s": 80.77,
+   "server_cpu_ms_per_subtask": 17.317,
+   "postgres_cpu_ms_per_subtask": 3.896,
+   "H": 0.258,
+   "mix": "S-sat",
+   "W": 2,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w2-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.628,
+   "completed": 12459,
+   "assigned": 12510,
+   "goodput_per_s": 103.284,
+   "shed_503": 7080,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 12510,
+     "per_s": 103.71,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12510
+     }
+    },
+    "acquire_error": {
+     "count": 7080,
+     "per_s": 58.69,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7080,
+     "statuses": {
+      "503": 7080
+     }
+    },
+    "complete": {
+     "count": 12459,
+     "per_s": 103.28,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12459
+     }
+    },
+    "output_put": {
+     "count": 12459,
+     "per_s": 103.28,
+     "p50_s": 0.0025,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 12459
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.14,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 51,
+     "per_s": 0.42,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 51
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 14075,
+     "mean_exec_ms": 1.4718,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 12459,
+     "mean_exec_ms": 0.1088,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 12510,
+     "mean_exec_ms": 0.0826,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 12459,
+     "mean_exec_ms": 0.0812,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 12459,
+     "mean_exec_ms": 0.0718,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.125,
+   "claim_mean_exec_ms": 1.4718,
+   "cgroup_cpu_s": {
+    "server": 214.37,
+    "postgres": 44.48,
+    "s3": 29.62,
+    "watchdog": 0.25
+   },
+   "generator_cpu_s": 80.55,
+   "server_cpu_ms_per_subtask": 17.206,
+   "postgres_cpu_ms_per_subtask": 3.57,
+   "H": 0.255,
+   "mix": "S-sat",
+   "W": 2,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w2-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.67,
+   "completed": 12484,
+   "assigned": 12531,
+   "goodput_per_s": 103.456,
+   "shed_503": 7018,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 12531,
+     "per_s": 103.85,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12531
+     }
+    },
+    "acquire_error": {
+     "count": 7018,
+     "per_s": 58.16,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7018,
+     "statuses": {
+      "503": 7018
+     }
+    },
+    "complete": {
+     "count": 12484,
+     "per_s": 103.46,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 12484
+     }
+    },
+    "output_put": {
+     "count": 12484,
+     "per_s": 103.46,
+     "p50_s": 0.005,
+     "p99_s": 0.005,
+     "shed_503": 0,
+     "statuses": {
+      "204": 12484
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.14,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 47,
+     "per_s": 0.39,
+     "p50_s": 0.25,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 47
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 14237,
+     "mean_exec_ms": 1.6534,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 12484,
+     "mean_exec_ms": 0.097,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 12531,
+     "mean_exec_ms": 0.0823,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 12484,
+     "mean_exec_ms": 0.0814,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 12484,
+     "mean_exec_ms": 0.0711,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.136,
+   "claim_mean_exec_ms": 1.6534,
+   "cgroup_cpu_s": {
+    "server": 215.09,
+    "postgres": 45.99,
+    "s3": 29.67,
+    "watchdog": 0.28
+   },
+   "generator_cpu_s": 82.22,
+   "server_cpu_ms_per_subtask": 17.229,
+   "postgres_cpu_ms_per_subtask": 3.684,
+   "H": 0.258,
+   "mix": "S-sat",
+   "W": 2,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w4-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.79,
+   "completed": 19433,
+   "assigned": 19506,
+   "goodput_per_s": 160.883,
+   "shed_503": 7586,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 19506,
+     "per_s": 161.49,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19506
+     }
+    },
+    "acquire_error": {
+     "count": 7511,
+     "per_s": 62.18,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7511,
+     "statuses": {
+      "503": 7511
+     }
+    },
+    "complete": {
+     "count": 19433,
+     "per_s": 160.88,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19433
+     }
+    },
+    "output_put": {
+     "count": 19433,
+     "per_s": 160.88,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 19433
+     }
+    },
+    "register": {
+     "count": 575,
+     "per_s": 4.76,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 75,
+     "statuses": {
+      "200": 500,
+      "503": 75
+     }
+    },
+    "release": {
+     "count": 73,
+     "per_s": 0.6,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 73
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 25480,
+     "mean_exec_ms": 3.8492,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 19433,
+     "mean_exec_ms": 0.2981,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 19506,
+     "mean_exec_ms": 0.1742,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 19433,
+     "mean_exec_ms": 0.1571,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 19433,
+     "mean_exec_ms": 0.1139,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    }
+   ],
+   "claim_calls_per_win": 1.306,
+   "claim_mean_exec_ms": 3.8492,
+   "cgroup_cpu_s": {
+    "server": 455.01,
+    "postgres": 109.66,
+    "s3": 63.11,
+    "watchdog": 0.32
+   },
+   "generator_cpu_s": 136.65,
+   "server_cpu_ms_per_subtask": 23.414,
+   "postgres_cpu_ms_per_subtask": 5.643,
+   "H": 0.528,
+   "mix": "S-sat",
+   "W": 4,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w4-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.734,
+   "completed": 19281,
+   "assigned": 19358,
+   "goodput_per_s": 159.698,
+   "shed_503": 7360,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 68,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 19358,
+     "per_s": 160.34,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19358
+     }
+    },
+    "acquire_error": {
+     "count": 7360,
+     "per_s": 60.96,
+     "p50_s": 0.1,
+     "p99_s": 0.5,
+     "shed_503": 7360,
+     "statuses": {
+      "503": 7360
+     }
+    },
+    "complete": {
+     "count": 19281,
+     "per_s": 159.7,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19281
+     }
+    },
+    "output_put": {
+     "count": 19281,
+     "per_s": 159.7,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 19281
+     }
+    },
+    "register": {
+     "count": 568,
+     "per_s": 4.7,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 68,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 77,
+     "per_s": 0.64,
+     "p50_s": 0.25,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 77
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 25230,
+     "mean_exec_ms": 3.5944,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 19281,
+     "mean_exec_ms": 0.2877,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 19281,
+     "mean_exec_ms": 0.1159,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 19358,
+     "mean_exec_ms": 0.1105,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 19281,
+     "mean_exec_ms": 0.1006,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.303,
+   "claim_mean_exec_ms": 3.5944,
+   "cgroup_cpu_s": {
+    "server": 452.73,
+    "postgres": 103.1,
+    "s3": 62.84,
+    "watchdog": 0.32
+   },
+   "generator_cpu_s": 135.14,
+   "server_cpu_ms_per_subtask": 23.481,
+   "postgres_cpu_ms_per_subtask": 5.347,
+   "H": 0.521,
+   "mix": "S-sat",
+   "W": 4,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w4-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.734,
+   "completed": 19079,
+   "assigned": 19158,
+   "goodput_per_s": 158.025,
+   "shed_503": 7393,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 60,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 19158,
+     "per_s": 158.68,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19158
+     }
+    },
+    "acquire_error": {
+     "count": 7393,
+     "per_s": 61.23,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 7393,
+     "statuses": {
+      "503": 7393
+     }
+    },
+    "complete": {
+     "count": 19079,
+     "per_s": 158.03,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 19079
+     }
+    },
+    "output_put": {
+     "count": 19079,
+     "per_s": 158.03,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 19079
+     }
+    },
+    "register": {
+     "count": 560,
+     "per_s": 4.64,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 60,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 79,
+     "per_s": 0.65,
+     "p50_s": 0.25,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 79
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 24689,
+     "mean_exec_ms": 3.569,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 19079,
+     "mean_exec_ms": 0.3063,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 19079,
+     "mean_exec_ms": 0.1147,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 19158,
+     "mean_exec_ms": 0.1104,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 19079,
+     "mean_exec_ms": 0.1011,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.289,
+   "claim_mean_exec_ms": 3.569,
+   "cgroup_cpu_s": {
+    "server": 447.28,
+    "postgres": 102.59,
+    "s3": 61.31,
+    "watchdog": 0.32
+   },
+   "generator_cpu_s": 133.2,
+   "server_cpu_ms_per_subtask": 23.444,
+   "postgres_cpu_ms_per_subtask": 5.377,
+   "H": 0.514,
+   "mix": "S-sat",
+   "W": 4,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w6-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.885,
+   "completed": 21200,
+   "assigned": 21297,
+   "goodput_per_s": 175.374,
+   "shed_503": 7298,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 21297,
+     "per_s": 176.18,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21297
+     }
+    },
+    "acquire_error": {
+     "count": 7267,
+     "per_s": 60.11,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 7267,
+     "statuses": {
+      "503": 7267
+     }
+    },
+    "complete": {
+     "count": 21200,
+     "per_s": 175.37,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21200
+     }
+    },
+    "output_put": {
+     "count": 21200,
+     "per_s": 175.37,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21200
+     }
+    },
+    "register": {
+     "count": 531,
+     "per_s": 4.39,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 31,
+     "statuses": {
+      "200": 500,
+      "503": 31
+     }
+    },
+    "release": {
+     "count": 97,
+     "per_s": 0.8,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 97
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 32213,
+     "mean_exec_ms": 7.0608,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21200,
+     "mean_exec_ms": 0.61,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21297,
+     "mean_exec_ms": 0.2657,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21200,
+     "mean_exec_ms": 0.2517,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 21297,
+     "mean_exec_ms": 0.1996,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 1.513,
+   "claim_mean_exec_ms": 7.0608,
+   "cgroup_cpu_s": {
+    "server": 627.24,
+    "postgres": 156.19,
+    "s3": 80.48,
+    "watchdog": 0.38
+   },
+   "generator_cpu_s": 191.84,
+   "server_cpu_ms_per_subtask": 29.587,
+   "postgres_cpu_ms_per_subtask": 7.368,
+   "H": 0.728,
+   "mix": "S-sat",
+   "W": 6,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w6-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.824,
+   "completed": 21208,
+   "assigned": 21311,
+   "goodput_per_s": 175.528,
+   "shed_503": 7181,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 99,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 21311,
+     "per_s": 176.38,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21311
+     }
+    },
+    "acquire_empty": {
+     "count": 1,
+     "per_s": 0.01,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "204": 1
+     }
+    },
+    "acquire_error": {
+     "count": 7181,
+     "per_s": 59.43,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 7181,
+     "statuses": {
+      "503": 7181
+     }
+    },
+    "complete": {
+     "count": 21208,
+     "per_s": 175.53,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21208
+     }
+    },
+    "output_put": {
+     "count": 21208,
+     "per_s": 175.53,
+     "p50_s": 0.005,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21208
+     }
+    },
+    "register": {
+     "count": 599,
+     "per_s": 4.96,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 99,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 103,
+     "per_s": 0.85,
+     "p50_s": 0.25,
+     "p99_s": 0.25,
+     "shed_503": 0,
+     "statuses": {
+      "200": 103
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 31900,
+     "mean_exec_ms": 6.7336,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21208,
+     "mean_exec_ms": 0.5848,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21208,
+     "mean_exec_ms": 0.154,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 21311,
+     "mean_exec_ms": 0.1461,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21208,
+     "mean_exec_ms": 0.1265,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.497,
+   "claim_mean_exec_ms": 6.7336,
+   "cgroup_cpu_s": {
+    "server": 625.22,
+    "postgres": 146.47,
+    "s3": 80.09,
+    "watchdog": 0.36
+   },
+   "generator_cpu_s": 188.0,
+   "server_cpu_ms_per_subtask": 29.48,
+   "postgres_cpu_ms_per_subtask": 6.907,
+   "H": 0.717,
+   "mix": "S-sat",
+   "W": 6,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w6-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.814,
+   "completed": 21288,
+   "assigned": 21398,
+   "goodput_per_s": 176.205,
+   "shed_503": 7244,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 7,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 21398,
+     "per_s": 177.12,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21398
+     }
+    },
+    "acquire_error": {
+     "count": 7244,
+     "per_s": 59.96,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 7244,
+     "statuses": {
+      "503": 7244
+     }
+    },
+    "complete": {
+     "count": 21288,
+     "per_s": 176.2,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21288
+     }
+    },
+    "output_put": {
+     "count": 21288,
+     "per_s": 176.2,
+     "p50_s": 0.005,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21288
+     }
+    },
+    "register": {
+     "count": 507,
+     "per_s": 4.2,
+     "p50_s": 0.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "0": 7,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 110,
+     "per_s": 0.91,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 110
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 32020,
+     "mean_exec_ms": 6.6248,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21288,
+     "mean_exec_ms": 0.6035,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21288,
+     "mean_exec_ms": 0.1521,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 21398,
+     "mean_exec_ms": 0.1428,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21288,
+     "mean_exec_ms": 0.1277,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.496,
+   "claim_mean_exec_ms": 6.6248,
+   "cgroup_cpu_s": {
+    "server": 625.01,
+    "postgres": 146.5,
+    "s3": 80.13,
+    "watchdog": 0.35
+   },
+   "generator_cpu_s": 188.06,
+   "server_cpu_ms_per_subtask": 29.36,
+   "postgres_cpu_ms_per_subtask": 6.882,
+   "H": 0.717,
+   "mix": "S-sat",
+   "W": 6,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w8-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.038,
+   "completed": 21578,
+   "assigned": 21698,
+   "goodput_per_s": 178.274,
+   "shed_503": 6751,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 103,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 21698,
+     "per_s": 179.27,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21698
+     }
+    },
+    "acquire_empty": {
+     "count": 2,
+     "per_s": 0.02,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 2
+     }
+    },
+    "acquire_error": {
+     "count": 6733,
+     "per_s": 55.63,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6733,
+     "statuses": {
+      "503": 6733
+     }
+    },
+    "complete": {
+     "count": 21578,
+     "per_s": 178.27,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21578
+     }
+    },
+    "output_put": {
+     "count": 21578,
+     "per_s": 178.27,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21578
+     }
+    },
+    "register": {
+     "count": 621,
+     "per_s": 5.13,
+     "p50_s": 0.5,
+     "p99_s": 2.5,
+     "shed_503": 18,
+     "statuses": {
+      "0": 103,
+      "200": 500,
+      "503": 18
+     }
+    },
+    "release": {
+     "count": 120,
+     "per_s": 0.99,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 120
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 37815,
+     "mean_exec_ms": 10.9869,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21578,
+     "mean_exec_ms": 0.9948,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21698,
+     "mean_exec_ms": 0.2888,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21578,
+     "mean_exec_ms": 0.2611,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 21698,
+     "mean_exec_ms": 0.1991,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 1.743,
+   "claim_mean_exec_ms": 10.9869,
+   "cgroup_cpu_s": {
+    "server": 721.04,
+    "postgres": 180.49,
+    "s3": 85.78,
+    "watchdog": 0.36
+   },
+   "generator_cpu_s": 217.98999999999998,
+   "server_cpu_ms_per_subtask": 33.415,
+   "postgres_cpu_ms_per_subtask": 8.365,
+   "H": 0.83,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w8-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.927,
+   "completed": 21969,
+   "assigned": 22086,
+   "goodput_per_s": 181.672,
+   "shed_503": 6852,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 22086,
+     "per_s": 182.64,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 22086
+     }
+    },
+    "acquire_empty": {
+     "count": 4,
+     "per_s": 0.03,
+     "p50_s": 2.5,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 4
+     }
+    },
+    "acquire_error": {
+     "count": 6852,
+     "per_s": 56.66,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6852,
+     "statuses": {
+      "503": 6852
+     }
+    },
+    "complete": {
+     "count": 21969,
+     "per_s": 181.67,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21969
+     }
+    },
+    "output_put": {
+     "count": 21969,
+     "per_s": 181.67,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21969
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 4.13,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 117,
+     "per_s": 0.97,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 117
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 38169,
+     "mean_exec_ms": 10.6227,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21969,
+     "mean_exec_ms": 0.921,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21969,
+     "mean_exec_ms": 0.1841,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 22086,
+     "mean_exec_ms": 0.1712,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21969,
+     "mean_exec_ms": 0.1432,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.728,
+   "claim_mean_exec_ms": 10.6227,
+   "cgroup_cpu_s": {
+    "server": 728.08,
+    "postgres": 173.15,
+    "s3": 86.57,
+    "watchdog": 0.38
+   },
+   "generator_cpu_s": 220.07999999999998,
+   "server_cpu_ms_per_subtask": 33.141,
+   "postgres_cpu_ms_per_subtask": 7.882,
+   "H": 0.833,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "curve"
+  },
+  {
+   "name": "sat-w8-r3",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 120.981,
+   "completed": 21530,
+   "assigned": 21648,
+   "goodput_per_s": 177.961,
+   "shed_503": 6763,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 75,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 21648,
+     "per_s": 178.94,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21648
+     }
+    },
+    "acquire_empty": {
+     "count": 2,
+     "per_s": 0.02,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "204": 2
+     }
+    },
+    "acquire_error": {
+     "count": 6763,
+     "per_s": 55.9,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6763,
+     "statuses": {
+      "503": 6763
+     }
+    },
+    "complete": {
+     "count": 21530,
+     "per_s": 177.96,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 21530
+     }
+    },
+    "output_put": {
+     "count": 21530,
+     "per_s": 177.96,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 21530
+     }
+    },
+    "register": {
+     "count": 575,
+     "per_s": 4.75,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 75,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 118,
+     "per_s": 0.98,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 118
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 37297,
+     "mean_exec_ms": 10.6589,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 21530,
+     "mean_exec_ms": 1.0586,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 21530,
+     "mean_exec_ms": 0.192,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 21648,
+     "mean_exec_ms": 0.1713,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 21530,
+     "mean_exec_ms": 0.1494,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.723,
+   "claim_mean_exec_ms": 10.6589,
+   "cgroup_cpu_s": {
+    "server": 727.56,
+    "postgres": 173.67,
+    "s3": 86.33,
+    "watchdog": 0.39
+   },
+   "generator_cpu_s": 218.39000000000001,
+   "server_cpu_ms_per_subtask": 33.793,
+   "postgres_cpu_ms_per_subtask": 8.066,
+   "H": 0.831,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "curve"
+  },
+  {
+   "name": "satwin64-w8-r1",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.026,
+   "completed": 23883,
+   "assigned": 24012,
+   "goodput_per_s": 197.338,
+   "shed_503": 6498,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 99,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 24012,
+     "per_s": 198.4,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 24012
+     }
+    },
+    "acquire_error": {
+     "count": 6497,
+     "per_s": 53.68,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6497,
+     "statuses": {
+      "503": 6497
+     }
+    },
+    "complete": {
+     "count": 23883,
+     "per_s": 197.34,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 23883
+     }
+    },
+    "output_put": {
+     "count": 23883,
+     "per_s": 197.34,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 23883
+     }
+    },
+    "register": {
+     "count": 600,
+     "per_s": 4.96,
+     "p50_s": 0.5,
+     "p99_s": 2.5,
+     "shed_503": 1,
+     "statuses": {
+      "0": 99,
+      "200": 500,
+      "503": 1
+     }
+    },
+    "release": {
+     "count": 129,
+     "per_s": 1.07,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 129
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 27518,
+     "mean_exec_ms": 4.0419,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 23883,
+     "mean_exec_ms": 1.501,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 24012,
+     "mean_exec_ms": 0.2878,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 23883,
+     "mean_exec_ms": 0.2692,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    },
+    {
+     "calls": 24012,
+     "mean_exec_ms": 0.2027,
+     "query": "SELECT minion_subtask.record_count, minion_subtask.max_attem"
+    }
+   ],
+   "claim_calls_per_win": 1.146,
+   "claim_mean_exec_ms": 4.0419,
+   "cgroup_cpu_s": {
+    "server": 716.94,
+    "postgres": 163.84,
+    "s3": 92.62,
+    "watchdog": 0.38
+   },
+   "generator_cpu_s": 234.39,
+   "server_cpu_ms_per_subtask": 30.019,
+   "postgres_cpu_ms_per_subtask": 6.86,
+   "H": 0.832,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "window64"
+  },
+  {
+   "name": "satwin64-w8-r2",
+   "work_s": 0.25,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 121.069,
+   "completed": 24152,
+   "assigned": 24281,
+   "goodput_per_s": 199.49,
+   "shed_503": 6743,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 3,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 24281,
+     "per_s": 200.56,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 24281
+     }
+    },
+    "acquire_error": {
+     "count": 6743,
+     "per_s": 55.7,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 6743,
+     "statuses": {
+      "503": 6743
+     }
+    },
+    "complete": {
+     "count": 24152,
+     "per_s": 199.49,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 24152
+     }
+    },
+    "output_put": {
+     "count": 24152,
+     "per_s": 199.49,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 24152
+     }
+    },
+    "register": {
+     "count": 503,
+     "per_s": 4.15,
+     "p50_s": 1.0,
+     "p99_s": 2.5,
+     "shed_503": 0,
+     "statuses": {
+      "0": 3,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 129,
+     "per_s": 1.07,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 129
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 27636,
+     "mean_exec_ms": 3.8437,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 24152,
+     "mean_exec_ms": 1.4592,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 24152,
+     "mean_exec_ms": 0.1792,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 24281,
+     "mean_exec_ms": 0.1673,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 24152,
+     "mean_exec_ms": 0.1448,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.138,
+   "claim_mean_exec_ms": 3.8437,
+   "cgroup_cpu_s": {
+    "server": 721.74,
+    "postgres": 155.5,
+    "s3": 93.67,
+    "watchdog": 0.35
+   },
+   "generator_cpu_s": 237.49,
+   "server_cpu_ms_per_subtask": 29.883,
+   "postgres_cpu_ms_per_subtask": 6.439,
+   "H": 0.832,
+   "mix": "S-sat",
+   "W": 8,
+   "kind": "window64"
+  },
+  {
+   "name": "stress-w4-r1",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.099,
+   "completed": 40703,
+   "assigned": 41034,
+   "goodput_per_s": 168.823,
+   "shed_503": 6937,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 7,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 41034,
+     "per_s": 170.2,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 41034
+     }
+    },
+    "acquire_error": {
+     "count": 6937,
+     "per_s": 28.77,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 6937,
+     "statuses": {
+      "503": 6937
+     }
+    },
+    "complete": {
+     "count": 40703,
+     "per_s": 168.82,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 40703
+     }
+    },
+    "output_put": {
+     "count": 40703,
+     "per_s": 168.82,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 40703
+     }
+    },
+    "register": {
+     "count": 507,
+     "per_s": 2.1,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 7,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 331,
+     "per_s": 1.37,
+     "p50_s": 0.5,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 331
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 49041,
+     "mean_exec_ms": 2.3719,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 40703,
+     "mean_exec_ms": 0.237,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 40703,
+     "mean_exec_ms": 0.1378,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 41034,
+     "mean_exec_ms": 0.1081,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 40703,
+     "mean_exec_ms": 0.1011,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.195,
+   "claim_mean_exec_ms": 2.3719,
+   "cgroup_cpu_s": {
+    "server": 902.34,
+    "postgres": 232.48,
+    "s3": 131.79,
+    "watchdog": 0.59
+   },
+   "generator_cpu_s": 253.94,
+   "server_cpu_ms_per_subtask": 22.169,
+   "postgres_cpu_ms_per_subtask": 5.712,
+   "H": 0.526,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "curve"
+  },
+  {
+   "name": "stress-w4-r2",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.137,
+   "completed": 41165,
+   "assigned": 41512,
+   "goodput_per_s": 170.712,
+   "shed_503": 6634,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 21,
+   "event_loop_lag_p99_s": 0.0025,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 41512,
+     "per_s": 172.15,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 41512
+     }
+    },
+    "acquire_error": {
+     "count": 6634,
+     "per_s": 27.51,
+     "p50_s": 0.1,
+     "p99_s": 0.25,
+     "shed_503": 6634,
+     "statuses": {
+      "503": 6634
+     }
+    },
+    "complete": {
+     "count": 41165,
+     "per_s": 170.71,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 0,
+     "statuses": {
+      "200": 41165
+     }
+    },
+    "output_put": {
+     "count": 41165,
+     "per_s": 170.71,
+     "p50_s": 0.005,
+     "p99_s": 0.01,
+     "shed_503": 0,
+     "statuses": {
+      "204": 41165
+     }
+    },
+    "register": {
+     "count": 521,
+     "per_s": 2.16,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 21,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 347,
+     "per_s": 1.44,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 347
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 49761,
+     "mean_exec_ms": 2.3928,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 41165,
+     "mean_exec_ms": 0.235,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 41165,
+     "mean_exec_ms": 0.1374,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 41165,
+     "mean_exec_ms": 0.1083,
+     "query": "SELECT minion_task.total_subtasks, (SELECT coalesce(sum(mini"
+    },
+    {
+     "calls": 41512,
+     "mean_exec_ms": 0.1065,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    }
+   ],
+   "claim_calls_per_win": 1.199,
+   "claim_mean_exec_ms": 2.3928,
+   "cgroup_cpu_s": {
+    "server": 909.02,
+    "postgres": 234.24,
+    "s3": 134.15,
+    "watchdog": 0.62
+   },
+   "generator_cpu_s": 256.36,
+   "server_cpu_ms_per_subtask": 22.082,
+   "postgres_cpu_ms_per_subtask": 5.69,
+   "H": 0.53,
+   "mix": "S-stress",
+   "W": 4,
+   "kind": "curve"
+  },
+  {
+   "name": "stress-w8-r1",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.438,
+   "completed": 47016,
+   "assigned": 47430,
+   "goodput_per_s": 194.734,
+   "shed_503": 3148,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 0,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 47430,
+     "per_s": 196.45,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 47430
+     }
+    },
+    "acquire_error": {
+     "count": 3148,
+     "per_s": 13.04,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 3148,
+     "statuses": {
+      "503": 3148
+     }
+    },
+    "complete": {
+     "count": 47016,
+     "per_s": 194.73,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 47016
+     }
+    },
+    "output_put": {
+     "count": 47016,
+     "per_s": 194.73,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 47016
+     }
+    },
+    "register": {
+     "count": 500,
+     "per_s": 2.07,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 414,
+     "per_s": 1.71,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 414
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 63881,
+     "mean_exec_ms": 5.089,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 47016,
+     "mean_exec_ms": 0.4102,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 47016,
+     "mean_exec_ms": 0.216,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 47430,
+     "mean_exec_ms": 0.1545,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 47016,
+     "mean_exec_ms": 0.1405,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.347,
+   "claim_mean_exec_ms": 5.089,
+   "cgroup_cpu_s": {
+    "server": 1352.8,
+    "postgres": 352.51,
+    "s3": 177.16,
+    "watchdog": 0.71
+   },
+   "generator_cpu_s": 389.5,
+   "server_cpu_ms_per_subtask": 28.773,
+   "postgres_cpu_ms_per_subtask": 7.498,
+   "H": 0.784,
+   "mix": "S-stress",
+   "W": 8,
+   "kind": "curve"
+  },
+  {
+   "name": "stress-w8-r2",
+   "work_s": 2.0,
+   "sims": 500,
+   "procs": 8,
+   "duration_s": 241.57,
+   "completed": 46786,
+   "assigned": 47235,
+   "goodput_per_s": 193.675,
+   "shed_503": 3044,
+   "server_errors_5xx": 0,
+   "conflicts_409": 0,
+   "rate_limited_429": 0,
+   "transport_errors": 81,
+   "event_loop_lag_p99_s": 0.005,
+   "endpoints": {
+    "acquire_assigned": {
+     "count": 47235,
+     "per_s": 195.53,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 47235
+     }
+    },
+    "acquire_empty": {
+     "count": 1,
+     "per_s": 0.0,
+     "p50_s": 1.0,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "204": 1
+     }
+    },
+    "acquire_error": {
+     "count": 3044,
+     "per_s": 12.6,
+     "p50_s": 0.25,
+     "p99_s": 0.5,
+     "shed_503": 3044,
+     "statuses": {
+      "503": 3044
+     }
+    },
+    "complete": {
+     "count": 46786,
+     "per_s": 193.67,
+     "p50_s": 0.25,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 46786
+     }
+    },
+    "output_put": {
+     "count": 46786,
+     "per_s": 193.67,
+     "p50_s": 0.01,
+     "p99_s": 0.025,
+     "shed_503": 0,
+     "statuses": {
+      "204": 46786
+     }
+    },
+    "register": {
+     "count": 581,
+     "per_s": 2.41,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "0": 81,
+      "200": 500
+     }
+    },
+    "release": {
+     "count": 449,
+     "per_s": 1.86,
+     "p50_s": 0.5,
+     "p99_s": 1.0,
+     "shed_503": 0,
+     "statuses": {
+      "200": 449
+     }
+    }
+   },
+   "pg_stat_statements_top5": [
+    {
+     "calls": 63661,
+     "mean_exec_ms": 5.014,
+     "query": "WITH cand AS (SELECT t.team AS team, t.project AS project, t"
+    },
+    {
+     "calls": 46786,
+     "mean_exec_ms": 0.4306,
+     "query": "INSERT INTO minion_task_counter (team, project, task_name, s"
+    },
+    {
+     "calls": 46786,
+     "mean_exec_ms": 0.2143,
+     "query": "INSERT INTO minion_subtask_attempt (team, project, task_name"
+    },
+    {
+     "calls": 47235,
+     "mean_exec_ms": 0.1555,
+     "query": "UPDATE minion_subtask SET status=$1, attempt=(minion_subtask"
+    },
+    {
+     "calls": 46786,
+     "mean_exec_ms": 0.1414,
+     "query": "UPDATE minion_subtask SET status=$1, output_uri=$2::VARCHAR,"
+    }
+   ],
+   "claim_calls_per_win": 1.348,
+   "claim_mean_exec_ms": 5.014,
+   "cgroup_cpu_s": {
+    "server": 1353.46,
+    "postgres": 353.03,
+    "s3": 177.57,
+    "watchdog": 0.7
+   },
+   "generator_cpu_s": 388.24,
+   "server_cpu_ms_per_subtask": 28.929,
+   "postgres_cpu_ms_per_subtask": 7.546,
+   "H": 0.784,
+   "mix": "S-stress",
+   "W": 8,
+   "kind": "curve"
+  }
+ ],
+ "curve": {
+  "sat-W1": {
+   "n": 3,
+   "Xmin": 68.643,
+   "Xmed": 69.64,
+   "Xmax": 70.386,
+   "Csrv": 14.431,
+   "Cpg": 3.2186,
+   "H": 0.1664,
+   "srv_cores": 1.0046,
+   "pg_cores": 0.2241,
+   "acq_p99": 0.5,
+   "comp_p99": 0.5,
+   "shed_pct": 27.84,
+   "shed": 6524,
+   "cand_ms": 0.7283,
+   "lag99": 0.0025,
+   "e5": 0,
+   "calls_per_win": 1.0569,
+   "E": 1.0,
+   "E2": 1.3485
+  },
+  "sat-W2": {
+   "n": 3,
+   "Xmin": 102.866,
+   "Xmed": 103.284,
+   "Xmax": 103.456,
+   "Csrv": 17.2291,
+   "Cpg": 3.6836,
+   "H": 0.2578,
+   "srv_cores": 1.7813,
+   "pg_cores": 0.3811,
+   "acq_p99": 0.5,
+   "comp_p99": 0.5,
+   "shed_pct": 22.0912,
+   "shed": 7080,
+   "cand_ms": 1.6534,
+   "lag99": 0.0025,
+   "e5": 0,
+   "calls_per_win": 1.1361,
+   "E": 0.7416,
+   "E2": 1.0
+  },
+  "sat-W4": {
+   "n": 3,
+   "Xmin": 158.025,
+   "Xmed": 159.698,
+   "Xmax": 160.883,
+   "Csrv": 23.4437,
+   "Cpg": 5.377,
+   "H": 0.5205,
+   "srv_cores": 3.7498,
+   "pg_cores": 0.854,
+   "acq_p99": 0.5,
+   "comp_p99": 0.5,
+   "shed_pct": 16.2021,
+   "shed": 7393,
+   "cand_ms": 3.5944,
+   "lag99": 0.0025,
+   "e5": 0,
+   "calls_per_win": 1.3033,
+   "E": 0.5733,
+   "E2": 0.7731
+  },
+  "sat-W6": {
+   "n": 3,
+   "Xmin": 175.374,
+   "Xmed": 175.528,
+   "Xmax": 176.205,
+   "Csrv": 29.4802,
+   "Cpg": 6.9065,
+   "H": 0.7174,
+   "srv_cores": 5.1746,
+   "pg_cores": 1.2126,
+   "acq_p99": 1.0,
+   "comp_p99": 0.5,
+   "shed_pct": 14.5083,
+   "shed": 7244,
+   "cand_ms": 6.7336,
+   "lag99": 0.005,
+   "e5": 0,
+   "calls_per_win": 1.4969,
+   "E": 0.4201,
+   "E2": 0.5665
+  },
+  "sat-W8": {
+   "n": 3,
+   "Xmin": 177.961,
+   "Xmed": 178.274,
+   "Xmax": 181.672,
+   "Csrv": 33.4153,
+   "Cpg": 8.0663,
+   "H": 0.8309,
+   "srv_cores": 6.0139,
+   "pg_cores": 1.4355,
+   "acq_p99": 1.0,
+   "comp_p99": 1.0,
+   "shed_pct": 13.4996,
+   "shed": 6763,
+   "cand_ms": 10.6589,
+   "lag99": 0.005,
+   "e5": 0,
+   "calls_per_win": 1.7282,
+   "E": 0.32,
+   "E2": 0.4315
+  },
+  "sat-W12": {
+   "n": 3,
+   "Xmin": 163.564,
+   "Xmed": 164.273,
+   "Xmax": 165.584,
+   "Csrv": 42.4783,
+   "Cpg": 10.2911,
+   "H": 0.9305,
+   "srv_cores": 6.9828,
+   "pg_cores": 1.6906,
+   "acq_p99": 2.5,
+   "comp_p99": 1.0,
+   "shed_pct": 13.2075,
+   "shed": 6100,
+   "cand_ms": 20.6372,
+   "lag99": 0.01,
+   "e5": 0,
+   "calls_per_win": 2.1919,
+   "E": 0.1966,
+   "E2": 0.2651
+  },
+  "stress-W4": {
+   "n": 2,
+   "Xmin": 168.823,
+   "Xmed": 169.7675,
+   "Xmax": 170.712,
+   "Csrv": 22.1257,
+   "Cpg": 5.701,
+   "H": 0.528,
+   "srv_cores": 3.7562,
+   "pg_cores": 0.9678,
+   "acq_p99": 0.5,
+   "comp_p99": 0.5,
+   "shed_pct": 7.6255,
+   "shed": 6785.5,
+   "cand_ms": 2.3823,
+   "lag99": 0.0025,
+   "e5": 0,
+   "calls_per_win": 1.1969,
+   "E": null,
+   "E2": null
+  },
+  "stress-W8": {
+   "n": 2,
+   "Xmin": 193.675,
+   "Xmed": 194.2045,
+   "Xmax": 194.734,
+   "Csrv": 28.8509,
+   "Cpg": 7.5217,
+   "H": 0.7843,
+   "srv_cores": 5.6029,
+   "pg_cores": 1.4607,
+   "acq_p99": 1.0,
+   "comp_p99": 1.0,
+   "shed_pct": 3.1808,
+   "shed": 3096.0,
+   "cand_ms": 5.0515,
+   "lag99": 0.005,
+   "e5": 0,
+   "calls_per_win": 1.3473,
+   "E": null,
+   "E2": null
+  }
+ },
+ "profiles": [
+  {
+   "bad_lines": 0,
+   "pids": 1,
+   "samples_all": 36775,
+   "samples_wait_excluded": 7514,
+   "samples": 28612,
+   "categories": {
+    "sqlalchemy": {
+     "self_pct": 40.33,
+     "incl_pct": 46.22
+    },
+    "event loop/native I/O": {
+     "self_pct": 32.7,
+     "incl_pct": 58.27
+    },
+    "asyncpg": {
+     "self_pct": 9.25,
+     "incl_pct": 9.35
+    },
+    "app logic": {
+     "self_pct": 4.68,
+     "incl_pct": 33.93
+    },
+    "fastapi": {
+     "self_pct": 4.3,
+     "incl_pct": 34.66
+    },
+    "presign/boto": {
+     "self_pct": 2.58,
+     "incl_pct": 3.09
+    },
+    "starlette": {
+     "self_pct": 1.97,
+     "incl_pct": 33.12
+    },
+    "structlog": {
+     "self_pct": 1.45,
+     "incl_pct": 1.6
+    },
+    "other": {
+     "self_pct": 1.32,
+     "incl_pct": 0.0
+    },
+    "pydantic": {
+     "self_pct": 0.43,
+     "incl_pct": 0.45
+    },
+    "metrics": {
+     "self_pct": 0.4,
+     "incl_pct": 28.07
+    },
+    "auth": {
+     "self_pct": 0.35,
+     "incl_pct": 0.79
+    },
+    "uvicorn": {
+     "self_pct": 0.25,
+     "incl_pct": 57.28
+    }
+   },
+   "routes": {
+    "(event loop main thread, no endpoint frame)": {
+     "incl_pct": 43.9,
+     "self_by_category": {
+      "event loop/native I/O": 72.5,
+      "fastapi": 9.8,
+      "starlette": 4.4,
+      "structlog": 3.3,
+      "sqlalchemy": 2.3,
+      "other": 1.8
+     }
+    },
+    "(SQL in greenlet, route not recoverable)": {
+     "incl_pct": 28.14,
+     "self_by_category": {
+      "sqlalchemy": 77.0,
+      "asyncpg": 21.9,
+      "event loop/native I/O": 0.6,
+      "other": 0.3,
+      "starlette": 0.1,
+      "structlog": 0.0
+     }
+    },
+    "acquire": {
+     "incl_pct": 18.21,
+     "self_by_category": {
+      "sqlalchemy": 75.1,
+      "app logic": 13.6,
+      "asyncpg": 7.5,
+      "pydantic": 1.2,
+      "event loop/native I/O": 1.1,
+      "other": 0.8
+     }
+    },
+    "complete": {
+     "incl_pct": 6.91,
+     "self_by_category": {
+      "sqlalchemy": 57.8,
+      "app logic": 20.3,
+      "asyncpg": 15.1,
+      "event loop/native I/O": 5.5,
+      "other": 0.8,
+      "presign/boto": 0.5
+     }
+    },
+    "(thread pool: S3 head/copy, other sync)": {
+     "incl_pct": 2.85,
+     "self_by_category": {
+      "presign/boto": 85.4,
+      "other": 9.2,
+      "event loop/native I/O": 4.7,
+      "structlog": 0.2,
+      "pydantic": 0.1,
+      "auth": 0.1
+     }
+    }
+   },
+   "top_self": [
+    {
+     "frame": "run (asyncio/runners.py)",
+     "self_pct": 28.64
+    },
+    {
+     "frame": "_generate_cache_key (sqlalchemy/sql/cache_key.py)",
+     "self_pct": 3.79
+    },
+    {
+     "frame": "__do_execute (asyncpg/prepared_stmt.py)",
+     "self_pct": 3.69
+    },
+    {
+     "frame": "execute (asyncpg/connection.py)",
+     "self_pct": 2.83
+    },
+    {
+     "frame": "expect (sqlalchemy/sql/coercions.py)",
+     "self_pct": 2.41
+    },
+    {
+     "frame": "greenlet_spawn (sqlalchemy/util/concurrency.py)",
+     "self_pct": 2.36
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/schema.py)",
+     "self_pct": 1.32
+    },
+    {
+     "frame": "emit (logging/__init__.py)",
+     "self_pct": 1.1
+    },
+    {
+     "frame": "_prepare_and_execute (sqlalchemy/dialects/postgresql/asyncpg.py)",
+     "self_pct": 1.1
+    },
+    {
+     "frame": "get (sqlalchemy/util/_collections.py)",
+     "self_pct": 0.96
+    },
+    {
+     "frame": "app (fastapi/routing.py)",
+     "self_pct": 0.93
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/elements.py)",
+     "self_pct": 0.82
+    },
+    {
+     "frame": "construct_params (sqlalchemy/sql/compiler.py)",
+     "self_pct": 0.79
+    },
+    {
+     "frame": "solve_dependencies (fastapi/dependencies/utils.py)",
+     "self_pct": 0.76
+    },
+    {
+     "frame": "await_ (sqlalchemy/util/concurrency.py)",
+     "self_pct": 0.72
+    },
+    {
+     "frame": "_make_proxy (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.66
+    },
+    {
+     "frame": "request (urllib3/connection.py)",
+     "self_pct": 0.66
+    },
+    {
+     "frame": "acquire (minion_server/services/acquisition.py)",
+     "self_pct": 0.65
+    },
+    {
+     "frame": "__get__ (sqlalchemy/util/langhelpers.py)",
+     "self_pct": 0.64
+    },
+    {
+     "frame": "_execute_internal (sqlalchemy/orm/session.py)",
+     "self_pct": 0.63
+    },
+    {
+     "frame": "_do_execute (asyncpg/connection.py)",
+     "self_pct": 0.6
+    },
+    {
+     "frame": "_init_compiled (sqlalchemy/engine/default.py)",
+     "self_pct": 0.59
+    },
+    {
+     "frame": "getresponse (urllib3/connection.py)",
+     "self_pct": 0.53
+    },
+    {
+     "frame": "send (uvicorn/protocols/http/httptools_impl.py)",
+     "self_pct": 0.5
+    },
+    {
+     "frame": "_execute_clauseelement (sqlalchemy/engine/base.py)",
+     "self_pct": 0.46
+    }
+   ],
+   "sqlalchemy_self_split": {
+    "sql": 21.16,
+    "util": 5.58,
+    "orm": 5.57,
+    "engine": 3.23,
+    "dialects": 1.91,
+    "event": 1.44,
+    "ext": 0.87,
+    "pool": 0.43
+   },
+   "P_py": 0.673,
+   "name": "P1",
+   "W": 4,
+   "mix": "S-stress",
+   "rate_hz": 100,
+   "duration_s": 120,
+   "mode": "nonblocking",
+   "run": "prof-P1-w4"
+  },
+  {
+   "bad_lines": 0,
+   "pids": 1,
+   "samples_all": 18620,
+   "samples_wait_excluded": 3668,
+   "samples": 14577,
+   "categories": {
+    "sqlalchemy": {
+     "self_pct": 40.04,
+     "incl_pct": 45.76
+    },
+    "event loop/native I/O": {
+     "self_pct": 33.65,
+     "incl_pct": 58.89
+    },
+    "asyncpg": {
+     "self_pct": 8.66,
+     "incl_pct": 8.73
+    },
+    "app logic": {
+     "self_pct": 4.99,
+     "incl_pct": 32.91
+    },
+    "fastapi": {
+     "self_pct": 3.75,
+     "incl_pct": 33.35
+    },
+    "presign/boto": {
+     "self_pct": 2.71,
+     "incl_pct": 3.35
+    },
+    "starlette": {
+     "self_pct": 2.13,
+     "incl_pct": 32.02
+    },
+    "other": {
+     "self_pct": 1.37,
+     "incl_pct": 0.0
+    },
+    "structlog": {
+     "self_pct": 1.31,
+     "incl_pct": 1.42
+    },
+    "metrics": {
+     "self_pct": 0.43,
+     "incl_pct": 27.38
+    },
+    "pydantic": {
+     "self_pct": 0.38,
+     "incl_pct": 0.42
+    },
+    "auth": {
+     "self_pct": 0.35,
+     "incl_pct": 0.75
+    },
+    "uvicorn": {
+     "self_pct": 0.23,
+     "incl_pct": 58.09
+    }
+   },
+   "routes": {
+    "(event loop main thread, no endpoint frame)": {
+     "incl_pct": 44.12,
+     "self_by_category": {
+      "event loop/native I/O": 74.5,
+      "fastapi": 8.5,
+      "starlette": 4.8,
+      "structlog": 2.9,
+      "sqlalchemy": 2.2,
+      "other": 1.8
+     }
+    },
+    "(SQL in greenlet, route not recoverable)": {
+     "incl_pct": 28.3,
+     "self_by_category": {
+      "sqlalchemy": 79.1,
+      "asyncpg": 19.8,
+      "event loop/native I/O": 0.6,
+      "other": 0.4,
+      "metrics": 0.0,
+      "structlog": 0.0
+     }
+    },
+    "acquire": {
+     "incl_pct": 18.04,
+     "self_by_category": {
+      "sqlalchemy": 72.5,
+      "app logic": 15.3,
+      "asyncpg": 8.4,
+      "event loop/native I/O": 1.3,
+      "other": 1.1,
+      "pydantic": 1.0
+     }
+    },
+    "complete": {
+     "incl_pct": 6.57,
+     "self_by_category": {
+      "sqlalchemy": 54.6,
+      "app logic": 24.1,
+      "asyncpg": 15.3,
+      "event loop/native I/O": 4.5,
+      "other": 0.8,
+      "presign/boto": 0.6
+     }
+    },
+    "(thread pool: S3 head/copy, other sync)": {
+     "incl_pct": 2.96,
+     "self_by_category": {
+      "presign/boto": 87.9,
+      "other": 7.7,
+      "event loop/native I/O": 2.6,
+      "structlog": 1.2,
+      "auth": 0.2,
+      "sqlalchemy": 0.2
+     }
+    }
+   },
+   "top_self": [
+    {
+     "frame": "run (asyncio/runners.py)",
+     "self_pct": 29.94
+    },
+    {
+     "frame": "_generate_cache_key (sqlalchemy/sql/cache_key.py)",
+     "self_pct": 3.79
+    },
+    {
+     "frame": "__do_execute (asyncpg/prepared_stmt.py)",
+     "self_pct": 3.52
+    },
+    {
+     "frame": "execute (asyncpg/connection.py)",
+     "self_pct": 2.5
+    },
+    {
+     "frame": "greenlet_spawn (sqlalchemy/util/concurrency.py)",
+     "self_pct": 2.28
+    },
+    {
+     "frame": "expect (sqlalchemy/sql/coercions.py)",
+     "self_pct": 2.22
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/schema.py)",
+     "self_pct": 1.15
+    },
+    {
+     "frame": "emit (logging/__init__.py)",
+     "self_pct": 0.96
+    },
+    {
+     "frame": "get (sqlalchemy/util/_collections.py)",
+     "self_pct": 0.93
+    },
+    {
+     "frame": "_prepare_and_execute (sqlalchemy/dialects/postgresql/asyncpg.py)",
+     "self_pct": 0.92
+    },
+    {
+     "frame": "request (urllib3/connection.py)",
+     "self_pct": 0.81
+    },
+    {
+     "frame": "await_ (sqlalchemy/util/concurrency.py)",
+     "self_pct": 0.8
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/elements.py)",
+     "self_pct": 0.8
+    },
+    {
+     "frame": "app (fastapi/routing.py)",
+     "self_pct": 0.77
+    },
+    {
+     "frame": "construct_params (sqlalchemy/sql/compiler.py)",
+     "self_pct": 0.75
+    },
+    {
+     "frame": "solve_dependencies (fastapi/dependencies/utils.py)",
+     "self_pct": 0.71
+    },
+    {
+     "frame": "acquire (minion_server/services/acquisition.py)",
+     "self_pct": 0.68
+    },
+    {
+     "frame": "_init_compiled (sqlalchemy/engine/default.py)",
+     "self_pct": 0.63
+    },
+    {
+     "frame": "_do_execute (asyncpg/connection.py)",
+     "self_pct": 0.59
+    },
+    {
+     "frame": "__get__ (sqlalchemy/util/langhelpers.py)",
+     "self_pct": 0.58
+    },
+    {
+     "frame": "_execute_clauseelement (sqlalchemy/engine/base.py)",
+     "self_pct": 0.58
+    },
+    {
+     "frame": "_execute_internal (sqlalchemy/orm/session.py)",
+     "self_pct": 0.56
+    },
+    {
+     "frame": "_make_proxy (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.51
+    },
+    {
+     "frame": "inner (typing.py)",
+     "self_pct": 0.5
+    },
+    {
+     "frame": "send (uvicorn/protocols/http/httptools_impl.py)",
+     "self_pct": 0.5
+    }
+   ],
+   "sqlalchemy_self_split": {
+    "sql": 20.85,
+    "orm": 5.78,
+    "util": 5.49,
+    "engine": 3.42,
+    "dialects": 1.91,
+    "event": 1.32,
+    "ext": 0.76,
+    "pool": 0.37
+   },
+   "P_py": 0.6635,
+   "name": "P1b",
+   "W": 4,
+   "mix": "S-stress",
+   "rate_hz": 50,
+   "duration_s": 120,
+   "mode": "nonblocking",
+   "run": "prof-P1b-w4"
+  },
+  {
+   "bad_lines": 1,
+   "pids": 2,
+   "samples_all": 87698,
+   "samples_wait_excluded": 19267,
+   "samples": 65752,
+   "categories": {
+    "sqlalchemy": {
+     "self_pct": 47.55,
+     "incl_pct": 58.36
+    },
+    "event loop/native I/O": {
+     "self_pct": 20.43,
+     "incl_pct": 54.95
+    },
+    "asyncpg": {
+     "self_pct": 12.16,
+     "incl_pct": 12.25
+    },
+    "presign/boto": {
+     "self_pct": 4.89,
+     "incl_pct": 5.61
+    },
+    "app logic": {
+     "self_pct": 4.24,
+     "incl_pct": 44.98
+    },
+    "fastapi": {
+     "self_pct": 3.46,
+     "incl_pct": 44.96
+    },
+    "structlog": {
+     "self_pct": 2.43,
+     "incl_pct": 2.65
+    },
+    "starlette": {
+     "self_pct": 1.97,
+     "incl_pct": 43.36
+    },
+    "other": {
+     "self_pct": 1.4,
+     "incl_pct": 0.0
+    },
+    "metrics": {
+     "self_pct": 0.42,
+     "incl_pct": 37.68
+    },
+    "pydantic": {
+     "self_pct": 0.4,
+     "incl_pct": 0.43
+    },
+    "uvicorn": {
+     "self_pct": 0.34,
+     "incl_pct": 54.8
+    },
+    "auth": {
+     "self_pct": 0.31,
+     "incl_pct": 0.84
+    }
+   },
+   "routes": {
+    "(event loop main thread, no endpoint frame)": {
+     "incl_pct": 31.4,
+     "self_by_category": {
+      "event loop/native I/O": 62.0,
+      "fastapi": 11.0,
+      "structlog": 7.4,
+      "starlette": 6.1,
+      "sqlalchemy": 3.0,
+      "asyncpg": 2.8
+     }
+    },
+    "(SQL in greenlet, route not recoverable)": {
+     "incl_pct": 27.92,
+     "self_by_category": {
+      "sqlalchemy": 84.6,
+      "asyncpg": 14.3,
+      "event loop/native I/O": 0.4,
+      "other": 0.4,
+      "structlog": 0.2,
+      "starlette": 0.1
+     }
+    },
+    "acquire": {
+     "incl_pct": 26.47,
+     "self_by_category": {
+      "sqlalchemy": 69.6,
+      "asyncpg": 17.7,
+      "app logic": 9.6,
+      "event loop/native I/O": 1.4,
+      "other": 0.7,
+      "pydantic": 0.7
+     }
+    },
+    "complete": {
+     "incl_pct": 8.69,
+     "self_by_category": {
+      "sqlalchemy": 52.2,
+      "asyncpg": 30.0,
+      "app logic": 12.5,
+      "event loop/native I/O": 4.1,
+      "other": 0.8,
+      "starlette": 0.2
+     }
+    },
+    "(thread pool: S3 head/copy, other sync)": {
+     "incl_pct": 5.52,
+     "self_by_category": {
+      "presign/boto": 87.1,
+      "other": 8.4,
+      "event loop/native I/O": 2.1,
+      "auth": 0.8,
+      "structlog": 0.6,
+      "sqlalchemy": 0.6
+     }
+    }
+   },
+   "top_self": [
+    {
+     "frame": "run (asyncio/runners.py)",
+     "self_pct": 16.74
+    },
+    {
+     "frame": "__do_execute (asyncpg/prepared_stmt.py)",
+     "self_pct": 5.76
+    },
+    {
+     "frame": "execute (asyncpg/connection.py)",
+     "self_pct": 3.66
+    },
+    {
+     "frame": "_generate_cache_key (sqlalchemy/sql/cache_key.py)",
+     "self_pct": 3.51
+    },
+    {
+     "frame": "expect (sqlalchemy/sql/coercions.py)",
+     "self_pct": 3.0
+    },
+    {
+     "frame": "greenlet_spawn (sqlalchemy/util/concurrency.py)",
+     "self_pct": 2.41
+    },
+    {
+     "frame": "emit (logging/__init__.py)",
+     "self_pct": 2.14
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/schema.py)",
+     "self_pct": 1.52
+    },
+    {
+     "frame": "_prepare_and_execute (sqlalchemy/dialects/postgresql/asyncpg.py)",
+     "self_pct": 1.26
+    },
+    {
+     "frame": "request (urllib3/connection.py)",
+     "self_pct": 1.03
+    },
+    {
+     "frame": "do_poll (urllib3/util/wait.py)",
+     "self_pct": 0.93
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/elements.py)",
+     "self_pct": 0.93
+    },
+    {
+     "frame": "await_ (sqlalchemy/util/concurrency.py)",
+     "self_pct": 0.91
+    },
+    {
+     "frame": "__get__ (sqlalchemy/util/langhelpers.py)",
+     "self_pct": 0.9
+    },
+    {
+     "frame": "get (sqlalchemy/util/_collections.py)",
+     "self_pct": 0.82
+    },
+    {
+     "frame": "construct_params (sqlalchemy/sql/compiler.py)",
+     "self_pct": 0.78
+    },
+    {
+     "frame": "_do_execute (asyncpg/connection.py)",
+     "self_pct": 0.75
+    },
+    {
+     "frame": "_init_compiled (sqlalchemy/engine/default.py)",
+     "self_pct": 0.72
+    },
+    {
+     "frame": "app (fastapi/routing.py)",
+     "self_pct": 0.71
+    },
+    {
+     "frame": "uuid4 (uuid.py)",
+     "self_pct": 0.69
+    },
+    {
+     "frame": "inner (typing.py)",
+     "self_pct": 0.66
+    },
+    {
+     "frame": "_gen_cache_key (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.65
+    },
+    {
+     "frame": "_make_proxy (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.62
+    },
+    {
+     "frame": "solve_dependencies (fastapi/dependencies/utils.py)",
+     "self_pct": 0.61
+    },
+    {
+     "frame": "acquire (minion_server/services/acquisition.py)",
+     "self_pct": 0.57
+    }
+   ],
+   "sqlalchemy_self_split": {
+    "sql": 25.81,
+    "util": 6.26,
+    "orm": 6.08,
+    "engine": 3.81,
+    "dialects": 2.33,
+    "event": 1.83,
+    "ext": 0.82,
+    "pool": 0.42
+   },
+   "P_py": 0.7957,
+   "name": "P2",
+   "W": 8,
+   "mix": "S-sat",
+   "rate_hz": 100,
+   "duration_s": 120,
+   "mode": "nonblocking",
+   "run": "prof-P2-w8"
+  },
+  {
+   "bad_lines": 1,
+   "pids": 1,
+   "samples_all": 44074,
+   "samples_wait_excluded": 9614,
+   "samples": 33020,
+   "categories": {
+    "sqlalchemy": {
+     "self_pct": 46.56,
+     "incl_pct": 55.25
+    },
+    "event loop/native I/O": {
+     "self_pct": 21.67,
+     "incl_pct": 55.3
+    },
+    "asyncpg": {
+     "self_pct": 10.18,
+     "incl_pct": 10.27
+    },
+    "presign/boto": {
+     "self_pct": 6.5,
+     "incl_pct": 7.4
+    },
+    "app logic": {
+     "self_pct": 4.42,
+     "incl_pct": 42.94
+    },
+    "fastapi": {
+     "self_pct": 3.38,
+     "incl_pct": 43.2
+    },
+    "structlog": {
+     "self_pct": 2.5,
+     "incl_pct": 2.67
+    },
+    "starlette": {
+     "self_pct": 1.79,
+     "incl_pct": 41.64
+    },
+    "other": {
+     "self_pct": 1.7,
+     "incl_pct": 0.0
+    },
+    "pydantic": {
+     "self_pct": 0.37,
+     "incl_pct": 0.4
+    },
+    "metrics": {
+     "self_pct": 0.34,
+     "incl_pct": 36.61
+    },
+    "auth": {
+     "self_pct": 0.3,
+     "incl_pct": 0.72
+    },
+    "uvicorn": {
+     "self_pct": 0.29,
+     "incl_pct": 55.0
+    }
+   },
+   "routes": {
+    "(event loop main thread, no endpoint frame)": {
+     "incl_pct": 32.31,
+     "self_by_category": {
+      "event loop/native I/O": 64.2,
+      "fastapi": 10.4,
+      "structlog": 7.5,
+      "starlette": 5.5,
+      "sqlalchemy": 2.8,
+      "asyncpg": 2.1
+     }
+    },
+    "(SQL in greenlet, route not recoverable)": {
+     "incl_pct": 26.98,
+     "self_by_category": {
+      "sqlalchemy": 84.7,
+      "asyncpg": 14.3,
+      "event loop/native I/O": 0.5,
+      "other": 0.3,
+      "structlog": 0.2,
+      "uvicorn": 0.0
+     }
+    },
+    "acquire": {
+     "incl_pct": 25.21,
+     "self_by_category": {
+      "sqlalchemy": 72.3,
+      "asyncpg": 14.2,
+      "app logic": 10.3,
+      "event loop/native I/O": 1.5,
+      "pydantic": 0.7,
+      "other": 0.7
+     }
+    },
+    "complete": {
+     "incl_pct": 8.17,
+     "self_by_category": {
+      "sqlalchemy": 55.7,
+      "asyncpg": 25.3,
+      "app logic": 14.0,
+      "event loop/native I/O": 3.7,
+      "other": 0.9,
+      "presign/boto": 0.4
+     }
+    },
+    "(thread pool: S3 head/copy, other sync)": {
+     "incl_pct": 7.33,
+     "self_by_category": {
+      "presign/boto": 86.8,
+      "other": 9.5,
+      "event loop/native I/O": 1.9,
+      "sqlalchemy": 0.7,
+      "auth": 0.5,
+      "structlog": 0.4
+     }
+    }
+   },
+   "top_self": [
+    {
+     "frame": "run (asyncio/runners.py)",
+     "self_pct": 17.87
+    },
+    {
+     "frame": "__do_execute (asyncpg/prepared_stmt.py)",
+     "self_pct": 4.61
+    },
+    {
+     "frame": "_generate_cache_key (sqlalchemy/sql/cache_key.py)",
+     "self_pct": 3.26
+    },
+    {
+     "frame": "execute (asyncpg/connection.py)",
+     "self_pct": 2.82
+    },
+    {
+     "frame": "expect (sqlalchemy/sql/coercions.py)",
+     "self_pct": 2.72
+    },
+    {
+     "frame": "greenlet_spawn (sqlalchemy/util/concurrency.py)",
+     "self_pct": 2.51
+    },
+    {
+     "frame": "emit (logging/__init__.py)",
+     "self_pct": 2.18
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/schema.py)",
+     "self_pct": 1.47
+    },
+    {
+     "frame": "request (urllib3/connection.py)",
+     "self_pct": 1.23
+    },
+    {
+     "frame": "_prepare_and_execute (sqlalchemy/dialects/postgresql/asyncpg.py)",
+     "self_pct": 1.23
+    },
+    {
+     "frame": "do_poll (urllib3/util/wait.py)",
+     "self_pct": 0.98
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/elements.py)",
+     "self_pct": 0.97
+    },
+    {
+     "frame": "__get__ (sqlalchemy/util/langhelpers.py)",
+     "self_pct": 0.9
+    },
+    {
+     "frame": "get (sqlalchemy/util/_collections.py)",
+     "self_pct": 0.81
+    },
+    {
+     "frame": "uuid4 (uuid.py)",
+     "self_pct": 0.8
+    },
+    {
+     "frame": "await_ (sqlalchemy/util/concurrency.py)",
+     "self_pct": 0.8
+    },
+    {
+     "frame": "construct_params (sqlalchemy/sql/compiler.py)",
+     "self_pct": 0.72
+    },
+    {
+     "frame": "app (fastapi/routing.py)",
+     "self_pct": 0.69
+    },
+    {
+     "frame": "_init_compiled (sqlalchemy/engine/default.py)",
+     "self_pct": 0.64
+    },
+    {
+     "frame": "_make_proxy (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.63
+    },
+    {
+     "frame": "_do_execute (asyncpg/connection.py)",
+     "self_pct": 0.61
+    },
+    {
+     "frame": "_gen_cache_key (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.6
+    },
+    {
+     "frame": "solve_dependencies (fastapi/dependencies/utils.py)",
+     "self_pct": 0.58
+    },
+    {
+     "frame": "inner (typing.py)",
+     "self_pct": 0.58
+    },
+    {
+     "frame": "_collection_gced (sqlalchemy/event/registry.py)",
+     "self_pct": 0.58
+    }
+   ],
+   "sqlalchemy_self_split": {
+    "sql": 25.03,
+    "orm": 6.21,
+    "util": 6.09,
+    "engine": 3.6,
+    "dialects": 2.17,
+    "event": 1.85,
+    "ext": 0.91,
+    "pool": 0.45
+   },
+   "P_py": 0.7833,
+   "name": "P2b",
+   "W": 8,
+   "mix": "S-sat",
+   "rate_hz": 50,
+   "duration_s": 120,
+   "mode": "nonblocking",
+   "run": "prof-P2b-w8"
+  },
+  {
+   "bad_lines": 1,
+   "pids": 1,
+   "samples_all": 8383,
+   "samples_wait_excluded": 1319,
+   "samples": 6885,
+   "categories": {
+    "sqlalchemy": {
+     "self_pct": 41.77,
+     "incl_pct": 46.93
+    },
+    "event loop/native I/O": {
+     "self_pct": 28.32,
+     "incl_pct": 56.47
+    },
+    "asyncpg": {
+     "self_pct": 8.69,
+     "incl_pct": 8.74
+    },
+    "fastapi": {
+     "self_pct": 5.91,
+     "incl_pct": 36.21
+    },
+    "app logic": {
+     "self_pct": 4.65,
+     "incl_pct": 60.92
+    },
+    "presign/boto": {
+     "self_pct": 2.83,
+     "incl_pct": 3.54
+    },
+    "starlette": {
+     "self_pct": 2.66,
+     "incl_pct": 35.05
+    },
+    "structlog": {
+     "self_pct": 1.63,
+     "incl_pct": 1.8
+    },
+    "other": {
+     "self_pct": 1.26,
+     "incl_pct": 0.0
+    },
+    "pydantic": {
+     "self_pct": 0.65,
+     "incl_pct": 0.7
+    },
+    "metrics": {
+     "self_pct": 0.57,
+     "incl_pct": 30.34
+    },
+    "uvicorn": {
+     "self_pct": 0.54,
+     "incl_pct": 55.35
+    },
+    "auth": {
+     "self_pct": 0.52,
+     "incl_pct": 1.26
+    }
+   },
+   "routes": {
+    "(event loop main thread, no endpoint frame)": {
+     "incl_pct": 43.22,
+     "self_by_category": {
+      "event loop/native I/O": 63.5,
+      "fastapi": 13.7,
+      "starlette": 6.1,
+      "structlog": 3.7,
+      "sqlalchemy": 3.4,
+      "other": 1.7
+     }
+    },
+    "(SQL in greenlet, route not recoverable)": {
+     "incl_pct": 30.05,
+     "self_by_category": {
+      "sqlalchemy": 74.4,
+      "asyncpg": 24.5,
+      "event loop/native I/O": 0.9,
+      "other": 0.3
+     }
+    },
+    "acquire": {
+     "incl_pct": 17.78,
+     "self_by_category": {
+      "sqlalchemy": 79.7,
+      "app logic": 13.4,
+      "asyncpg": 3.3,
+      "pydantic": 1.6,
+      "event loop/native I/O": 0.9,
+      "metrics": 0.7
+     }
+    },
+    "complete": {
+     "incl_pct": 6.0,
+     "self_by_category": {
+      "sqlalchemy": 63.4,
+      "app logic": 25.2,
+      "event loop/native I/O": 7.0,
+      "asyncpg": 2.7,
+      "other": 1.2,
+      "presign/boto": 0.5
+     }
+    },
+    "(thread pool: S3 head/copy, other sync)": {
+     "incl_pct": 2.95,
+     "self_by_category": {
+      "presign/boto": 89.7,
+      "other": 9.4,
+      "event loop/native I/O": 0.5,
+      "structlog": 0.5
+     }
+    }
+   },
+   "top_self": [
+    {
+     "frame": "run (asyncio/runners.py)",
+     "self_pct": 24.2
+    },
+    {
+     "frame": "_generate_cache_key (sqlalchemy/sql/cache_key.py)",
+     "self_pct": 4.63
+    },
+    {
+     "frame": "__do_execute (asyncpg/prepared_stmt.py)",
+     "self_pct": 3.53
+    },
+    {
+     "frame": "execute (asyncpg/connection.py)",
+     "self_pct": 2.8
+    },
+    {
+     "frame": "expect (sqlalchemy/sql/coercions.py)",
+     "self_pct": 2.25
+    },
+    {
+     "frame": "greenlet_spawn (sqlalchemy/util/concurrency.py)",
+     "self_pct": 2.05
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/schema.py)",
+     "self_pct": 1.71
+    },
+    {
+     "frame": "get (sqlalchemy/util/_collections.py)",
+     "self_pct": 1.38
+    },
+    {
+     "frame": "app (fastapi/routing.py)",
+     "self_pct": 1.29
+    },
+    {
+     "frame": "solve_dependencies (fastapi/dependencies/utils.py)",
+     "self_pct": 1.16
+    },
+    {
+     "frame": "emit (logging/__init__.py)",
+     "self_pct": 1.16
+    },
+    {
+     "frame": "_prepare_and_execute (sqlalchemy/dialects/postgresql/asyncpg.py)",
+     "self_pct": 1.15
+    },
+    {
+     "frame": "construct_params (sqlalchemy/sql/compiler.py)",
+     "self_pct": 0.97
+    },
+    {
+     "frame": "_make_proxy (sqlalchemy/sql/schema.py)",
+     "self_pct": 0.89
+    },
+    {
+     "frame": "__init__ (sqlalchemy/sql/elements.py)",
+     "self_pct": 0.81
+    },
+    {
+     "frame": "_do_execute (asyncpg/connection.py)",
+     "self_pct": 0.78
+    },
+    {
+     "frame": "_execute_internal (sqlalchemy/orm/session.py)",
+     "self_pct": 0.65
+    },
+    {
+     "frame": "inner (typing.py)",
+     "self_pct": 0.64
+    },
+    {
+     "frame": "__get__ (sqlalchemy/util/langhelpers.py)",
+     "self_pct": 0.64
+    },
+    {
+     "frame": "_init_compiled (sqlalchemy/engine/default.py)",
+     "self_pct": 0.61
+    },
+    {
+     "frame": "acquire (minion_server/services/acquisition.py)",
+     "self_pct": 0.6
+    },
+    {
+     "frame": "await_ (sqlalchemy/util/concurrency.py)",
+     "self_pct": 0.58
+    },
+    {
+     "frame": "_execute_clauseelement (sqlalchemy/engine/base.py)",
+     "self_pct": 0.54
+    },
+    {
+     "frame": "send (uvicorn/protocols/http/httptools_impl.py)",
+     "self_pct": 0.49
+    },
+    {
+     "frame": "__init__ (sqlalchemy/event/attr.py)",
+     "self_pct": 0.48
+    }
+   ],
+   "sqlalchemy_self_split": {
+    "sql": 22.98,
+    "orm": 5.9,
+    "util": 5.5,
+    "engine": 2.64,
+    "dialects": 2.09,
+    "event": 1.44,
+    "ext": 0.78,
+    "pool": 0.38
+   },
+   "P_py": 0.7168,
+   "name": "P3",
+   "W": 1,
+   "mix": "S-sat",
+   "rate_hz": 100,
+   "duration_s": 120,
+   "mode": "nonblocking",
+   "run": "prof-P3-w1"
+  },
+  {
+   "samples_main_thread": 1122,
+   "samples_other_threads_excluded": 1934,
+   "main_thread_leaf_class": {
+    "python frame leaf (interpreter executing bytecode; libpython internals folded in by py-spy)": 41.62,
+    "unresolved native (stripped extension .so: uvloop/asyncpg/greenlet/...)": 25.31,
+    "libc: I/O syscalls (socket write/read, epoll)": 12.48,
+    "libc: other / unresolved address": 12.21,
+    "libc: memory (mmap/munmap/malloc)": 3.65,
+    "libc: thread sync (futex/cond)": 2.76,
+    "extension: _asyncio": 1.07,
+    "extension: libcrypto": 0.62,
+    "other": 0.18,
+    "extension: _hashlib": 0.09
+   },
+   "python_leaf_pct": 41.62,
+   "libc_io_pct": 12.48,
+   "libc_mem_pct": 3.65,
+   "unresolved_native_pct": 25.31,
+   "top_leaf": [
+    [
+     "write (libc.so.6)",
+     8.47
+    ],
+    [
+     "0xffffa478e834 (libc.so.6)",
+     6.77
+    ],
+    [
+     "pthread_cond_signal (libc.so.6)",
+     2.76
+    ],
+    [
+     "epoll_pwait (libc.so.6)",
+     2.76
+    ],
+    [
+     "0xffffa1ab4c4c (?)",
+     2.41
+    ],
+    [
+     "munmap (libc.so.6)",
+     2.41
+    ],
+    [
+     "0xffffa478e838 (libc.so.6)",
+     1.87
+    ],
+    [
+     "read (libc.so.6)",
+     1.25
+    ],
+    [
+     "_literal_execute_expanding_parameter (sqlalchemy/sql/compiler.py:3628)",
+     1.25
+    ],
+    [
+     "get (sqlalchemy/util/_collections.py:502)",
+     1.16
+    ],
+    [
+     "mmap64 (libc.so.6)",
+     1.16
+    ],
+    [
+     "0xffffa1544384 (?)",
+     1.07
+    ],
+    [
+     "0xffffa478eb20 (libc.so.6)",
+     0.8
+    ],
+    [
+     "__hash__ (sqlalchemy/sql/annotation.py:369)",
+     0.8
+    ],
+    [
+     "0xffffa1ab5064 (?)",
+     0.71
+    ]
+   ],
+   "name": "P4",
+   "W": 4,
+   "mix": "S-stress",
+   "rate_hz": 50,
+   "duration_s": 60,
+   "mode": "blocking, --native, one uvicorn worker (main thread only)",
+   "run": "prof-P4b-w4"
+  }
+ ],
+ "decision": {
+  "W_hr": 8,
+  "H_by_W": {
+   "1": 0.17,
+   "2": 0.26,
+   "4": 0.52,
+   "6": 0.72,
+   "8": 0.83,
+   "12": 0.93
+  },
+  "A": {
+   "met": true,
+   "P_py": {
+    "P1": 0.673,
+    "P1b": 0.6635,
+    "P2": 0.7957,
+    "P2b": 0.7833,
+    "P3": 0.7168
+   },
+   "Csrv_over_Cpg": {
+    "W4": 4.36,
+    "W8": 4.14
+   },
+   "native_cross_check_python_leaf_pct": 41.62
+  },
+  "B": {
+   "met": true,
+   "E": {
+    "2": 0.74,
+    "4": 0.57,
+    "6": 0.42,
+    "8": 0.32,
+    "12": 0.2
+   },
+   "Csrv_ratio_vs_W1": {
+    "2": 1.19,
+    "4": 1.62,
+    "6": 2.04,
+    "8": 2.32,
+    "12": 2.94
+   }
+  },
+  "C": {
+   "met": false,
+   "postgres_cores_max_W_le_8": 1.44,
+   "claim_mean_ms": {
+    "1": 0.73,
+    "2": 1.65,
+    "4": 3.59,
+    "6": 6.73,
+    "8": 10.66,
+    "12": 20.64
+   },
+   "claim_calls_per_win": {
+    "1": 1.06,
+    "2": 1.14,
+    "4": 1.3,
+    "6": 1.5,
+    "8": 1.73,
+    "12": 2.19
+   },
+   "claim_ms_limit_2x_W1": 1.46,
+   "generator_lag_p99_max_s": 0.01,
+   "shed_pct_range": [
+    13.2,
+    27.8
+   ],
+   "explained_by": "consistent with claim contention: calls per win and claim mean ms grow with W; MINION_ACQUIRE_WINDOW=64 at W=8 gives calls per win 1.14 and +11 percent goodput (not a proof of cause)"
+  },
+  "window64_w8": [
+   {
+    "name": "satwin64-w8-r1",
+    "goodput": 197.338,
+    "claim_calls_per_win": 1.146,
+    "claim_mean_ms": 4.0419,
+    "server_cpu_ms_per_subtask": 30.019
+   },
+   {
+    "name": "satwin64-w8-r2",
+    "goodput": 199.49,
+    "claim_calls_per_win": 1.138,
+    "claim_mean_ms": 3.8437,
+    "server_cpu_ms_per_subtask": 29.883
+   }
+  ],
+  "verdict": "ADR-0001 stands: rewrite trigger not met (condition C fails)"
+ }
+}
