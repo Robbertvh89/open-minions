@@ -1,10 +1,10 @@
 ---
 id: TASK-15
 title: Controller-side GPU duty enforcement (don't trust the worker's self-pacing)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 01:56'
-updated_date: '2026-10-18 21:06'
+updated_date: '2026-10-19 06:58'
 labels:
   - executor
   - security
