@@ -1,10 +1,10 @@
 ---
 id: TASK-33
 title: Per-executor limit on open acquirements
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 08:03'
-updated_date: '2026-10-18 18:28'
+updated_date: '2026-10-19 06:58'
 labels:
   - security
 dependencies: []
