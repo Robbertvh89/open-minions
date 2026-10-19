@@ -496,7 +496,8 @@ deviate from the paper get an ADR in `docs/adr/`.
   tests with injected signals only. Screen sharing is not detected.
 - **GPU duty cycle:** the control process measures the worker's GPU use and kills a worker above
   duty + 10 pp, but it cannot slow one down first; SIGSTOP gating is open (TASK-15.1). A rogue worker
-  can use up to about 49 s of excess before it is stopped. Measured on one Mac (Apple M3 Pro); other
+  can use about 20 GPU-seconds above its budget before it is stopped (a full-speed rogue: about
+  35 s at light, 50 s at balanced). Measured on one Mac (Apple M3 Pro); other
   chips are untested, and engines that run outside the worker process (Ollama, the dev fake) are not
   metered.
 - **Output size is capped by the S3 policy, not the quota.** Use a bucket quota and lifecycle rules
