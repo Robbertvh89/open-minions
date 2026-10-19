@@ -3,7 +3,7 @@
 TASK-15 step 5. Raw data: [`m-task15-gpu-guard-apple-m3-pro.json`](m-task15-gpu-guard-apple-m3-pro.json)
 (`bench --budget-check` output, schema_version 1, with the new per-row fields `max_window_share` and
 `gpu_clients`). Purpose: justify the guard defaults in `capacity/gpu_guard.py`: window 10 s, margin
-+10 pp (NF-8), kill after 30 s over the limit, `max_clients` 4.
++10 pp (NF-8), a 20 GPU-s excess bucket (round 2; 30 s over the limit in the first version), `max_clients` 4.
 
 ## Setup
 
@@ -47,6 +47,26 @@ All 18 rows pass the NF-8 verdicts (hard, accuracy, memory).
 | balanced | 50% | 45.6% (qwen) | 60% | 14.4 pp | 1 |
 | full | 100% | 98.5% (qwen) | never acts | - | 1 |
 
+## HF/MPS rows (appended in the TASK-15 fix round 2)
+
+Same harness, `--engines hf` models on the `mps` device (transformers 5.20.0, torch 2.14.1), one repeat,
+`--duration 40 --baseline-s 5`. The host GPU was busy with other processes (video wallpaper, about 30 %), so
+the shares are noisy upward if anything. Raw rows are in the JSON (`results[18:]`).
+
+| model | profile | duty | measured (whole phase) | max 10 s window | guard limit | headroom | GPU clients |
+|---|---|---|---|---|---|---|---|
+| qwen2.5-0.5b-hf | light | 30% | 8% | 10% | 40% | 30 pp | 1 |
+| qwen2.5-0.5b-hf | balanced | 50% | 26% | 28% | 60% | 32 pp | 1 |
+| qwen2.5-0.5b-hf | full | 100% | 67% | 68% | none | - | 1 |
+| minilm-hf | light | 30% | 11% | 12% | 40% | 28 pp | 1 |
+| minilm-hf | balanced | 50% | 31% | 32% | 60% | 28 pp | 1 |
+| minilm-hf | full | 100% | 61% | 64% | none | - | 1 |
+
+All 6 rows pass the NF-8 verdicts. The HF worker holds exactly 1 GPU client (like MLX), so `max_clients` 4
+holds, and its honest windows stay 28 pp or more below the limit (the HF runner paces coarser than MLX, so it
+undershoots its duty even more): no default needs to change for HF. One repeat only; the numbers say HF/MPS
+is metered in the worker pid and not near the limits, not that HF behaviour is fully characterised.
+
 ## Verdict on the defaults
 
 - **Margin +10 pp, window 10 s: safe for these workloads.** The honest worker stays 14 pp or more below the
@@ -55,7 +75,7 @@ All 18 rows pass the NF-8 verdicts (hard, accuracy, memory).
   (max window 45.6 % against 60 %).
 - **`max_clients` 4: safe.** An honest MLX worker holds exactly 1 GPU client (every row, every profile).
 - **Not covered by this data:** steady batches only. Short prefill bursts or very short subtasks are not
-  shown here; see the next section for a related blind spot. HF/MPS and Ollama workers were not measured.
+  shown here; see the next section for a related blind spot. Ollama workers were not measured (HF/MPS: see the appended rows).
 - Full profile: duty 1.0 gives a limit above 1, so the guard never acts there (by design).
 
 ## Real-worker `gpu` tests (`packages/minion-executor/tests/test_gpu_guard_gpu.py`)
