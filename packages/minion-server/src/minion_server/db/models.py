@@ -256,6 +256,7 @@ class SubtaskAcquirement(Base):
             ondelete="CASCADE",
         ),
         Index("ix_minion_subtask_acquirement_acquired_at", "acquired_at"),
+        Index("ix_minion_subtask_acquirement_executor_id", "executor_id"),
     )
 
     acquirement_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)

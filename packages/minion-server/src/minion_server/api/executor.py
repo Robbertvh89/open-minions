@@ -195,6 +195,8 @@ async def acquire(
     except HTTPException as exc:
         if exc.status_code == 503:  # ACQUIRE_DEADLINE
             outcome = "shed"
+        elif exc.status_code == 429:  # TOO_MANY_ACQUIREMENTS (per-executor cap, ADR-0019)
+            outcome = "capped"
         raise
     finally:
         if inflight is not None:

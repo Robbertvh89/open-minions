@@ -64,3 +64,5 @@ ROLLBACK plus a pool checkout). The server saturated on these round trips while 
   visible as the `acquire_rounds_exhausted` log event (rounds, window, pass; no identities). Exhausted acquires are logged (`acquire_rounds_exhausted`) and counted as "empty" in
   `minion_acquire_total`; a separate `exhausted` label is a tracked follow-up.
 - The claim returns the inserted key next to the picked key and refuses to serve a mismatch.
+
+See also ADR-0019: each claim round now first locks the executor row and checks the per-executor open-acquirement cap; the claim statement itself is unchanged.

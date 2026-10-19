@@ -20,6 +20,19 @@ def busy_error(code: str, message: str, *, retry_after: tuple[int, int] = (1, 3)
     )
 
 
+def capped_error() -> HTTPException:
+    """429 TOO_MANY_ACQUIREMENTS: the executor already holds the maximum number of open
+    acquirements (TASK-33, ADR-0019). The executor backs off like for any 429."""
+    return HTTPException(
+        status_code=429,
+        detail={
+            "code": "TOO_MANY_ACQUIREMENTS",
+            "message": "executor holds too many open acquirements",
+        },
+        headers={"Retry-After": "30"},
+    )
+
+
 class ExecutorRevokedError(Exception):
     """The authenticated executor token no longer matches a live executor row (revoked, rotated
     away): answered 401 by an app-wide handler, which also drops the token from the auth cache so

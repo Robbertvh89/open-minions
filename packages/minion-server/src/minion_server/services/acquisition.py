@@ -1,6 +1,7 @@
 """Acquire service: one-statement claim per round (ADR-0013)."""
 
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -9,7 +10,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from minion_server.auth import ExecutorPrincipal
-from minion_server.errors import ExecutorRevokedError, busy_error
+from minion_server.errors import ExecutorRevokedError, busy_error, capped_error
 from minion_server.repositories import acquisition as repo
 from minion_server.repositories import executors as executors_repo
 from minion_server.settings import ServerSettings
@@ -18,6 +19,25 @@ from minion_server.uris import parse_s3_uri
 
 MAX_ROUNDS = 10
 _log = structlog.get_logger(__name__)
+
+
+_CAPPED_LOG_EVERY_S = 60.0
+_CAPPED_LOG_MAX = 10_000
+_capped_logged: dict[uuid.UUID, float] = {}  # executor_id -> monotonic time of the last log
+
+
+def _log_capped(executor_id: uuid.UUID, open_now: int) -> None:
+    """Tell the operator which token sits at the cap (ids and a count only), at most once per
+    executor per minute per process; the map is bounded (oldest half dropped when full)."""
+    now = time.monotonic()
+    last = _capped_logged.get(executor_id)
+    if last is not None and now - last < _CAPPED_LOG_EVERY_S:
+        return
+    if len(_capped_logged) >= _CAPPED_LOG_MAX:
+        for k in sorted(_capped_logged, key=_capped_logged.__getitem__)[: _CAPPED_LOG_MAX // 2]:
+            del _capped_logged[k]
+    _capped_logged[executor_id] = now
+    _log.warning("acquire_capped", executor_id=str(executor_id), open_acquirements=open_now)
 
 
 class _LostRaceError(Exception):
@@ -74,6 +94,17 @@ async def acquire(
                         # unique index, a slow plan): the statement is cancelled and nothing commits
                         left_ms = int((deadline - time.monotonic()) * 1000) + 100
                         await repo.set_statement_timeout(session, max(100, left_ms))
+                    # Per-executor cap (ADR-0019): lock own row, then a separate count statement;
+                    # a capped round ends before any candidate read. Admission only: ownership is
+                    # still decided by the claim INSERT ... ON CONFLICT DO NOTHING.
+                    if not await repo.lock_executor_for_claim(
+                        session, principal.executor_id, principal.token_hash
+                    ):
+                        raise ExecutorRevokedError(principal.token_hash)
+                    open_now = await repo.count_open_acquirements(session, principal.executor_id)
+                    if open_now >= settings.max_open_acquirements:
+                        _log_capped(principal.executor_id, open_now)
+                        raise capped_error()
                     result = await repo.claim(
                         session,
                         principal.executor_id,

@@ -179,3 +179,14 @@ def test_auth_cache_settings_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name)
     monkeypatch.setenv("MINION_EXECUTOR_AUTH_CACHE_TTL_S", "0")
     assert ServerSettings(_env_file=None).executor_auth_cache_ttl_s == 0
+
+
+def test_max_open_acquirements_default_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert ServerSettings(_env_file=None).max_open_acquirements == 4
+    for bad in ("0", "65"):
+        monkeypatch.setenv("MINION_MAX_OPEN_ACQUIREMENTS", bad)
+        with pytest.raises(ValidationError):
+            ServerSettings(_env_file=None)
+    for good in ("1", "64"):
+        monkeypatch.setenv("MINION_MAX_OPEN_ACQUIREMENTS", good)
+        assert ServerSettings(_env_file=None).max_open_acquirements == int(good)

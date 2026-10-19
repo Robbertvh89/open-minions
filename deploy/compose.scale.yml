@@ -56,6 +56,11 @@ services:
       MINION_DB_MAX_OVERFLOW: ${MINION_DB_MAX_OVERFLOW:-4}
       MINION_ACQUIRE_CONCURRENCY: ${MINION_ACQUIRE_CONCURRENCY:-8}
       MINION_DB_MAX_CONNECTIONS: "300"
+      # Per-executor open-acquirement cap (ADR-0019): a sim with the `vanish` fault keeps acquiring
+      # while its abandoned acquirements wait for the watchdog, which would hit the production
+      # default of 4 and change the M6.4 numbers. Raised to the maximum for report parity; set 4
+      # to see the cap under faults (sims then count the 429s as back-offs).
+      MINION_MAX_OPEN_ACQUIREMENTS: ${MINION_MAX_OPEN_ACQUIREMENTS:-64}
     volumes:
       - ./scale/models.scale.yaml:/run/minion-models/models.scale.yaml:ro
 
