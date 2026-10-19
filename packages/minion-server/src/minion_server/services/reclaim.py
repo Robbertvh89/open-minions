@@ -202,7 +202,9 @@ async def reclaim_stale(
     for k in lapsed:
         del _QUARANTINE[k]
     added = evicted = 0
-    systemic = False  # a chunk failed with no proof of a bad row: skip row-by-row redo this call
+    # a chunk failed with no proof of a bad row: skip row-by-row redo until a later chunk commits
+    systemic = False
+    pending: list[tuple[uuid.UUID, BaseException]] = []  # row-specific failures awaiting proof
     skip = list(_QUARANTINE)  # excluded in SQL: they must not hold the oldest LIMIT slots
     async with sm() as s:
         ids = await repo.stale_ids(s, timeout_s, batch_size, skip)
@@ -225,15 +227,16 @@ async def reclaim_stale(
     for start in range(0, len(ids), RECLAIM_CHUNK):
         chunk = ids[start : start + RECLAIM_CHUNK]
         hits: list[repo.Finish] = []
+        proved = False  # a row of this call committed an expiry: faults are the rows', not systemic
         try:
             async with sm() as s, s.begin():
                 done = await reclaim_chunk(s, chunk, cap_hits=hits, **kw)
+            proved = any(r in _EXPIRED for r in done.values())
         except Exception as exc:  # poisoned chunk: isolate the bad row, keep the rest
             log.error("reclaim_chunk_failed", size=len(chunk), error_type=type(exc).__name__)
             done = {}
             hits = []
             failed: list[tuple[uuid.UUID, BaseException]] = []
-            proved = False  # a peer row of this chunk committed an expiry, so the fault is a row's
             if len(chunk) > 1 and not systemic:
                 for aid in chunk:
                     row_hits: list[repo.Finish] = []
@@ -258,11 +261,13 @@ async def reclaim_stale(
                         failed=len(failed),
                         error_type=type(failed[0][1]).__name__,
                     )
-                elif proved:
-                    for bad, err in failed:
-                        if _row_specific(err):
-                            added += 1
-                            evicted += _quarantine_add(bad, type(err).__name__)
+                pending += [(bad, err) for bad, err in failed if _row_specific(err)]
+        if proved:  # proof from this chunk or an earlier redo: earlier all-failed chunks were rows'
+            systemic = False
+            for bad, err in pending:
+                added += 1
+                evicted += _quarantine_add(bad, type(err).__name__)
+            pending.clear()
         for f in hits:
             log.info(
                 "unacked_cap_reached",
@@ -277,7 +282,7 @@ async def reclaim_stale(
                 log.info("subtask_reclaimed", acquirement_id=str(aid), result=res.value)
     if added or evicted or lapsed:
         log.info(
-            "reclaim_quarantine",
+            "reclaim_quarantine_summary",
             size=len(_QUARANTINE),
             added=added,
             evicted=evicted,

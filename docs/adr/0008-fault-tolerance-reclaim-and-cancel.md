@@ -87,16 +87,16 @@ The watchdog takes the stale / over-lease candidates, splits them into chunks of
 - A chunk that raises is rolled back and retried row by row, each in its own transaction, so one
   bad row still cannot block the batch. A failing row is quarantined (skipped for 10 minutes,
   in-memory, per process, at most 1000 ids) only when the fault is shown to be isolated: another row
-  of the same chunk committed an expiry in its own transaction (SKIPPED / NOT_STALE do not count).
+  of the same chunk committed an expiry in its own transaction (SKIPPED / NOT_STALE do not count), or a later chunk of the same `reclaim_stale` call did (earlier all-failed chunks' row-specific failures are then quarantined too).
   If no peer succeeded the failure is systemic (a code bug, `XX000`, `25P02`, an unwell DB): nothing
-  is quarantined, `reclaim_chunk_systemic` is logged, the rows are retried next tick, and the rest of
-  that `reclaim_stale` call skips the row-by-row redo. A one-row chunk is never quarantined.
+  is quarantined, `reclaim_chunk_systemic` is logged, the rows are retried next tick, and later chunks
+  of that call skip the row-by-row redo until one commits an expiry. A one-row chunk is never quarantined.
   Quarantined ids are excluded in the candidate scans themselves, so they do not occupy the oldest
   `LIMIT` slots. When the quarantine is full the soonest-expiring entry is evicted
   (`reclaim_quarantine_full`, counted in `evicted_total`) instead of silently ceasing to exclude.
   Observable through structlog only (the watchdog has no `/metrics`): `reclaim_quarantined`
   (acquirement_id, until, error_type; never an exception message) per entry and a per-call summary
-  `reclaim_quarantine` (size, added, evicted, expired, evicted_total). Transient infrastructure
+  `reclaim_quarantine_summary` (size, added, evicted, expired, evicted_total). Transient infrastructure
   errors never quarantine: connection and pool errors, timeouts, `OperationalError`/`InterfaceError`,
   and any driver error whose SQLSTATE is in class 08 (connection), 40 (rollback: deadlock 40P01,
   serialization 40001), 53 (resources, e.g. too many connections), 57 (operator intervention:
