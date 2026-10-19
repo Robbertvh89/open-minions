@@ -1,0 +1,1392 @@
+{
+ "schema_version": 1,
+ "kind": "task35-reclaim-tick",
+ "environment": {
+  "machine": "Apple M3 Pro (12 cores)",
+  "macos": "27.0",
+  "docker": "Docker Desktop 27.4.1 (desktop-linux), Docker VM 12 CPUs",
+  "stack": "compose project open-minions-scale, deploy/compose.scale.yml, PostgreSQL 16 (shared_buffers 1GB, pg_stat_statements track=all, track_io_timing on, track_wal_io_timing on for the tick runs)",
+  "date": "2026-10-19",
+  "before_code": "origin/main 3295544",
+  "after_code": "branch perf/task-35-chunked-reclaim 06fc70b",
+  "setup": "1,000,000 PENDING (100 tasks x 10,000), 500 sims (vanish 1.0) acquire once and walk away, >25 s wait, one minion_watchdog.main.tick with heartbeat_timeout_s=20, batch 500, release_limit 10 unless stated; host cases run from the Mac over the 55432 port forward, net cases in a container on the compose network"
+ },
+ "cases": {
+  "after-host": {
+   "n": 3,
+   "tick_wall_ms": [
+    196.0,
+    187.1,
+    188.8
+   ],
+   "median_ms": 188.8,
+   "min_ms": 187.1,
+   "max_ms": 196.0,
+   "runs": [
+    {
+     "label": "after-host-1",
+     "tick_wall_ms": 196.0,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 95.6,
+     "commits": 0,
+     "commit_ms_total": 0.0,
+     "rollbacks": null,
+     "rollback_ms_total": null,
+     "server_calls_total_excl_stat": 1075,
+     "server_exec_ms_total": 38.9,
+     "wal_delta": {
+      "wal_records": 6966.0,
+      "wal_bytes": 684746.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 2.7
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 34
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "after-host-2",
+     "tick_wall_ms": 187.1,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 96.2,
+     "commits": 6,
+     "commit_ms_total": 4.7,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.2,
+     "server_calls_total_excl_stat": 71,
+     "server_exec_ms_total": 35.6,
+     "wal_delta": {
+      "wal_records": 6875.0,
+      "wal_bytes": 646172.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 2.0300000000000296
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false,
+     "client_statements": [
+      {
+       "sql": "UPDATE minion_subtask SET status=$1, error=NULL, updated_at=now() WHER",
+       "n": 5,
+       "client_ms_total": 33.1,
+       "client_ms_mean": 6.623
+      },
+      {
+       "sql": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_",
+       "n": 5,
+       "client_ms_total": 23.2,
+       "client_ms_mean": 4.639
+      },
+      {
+       "sql": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acqui",
+       "n": 5,
+       "client_ms_total": 18.6,
+       "client_ms_mean": 3.714
+      },
+      {
+       "sql": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquiremen",
+       "n": 5,
+       "client_ms_total": 8.5,
+       "client_ms_mean": 1.702
+      },
+      {
+       "sql": "SELECT minion_subtask_acquirement.acquirement_id FROM minion_subtask_a",
+       "n": 7,
+       "client_ms_total": 6.6,
+       "client_ms_mean": 0.941
+      },
+      {
+       "sql": "SELECT minion_executor_heartbeat.acquirement_id FROM minion_executor_h",
+       "n": 2,
+       "client_ms_total": 2.9,
+       "client_ms_mean": 1.443
+      },
+      {
+       "sql": "WITH batch AS MATERIALIZED (SELECT minion_subtask.team AS team, minion",
+       "n": 1,
+       "client_ms_total": 1.8,
+       "client_ms_mean": 1.771
+      },
+      {
+       "sql": "SELECT minion_task.team, minion_task.project, minion_task.task_name FR",
+       "n": 1,
+       "client_ms_total": 1.6,
+       "client_ms_mean": 1.578
+      }
+     ],
+     "pg_stat_statements_top": [
+      {
+       "q": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquire",
+       "calls": 5,
+       "total_ms": 11.3,
+       "mean_ms": 2.2609
+      },
+      {
+       "q": "UPDATE minion_subtask SET status=$1, error=$402, updated_at=now() WHERE (minion_subtask.te",
+       "calls": 5,
+       "total_ms": 10.86,
+       "mean_ms": 2.1718
+      },
+      {
+       "q": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acquirement.team, minion_",
+       "calls": 5,
+       "total_ms": 7.13,
+       "mean_ms": 1.4251
+      },
+      {
+       "q": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquirement.acquirement_id IN ",
+       "calls": 5,
+       "total_ms": 5.43,
+       "mean_ms": 1.0859
+      },
+      {
+       "q": "SELECT $2 FROM ONLY \"public\".\"minion_executor\" x WHERE \"executor_id\" OPERATOR(pg_catalog.=",
+       "calls": 500,
+       "total_ms": 3.06,
+       "mean_ms": 0.0061
+      },
+      {
+       "q": "DELETE FROM ONLY \"public\".\"minion_executor_heartbeat\" WHERE $1 OPERATOR(pg_catalog.=) \"acq",
+       "calls": 500,
+       "total_ms": 2.49,
+       "mean_ms": 0.005
+      },
+      {
+       "q": "SELECT minion_subtask_acquirement.acquirement_id FROM minion_subtask_acquirement WHERE min",
+       "calls": 5,
+       "total_ms": 0.54,
+       "mean_ms": 0.1071
+      },
+      {
+       "q": "select count(*) from pg_stat_activity where backend_type=$1",
+       "calls": 4,
+       "total_ms": 0.42,
+       "mean_ms": 0.1051
+      },
+      {
+       "q": "SELECT minion_executor_heartbeat.acquirement_id FROM minion_executor_heartbeat WHERE minio",
+       "calls": 2,
+       "total_ms": 0.18,
+       "mean_ms": 0.0903
+      },
+      {
+       "q": "select pid, state, left(query,$1) q from pg_stat_activity where datname=current_database()",
+       "calls": 1,
+       "total_ms": 0.15,
+       "mean_ms": 0.1483
+      },
+      {
+       "q": "select count(*) from minion_subtask_acquirement",
+       "calls": 1,
+       "total_ms": 0.13,
+       "mean_ms": 0.1286
+      },
+      {
+       "q": "select pg_stat_statements_reset()",
+       "calls": 1,
+       "total_ms": 0.11,
+       "mean_ms": 0.1076
+      },
+      {
+       "q": "WITH batch AS MATERIALIZED (SELECT minion_subtask.team AS team, minion_subtask.project AS ",
+       "calls": 1,
+       "total_ms": 0.08,
+       "mean_ms": 0.0801
+      },
+      {
+       "q": "select wal_records, wal_bytes, wal_sync, wal_sync_time from pg_stat_wal",
+       "calls": 2,
+       "total_ms": 0.04,
+       "mean_ms": 0.0198
+      },
+      {
+       "q": "select current_schema()",
+       "calls": 1,
+       "total_ms": 0.01,
+       "mean_ms": 0.0115
+      },
+      {
+       "q": "SELECT minion_subtask_acquirement.acquirement_id FROM minion_subtask_acquirement WHERE min",
+       "calls": 2,
+       "total_ms": 0.01,
+       "mean_ms": 0.0045
+      },
+      {
+       "q": "BEGIN",
+       "calls": 19,
+       "total_ms": 0.01,
+       "mean_ms": 0.0004
+      },
+      {
+       "q": "select checkpoints_timed, checkpoints_req, buffers_checkpoint from pg_stat_bgwriter",
+       "calls": 2,
+       "total_ms": 0.01,
+       "mean_ms": 0.0033
+      },
+      {
+       "q": "select pg_catalog.version()",
+       "calls": 1,
+       "total_ms": 0.01,
+       "mean_ms": 0.006
+      },
+      {
+       "q": "COMMIT",
+       "calls": 6,
+       "total_ms": 0.01,
+       "mean_ms": 0.0009
+      }
+     ]
+    },
+    {
+     "label": "after-host-3",
+     "tick_wall_ms": 188.8,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 96.0,
+     "commits": 6,
+     "commit_ms_total": 4.2,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.4,
+     "server_calls_total_excl_stat": 91,
+     "server_exec_ms_total": 36.3,
+     "wal_delta": {
+      "wal_records": 6838.0,
+      "wal_bytes": 645738.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 1.88799999999992
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    }
+   ]
+  },
+  "after-net": {
+   "n": 3,
+   "tick_wall_ms": [
+    115.8,
+    121.4,
+    118.1
+   ],
+   "median_ms": 118.1,
+   "min_ms": 115.8,
+   "max_ms": 121.4,
+   "runs": [
+    {
+     "label": "after-net-1",
+     "tick_wall_ms": 115.8,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 48.3,
+     "commits": 6,
+     "commit_ms_total": 2.0,
+     "rollbacks": 16,
+     "rollback_ms_total": 0.3,
+     "server_calls_total_excl_stat": 71,
+     "server_exec_ms_total": 21.6,
+     "wal_delta": {
+      "wal_records": 6683.0,
+      "wal_bytes": 626792.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 1.8139999999998508
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "after-net-2",
+     "tick_wall_ms": 121.4,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 51.0,
+     "commits": 6,
+     "commit_ms_total": 2.4,
+     "rollbacks": 16,
+     "rollback_ms_total": 0.3,
+     "server_calls_total_excl_stat": 71,
+     "server_exec_ms_total": 23.4,
+     "wal_delta": {
+      "wal_records": 6683.0,
+      "wal_bytes": 1350162.0,
+      "wal_sync": 7.0,
+      "wal_sync_time": 1.9090000000001055
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 1
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "after-net-3",
+     "tick_wall_ms": 118.1,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 49.4,
+     "commits": 6,
+     "commit_ms_total": 1.9,
+     "rollbacks": 16,
+     "rollback_ms_total": 0.3,
+     "server_calls_total_excl_stat": 71,
+     "server_exec_ms_total": 22.5,
+     "wal_delta": {
+      "wal_records": 6652.0,
+      "wal_bytes": 625425.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 1.6340000000000146
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    }
+   ]
+  },
+  "after-rl0": {
+   "n": 3,
+   "tick_wall_ms": [
+    325.1,
+    204.9,
+    204.1
+   ],
+   "median_ms": 204.9,
+   "min_ms": 204.1,
+   "max_ms": 325.1,
+   "runs": [
+    {
+     "label": "after-rl0-1",
+     "tick_wall_ms": 325.1,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 44,
+     "client_stmt_ms": 161.4,
+     "commits": 6,
+     "commit_ms_total": 6.3,
+     "rollbacks": 16,
+     "rollback_ms_total": 3.3,
+     "server_calls_total_excl_stat": 84,
+     "server_exec_ms_total": 47.3,
+     "wal_delta": {
+      "wal_records": 6953.0,
+      "wal_bytes": 693587.0,
+      "wal_sync": 7.0,
+      "wal_sync_time": 3.2109999999993306
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 0,
+     "sync_off": false
+    },
+    {
+     "label": "after-rl0-2",
+     "tick_wall_ms": 204.9,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 43,
+     "client_stmt_ms": 107.3,
+     "commits": 6,
+     "commit_ms_total": 4.8,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.4,
+     "server_calls_total_excl_stat": 83,
+     "server_exec_ms_total": 39.3,
+     "wal_delta": {
+      "wal_records": 6923.0,
+      "wal_bytes": 1557077.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 2.6159999999999854
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 2
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 0,
+     "sync_off": false
+    },
+    {
+     "label": "after-rl0-3",
+     "tick_wall_ms": 204.1,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 41,
+     "client_stmt_ms": 107.5,
+     "commits": 6,
+     "commit_ms_total": 4.4,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.5,
+     "server_calls_total_excl_stat": 81,
+     "server_exec_ms_total": 38.1,
+     "wal_delta": {
+      "wal_records": 6892.0,
+      "wal_bytes": 684969.0,
+      "wal_sync": 6.0,
+      "wal_sync_time": 1.9639999999999418
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 0,
+     "sync_off": false
+    }
+   ]
+  },
+  "after-syncoff": {
+   "n": 3,
+   "tick_wall_ms": [
+    193.0,
+    211.5,
+    197.7
+   ],
+   "median_ms": 197.7,
+   "min_ms": 193.0,
+   "max_ms": 211.5,
+   "runs": [
+    {
+     "label": "after-syncoff-1",
+     "tick_wall_ms": 193.0,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 34,
+     "client_stmt_ms": 105.3,
+     "commits": 6,
+     "commit_ms_total": 2.1,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.3,
+     "server_calls_total_excl_stat": 74,
+     "server_exec_ms_total": 39.1,
+     "wal_delta": {
+      "wal_records": 6700.0,
+      "wal_bytes": 646468.0,
+      "wal_sync": 1.0,
+      "wal_sync_time": 0.5859999999993306
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    },
+    {
+     "label": "after-syncoff-2",
+     "tick_wall_ms": 211.5,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 35,
+     "client_stmt_ms": 113.1,
+     "commits": 6,
+     "commit_ms_total": 2.8,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.4,
+     "server_calls_total_excl_stat": 75,
+     "server_exec_ms_total": 41.7,
+     "wal_delta": {
+      "wal_records": 6710.0,
+      "wal_bytes": 634542.0,
+      "wal_sync": 2.0,
+      "wal_sync_time": 1.6060000000015862
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    },
+    {
+     "label": "after-syncoff-3",
+     "tick_wall_ms": 197.7,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 31,
+     "client_stmt_ms": 104.9,
+     "commits": 6,
+     "commit_ms_total": 2.5,
+     "rollbacks": 16,
+     "rollback_ms_total": 1.3,
+     "server_calls_total_excl_stat": 71,
+     "server_exec_ms_total": 42.1,
+     "wal_delta": {
+      "wal_records": 6734.0,
+      "wal_bytes": 1343750.0,
+      "wal_sync": 1.0,
+      "wal_sync_time": 1.2889999999988504
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    }
+   ]
+  },
+  "before-host": {
+   "n": 3,
+   "tick_wall_ms": [
+    8157.9,
+    9229.5,
+    2574.2
+   ],
+   "median_ms": 8157.9,
+   "min_ms": 2574.2,
+   "max_ms": 9229.5,
+   "runs": [
+    {
+     "label": "before-host-1",
+     "tick_wall_ms": 8157.9,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 3879.0,
+     "commits": 501,
+     "commit_ms_total": 599.9,
+     "rollbacks": 511,
+     "rollback_ms_total": 3.2,
+     "server_calls_total_excl_stat": 6106,
+     "server_exec_ms_total": 323.1,
+     "wal_delta": {
+      "wal_records": 7326.0,
+      "wal_bytes": 642522.0,
+      "wal_sync": 501.0,
+      "wal_sync_time": 193.11599999999999
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false,
+     "client_statements": [
+      {
+       "sql": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acqui",
+       "n": 500,
+       "client_ms_total": 656.8,
+       "client_ms_mean": 1.314
+      },
+      {
+       "sql": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_",
+       "n": 500,
+       "client_ms_total": 527.8,
+       "client_ms_mean": 1.056
+      },
+      {
+       "sql": "UPDATE minion_subtask SET status=$1, error=NULL, updated_at=now() WHER",
+       "n": 500,
+       "client_ms_total": 503.7,
+       "client_ms_mean": 1.007
+      },
+      {
+       "sql": "SELECT minion_subtask.record_count, minion_subtask.max_attempts, minio",
+       "n": 500,
+       "client_ms_total": 464.0,
+       "client_ms_mean": 0.928
+      },
+      {
+       "sql": "SELECT count(*) AS count_1 FROM minion_subtask_attempt WHERE minion_su",
+       "n": 500,
+       "client_ms_total": 447.6,
+       "client_ms_mean": 0.895
+      },
+      {
+       "sql": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquiremen",
+       "n": 500,
+       "client_ms_total": 428.3,
+       "client_ms_mean": 0.857
+      },
+      {
+       "sql": "SELECT EXISTS (SELECT * FROM minion_executor_heartbeat WHERE minion_ex",
+       "n": 500,
+       "client_ms_total": 425.7,
+       "client_ms_mean": 0.851
+      },
+      {
+       "sql": "SELECT EXISTS (SELECT * FROM minion_executor_heartbeat, minion_subtask",
+       "n": 500,
+       "client_ms_total": 408.3,
+       "client_ms_mean": 0.817
+      },
+      {
+       "sql": "SELECT minion_executor_heartbeat.acquirement_id FROM minion_executor_h",
+       "n": 2,
+       "client_ms_total": 7.8,
+       "client_ms_mean": 3.881
+      },
+      {
+       "sql": "SELECT minion_subtask_acquirement.acquirement_id FROM minion_subtask_a",
+       "n": 2,
+       "client_ms_total": 4.7,
+       "client_ms_mean": 2.336
+      },
+      {
+       "sql": "SELECT minion_task.team, minion_task.project, minion_task.task_name FR",
+       "n": 1,
+       "client_ms_total": 2.3,
+       "client_ms_mean": 2.307
+      },
+      {
+       "sql": "WITH batch AS MATERIALIZED (SELECT minion_subtask.team AS team, minion",
+       "n": 1,
+       "client_ms_total": 2.1,
+       "client_ms_mean": 2.107
+      }
+     ],
+     "pg_stat_statements_top": [
+      {
+       "q": "UPDATE minion_subtask SET status=$1, error=$6, updated_at=now() WHERE minion_subtask.team ",
+       "calls": 500,
+       "total_ms": 75.48,
+       "mean_ms": 0.151
+      },
+      {
+       "q": "INSERT INTO minion_subtask_attempt (team, project, task_name, subtask_id, attempt, acquire",
+       "calls": 500,
+       "total_ms": 74.75,
+       "mean_ms": 0.1495
+      },
+      {
+       "q": "SELECT minion_subtask.record_count, minion_subtask.max_attempts, minion_task.output_uri, m",
+       "calls": 500,
+       "total_ms": 43.17,
+       "mean_ms": 0.0863
+      },
+      {
+       "q": "DELETE FROM minion_subtask_acquirement WHERE minion_subtask_acquirement.acquirement_id = $",
+       "calls": 500,
+       "total_ms": 36.86,
+       "mean_ms": 0.0737
+      },
+      {
+       "q": "select count(*) from pg_stat_activity where backend_type=$1",
+       "calls": 157,
+       "total_ms": 33.3,
+       "mean_ms": 0.2121
+      },
+      {
+       "q": "SELECT minion_subtask_acquirement.acquirement_id, minion_subtask_acquirement.team, minion_",
+       "calls": 500,
+       "total_ms": 30.42,
+       "mean_ms": 0.0608
+      },
+      {
+       "q": "SELECT count(*) AS count_1 FROM minion_subtask_attempt WHERE minion_subtask_attempt.team =",
+       "calls": 500,
+       "total_ms": 22.33,
+       "mean_ms": 0.0447
+      },
+      {
+       "q": "SELECT EXISTS (SELECT * FROM minion_executor_heartbeat, minion_subtask_acquirement WHERE m",
+       "calls": 500,
+       "total_ms": 19.24,
+       "mean_ms": 0.0385
+      },
+      {
+       "q": "SELECT EXISTS (SELECT * FROM minion_executor_heartbeat WHERE minion_executor_heartbeat.acq",
+       "calls": 500,
+       "total_ms": 16.85,
+       "mean_ms": 0.0337
+      },
+      {
+       "q": "SELECT $2 FROM ONLY \"public\".\"minion_executor\" x WHERE \"executor_id\" OPERATOR(pg_catalog.=",
+       "calls": 500,
+       "total_ms": 12.03,
+       "mean_ms": 0.0241
+      },
+      {
+       "q": "DELETE FROM ONLY \"public\".\"minion_executor_heartbeat\" WHERE $1 OPERATOR(pg_catalog.=) \"acq",
+       "calls": 500,
+       "total_ms": 6.87,
+       "mean_ms": 0.0137
+      },
+      {
+       "q": "SELECT minion_task.team, minion_task.project, minion_task.task_name, minion_task.type, min",
+       "calls": 16,
+       "total_ms": 1.36,
+       "mean_ms": 0.085
+      },
+      {
+       "q": "BEGIN",
+       "calls": 1041,
+       "total_ms": 0.86,
+       "mean_ms": 0.0008
+      },
+      {
+       "q": "COMMIT",
+       "calls": 517,
+       "total_ms": 0.73,
+       "mean_ms": 0.0014
+      },
+      {
+       "q": "SELECT minion_executor_heartbeat.acquirement_id FROM minion_executor_heartbeat WHERE minio",
+       "calls": 2,
+       "total_ms": 0.56,
+       "mean_ms": 0.2786
+      },
+      {
+       "q": "ROLLBACK",
+       "calls": 524,
+       "total_ms": 0.43,
+       "mean_ms": 0.0008
+      },
+      {
+       "q": "select pid, state, left(query,$1) q from pg_stat_activity where datname=current_database()",
+       "calls": 1,
+       "total_ms": 0.21,
+       "mean_ms": 0.2051
+      },
+      {
+       "q": "select pg_stat_statements_reset()",
+       "calls": 1,
+       "total_ms": 0.16,
+       "mean_ms": 0.1588
+      },
+      {
+       "q": "select count(*) from minion_subtask_acquirement",
+       "calls": 1,
+       "total_ms": 0.15,
+       "mean_ms": 0.1535
+      },
+      {
+       "q": "select current_schema()",
+       "calls": 1,
+       "total_ms": 0.07,
+       "mean_ms": 0.0695
+      }
+     ]
+    },
+    {
+     "label": "before-host-2",
+     "tick_wall_ms": 9229.5,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 4456.9,
+     "commits": 501,
+     "commit_ms_total": 679.6,
+     "rollbacks": 511,
+     "rollback_ms_total": 3.6,
+     "server_calls_total_excl_stat": 6126,
+     "server_exec_ms_total": 374.1,
+     "wal_delta": {
+      "wal_records": 7287.0,
+      "wal_bytes": 1303970.0,
+      "wal_sync": 504.0,
+      "wal_sync_time": 221.096
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 91
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "before-host-3",
+     "tick_wall_ms": 2574.2,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 1290.3,
+     "commits": 501,
+     "commit_ms_total": 196.1,
+     "rollbacks": 511,
+     "rollback_ms_total": 1.7,
+     "server_calls_total_excl_stat": 6066,
+     "server_exec_ms_total": 93.2,
+     "wal_delta": {
+      "wal_records": 7408.0,
+      "wal_bytes": 679951.0,
+      "wal_sync": 501.0,
+      "wal_sync_time": 66.57699999999977
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 25
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    }
+   ]
+  },
+  "before-net": {
+   "n": 3,
+   "tick_wall_ms": [
+    1099.8,
+    1306.8,
+    1267.0
+   ],
+   "median_ms": 1267.0,
+   "min_ms": 1099.8,
+   "max_ms": 1306.8,
+   "runs": [
+    {
+     "label": "before-net-1",
+     "tick_wall_ms": 1099.8,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 319.2,
+     "commits": 501,
+     "commit_ms_total": 72.6,
+     "rollbacks": 511,
+     "rollback_ms_total": 0.4,
+     "server_calls_total_excl_stat": 6026,
+     "server_exec_ms_total": 61.6,
+     "wal_delta": {
+      "wal_records": 7212.0,
+      "wal_bytes": 657794.0,
+      "wal_sync": 500.0,
+      "wal_sync_time": 46.47999999999956
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "before-net-2",
+     "tick_wall_ms": 1306.8,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4476,
+     "client_stmt_ms": 391.3,
+     "commits": 501,
+     "commit_ms_total": 76.8,
+     "rollbacks": 511,
+     "rollback_ms_total": 0.4,
+     "server_calls_total_excl_stat": 6516,
+     "server_exec_ms_total": 74.3,
+     "wal_delta": {
+      "wal_records": 7453.0,
+      "wal_bytes": 1226320.0,
+      "wal_sync": 501.0,
+      "wal_sync_time": 49.277000000000044
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "before-net-3",
+     "tick_wall_ms": 1267.0,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4487,
+     "client_stmt_ms": 378.1,
+     "commits": 501,
+     "commit_ms_total": 71.9,
+     "rollbacks": 511,
+     "rollback_ms_total": 0.4,
+     "server_calls_total_excl_stat": 6507,
+     "server_exec_ms_total": 70.1,
+     "wal_delta": {
+      "wal_records": 7385.0,
+      "wal_bytes": 686045.0,
+      "wal_sync": 501.0,
+      "wal_sync_time": 45.08799999999974
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    }
+   ]
+  },
+  "before-nosample": {
+   "n": 2,
+   "tick_wall_ms": [
+    9094.8,
+    3013.4
+   ],
+   "median_ms": 6054.099999999999,
+   "min_ms": 3013.4,
+   "max_ms": 9094.8,
+   "runs": [
+    {
+     "label": "before-nosample-1",
+     "tick_wall_ms": 9094.8,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4008,
+     "client_stmt_ms": 4306.9,
+     "commits": 501,
+     "commit_ms_total": 654.5,
+     "rollbacks": 511,
+     "rollback_ms_total": 4.3,
+     "server_calls_total_excl_stat": 6118,
+     "server_exec_ms_total": 368.2,
+     "wal_delta": {
+      "wal_records": 7269.0,
+      "wal_bytes": 676218.0,
+      "wal_sync": 503.0,
+      "wal_sync_time": 204.10499999999956
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    },
+    {
+     "label": "before-nosample-2",
+     "tick_wall_ms": 3013.4,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4010,
+     "client_stmt_ms": 1467.6,
+     "commits": 501,
+     "commit_ms_total": 225.9,
+     "rollbacks": 511,
+     "rollback_ms_total": 1.5,
+     "server_calls_total_excl_stat": 6055,
+     "server_exec_ms_total": 114.3,
+     "wal_delta": {
+      "wal_records": 7310.0,
+      "wal_bytes": 1757231.0,
+      "wal_sync": 502.0,
+      "wal_sync_time": 75.65499999999884
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": false
+    }
+   ]
+  },
+  "before-rl0": {
+   "n": 3,
+   "tick_wall_ms": [
+    9234.9,
+    7116.0,
+    9217.5
+   ],
+   "median_ms": 9217.5,
+   "min_ms": 7116.0,
+   "max_ms": 9234.9,
+   "runs": [
+    {
+     "label": "before-rl0-1",
+     "tick_wall_ms": 9234.9,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 3506,
+     "client_stmt_ms": 4232.2,
+     "commits": 501,
+     "commit_ms_total": 688.4,
+     "rollbacks": 511,
+     "rollback_ms_total": 6.6,
+     "server_calls_total_excl_stat": 5626,
+     "server_exec_ms_total": 390.5,
+     "wal_delta": {
+      "wal_records": 7437.0,
+      "wal_bytes": 689073.0,
+      "wal_sync": 501.0,
+      "wal_sync_time": 215.91200000000026
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 0,
+     "sync_off": false
+    },
+    {
+     "label": "before-rl0-2",
+     "tick_wall_ms": 7116.0,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 3506,
+     "client_stmt_ms": 3203.5,
+     "commits": 501,
+     "commit_ms_total": 551.0,
+     "rollbacks": 511,
+     "rollback_ms_total": 4.0,
+     "server_calls_total_excl_stat": 5586,
+     "server_exec_ms_total": 298.5,
+     "wal_delta": {
+      "wal_records": 7398.0,
+      "wal_bytes": 1589507.0,
+      "wal_sync": 504.0,
+      "wal_sync_time": 180.02899999999954
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 64
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 0,
+     "sync_off": false
+    },
+    {
+     "label": "before-rl0-3",
+     "tick_wall_ms": 9217.5,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 3970,
+     "client_stmt_ms": 4290.6,
+     "commits": 501,
+     "commit_ms_total": 656.6,
+     "rollbacks": 511,
+     "rollback_ms_total": 3.0,
+     "server_calls_total_excl_stat": 6090,
+     "server_exec_ms_total": 399.7,
+     "wal_delta": {
+      "wal_records": 8192.0,
+      "wal_bytes": 771425.0,
+      "wal_sync": 506.0,
+      "wal_sync_time": 219.3069999999998
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 1,
+     "release_limit": 0,
+     "sync_off": false
+    }
+   ]
+  },
+  "before-syncoff": {
+   "n": 3,
+   "tick_wall_ms": [
+    8239.0,
+    7045.5,
+    8164.6
+   ],
+   "median_ms": 8164.6,
+   "min_ms": 7045.5,
+   "max_ms": 8239.0,
+   "runs": [
+    {
+     "label": "before-syncoff-1",
+     "tick_wall_ms": 8239.0,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 4060.9,
+     "commits": 501,
+     "commit_ms_total": 380.3,
+     "rollbacks": 511,
+     "rollback_ms_total": 5.7,
+     "server_calls_total_excl_stat": 6106,
+     "server_exec_ms_total": 309.6,
+     "wal_delta": {
+      "wal_records": 7152.0,
+      "wal_bytes": 650850.0,
+      "wal_sync": 39.0,
+      "wal_sync_time": 25.520000000000437
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    },
+    {
+     "label": "before-syncoff-2",
+     "tick_wall_ms": 7045.5,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4008,
+     "client_stmt_ms": 3458.2,
+     "commits": 501,
+     "commit_ms_total": 327.5,
+     "rollbacks": 511,
+     "rollback_ms_total": 2.2,
+     "server_calls_total_excl_stat": 6103,
+     "server_exec_ms_total": 272.3,
+     "wal_delta": {
+      "wal_records": 7097.0,
+      "wal_bytes": 1640085.0,
+      "wal_sync": 34.0,
+      "wal_sync_time": 23.712000000001353
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 70
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    },
+    {
+     "label": "before-syncoff-3",
+     "tick_wall_ms": 8164.6,
+     "acquirements_before": 500,
+     "acquirements_after": 0,
+     "other_active_sessions": 0,
+     "client_stmt_total": 4006,
+     "client_stmt_ms": 4079.5,
+     "commits": 501,
+     "commit_ms_total": 382.6,
+     "rollbacks": 511,
+     "rollback_ms_total": 2.8,
+     "server_calls_total_excl_stat": 6106,
+     "server_exec_ms_total": 324.2,
+     "wal_delta": {
+      "wal_records": 7125.0,
+      "wal_bytes": 657532.0,
+      "wal_sync": 39.0,
+      "wal_sync_time": 31.60200000000077
+     },
+     "bgwriter_delta": {
+      "checkpoints_timed": 0,
+      "checkpoints_req": 0,
+      "buffers_checkpoint": 0
+     },
+     "autovac_workers_max": 0,
+     "release_limit": 10,
+     "sync_off": true
+    }
+   ]
+  }
+ },
+ "round_trip_baseline_ms": {
+  "select1_host_asyncpg_x1000": [
+   {
+    "mean": 0.268,
+    "p50": 0.258,
+    "p99": 0.688
+   },
+   {
+    "mean": 0.241,
+    "p50": 0.224,
+    "p99": 0.872
+   },
+   {
+    "mean": 0.232,
+    "p50": 0.221,
+    "p99": 0.451
+   }
+  ],
+  "select1_container_asyncpg_x1000": [
+   {
+    "mean": 0.056,
+    "p50": 0.052,
+    "p99": 0.075
+   },
+   {
+    "mean": 0.052,
+    "p50": 0.052,
+    "p99": 0.069
+   },
+   {
+    "mean": 0.055,
+    "p50": 0.054,
+    "p99": 0.082
+   }
+  ],
+  "sqlalchemy_tx_300x_host": {
+   "1_stmt_mean": 1.59,
+   "8_stmt_mean": 3.45,
+   "per_extra_stmt": 0.27
+  },
+  "sqlalchemy_tx_300x_container": {
+   "1_stmt_mean": 0.46,
+   "8_stmt_mean": 1.12,
+   "per_extra_stmt": 0.094
+  }
+ },
+ "chaos_drain_b_after": {
+  "config": "20 tasks x 5000 subtasks, 500 sims, 8 procs, work 1 s, hb 5 s, vanish 0.01 release 0.02 fail 0.02 late 0.005, late-wait 40 s, watchdog container (branch image) timeout 20 s interval 5 s",
+  "duration_s": 656.257,
+  "throughput_per_s": 152.379,
+  "completed": 100000,
+  "attempts_by_outcome": {
+   "SUCCEEDED": 100000,
+   "FAILED": 2103,
+   "RELEASED": 2071,
+   "EXPIRED": 1594
+  },
+  "expired_error_code": {
+   "NOT_ACKNOWLEDGED": 1594
+  },
+  "faults": {
+   "fail": 2103,
+   "late": 544,
+   "release": 2071,
+   "vanish": 1050
+  },
+  "conflicts_409": 544,
+  "status_5xx": 0,
+  "status_503": 26473,
+  "transport": 0,
+  "watchdog_reclaimed_in_logs": {
+   "EXPIRED_REQUEUED": 1594
+  },
+  "watchdog_error_or_warning_lines": 0,
+  "verify": {
+   "checks": [
+    {
+     "detail": {
+      "samples": [],
+      "violations": 0
+     },
+     "name": "nf2_one_succeeded_attempt_per_succeeded_subtask",
+     "ok": true
+    },
+    {
+     "detail": {
+      "final_objects": 100000,
+      "missing": 0,
+      "succeeded": 100000,
+      "unexpected": 0
+     },
+     "name": "nf2_final_objects_match_succeeded",
+     "ok": true
+    },
+    {
+     "detail": {
+      "non_terminal": 0,
+      "samples": []
+     },
+     "name": "nf3_all_subtasks_terminal",
+     "ok": true
+    },
+    {
+     "detail": {
+      "orphans": 0,
+      "samples": []
+     },
+     "name": "nf3_no_orphan_acquirements",
+     "ok": true
+    },
+    {
+     "detail": {
+      "samples": [],
+      "violations": 0
+     },
+     "name": "task_counters_match_subtasks",
+     "ok": true
+    },
+    {
+     "detail": {
+      "non_terminal_tasks": 0
+     },
+     "name": "tasks_terminal",
+     "ok": true
+    }
+   ],
+   "counts": {
+    "acquirements": 0,
+    "attempts": 105768,
+    "cancelled": 0,
+    "failed": 0,
+    "subtasks": 100000,
+    "succeeded": 100000,
+    "tasks": 20
+   },
+   "ok": true
+  }
+ }
+}

@@ -27,11 +27,53 @@ BUDGET_OUTCOMES = (AttemptOutcome.FAILED.value, AttemptOutcome.EXPIRED.value)
 NOT_ACKNOWLEDGED = "NOT_ACKNOWLEDGED"  # ADR-0014: EXPIRED, never heartbeated after the claim
 
 
-def _unacked_expiry() -> Any:
+def unacked_expiry() -> Any:
     """Attempt rows that are free EXPIRED / NOT_ACKNOWLEDGED (history `error.code`)."""
     return (SubtaskAttempt.outcome == AttemptOutcome.EXPIRED.value) & (
         SubtaskAttempt.error["code"].astext == NOT_ACKNOWLEDGED
     )
+
+
+def budget_attempt() -> Any:
+    """Attempt rows that consume the retry budget (FAILED + EXPIRED, minus the free NOT_ACKNOWLEDGED
+    expiries of ADR-0014). One definition for owner ops and the batched reclaim."""
+    return SubtaskAttempt.outcome.in_(BUDGET_OUTCOMES) & ~func.coalesce(unacked_expiry(), false())
+
+
+def attempt_row(
+    o: "Owned",
+    outcome: AttemptOutcome,
+    error: dict[str, Any] | None,
+    attempt_error: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Column values of the attempt-history row; shared by `finish_attempt` and the batched
+    reclaim writer. `error` goes on both rows, `attempt_error` (a release reason) only here."""
+    return {
+        "team": o.team,
+        "project": o.project,
+        "task_name": o.task_name,
+        "subtask_id": o.subtask_id,
+        "attempt": o.attempt,
+        "acquirement_id": o.acquirement_id,
+        "executor_id": o.executor_id,
+        "outcome": outcome.value,
+        "started_at": o.acquired_at,
+        # SQL NULL (not JSON null) when there is no error / release reason
+        "error": (error if error is not None else attempt_error) or null(),
+    }
+
+
+def subtask_values(
+    status: SubtaskStatus, error: dict[str, Any] | None, output_uri: str | None = None
+) -> dict[str, Any]:
+    """SET values of the subtask row after an attempt ends (shared, see `attempt_row`)."""
+    values: dict[str, Any] = {
+        "status": status.value,
+        "error": error if error is not None else null(),
+    }
+    if output_uri is not None:
+        values["output_uri"] = output_uri
+    return values
 
 
 @dataclass(frozen=True)
@@ -134,8 +176,7 @@ async def failed_attempt_count(session: AsyncSession, o: Owned) -> int:
                     SubtaskAttempt.project == o.project,
                     SubtaskAttempt.task_name == o.task_name,
                     SubtaskAttempt.subtask_id == o.subtask_id,
-                    SubtaskAttempt.outcome.in_(BUDGET_OUTCOMES),
-                    ~func.coalesce(_unacked_expiry(), false()),
+                    budget_attempt(),
                 )
             )
         ).scalar_one()
@@ -161,25 +202,6 @@ async def released_attempt_count(session: AsyncSession, o: Owned) -> int:
     )
 
 
-async def unacknowledged_attempt_count(session: AsyncSession, o: Owned) -> int:
-    """Earlier NOT_ACKNOWLEDGED expiries of this subtask (free until the cap, ADR-0014)."""
-    return int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(SubtaskAttempt)
-                .where(
-                    SubtaskAttempt.team == o.team,
-                    SubtaskAttempt.project == o.project,
-                    SubtaskAttempt.task_name == o.task_name,
-                    SubtaskAttempt.subtask_id == o.subtask_id,
-                    _unacked_expiry(),
-                )
-            )
-        ).scalar_one()
-    )
-
-
 async def finish_attempt(
     session: AsyncSession,
     o: Owned,
@@ -195,31 +217,13 @@ async def finish_attempt(
     `error` goes on both rows; `attempt_error` (a release reason) only on the attempt history.
     """
     await session.execute(
-        pg_insert(SubtaskAttempt).values(
-            team=o.team,
-            project=o.project,
-            task_name=o.task_name,
-            subtask_id=o.subtask_id,
-            attempt=o.attempt,
-            acquirement_id=o.acquirement_id,
-            executor_id=o.executor_id,
-            outcome=outcome.value,
-            started_at=o.acquired_at,
-            # SQL NULL (not JSON null) when there is no error / release reason
-            error=(error if error is not None else attempt_error) or null(),
-        )
+        pg_insert(SubtaskAttempt).values(**attempt_row(o, outcome, error, attempt_error))
     )
     await session.execute(
         SubtaskAcquirement.__table__.delete().where(  # type: ignore[attr-defined]
             SubtaskAcquirement.acquirement_id == o.acquirement_id
         )
     )
-    values: dict[str, Any] = {
-        "status": subtask_status.value,
-        "error": error if error is not None else null(),
-    }
-    if output_uri is not None:
-        values["output_uri"] = output_uri
     await session.execute(
         update(Subtask)
         .where(
@@ -228,7 +232,7 @@ async def finish_attempt(
             Subtask.task_name == o.task_name,
             Subtask.subtask_id == o.subtask_id,
         )
-        .values(**values)
+        .values(**subtask_values(subtask_status, error, output_uri))
     )
 
 

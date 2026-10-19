@@ -16,10 +16,17 @@ from httpx import ASGITransport, AsyncClient
 from minion_common.enums import SubtaskStatus
 from minion_server.app import create_app
 from minion_server.services.completion import next_status
-from minion_server.services.reclaim import ReclaimResult, reclaim_one, reclaim_stale, settle_stuck
+from minion_server.services.reclaim import (
+    ReclaimResult,
+    reclaim_chunk,
+    reclaim_one,
+    reclaim_stale,
+    settle_stuck,
+)
 from minion_server.settings import ServerSettings
 from pydantic import SecretStr
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import TEST_MODELS_FILE, S3Env, _auth, _req, make_executors, seed_task
@@ -549,14 +556,14 @@ async def test_reclaim_stale_continues_after_failing_id(
     owned = await _acquire_all(c, execs)
     await _backdate(sm)
     poisoned = owned[0]["acquirement_id"]
-    real = mod.reclaim_one
+    real = mod.reclaim_chunk
 
-    async def flaky(session: AsyncSession, aid: Any, **kw: Any) -> ReclaimResult:
-        if str(aid) == poisoned:
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        if any(str(i) == poisoned for i in ids):  # poisons the chunk and the 1-id retry
             raise RuntimeError("boom")
-        return await real(session, aid, **kw)
+        return await real(session, ids, **kw)
 
-    monkeypatch.setattr(mod, "reclaim_one", flaky)
+    monkeypatch.setattr(mod, "reclaim_chunk", flaky)
     res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
     assert res[ReclaimResult.EXPIRED_REQUEUED] == n - 1
     assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(1,)]
@@ -727,3 +734,478 @@ async def test_unacked_reclaim_of_cancelled_task_stays_cancelled(
         await s.execute(text("UPDATE minion_task SET status = 'CANCELLED'"))
     await _ghost_age(sm)
     assert await _reclaim_cap(sm, a["acquirement_id"]) == ReclaimResult.EXPIRED_CANCELLED
+
+
+# --- chunked reclaim (TASK-35) ------------------------------------------------------------------
+
+
+async def _acquire_many(
+    c: AsyncClient, sm: Sm, n: int, name: str
+) -> list[tuple[dict[str, Any], str]]:
+    """n live acquirements (4 per executor, the open-acquirement cap)."""
+    await seed_task(sm, name, n, team=name)
+    execs = await make_executors(sm, (n + 3) // 4)
+    out: list[tuple[dict[str, Any], str]] = []
+
+    for _, tok in execs:  # sequential: concurrent claims fight over the acquire window
+        for _ in range(4):
+            if len(out) < n:
+                out.append((await _acquire(c, tok), tok))
+    assert len(out) == n
+    return out
+
+
+@pytest.mark.integration
+async def test_classify_and_lock_batch(env: tuple[AsyncClient, Any]) -> None:
+    import uuid
+
+    from minion_server.repositories import reclaim as repo
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 4, "cl")
+    fresh, ghost, acked, leased = (uuid.UUID(a["acquirement_id"]) for a, _ in got)
+    async with sm() as s, s.begin():
+        # ghost: aged together with its claim-time beat (never acked); acked: only the beat aged
+        for aid, both in ((ghost, True), (acked, False)):
+            await s.execute(
+                text(
+                    "UPDATE minion_executor_heartbeat SET last_seen_at = now() - interval '1 hour'"
+                    " WHERE acquirement_id = :a"
+                ),
+                {"a": aid},
+            )
+            if both:
+                await s.execute(
+                    text(
+                        "UPDATE minion_subtask_acquirement"
+                        " SET acquired_at = now() - interval '1 hour' WHERE acquirement_id = :a"
+                    ),
+                    {"a": aid},
+                )
+        # leased: fresh beat on top of an old claim
+        await s.execute(
+            text(
+                "UPDATE minion_subtask_acquirement SET acquired_at = now() - interval '1 hour'"
+                " WHERE acquirement_id = :a"
+            ),
+            {"a": leased},
+        )
+        await s.execute(
+            text(
+                "UPDATE minion_executor_heartbeat SET last_seen_at = now()"
+                " WHERE acquirement_id = :a"
+            ),
+            {"a": leased},
+        )
+    ids = [fresh, ghost, acked, leased]
+    async with sm() as s, s.begin():
+        locked = await repo.lock_batch(s, ids)
+        assert locked == sorted(ids)
+        rows = {
+            r.owned.acquirement_id: r
+            for r in await repo.classify_locked(s, locked, timeout_s=TIMEOUT, max_lease_s=1800.0)
+        }
+    flags = {k: (r.stale, r.never_acked, r.over_lease) for k, r in rows.items()}
+    assert flags[fresh] == (False, True, False)  # claim-time beat only, but fresh
+    assert flags[ghost] == (True, True, True)
+    assert flags[acked] == (True, False, False)
+    assert flags[leased] == (False, False, True)
+    assert all(r.budget_used == 0 and r.unacked_used == 0 for r in rows.values())
+
+
+@pytest.mark.integration
+async def test_lock_batch_skips_row_locked_elsewhere(env: tuple[AsyncClient, Any]) -> None:
+    import uuid
+
+    from minion_server.repositories import reclaim as repo
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "lk")
+    ids = [uuid.UUID(a["acquirement_id"]) for a, _ in got]
+    async with sm() as holder, holder.begin():
+        await holder.execute(
+            text("SELECT 1 FROM minion_subtask_acquirement WHERE acquirement_id = :a FOR UPDATE"),
+            {"a": ids[1]},
+        )
+        async with sm() as s, s.begin():
+            locked = await repo.lock_batch(s, ids)
+            assert sorted(locked) == sorted([ids[0], ids[2]])
+            res = await reclaim_chunk(s, ids, timeout_s=TIMEOUT)
+        assert res[ids[1]] == ReclaimResult.SKIPPED
+
+
+@pytest.mark.integration
+async def test_chunk_beat_before_lock_is_not_stale(env: tuple[AsyncClient, Any]) -> None:
+    import uuid
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "bb")
+    await _backdate(sm)
+    ids = [uuid.UUID(a["acquirement_id"]) for a, _ in got]
+    # the unlocked scan saw all three stale; one beat commits before the chunk takes its lock
+    assert (await _call(c, got[1][0], got[1][1], "heartbeat")).status_code == 200
+    async with sm() as s, s.begin():
+        res = await reclaim_chunk(s, ids, timeout_s=TIMEOUT)
+    assert res[ids[1]] == ReclaimResult.NOT_STALE
+    assert res[ids[0]] == res[ids[2]] == ReclaimResult.EXPIRED_REQUEUED
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_attempt") == [(2,)]
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(1,)]
+
+
+@pytest.mark.integration
+async def test_two_replicas_with_concurrent_beats_and_completes(
+    env: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    n = 200
+    got = await _acquire_many(c, sm, n, "rep")
+    outputs = {a["acquirement_id"]: _put_output(s3, "rep", a) for a, _ in got[:40]}
+    assert outputs
+    await _backdate(sm)
+
+    async def beat(a: dict[str, Any], tok: str) -> int:
+        return int((await _call(c, a, tok, "heartbeat")).status_code)
+
+    async def complete(a: dict[str, Any], tok: str) -> int:
+        return int((await _call(c, a, tok, "complete")).status_code)
+
+    kw: dict[str, Any] = {"timeout_s": TIMEOUT, "batch_size": 500}
+    results = await asyncio.gather(
+        reclaim_stale(sm, **kw),
+        reclaim_stale(sm, **kw),
+        *(complete(a, t) for a, t in got[:20]),
+        *(beat(a, t) for a, t in got[20:40]),
+    )
+    await reclaim_stale(sm, **kw)  # mop-up
+    assert set(results[2:]) <= {200, 204, 409}, Counter(results[2:])  # no 500 / deadlock
+    per_acq = await _rows(
+        sm,
+        "SELECT a.acquirement_id, (SELECT count(*) FROM minion_subtask_attempt t"
+        "  WHERE t.acquirement_id = a.acquirement_id) FROM minion_subtask_acquirement a",
+    )
+    assert all(cnt == 0 for _, cnt in per_acq)  # live rows have no attempt (beaten survivors)
+    attempts = await _rows(
+        sm, "SELECT acquirement_id, count(*) FROM minion_subtask_attempt GROUP BY 1"
+    )
+    assert all(cnt == 1 for _, cnt in attempts)
+    assert len(attempts) + len(per_acq) == n
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask WHERE status = 'RUNNING'") == [
+        (len(per_acq),)
+    ]
+    done = await _rows(
+        sm,
+        "SELECT count(*) FROM minion_subtask_attempt WHERE outcome = 'SUCCEEDED'",
+    )
+    assert done == [(sum(1 for r in results[2:22] if r == 204),)]
+    # every other expiry requeued exactly once
+    assert await _rows(
+        sm, "SELECT count(*) FROM minion_subtask_attempt WHERE outcome = 'EXPIRED'"
+    ) == await _rows(sm, "SELECT count(*) FROM minion_subtask WHERE status = 'PENDING'")
+
+
+@pytest.mark.integration
+async def test_chunked_reclaim_statement_count_is_bounded(env: tuple[AsyncClient, Any]) -> None:
+    from sqlalchemy import event
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    n = 250
+    await _acquire_many(c, sm, n, "cnt")
+    await _backdate(sm)
+    seen: list[str] = []
+    engine = sm.kw["bind"].sync_engine
+
+    def count(conn: Any, cur: Any, stmt: str, *a: Any) -> None:
+        seen.append(stmt)
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=1000)
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == n
+    chunks = 3  # RECLAIM_CHUNK = 100
+    # scan + per chunk: lock, classify, INSERT, DELETE, UPDATE (+ shard bumps only for FAILED)
+    assert len(seen) <= 1 + chunks * 6, len(seen)
+
+
+def _record_chunks(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    import minion_server.services.reclaim as mod
+
+    sizes: list[int] = []
+    real = mod.reclaim_chunk
+
+    async def spy(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        sizes.append(len(ids))
+        return await real(session, ids, **kw)
+
+    monkeypatch.setattr(mod, "reclaim_chunk", spy)
+    return sizes
+
+
+@pytest.mark.integration
+async def test_two_replicas_mixed_outcomes_counters_and_codes(
+    env: tuple[AsyncClient, Any], s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    n, extra = 120, 10
+    got = await _acquire_many(c, sm, n + extra, "mx")
+    victims, finishers = got[:n], got[n:]
+    ghosts, acked = victims[:40], victims[40:]
+    for a, tok in acked:  # a real beat after the claim: not a ghost
+        assert (await _call(c, a, tok, "heartbeat")).status_code == 200
+    for a, _ in finishers:
+        _put_output(s3, "mx", a)
+    ghost_ids = [a["acquirement_id"] for a, _ in ghosts]
+    acked_ids = [a["acquirement_id"] for a, _ in acked]
+    async with sm() as s, s.begin():
+        await s.execute(
+            text(
+                "UPDATE minion_subtask_acquirement SET acquired_at = now() - interval '1 hour'"
+                " WHERE acquirement_id = ANY(CAST(:g AS uuid[]))"
+            ),
+            {"g": ghost_ids},
+        )  # ghost: claim-time beat aged together with the claim
+        await s.execute(
+            text(
+                "UPDATE minion_executor_heartbeat h SET last_seen_at = a.acquired_at"
+                " FROM minion_subtask_acquirement a WHERE a.acquirement_id = h.acquirement_id"
+                " AND a.acquirement_id = ANY(CAST(:g AS uuid[]))"
+            ),
+            {"g": ghost_ids},
+        )
+        await s.execute(
+            text(
+                "UPDATE minion_executor_heartbeat SET last_seen_at = now() - interval '2 hours'"
+                " WHERE acquirement_id = ANY(CAST(:g AS uuid[]))"
+            ),
+            {"g": acked_ids},
+        )
+        await s.execute(text("UPDATE minion_subtask SET max_attempts = 1 WHERE subtask_id % 2 = 0"))
+    sizes = _record_chunks(monkeypatch)
+    kw: dict[str, Any] = {"timeout_s": TIMEOUT, "batch_size": 500, "unacked_free_cap": 2}
+    r1, r2, *codes = await asyncio.gather(
+        reclaim_stale(sm, **kw),
+        reclaim_stale(sm, **kw),
+        *(_call(c, a, t, "complete") for a, t in finishers),
+    )
+    assert all(x.status_code == 204 for x in codes)
+    total = r1 + r2
+    assert sum(total.values()) - total[ReclaimResult.SKIPPED] == n, total  # no mop-up
+    assert min(sizes) > 1, sizes  # the row-by-row fallback never ran
+    subs = {
+        sid: (st, code)
+        for sid, st, code in await _rows(
+            sm, "SELECT subtask_id, status, error->>'code' FROM minion_subtask"
+        )
+    }
+    ghost_sids = {a["subtask_id"] for a, _ in ghosts}
+    victim_sids = {a["subtask_id"] for a, _ in victims}
+    for sid, (st, code) in subs.items():
+        if sid in ghost_sids:
+            assert (st, code) == ("PENDING", None)  # NOT_ACKNOWLEDGED lives on the history only
+        elif sid in victim_sids:
+            assert code == "HEARTBEAT_TIMEOUT"
+            assert st == ("FAILED" if sid % 2 == 0 else "PENDING")
+        else:
+            assert st == "SUCCEEDED"
+    want: dict[int, int] = {}
+    for sid, (st, _) in subs.items():
+        if st == "FAILED":
+            want[sid % 16] = want.get(sid % 16, 0) + 1
+    shards = dict(
+        await _rows(sm, "SELECT shard, failed FROM minion_task_counter WHERE task_name = 'mx'")
+    )
+    assert {k: v for k, v in shards.items() if v} == want
+    assert dict(
+        await _rows(
+            sm,
+            "SELECT error->>'code', count(*) FROM minion_subtask_attempt"
+            " WHERE outcome = 'EXPIRED' GROUP BY 1",
+        )
+    ) == {"NOT_ACKNOWLEDGED": 40, "HEARTBEAT_TIMEOUT": 80}
+
+
+@pytest.mark.integration
+async def test_partial_chunk_write_rolls_back_before_fallback(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.repositories import reclaim as repo_mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    n = 5
+    await _acquire_many(c, sm, n, "pw")
+    await _backdate(sm)
+    real = repo_mod.finish_reclaimed
+    calls = 0
+
+    async def write_then_boom(session: AsyncSession, items: Any) -> None:
+        nonlocal calls
+        calls += 1
+        await real(session, items)  # real writes in the open transaction ...
+        if calls == 1:
+            raise RuntimeError("boom after writes")  # ... then fail the chunk once
+
+    monkeypatch.setattr(repo_mod, "finish_reclaimed", write_then_boom)
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == n
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(0,)]
+    assert await _rows(
+        sm, "SELECT count(*), count(DISTINCT acquirement_id) FROM minion_subtask_attempt"
+    ) == [(n, n)]
+
+
+@pytest.mark.integration
+async def test_failing_row_is_quarantined_for_next_cycles(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 4, "qq")
+    await _backdate(sm)
+    poisoned = got[0][0]["acquirement_id"]
+    real = mod.reclaim_chunk
+    seen: list[list[str]] = []
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        seen.append([str(i) for i in ids])
+        if any(str(i) == poisoned for i in ids):
+            raise RuntimeError("boom")
+        return await real(session, ids, **kw)
+
+    monkeypatch.setattr(mod, "reclaim_chunk", flaky)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert len(seen) == 1 + 4  # the chunk, then each row alone
+    seen.clear()
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert not res and seen == []  # quarantined: not retried (and nothing else is stale)
+
+
+@pytest.mark.integration
+async def test_quarantined_rows_do_not_hold_the_scan_slots(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import uuid
+
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 4, "qs")
+    ids = [a["acquirement_id"] for a, _ in got]
+    async with sm() as s, s.begin():  # the three oldest are quarantined, one newer is stale
+        for i, aid in enumerate(ids):
+            await s.execute(
+                text(
+                    "UPDATE minion_executor_heartbeat SET last_seen_at ="
+                    " now() - make_interval(hours => 5 - :i) WHERE acquirement_id = :a"
+                ),
+                {"i": i, "a": aid},
+            )
+    for aid in ids[:3]:
+        mod._QUARANTINE[uuid.UUID(aid)] = 10**12
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=3)  # LIMIT == quarantined count
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == 1
+    assert await _rows(sm, "SELECT count(*) FROM minion_subtask_acquirement") == [(3,)]
+
+
+@pytest.mark.integration
+async def test_transient_errors_never_quarantine(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 3, "tr")
+    await _backdate(sm)
+
+    async def down(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        raise OperationalError("SELECT 1", {}, Exception("connection lost"))
+
+    monkeypatch.setattr(mod, "reclaim_chunk", down)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert mod._QUARANTINE == {}
+
+
+@pytest.mark.integration
+async def test_quarantine_expires_and_is_capped(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import minion_server.services.reclaim as mod
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    got = await _acquire_many(c, sm, 3, "ex")
+    await _backdate(sm)
+    real = mod.reclaim_chunk
+    poison = True
+
+    async def flaky(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        if poison:
+            raise RuntimeError("boom")
+        return await real(session, ids, **kw)
+
+    monkeypatch.setattr(mod, "reclaim_chunk", flaky)
+    monkeypatch.setattr(mod, "_QUARANTINE_MAX", 2)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert len(mod._QUARANTINE) == 2  # the cap holds
+    # time passes: the quarantine lapses and the rows are reclaimed again
+    import time
+    from types import SimpleNamespace
+
+    clock = time.monotonic() + mod.QUARANTINE_S + 1
+
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock))
+    poison = False
+    res = await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert res[ReclaimResult.EXPIRED_REQUEUED] == len(got)
+    assert mod._QUARANTINE == {}
+
+
+class _PgError(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("sqlstate", "quarantined"),
+    [
+        ("40P01", False),  # deadlock
+        ("40001", False),  # serialization failure
+        ("57014", False),  # statement_timeout
+        ("55P03", False),  # lock_not_available
+        ("53300", False),  # too_many_connections
+        ("57P03", False),  # cannot_connect_now
+        ("08006", False),  # connection failure
+        ("23505", True),  # unique violation: about the row
+        ("22P02", True),  # invalid text representation: about the row
+    ],
+)
+async def test_sqlstate_classifies_quarantine(
+    env: tuple[AsyncClient, Any], monkeypatch: pytest.MonkeyPatch, sqlstate: str, quarantined: bool
+) -> None:
+    import minion_server.services.reclaim as mod
+    from sqlalchemy.exc import DBAPIError
+
+    c, app = env
+    sm: Sm = app.state.sessionmaker
+    await _acquire_many(c, sm, 2, "ss")
+    await _backdate(sm)
+
+    async def fail(session: AsyncSession, ids: Any, **kw: Any) -> Any:
+        raise DBAPIError("stmt", {}, _PgError(sqlstate))
+
+    monkeypatch.setattr(mod, "reclaim_chunk", fail)
+    await reclaim_stale(sm, timeout_s=TIMEOUT, batch_size=100)
+    assert (len(mod._QUARANTINE) == 2) is quarantined
