@@ -202,7 +202,10 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             route=getattr(route, "path", None),
             method=request.method,
             errors=[
-                {"loc": [_safe_loc_part(part) for part in err.get("loc", ())], "type": str(err.get("type"))}
+                {
+                    "loc": [_safe_loc_part(part) for part in err.get("loc", ())],
+                    "type": str(err.get("type")),
+                }
                 for err in exc.errors()
             ],
         )
