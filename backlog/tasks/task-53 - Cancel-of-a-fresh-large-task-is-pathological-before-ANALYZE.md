@@ -1,10 +1,10 @@
 ---
 id: TASK-53
 title: Cancel of a fresh large task is pathological before ANALYZE
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-20 02:19'
-updated_date: '2026-10-20 03:07'
+updated_date: '2026-10-20 03:40'
 labels:
   - perf
   - server
