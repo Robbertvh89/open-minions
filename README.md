@@ -483,6 +483,17 @@ Workflow: every change starts with a [Backlog.md](backlog/) task, one branch and
 Conventional Commits, as described in CLAUDE.md and `.claude/skills/feature-workflow`. Decisions that
 deviate from the paper get an ADR in `docs/adr/`.
 
+## Upgrading
+
+Migration 0013 (task counters, TASK-16) needs a quiet database: it blocks writes to `minion_subtask`
+while it backfills, and an old server would not maintain the new `cancelled` counter. Compose does
+not stop a running server before `migrate` runs, so stop them first:
+
+```bash
+docker compose -f deploy/compose.yml --profile app stop server watchdog
+docker compose -f deploy/compose.yml --profile app up -d --build
+```
+
 ## Known limitations
 
 - **NF-7 (no visible harm during video calls) is not met everywhere.** The synthetic foreground

@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-17 07:22'
-updated_date: '2026-10-20 02:18'
+updated_date: '2026-10-20 02:25'
 labels:
   - server
   - performance
@@ -22,11 +22,9 @@ GET /tasks aggregates every subtask of up to 100 tasks per page (up to ~10M rows
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 List/detail counts read O(1) per task
-- [x] #2 Counters stay consistent under concurrent acquire/complete/reclaim (integration test)
+- [x] #1 Counters stay consistent under concurrent acquire/complete/reclaim (integration test)
+- [x] #2 List/detail counts read without scanning subtasks; per task O(16 shards + open acquirements <= executors x MINION_MAX_OPEN_ACQUIREMENTS)
 <!-- AC:END -->
-
-
 
 ## Implementation Plan
 
@@ -352,3 +350,9 @@ Postgres and S3).
 
 5 steps, each at most about 250 changed lines, in one PR. No sub-tasks are needed.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+AC (list/detail without scanning subtasks) evidenced by test_counts_plans_never_touch_subtasks (EXPLAIN, 20k subtasks) and test_list_tasks_counts_one_statement. Bound accepted: running = acquirement rows <= executors x MINION_MAX_OPEN_ACQUIREMENTS (ADR-0015 addendum).
+<!-- SECTION:NOTES:END -->

@@ -420,7 +420,7 @@ sequential per task and deterministic from the input. `attempt` is an integer �
 `team, project, task_name, type, model, input_uri, output_uri, params, records_per_subtask, priority,
 allowed_pool, status` (`SPLITTING | PENDING | RUNNING | SUCCEEDED | FAILED | PARTIAL | CANCELLED`),
 `created_by` (the API key's name), `created_at`, `finished_at` (null until terminal), `error` (null or a
-short diagnostic), `counts: {total, pending, running, succeeded, failed, cancelled}`.
+short diagnostic), `counts: {total, pending, running, succeeded, failed, cancelled}`; `pending` is derived as `max(0, total - running - succeeded - failed - cancelled)` and reads 0 while the task is SPLITTING or its split never finished.
 
 ## 7. Data model (PostgreSQL — 8 tables)
 
@@ -528,7 +528,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   use `ignore`). `on_call = "light"` on a pinned executor reveals calls the same way. `on_call = "pause"` reveals it outright (`paused_reason = in_call`); `"light"` caps pinned
   profiles too. Set `on_call = "ignore"` in `executor.toml` to avoid it. The microphone/camera state
   itself is never sent (the local status file only).
-- S-12. Read-endpoint cost **[ours]**. `GET /tasks` and the task detail read the per-status counts from the counter shards and the task's acquirement rows (bounded by executors x `MINION_MAX_OPEN_ACQUIREMENTS`), never from `minion_subtask`; `pending` is derived as `max(0, total - running - succeeded - failed - cancelled)`, so it reads 0 while a task is SPLITTING (total is not set yet). ` `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter.
+- S-12. Read-endpoint cost **[ours]**. `GET /tasks` and the task detail read the per-status counts from the counter shards and the task's acquirement rows (bounded by executors x `MINION_MAX_OPEN_ACQUIREMENTS`), never from `minion_subtask`; `pending` is derived as `max(0, total - running - succeeded - failed - cancelled)`, so it reads 0 while a task is SPLITTING (total is not set yet). `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter.
 - S-13. Web UI **[ours]** (ADR-0010). Off (`404`) unless `MINION_UI_SESSION_SECRET` (>= 32 bytes) is set. Login with
   a user API key (checked like an API request; wrong, expired and removed keys all get one `401` page; the
   key is never logged or echoed) sets `minion_session`, a stateless cookie HMAC-SHA256-signed over the key

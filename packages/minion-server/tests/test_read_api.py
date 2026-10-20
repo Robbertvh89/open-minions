@@ -205,7 +205,7 @@ async def test_list_tasks_counts_one_statement(http: tuple[AsyncClient, Any]) ->
                 s, teams=["ra"], project=None, status=None, after=None, limit=n
             )
         assert len(rows) == n and len(stmts) == 1  # page and counts in one statement
-        assert "minion_subtask " not in stmts[0].replace("minion_subtask_acquirement", "")
+        assert not re.search(r"\bminion_subtask\b(?!_)", stmts[0])
     stmts.clear()
     async with sm() as s, s.begin():
         got = await repo.get_task(s, "ra", "p", "q00")

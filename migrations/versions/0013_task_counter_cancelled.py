@@ -8,8 +8,9 @@ List/detail counts read counters instead of aggregating `minion_subtask` (ADR-00
 Backfills `cancelled` from the existing CANCELLED rows.
 
 Deploy like 0011: stop the servers and the watchdog first. The backfill scans `minion_subtask`
-once while writers are blocked (SHARE lock); the lock_timeout makes it fail fast if something is
-still running. A rolling deploy is unsafe: an old server would not bump `cancelled`.
+once while writers are blocked (SHARE lock). lock_timeout makes it fail fast if something still
+holds a conflicting lock; statement_timeout (15 min) aborts a mistaken run with servers up instead
+of stalling indefinitely. A rolling deploy is unsafe: an old server would not bump `cancelled`.
 """
 
 from collections.abc import Sequence
@@ -24,8 +25,9 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
-    op.execute("LOCK TABLE minion_task_counter IN ACCESS EXCLUSIVE MODE")
+    op.execute("SET LOCAL statement_timeout = '15min'")
     op.execute("LOCK TABLE minion_subtask IN SHARE MODE")  # no status change during the backfill
+    op.execute("LOCK TABLE minion_task_counter IN ACCESS EXCLUSIVE MODE")
     op.execute("ALTER TABLE minion_task_counter ADD COLUMN cancelled integer NOT NULL DEFAULT 0")
     op.execute(
         "ALTER TABLE minion_task_counter "

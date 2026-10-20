@@ -25,7 +25,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.orm.util import AliasedClass
 
 from minion_server.db.models import Subtask, SubtaskAcquirement, Task, TaskCounter
-from minion_server.repositories.completion import bump_cancelled
+from minion_server.repositories.completion import bump_cancelled, shard_sum
 
 OUTPUT_URI_CONSTRAINT = "uq_minion_task_output_uri"
 
@@ -94,17 +94,6 @@ def _count_columns(t: type[Task] | AliasedClass[Task]) -> tuple[ColumnElement[in
     executors x MINION_MAX_OPEN_ACQUIREMENTS across all tasks); never `minion_subtask`.
     """
 
-    def shard_sum(col: Any) -> ColumnElement[int]:
-        return (
-            select(func.coalesce(func.sum(col), 0))
-            .where(
-                TaskCounter.team == t.team,
-                TaskCounter.project == t.project,
-                TaskCounter.task_name == t.task_name,
-            )
-            .scalar_subquery()
-        )
-
     running = (
         select(func.count())
         .select_from(SubtaskAcquirement)
@@ -117,9 +106,9 @@ def _count_columns(t: type[Task] | AliasedClass[Task]) -> tuple[ColumnElement[in
     )
     return (
         running,
-        shard_sum(TaskCounter.succeeded),
-        shard_sum(TaskCounter.failed),
-        shard_sum(TaskCounter.cancelled),
+        shard_sum(t, TaskCounter.succeeded),
+        shard_sum(t, TaskCounter.failed),
+        shard_sum(t, TaskCounter.cancelled),
     )
 
 

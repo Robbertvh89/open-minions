@@ -311,26 +311,27 @@ class TaskKey:
     task_name: str
 
 
+def shard_sum(t: Any, col: Any) -> Any:
+    """Correlated scalar subquery: sum of counter column `col` over the shards of task row `t`."""
+    return (
+        select(func.coalesce(func.sum(col), 0))
+        .where(
+            TaskCounter.team == t.team,
+            TaskCounter.project == t.project,
+            TaskCounter.task_name == t.task_name,
+        )
+        .scalar_subquery()
+    )
+
+
 async def task_counts(session: AsyncSession, key: TaskKey) -> TaskCounts | None:
     """Task status, total and the shard sums; None if the task is gone."""
     row = (
         await session.execute(
             select(
                 Task.total_subtasks,
-                select(func.coalesce(func.sum(TaskCounter.succeeded), 0))
-                .where(
-                    TaskCounter.team == Task.team,
-                    TaskCounter.project == Task.project,
-                    TaskCounter.task_name == Task.task_name,
-                )
-                .scalar_subquery(),
-                select(func.coalesce(func.sum(TaskCounter.failed), 0))
-                .where(
-                    TaskCounter.team == Task.team,
-                    TaskCounter.project == Task.project,
-                    TaskCounter.task_name == Task.task_name,
-                )
-                .scalar_subquery(),
+                shard_sum(Task, TaskCounter.succeeded),
+                shard_sum(Task, TaskCounter.failed),
                 Task.status,
             ).where(
                 Task.team == key.team, Task.project == key.project, Task.task_name == key.task_name
