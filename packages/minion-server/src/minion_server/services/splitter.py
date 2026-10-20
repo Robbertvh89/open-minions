@@ -382,14 +382,15 @@ async def _retry(
     error_class: str,
     tid: str,
 ) -> None:
-    # `task.split_attempts` already includes this attempt (bumped by the claim).
-    if task.split_attempts >= limits.max_attempts:
-        await _fail(sessionmaker, task, f"splitting failed after {task.split_attempts} attempts")
+    # A real failure: count it. The claim is fenced, so `task.split_failures` is exact.
+    failures = task.split_failures + 1
+    if failures >= limits.max_attempts:
+        await _fail(sessionmaker, task, f"splitting failed after {failures} attempts")
         log.error("task_split_gave_up", task=tid, error_class=error_class)
         return
-    delay = backoff_s(task.split_attempts, limits)
+    delay = backoff_s(failures, limits)
     async with sessionmaker() as s, s.begin():
-        if not await tasks_repo.schedule_split_retry(s, task, delay):
+        if not await tasks_repo.schedule_split_retry(s, task, delay, failed=True):
             log.warning("task_split_lease_lost", task=tid)
             return
     log.warning("task_split_retry", task=tid, error_class=error_class, delay_s=delay)

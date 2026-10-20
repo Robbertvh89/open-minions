@@ -763,10 +763,13 @@ async def test_split_wall_clock_budget_backs_off(
 
 
 @pytest.mark.integration
-async def test_claim_fails_exhausted_tasks_crash_loop(fresh_engine: AsyncEngine) -> None:
+async def test_claim_hard_cap_fails_crash_loop_without_recorded_failures(
+    fresh_engine: AsyncEngine,
+) -> None:
     await _insert_task(fresh_engine, "fz5", "loop")
     sm = create_sessionmaker(fresh_engine)
-    for expected in (1, 2):  # claims whose holder crashed before any retry/fail bookkeeping
+    cap = 2 * tasks_repo.SPLIT_CLAIM_CAP_FACTOR
+    for expected in range(1, cap + 1):  # holders that crashed before any retry/fail bookkeeping
         async with sm() as s, s.begin():
             t = await tasks_repo.claim_splitting(s, 900, 2)
         assert t is not None and t.split_attempts == expected
@@ -775,7 +778,65 @@ async def test_claim_fails_exhausted_tasks_crash_loop(fresh_engine: AsyncEngine)
     async with sm() as s, s.begin():
         assert await tasks_repo.claim_splitting(s, 900, 2) is None
     status, error, attempts, _ = await _task_row(fresh_engine, "loop")
-    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", 2)
+    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", cap)
+
+
+@pytest.mark.integration
+async def test_restarts_and_released_leases_never_exhaust_a_valid_task(
+    fresh_engine: AsyncEngine,
+) -> None:
+    await _insert_task(fresh_engine, "fz7", "restarts")
+    sm = create_sessionmaker(fresh_engine)
+    limit = 3
+    for expected in range(1, 3 * limit + 1):  # many more claims than the failure limit
+        async with sm() as s, s.begin():
+            t = await tasks_repo.claim_splitting(s, 900, limit)
+        assert t is not None and t.split_attempts == expected
+        if expected % 2:  # shutdown: fenced release, no failure recorded
+            async with sm() as s, s.begin():
+                assert await tasks_repo.schedule_split_retry(s, t, 0)
+        else:  # crashed holder: the lease just expires
+            async with fresh_engine.begin() as conn:
+                await conn.execute(EXPIRE, {"n": "restarts"})
+    status, error, attempts, _ = await _task_row(fresh_engine, "restarts")
+    assert (status, error, attempts) == ("SPLITTING", None, 3 * limit)
+    async with fresh_engine.connect() as conn:
+        failures = (await conn.execute(text("SELECT split_failures FROM minion_task"))).scalar_one()
+    assert failures == 0
+
+
+@pytest.mark.integration
+async def test_real_split_failures_exhaust_at_the_limit(
+    fresh_engine: AsyncEngine, storage: S3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _insert_task(fresh_engine, "fz8", "flaky")
+    sm = create_sessionmaker(fresh_engine)
+
+    async def boom(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(S3Storage, "list_objects", boom)
+    lim = SplitLimits(max_attempts=3, backoff_base_s=0)
+    for n in (1, 2):
+        assert await split_one(sm, storage, lim)
+        async with fresh_engine.connect() as conn:
+            row = (await conn.execute(text("SELECT status, split_failures FROM minion_task"))).one()
+        assert tuple(row) == ("SPLITTING", n)
+    assert await split_one(sm, storage, lim)  # third real failure
+    status, error, attempts, _ = await _task_row(fresh_engine, "flaky")
+    assert status == "FAILED" and error == "splitting failed after 3 attempts" and attempts == 3
+
+
+@pytest.mark.integration
+async def test_claim_fails_task_with_exhausted_failures(fresh_engine: AsyncEngine) -> None:
+    await _insert_task(fresh_engine, "fz9", "spent")
+    async with fresh_engine.begin() as conn:
+        await conn.execute(text("UPDATE minion_task SET split_failures=2"))
+    sm = create_sessionmaker(fresh_engine)
+    async with sm() as s, s.begin():
+        assert await tasks_repo.claim_splitting(s, 900, 2) is None
+    status, error, attempts, _ = await _task_row(fresh_engine, "spent")
+    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", 0)
 
 
 @pytest.mark.integration

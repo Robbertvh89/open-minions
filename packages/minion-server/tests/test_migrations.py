@@ -386,3 +386,15 @@ def test_0014_team_live_index_round_trip(fresh_url: str) -> None:
     assert not asyncio.run(_index_exists(fresh_url, name))
     command.upgrade(cfg, "head")
     assert asyncio.run(_index_exists(fresh_url, name))
+
+
+def test_0016_split_failures_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "split_failures"))
+    assert asyncio.run(_has_constraint(fresh_url, "ck_minion_task_split_failures_nonneg"))
+    command.downgrade(cfg, "0014")
+    assert not asyncio.run(_has_column(fresh_url, "minion_task", "split_failures"))
+    assert not asyncio.run(_has_constraint(fresh_url, "ck_minion_task_split_failures_nonneg"))
+    assert asyncio.run(_has_column(fresh_url, "minion_task", "split_attempts"))
+    command.upgrade(cfg, "head")

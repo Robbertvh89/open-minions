@@ -4,7 +4,7 @@ title: 'Splitter: count split failures separately from claims'
 status: In Progress
 assignee: []
 created_date: '2026-10-20 04:46'
-updated_date: '2026-10-20 05:21'
+updated_date: '2026-10-20 05:27'
 labels:
   - server
   - splitter
@@ -20,6 +20,6 @@ From TASK-11 review: claim_splitting bumps split_attempts on every claim and the
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 N restarts during one long split never exhaust a valid task (test)
-- [ ] #2 Fencing token semantics unchanged; migration up/down tested
+- [x] #1 N restarts during one long split never exhaust a valid task (test)
+- [x] #2 Fencing token semantics unchanged; migration up/down tested
 <!-- AC:END -->
