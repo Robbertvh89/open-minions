@@ -403,7 +403,13 @@ ends as `FAILED` or `PARTIAL`. See `minion status NAME` and the executor log.
   the S3 backend enforces the signed `Range` (signed Range 206, none/other 403, `If-Range` never
   widens). Exit 0 = enforcing, 1 = not (the observed `(status, length)` per check is printed; input
   URLs are not slice-scoped then, SPEC S-2), 2 = config/connectivity error. Rerun after changing the
-  S3 backend or proxy.
+  S3 backend or proxy. It needs the server settings (`MINION_DATABASE_URL` is required by
+  `ServerSettings` although no DB access happens, plus `MINION_S3_*`), prints the endpoint host it
+  used, and should run from a network position like the executors' (the public endpoint, through
+  the same proxy). There must be no caching layer in front of the presigned S3 endpoint (a cache
+  could serve a slice or body to a request whose signature was never checked). A crashed run can
+  leave a probe object; the next run removes probes older than 1 h, and an S3 lifecycle rule
+  expiring `_preflight/check-storage/` after 1 day is a good backstop.
 - **API keys:** `uv run minion-server-admin generate-api-key --name <who> --teams a,b
   [--operator] [--expires-days N]`; add the entry to the keys file (live-reloaded within 5 s); delete
   the entry to revoke.
@@ -519,7 +525,7 @@ docker compose -f deploy/compose.yml --profile app up -d --build
   metered.
 - **Output size is capped by the S3 policy, not the quota.** Use a bucket quota and lifecycle rules
   (SPEC S-2, [ADR-0017](docs/adr/0017-presigned-post-output-uploads.md)).
-- **Signed `Range` reads are not verified on SeaweedFS** (the dev S3); AWS S3 and MinIO enforce them.
+- **Signed `Range` enforcement depends on the S3 backend.** Verify yours with `minion-server-admin check-storage` (the dev SeaweedFS passes). Per-prefix bucket policies are out of scope: input URLs are scoped per object and slice only.
 - **Server logs are plain, not JSON** (the watchdog's are structured; TASK-17).
 - **Ollama is opt-in and not benchmarked** (TASK-13): its daemon runs outside the sandbox and the
   capacity budget ([ADR-0009](docs/adr/0009-offline-sandboxed-inference-worker.md)). Ollama

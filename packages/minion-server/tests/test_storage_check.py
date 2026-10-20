@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 from minion_server import storage_check
 from minion_server.admin import app
@@ -11,7 +13,8 @@ from conftest import S3Env
 
 
 def _enforcing(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
-    return (206, SLICE_BODY) if headers.get("Range") == "bytes=4-9" else (403, b"")
+    ok = headers.get("Range") == "bytes=4-9" and "X-Amz-Signature=sigvalue" in url
+    return (206, SLICE_BODY) if ok else (403, b"")
 
 
 def _lax(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
@@ -20,7 +23,7 @@ def _lax(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
 
 
 def _widening(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
-    if "If-Range" in headers:
+    if headers.get("If-Range", "").startswith('"'):
         return 200, PROBE_BODY
     return _enforcing(url, headers)
 
@@ -31,6 +34,9 @@ class FakeStorage(S3Storage):
         self.deletes: list[str] = []
         self.fail_put = False
 
+    async def discard_stale(self, prefix: str, older_than_s: int) -> None:
+        pass
+
     async def put(self, key: str, data: bytes) -> None:
         if self.fail_put:
             raise OSError("boom")
@@ -40,7 +46,7 @@ class FakeStorage(S3Storage):
         self, key: str, ttl_s: int | None = None, byte_range: tuple[int, int] | None = None
     ) -> str:
         assert byte_range == (4, 10)
-        return "http://s3.invalid/b/k?X-Amz-Signature=secret"
+        return "http://s3.invalid/b/k?X-Amz-Signature=sigvalue"
 
     async def delete(self, key: str) -> None:
         self.deletes.append(key)
@@ -49,7 +55,7 @@ class FakeStorage(S3Storage):
 async def test_enforcing_backend_passes_and_probe_deleted() -> None:
     st = FakeStorage()
     checks = await run_check(st, _enforcing)
-    assert all(c.ok for c in checks) and len(checks) == 4
+    assert all(c.ok for c in checks) and len(checks) == 7
     assert st.puts == st.deletes and st.puts[0].startswith(storage_check.PROBE_PREFIX)
 
 
@@ -63,7 +69,7 @@ async def test_non_enforcing_backend_fails_with_observed_tuples() -> None:
 
 async def test_if_range_widening_fails() -> None:
     checks = await run_check(FakeStorage(), _widening)
-    assert [c.ok for c in checks] == [True, True, True, False]
+    assert [c.ok for c in checks] == [True, True, True, False, True, True, True]
 
 
 async def test_probe_deleted_when_fetch_raises() -> None:
@@ -81,8 +87,10 @@ def _patch(monkeypatch: pytest.MonkeyPatch, fetch: storage_check.Fetch) -> FakeS
     monkeypatch.setattr("minion_server.storage.S3Storage", lambda settings: st)
     orig = storage_check.run_check
 
-    async def run(storage: S3Storage, f: storage_check.Fetch = fetch) -> list[storage_check.Check]:
-        return await orig(storage, f)
+    async def run(
+        storage: S3Storage, f: storage_check.Fetch = fetch, warn: Any = None
+    ) -> list[storage_check.Check]:
+        return await orig(storage, f, warn)
 
     monkeypatch.setattr(storage_check, "run_check", run)
     return st
@@ -139,6 +147,66 @@ async def test_seaweedfs_observed_behaviour(s3: S3Env) -> None:
         "signed Range": (206, 6),
         "no Range": (403, 0),
         "different Range": (403, 0),
-        "If-Range does not widen": (206, 6),
+        "If-Range (ETag) does not widen": (206, 6),
+        "If-Range (HTTP date) does not widen": (206, 6),
+        "unsigned GET (no query)": (403, 0),
+        "tampered signature": (403, 0),
     }
     assert all(c.ok for c in checks)
+
+
+async def test_failing_probe_delete_keeps_results_and_warns() -> None:
+    st = FakeStorage()
+
+    async def bad_delete(key: str) -> None:
+        raise OSError("s3 down")
+
+    st.delete = bad_delete  # type: ignore[method-assign]
+    warnings: list[str] = []
+    checks = await run_check(st, _enforcing, warnings.append)
+    assert all(c.ok for c in checks)
+    assert warnings and "_preflight/check-storage/" in warnings[0]
+
+
+def test_cli_http_client_error_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    import http.client
+
+    monkeypatch.setenv("MINION_DATABASE_URL", "postgresql+asyncpg://x@h/db")
+    monkeypatch.setenv("MINION_S3_ACCESS_KEY", "ak")
+    monkeypatch.setenv("MINION_S3_SECRET_KEY", "sk")
+
+    def bad(url: str, headers: dict[str, str]) -> tuple[int, bytes]:
+        raise http.client.IncompleteRead(b"")
+
+    _patch(monkeypatch, bad)
+    assert CliRunner().invoke(app, ["check-storage"]).exit_code == 2
+
+
+async def test_discard_stale_deletes_only_old_objects() -> None:
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import MagicMock
+
+    from minion_server.storage import S3Storage as Real
+
+    now = datetime.now(UTC)
+    st = Real(
+        ServerSettings(
+            database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+            s3_access_key=SecretStr("ak"),
+            s3_secret_key=SecretStr("sk"),
+        )
+    )
+    client = MagicMock()
+    client.get_paginator.return_value.paginate.return_value = [
+        {
+            "Contents": [
+                {"Key": "old", "LastModified": now - timedelta(hours=2)},
+                {"Key": "new", "LastModified": now},
+            ]
+        }
+    ]
+    st._client = client
+    await st.discard_stale("p/", 3600)
+    client.delete_object.assert_called_once_with(Bucket=st.bucket, Key="old")
+    client.get_paginator.side_effect = OSError  # best effort and quiet
+    await st.discard_stale("p/", 3600)

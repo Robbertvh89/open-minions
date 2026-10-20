@@ -6,15 +6,21 @@ dedicated prefix, presigns exactly like production (`S3Storage.presign_get` with
 checks what the backend answers. Output never contains credentials or a presigned URL.
 """
 
+import asyncio
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from minion_common.schemas import range_header
 
 from minion_server.storage import S3Storage
 
 PROBE_PREFIX = "_preflight/check-storage/"
+STALE_PROBE_AGE_S = 3600
+IF_RANGE_DATE = "Thu, 01 Jan 1970 00:00:00 GMT"
 PROBE_BODY = b"0123456789abcdef"
 SLICE = (4, 10)  # [start, end) -> bytes=4-9
 SLICE_BODY = PROBE_BODY[SLICE[0] : SLICE[1]]
@@ -47,38 +53,63 @@ class Check:
     ok: bool
 
 
+def _unsigned(url: str) -> str:
+    return urlunsplit(urlsplit(url)._replace(query=""))
+
+
+def _tampered(url: str) -> str:
+    parts = urlsplit(url)
+    q = [
+        (k, ("0" * len(v)) if k == "X-Amz-Signature" else v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunsplit(parts._replace(query=urlencode(q)))
+
+
 def evaluate(fetch: Fetch, url: str) -> list[Check]:
-    ranged = {"Range": f"bytes={SLICE[0]}-{SLICE[1] - 1}"}
+    ranged = {"Range": range_header(*SLICE)}
+    other = {"Range": range_header(0, SLICE[1] - SLICE[0])}
     checks: list[Check] = []
 
     def add(name: str, expected: str, res: tuple[int, bytes], ok: bool) -> None:
         checks.append(Check(name, expected, (res[0], len(res[1])), ok))
 
+    def refused(name: str, target: str, headers: dict[str, str]) -> None:
+        res = fetch(target, headers)
+        add(name, "(403, 0)", res, res[0] == 403)
+
     res = fetch(url, ranged)
     add("signed Range", f"(206, {len(SLICE_BODY)}) with the slice", res, res == (206, SLICE_BODY))
-    res = fetch(url, {})
-    add("no Range", "(403, 0)", res, res[0] == 403)
-    res = fetch(url, {"Range": f"bytes=0-{SLICE[1] - SLICE[0] - 1}"})
-    add("different Range", "(403, 0)", res, res[0] == 403)
-    res = fetch(url, ranged | {"If-Range": '"bogus"'})
+    refused("no Range", url, {})
+    refused("different Range", url, other)
     # If-Range is unsigned: refusing (403) or serving the same slice is fine; a wider body is not.
-    add(
-        "If-Range does not widen",
-        f"(403, 0) or (206, {len(SLICE_BODY)})",
-        res,
-        res[0] == 403 or res == (206, SLICE_BODY),
-    )
+    for name, value in (("If-Range (ETag)", '"bogus"'), ("If-Range (HTTP date)", IF_RANGE_DATE)):
+        res = fetch(url, ranged | {"If-Range": value})
+        add(
+            f"{name} does not widen",
+            f"(403, 0) or (206, {len(SLICE_BODY)})",
+            res,
+            res[0] == 403 or res == (206, SLICE_BODY),
+        )
+    refused("unsigned GET (no query)", _unsigned(url), ranged)
+    refused("tampered signature", _tampered(url), ranged)
     return checks
 
 
-async def run_check(storage: S3Storage, fetch: Fetch = urllib_fetch) -> list[Check]:
-    """Run the probe; always deletes the probe object. Connectivity errors propagate (OSError)."""
-    import asyncio
-
+async def run_check(
+    storage: S3Storage,
+    fetch: Fetch = urllib_fetch,
+    warn: Callable[[str], None] = lambda _msg: None,
+) -> list[Check]:
+    """Run the probe; always tries to delete it. Connectivity errors propagate (OSError)."""
+    await storage.discard_stale(PROBE_PREFIX, STALE_PROBE_AGE_S)
     key = f"{PROBE_PREFIX}{uuid.uuid4().hex}"
     try:
         await storage.put(key, PROBE_BODY)
         url = await storage.presign_get(key, 60, SLICE)
         return await asyncio.to_thread(evaluate, fetch, url)
     finally:
-        await storage.delete(key)
+        try:
+            await storage.delete(key)
+        except Exception as exc:  # never replace the results; the key is random, so say where
+            warn(f"probe object not deleted under {PROBE_PREFIX} ({type(exc).__name__})")

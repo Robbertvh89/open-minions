@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import boto3
@@ -158,6 +159,24 @@ class S3Storage:
     async def delete(self, key: str) -> None:
         """Delete one object (idempotent in S3: a missing key is not an error)."""
         await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
+
+    async def discard_stale(self, prefix: str, older_than_s: int) -> None:
+        """Best effort, quiet: delete objects under `prefix` older than `older_than_s` seconds."""
+
+        def _run() -> None:
+            cutoff = datetime.now(UTC) - timedelta(seconds=older_than_s)
+            try:
+                pages = self._client.get_paginator("list_objects_v2").paginate(
+                    Bucket=self._bucket, Prefix=prefix, PaginationConfig={"MaxItems": 1000}
+                )
+                for page in pages:
+                    for o in page.get("Contents", []):
+                        if o["LastModified"] < cutoff:
+                            self._client.delete_object(Bucket=self._bucket, Key=o["Key"])
+            except Exception:  # noqa: S110 - housekeeping only
+                pass
+
+        await asyncio.to_thread(_run)
 
     async def put(self, key: str, data: bytes) -> None:
         """Write one small object (operator preflight probe; payloads use presigned POST)."""
