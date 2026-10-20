@@ -16,6 +16,7 @@ from sqlalchemy import (
     ColumnElement,
     Select,
     and_,
+    case,
     exists,
     func,
     literal,
@@ -40,6 +41,7 @@ from minion_server.db.models import (
 from minion_server.repositories.executors import token_match
 
 CANDIDATE_LIMIT = 16
+WALK_CHUNK = 8  # eligible live tasks fetched per walk step before the pending check
 MAX_WINDOW = 256  # matches ServerSettings.acquire_window le=256
 ACQUIREMENT_CONSTRAINT = "uq_minion_subtask_acquirement_subtask"
 
@@ -104,13 +106,17 @@ def candidates_stmt(
 ) -> Select[Any]:
     """The candidate query (also what the scale harness EXPLAINs).
 
-    A `WITH RECURSIVE` ordered walk (TASK-54, ADR-0021). Each recursion step is a `LIMIT 1`
-    range scan on `ix_minion_task_live_queue ((-priority), created_at, team, project,
-    task_name) WHERE live` that starts after a row-compare cursor, so no plan can read every live
-    task and sort them. A step returns the next eligible live task that still has a PENDING
-    subtask and adds `min(limit, its pending count)` to the running total `got`; the recursion
-    stops once `got >= limit` or no such task is left. The final SELECT takes each visited
-    task's first `limit` PENDING subtasks (LATERAL, ordered by subtask_id) and re-sorts.
+    A `WITH RECURSIVE` ordered walk (TASK-54, ADR-0021). Each recursion step fetches the next
+    `WALK_CHUNK` eligible live tasks after a row-compare cursor, in order, from
+    `ix_minion_task_live_queue ((-priority), created_at, team, project, task_name) WHERE live`
+    (no pending check yet), then takes the first of them that still has a PENDING subtask, or,
+    if none has, the chunk's last row as a "skip" row (NULL model_id, `got` unchanged) so the
+    cursor jumps the whole drained chunk. A real step adds `min(limit, its pending count)` to the
+    running total `got`; the recursion stops once `got >= limit` or no eligible task is left.
+    The final SELECT takes each visited task's first `limit` PENDING subtasks (LATERAL, ordered
+    by subtask_id) and re-sorts. The pending check only ever sees a bounded chunk, so a plan that
+    reads many live tasks per step (statistics of empty tables) costs buffers but not thousands
+    of subtask probes: 281k buffers / 126 ms became ~1.2k buffers / 13 ms in that case.
 
     Order equivalence with the single-join form `ORDER BY priority DESC, created_at, team,
     project, task_name, subtask_id LIMIT k`: the task key is the primary key, so the order is
@@ -119,9 +125,11 @@ def candidates_stmt(
     global first k rows; the outer ORDER BY + LIMIT yields exactly that list.
 
     Every LIMIT is a literal (a generic plan would otherwise assume 10 % of the rows). Cost:
-    O(contributing tasks x 3 probes + skipped live tasks); filtered tasks cost a heap filter,
-    drained tasks one probe each. The read stays unlocked; the acquirement INSERT remains the
-    only arbiter (invariant 2).
+    O(contributing tasks x 3 probes + chunk reads); with usable statistics the walk is an
+    ordered index scan (about 100 buffers at 10k live tasks), without them the planner may
+    bitmap-scan the live tasks once per step (bounded by steps x live tasks, no probes);
+    filtered tasks cost a heap filter, drained tasks one probe each. The read stays unlocked;
+    the acquirement INSERT remains the only arbiter (invariant 2).
     """
     if not 1 <= limit <= MAX_WINDOW:
         raise ValueError(f"limit must be in 1..{MAX_WINDOW}, got {limit}")
@@ -141,14 +149,11 @@ def candidates_stmt(
         literal_column("0::bigint").label("got"),
     ).cte("walk", recursive=True)
     nprio = -Task.priority
-    has_pending = _pending_probe(Task, 1, Subtask.subtask_id).scalar_subquery().is_not(None)
-    # .correlate(Task): without it the count becomes an uncorrelated cartesian product.
-    pending_count = (
-        select(func.count())
-        .select_from(_pending_probe(Task, limit, literal_column("1")).correlate(Task).subquery("c"))
-        .scalar_subquery()
-    )
-    step = (
+    order = (nprio, Task.created_at, Task.team, Task.project, Task.task_name)
+    # Chunk: the next WALK_CHUNK eligible live tasks after the cursor, in index order, WITHOUT the
+    # pending check. The check runs on this bounded set only, so even a plan that scans every live
+    # task (stale statistics) never probes more than WALK_CHUNK of them per step.
+    chunk_q = (
         select(
             nprio.label("nprio"),
             Task.created_at,
@@ -159,7 +164,6 @@ def candidates_stmt(
             Task.output_uri,
             Task.params,
             Task.priority,
-            (walk.c.got + pending_count).label("got"),
         )
         .where(
             Task.status.in_(
@@ -169,19 +173,57 @@ def candidates_stmt(
             Task.engine.in_([e.value for e in engines]),
             Task.model_memory_gb <= Decimal(str(memory_gb)),
             (Task.allowed_pool.is_(None)) | (Task.allowed_pool == pool),
-            has_pending,
-            tuple_(nprio, Task.created_at, Task.team, Task.project, Task.task_name)
+            tuple_(*order)
             > tuple_(
                 walk.c.nprio, walk.c.created_at, walk.c.team, walk.c.project, walk.c.task_name
             ),
         )
-        .order_by(nprio, Task.created_at, Task.team, Task.project, Task.task_name)
-        .limit(literal_column("1"))
+        .order_by(*order)
+        .limit(literal_column(str(WALK_CHUNK)))
+        .correlate(walk)
     )
     if preference is not None:
         for col, value in zip((Task.team, Task.project, Task.task_name), preference, strict=True):
             if value is not None:
-                step = step.where(col == value)
+                chunk_q = chunk_q.where(col == value)
+    ck = chunk_q.subquery("ck")
+    keys = (ck.c.nprio, ck.c.created_at, ck.c.team, ck.c.project, ck.c.task_name)
+    # Mark the chunk's last row: a chunk without any task with PENDING subtasks still returns that
+    # row (as a "skip" row) so the cursor jumps over the whole drained chunk.
+    d = select(
+        *ck.c, (func.row_number().over(order_by=keys) == func.count().over()).label("is_last")
+    ).subquery("d")
+    dkeys = (d.c.nprio, d.c.created_at, d.c.team, d.c.project, d.c.task_name)
+    first_live = (
+        select(*(c for c in d.c if c.key != "is_last"))
+        .where(
+            d.c.is_last | _pending_probe(d.c, 1, Subtask.subtask_id).scalar_subquery().is_not(None)
+        )
+        .order_by(*dkeys)
+        .limit(literal_column("1"))
+        .subquery("pk")
+    )
+    pc = (
+        select(func.count().label("n"))
+        .select_from(
+            _pending_probe(first_live.c, limit, literal_column("1"))
+            .correlate(first_live)
+            .subquery("c")
+        )
+        .lateral("pc")
+    )
+    step = select(
+        first_live.c.nprio,
+        first_live.c.created_at,
+        first_live.c.team,
+        first_live.c.project,
+        first_live.c.task_name,
+        case((pc.c.n > 0, first_live.c.model_id)).label("model_id"),  # NULL = skip row
+        first_live.c.output_uri,
+        first_live.c.params,
+        first_live.c.priority,
+        (walk.c.got + pc.c.n).label("got"),
+    ).select_from(first_live.join(pc, true()))
     nx = step.lateral("nx")
     walk = walk.union_all(select(*nx.c).select_from(walk).join(nx, true()).where(walk.c.got < lim))
     s = _pending_probe(

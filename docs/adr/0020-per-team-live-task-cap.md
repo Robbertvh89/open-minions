@@ -70,3 +70,11 @@ unrunnable tasks need 10 teams at their cap. Measured with 5,000 such tasks
   a re-run reuses identical parts. It exits 2 with the code in the message.
 - The cap is per team, not per key.
 - Write cost: one extra index on `minion_task` (status changes touch it; `(team, status)` is small).
+
+## Addendum (TASK-54)
+
+The candidate walk and its index changed: migration 0016 recreates `ix_minion_task_live_queue` on
+`((-priority), created_at, team, project, task_name)` and `candidates_stmt` is a recursive chunked walk
+(ADR-0021). The filters stay heap Filters. The bound numbers above (`0.10 ... 0.58 ms`, ~1 us per filtered
+task) were measured on the old shape; current numbers (5k unrunnable: ~161 buffers, 3 probes, <1 ms; 10k
+live: 96-127 buffers) are in ADR-0021 and ARCHITECTURE section 3.2.

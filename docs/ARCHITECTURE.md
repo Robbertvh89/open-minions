@@ -405,27 +405,33 @@ Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
   deliberately unlocked; losing an insert race is cheap.
 - Candidate query is a recursive ordered walk (TASK-54, ADR-0021; window = MINION_ACQUIRE_WINDOW,
-  default 16). `WITH RECURSIVE walk` visits the eligible live tasks in queue order, one `LIMIT 1` index
-  step per task, on the partial expression index `ix_minion_task_live_queue ((-priority), created_at,
-  team, project, task_name) WHERE status IN ('PENDING','RUNNING')` (migration 0015; `-priority` makes
-  every column ascend, so the cursor is one row-compare Index Cond:
-  `(-priority, created_at, team, project, task_name) > (cursor)`). A step skips tasks without a PENDING
-  subtask (a per-task probe `ORDER BY subtask_id LIMIT 1`), adds `min(window, pending count)` to a running
-  total and the recursion stops once the total reaches the window, so no plan can read every live task and
-  sort them (the former bitmap-plus-sort flip from about 1k live tasks, 310 buffers / 5-13 ms at 10k).
-  The final SELECT takes each visited task's first `window` PENDING subtasks (`LATERAL ... ORDER BY
-  subtask_id LIMIT window`) and sorts by the FR-22 keys + `subtask_id` `LIMIT window`: the task key is
-  unique so the order is total, and the visited tasks hold the global first window rows (same order as the
-  old single join; `test_new_statement_matches_old_order` is the oracle). All LIMITs and status values are
-  SQL literals (no 10 % LIMIT heuristic in generic plans, partial-index predicates always match). Every
-  probe has an `ORDER BY` so the planner never seq-scans subtasks or flattens an `EXISTS` into a semi-join.
-  Measured at 10k live tasks (20k or 40k finished history), literal and generic plans alike: 96 buffers,
-  12 subtask probes, ~0.3 ms (also under stale statistics, team preference, ten models); a full drain of
-  10k pending-free live tasks costs one probe each (291 buffers, ~7 ms, bounded by teams x the FR-9 cap);
-  window 256 with one pending subtask per task: 3074 buffers, ~2 ms
-  (`test_walk_*` in `test_candidate_index_path.py`). Live tasks that fail the model / engine / memory /
-  pool filters (heap Filter) cost one index entry each and never a subtask probe; their number is bounded
-  by the per-team live-task cap (FR-9, ADR-0020). 5,000 such tasks: ~161 buffers, 3 subtask probes, <1 ms
+  default 16). `WITH RECURSIVE walk` visits the eligible live tasks in queue order on the partial
+  expression index `ix_minion_task_live_queue ((-priority), created_at, team, project, task_name) WHERE
+  status IN ('PENDING','RUNNING')` (migration 0016; `-priority` makes every column ascend, so the cursor is
+  one row-compare Index Cond `(-priority, created_at, team, project, task_name) > (cursor)`). Each step
+  fetches the next 8 eligible live tasks after the cursor (`LIMIT 8`, no pending check), then returns the
+  first of them with a PENDING subtask (probe `ORDER BY subtask_id LIMIT 1`), or the chunk's last row as a
+  skip row when none has (cursor advances, `got` unchanged). A real step adds `min(window, pending count)`
+  to a running total; the recursion stops once the total reaches the window. The pending check therefore
+  only sees a bounded chunk, whatever plan the planner picks for the chunk read. The final SELECT takes
+  each visited task's first `window` PENDING subtasks (`LATERAL ... ORDER BY subtask_id LIMIT window`) and
+  sorts by the FR-22 keys + `subtask_id` `LIMIT window`: the task key is unique so the order is total, and
+  the visited tasks hold the global first window rows (same order as the old single join;
+  `test_new_statement_matches_old_order` is the oracle). All LIMITs and status values are SQL literals (no
+  10 % LIMIT heuristic in generic plans, partial-index predicates always match); every probe has an
+  `ORDER BY` so the planner never seq-scans subtasks or flattens an `EXISTS` into a semi-join.
+  Measured at 10k live tasks (20k or 40k finished history), literal and generic plans alike: 96-127
+  buffers, 12 subtask probes, ~0.3-0.5 ms (same priority, mixed, ten models, team preference, stale
+  statistics after a non-empty ANALYZE); window 256 with one pending subtask per task: 3116 buffers, ~4 ms;
+  10k live tasks without any pending subtask cost one probe each (4018 buffers, ~21 ms, bounded by teams x
+  the FR-9 cap). Before: 288-310 buffers / 5-13 ms at 10k, bitmap-plus-sort from ~1k live tasks.
+  **Caveat, statistics:** if the tables were ANALYZEd while empty (fresh restore, pg_upgrade) and then
+  filled without a new ANALYZE (autovacuum normally fixes this within minutes), the planner may
+  bitmap-scan the live tasks once per step; the chunk bounds the damage to ~1.2k buffers / ~13 ms at 10k
+  live tasks (the unchunked walk probed 39,994 times: 281k buffers / 126 ms). Run `vacuumdb
+  --analyze-in-stages` after a restore or `pg_upgrade`. Live tasks that fail the model / engine / memory /
+  pool filters (heap Filter) cost one index entry each and never a subtask probe; their number is bounded by
+  the per-team live-task cap (FR-9, ADR-0020). 5,000 such tasks: ~161 buffers, 3 subtask probes, <1 ms
   (`test_candidate_bounded_with_5k_unrunnable_live_tasks`). `ix_minion_task_queue` is no longer used by
   acquire; it stays for the splitter claim (`status = 'SPLITTING'`, 5 buffers vs a full
   `ix_minion_task_team_status` scan without it) and the cancel sweep (TASK-29).

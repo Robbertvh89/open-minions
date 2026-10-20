@@ -14,10 +14,12 @@ history size, so it could not be pinned with statistics.
 
 ## Decision
 
-1. `candidates_stmt` is a `WITH RECURSIVE` walk with one `LIMIT 1` index step per task, a row-compare
-   cursor, a per-task pending probe (`ORDER BY subtask_id LIMIT k`), and a stop once the visited tasks
-   hold `window` rows. The final SELECT is the lateral subtask fetch + the same ORDER BY / LIMIT.
-2. Migration 0015 recreates `ix_minion_task_live_queue` on `((-priority), created_at, team, project,
+1. `candidates_stmt` is a `WITH RECURSIVE` walk. Each step reads the next 8 eligible live tasks after a
+   row-compare cursor (no pending check), then takes the first with a PENDING subtask (probe `ORDER BY
+   subtask_id LIMIT k`) or, if none, the chunk's last row as a skip row. It stops once the visited tasks
+   hold `window` rows. The pending check only sees a bounded chunk, so a bad plan for the chunk read
+   cannot multiply subtask probes. The final SELECT is the lateral subtask fetch + the same ORDER BY / LIMIT.
+2. Migration 0016 recreates `ix_minion_task_live_queue` on `((-priority), created_at, team, project,
    task_name)` (same name and predicate) so all columns ascend and the cursor is a single Index Cond.
 3. Every LIMIT and status is a SQL literal; `claim()` is unchanged (ownership: invariant 2).
 4. `ix_minion_task_queue` is kept (TASK-29): the splitter claim and the cancel sweep use it.
@@ -33,9 +35,18 @@ history size, so it could not be pinned with statistics.
 
 ## Consequences
 
-- 10k live tasks: ~96 buffers / ~0.3 ms in literal and generic plans (was 288-310 / 5-13 ms).
-- A drained live task costs one probe (inherent; bounded by teams x cap). Window 256 with one pending
-  subtask per task costs up to 768 probes / ~3k buffers.
+- 10k live tasks: 96-127 buffers / ~0.3-0.5 ms in literal and generic plans (was 288-310 / 5-13 ms).
+- A drained live task costs one probe (inherent; bounded by teams x cap): 10k of them cost 4018
+  buffers / ~21 ms (main: 274-654). Window 256 with one pending subtask per task: 768 probes / ~3.1k buffers.
+- **Stale statistics.** Tables ANALYZEd while empty and then filled without ANALYZE (restore,
+  `pg_upgrade`, before autovacuum runs) can make the planner bitmap-scan the live tasks once per step.
+  The unchunked walk then probed 39,994 times (281k buffers / 126 ms at 10k live); with the chunk it is
+  ~1.2k buffers / ~13 ms, about main. Ops: `vacuumdb --analyze-in-stages` after restore or `pg_upgrade`
+  (README Upgrading).
 - Known residual (follow-up): with a very skewed task mix the per-task probe may use
   `ix_minion_subtask_progress` + Sort instead of `ix_minion_subtask_pending`.
-- `-priority` overflows only for `INT_MIN`; the API allows -1000..1000.
+- `-priority` overflows only for `INT_MIN`; the API allows -1000..1000. A direct-SQL row with that value
+  makes the INSERT fail loudly, never silently. A CHECK (`priority BETWEEN -1000 AND 1000`) would be a
+  separate migration (note only).
+- Migration 0016 takes ACCESS EXCLUSIVE on `minion_task` (DROP INDEX then CREATE INDEX in one transaction,
+  `lock_timeout` 5 s): stop server and watchdog first (README Upgrading).

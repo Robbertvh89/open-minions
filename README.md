@@ -503,6 +503,10 @@ deviate from the paper get an ADR in `docs/adr/`.
 
 ## Upgrading
 
+Migration 0016 (live-queue index, TASK-54) drops and recreates `ix_minion_task_live_queue`, which holds
+an exclusive lock on `minion_task` until it commits: stop server and watchdog first, exactly as below. After
+a database restore or `pg_upgrade`, run `vacuumdb --analyze-in-stages` so the planner has statistics.
+
 Migration 0013 (task counters, TASK-16) needs a quiet database: it blocks writes to `minion_subtask`
 while it backfills, and an old server would not maintain the new `cancelled` counter. Compose does
 not stop a running server before `migrate` runs, so stop them first:

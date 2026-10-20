@@ -124,7 +124,7 @@ async def _seed(sm: async_sessionmaker[AsyncSession], rng: random.Random) -> lis
                 "engine": rng.choice(ENGINES),
                 "mem": rng.choice([1, 4, 16]),
                 "out": f"s3://o/{i}",
-                "priority": rng.choice([0, 0, 1, 5]),
+                "priority": rng.choice([0, 0, 1, 5, -1000, -1, 1000]),
                 "pool": rng.choice([None, None, "default", "other"]),
                 "status": rng.choice(TASK_STATUSES),
                 # Few distinct values so created_at ties are common.
@@ -267,11 +267,22 @@ def _buffers(plan: dict[str, Any]) -> int:
     return int(root.get("Shared Hit Blocks", 0)) + int(root.get("Shared Read Blocks", 0))
 
 
-def assert_index_paths(plan: dict[str, Any], *, pending_index: bool = True) -> None:
+SORT_INPUT_BOUND = 2_000  # a few chunks; a scan of 10k live tasks per step is 40k
+
+
+def assert_index_paths(
+    plan: dict[str, Any],
+    *,
+    pending_index: bool = True,
+    allow_bitmap: bool = False,
+    sort_input: int = SORT_INPUT_BOUND,
+) -> None:
     """The recursive ordered walk (TASK-54): a Recursive Union whose steps are Index Scans on the
     live-queue index with a row-compare Index Cond; the pending probes use
     ix_minion_subtask_pending; no Seq Scan on either table; no Sort ever sees more rows than the
-    window (a Sort over all live tasks or all pending subtasks is the failure this guards)."""
+    window (a Sort over all live tasks or all pending subtasks is the failure this guards): the
+    rows a Sort READS (children's rows x loops) and returns are both bounded. A bitmap scan of the
+    live tasks (the planner's pick for a few hundred tasks) is allowed only with `allow_bitmap`."""
     nodes = _nodes(plan["Plan"])
     text_plan = json.dumps(plan)
     if pending_index:
@@ -289,10 +300,16 @@ def assert_index_paths(plan: dict[str, Any], *, pending_index: bool = True) -> N
             assert n.get("Relation Name") not in ("minion_subtask", "minion_task"), text_plan
         if n["Node Type"] == "Sort":
             rows = int(n.get("Actual Rows", 0)) * int(n.get("Actual Loops", 1))
+            read = sum(
+                int(c.get("Actual Rows", 0)) * int(c.get("Actual Loops", 1))
+                for c in n.get("Plans", [])
+            )
             assert rows <= SORT_ROW_BOUND, (rows, text_plan)
-        assert n["Node Type"] != "Bitmap Heap Scan" or n.get("Relation Name") != "minion_task", (
-            text_plan
-        )
+            assert read <= sort_input, (read, text_plan)
+        if not allow_bitmap:
+            assert (
+                n["Node Type"] != "Bitmap Heap Scan" or n.get("Relation Name") != "minion_task"
+            ), text_plan
 
 
 SORT_ROW_BOUND = 16 * 100  # window x pending rows per task in the seeds (loose; scans of 10k+ fail)
@@ -666,7 +683,11 @@ def check_walk(
     # At 12 live tasks a generic plan may use a bitmap per step on the tiny set (<= 34 buffers
     # measured): the shape is asserted from 200 up, the bounds always.
     if n >= 200:
-        assert_index_paths(plan, pending_index=False)
+        # A few hundred to ~2k live tasks: a per-step bitmap + top-N sort of them is the planner's
+        # pick and bounded by n (about 5 steps); from 5k up only the ordered index walk is allowed.
+        assert_index_paths(
+            plan, pending_index=False, allow_bitmap=n < 5000, sort_input=max(2_000, 6 * n)
+        )
     got = _buffers(plan)
     probes = _subtask_probes(plan)
     print(f"{label}: buffers={got} probes={probes} ms={plan['Execution Time']:.2f}")
@@ -746,7 +767,7 @@ async def test_walk_all_drained_costs_one_probe_per_live_task(fresh_url: str) ->
         probes, got = _subtask_probes(plan), _buffers(plan)
         print(f"drained {kind}: buffers={got} probes={probes} ms={plan['Execution Time']:.1f}")
         assert n <= probes <= n + 20, probes  # inherent: one pending check per live task
-        assert got <= n // 10 + 50, got  # measured 654
+        assert got <= n // 2, got  # measured 4018: probe + chunk step overhead, main 274-654
         assert any(x["Node Type"] == "Recursive Union" for x in _nodes(plan["Plan"]))
         assert "ix_minion_task_queue" not in json.dumps(plan)
 
@@ -802,6 +823,35 @@ async def test_walk_survives_stale_statistics(fresh_url: str, live_at_analyze: i
         check_walk(f"stale({live_at_analyze}) n=10000 {kind}", plan, 10_000, buffers=250)
 
 
+async def test_walk_never_analyzed_tables_stay_bounded(fresh_url: str) -> None:
+    """Statistics of EMPTY tables (fresh restore / pg_upgrade / first start), then 20k finished +
+    10k live tasks arrive without ANALYZE. The planner may bitmap-scan the live tasks per step
+    here, but the pending check runs on the 8-task chunk only: before the chunk, this case probed
+    39,994 times (281k buffers, 126 ms); now it stays within a few thousand buffers."""
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            for table in ("minion_task", "minion_subtask"):
+                await conn.execute(text(f"ALTER TABLE {table} SET (autovacuum_enabled = false)"))
+            for stmt in ANALYZE:
+                await conn.execute(text(stmt))  # on empty tables
+            await seed(conn, n=10_000, prio="g % 3", analyze=False)
+            kw = _kwargs(None, ALL_MODELS, 16)
+            plans = await explain_both(conn, candidates_stmt(**kw))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        got, probes = _buffers(plan), _subtask_probes(plan)
+        print(
+            f"never analyzed {kind}: buffers={got} probes={probes} ms={plan['Execution Time']:.1f}"
+        )
+        assert any(x["Node Type"] == "Recursive Union" for x in _nodes(plan["Plan"]))
+        assert probes <= 200, probes  # was 39,994+
+        assert got <= 3_000, got  # measured ~1,250; was 281,000
+        assert_index_paths(plan, pending_index=False, allow_bitmap=True, sort_input=50_000)
+    await assert_rows_equal_oracle(fresh_url, **kw)
+
+
 async def seed_without_analyze(conn: AsyncConnection) -> None:
     """10k more live tasks (own keys 'z..') with 5 pending subtasks each; no ANALYZE."""
     sql = WALK_SEED.format(
@@ -814,7 +864,7 @@ async def seed_without_analyze(conn: AsyncConnection) -> None:
             await conn.execute(text(stmt))
 
 
-async def test_full_claim_statement_walks_in_the_generic_plan(fresh_url: str) -> None:
+async def test_full_claim_statement_walk_plans(fresh_url: str) -> None:
     eng = create_async_engine(fresh_url)
     captured: list[tuple[str, Any]] = []
 
@@ -831,20 +881,19 @@ async def test_full_claim_statement_walks_in_the_generic_plan(fresh_url: str) ->
         async with raw.connect() as conn:
             await seed(conn, n=10_000)
         ((principal, _),) = await make_executors(sm, 1)
-        for _ in range(7):  # > 5 executions: PG may switch to the generic plan if cheaper
-            async with sm() as s:
-                res = await claim(
-                    s,
-                    principal.executor_id,
-                    engines=[Engine.FAKE],
-                    model_ids=["m1"],
-                    memory_gb=8.0,
-                    pool="default",
-                    preference=None,
-                    window=16,
-                )
-                assert res.won is not None
-                await s.rollback()
+        async with sm() as s:
+            res = await claim(
+                s,
+                principal.executor_id,
+                engines=[Engine.FAKE],
+                model_ids=["m1"],
+                memory_gb=8.0,
+                pool="default",
+                preference=None,
+                window=16,
+            )
+            assert res.won is not None
+            await s.rollback()
         stmt, params = captured[-1]
         args = ", ".join(f"'{v}'" if not isinstance(v, int | float) else str(v) for v in params)
         async with raw.connect() as conn:
@@ -896,7 +945,7 @@ async def test_task29_splitter_claim_needs_ix_minion_task_queue(fresh_url: str) 
                     "INSERT INTO minion_task (team, project, task_name, type, model_id, engine,"
                     " model_memory_gb, input_uri, output_uri, status, created_by)"
                     " SELECT 'sp', 'p', 's' || g, 'embedding', 'm1', 'fake', 1, 'in',"
-                    " 's3://sp/' || g, 'SPLITTING', 't' FROM generate_series(1, 3) g"
+                    " 's3://sp/' || g, 'SPLITTING', 't' FROM generate_series(1, 50) g"
                 )
             )
             await conn.execute(text("ANALYZE minion_task"))

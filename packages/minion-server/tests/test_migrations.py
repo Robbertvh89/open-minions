@@ -412,12 +412,12 @@ async def _indexdef(url: str, name: str) -> str:
         await eng.dispose()
 
 
-def test_0015_live_queue_expression_round_trip(fresh_url: str) -> None:
+def test_0016_live_queue_expression_round_trip(fresh_url: str) -> None:
     name = "ix_minion_task_live_queue"
     cfg = alembic_config(fresh_url)
     command.upgrade(cfg, "head")
     assert "(- priority)" in asyncio.run(_indexdef(fresh_url, name))
-    command.downgrade(cfg, "0014")
+    command.downgrade(cfg, "0015")
     assert "priority DESC" in asyncio.run(_indexdef(fresh_url, name))
     command.upgrade(cfg, "head")
     assert "(- priority)" in asyncio.run(_indexdef(fresh_url, name))
