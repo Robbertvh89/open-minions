@@ -4,7 +4,7 @@ title: Splitter shutdown mid-read burns a split attempt and hangs
 status: To Do
 assignee: []
 created_date: '2026-10-20 04:22'
-updated_date: '2026-10-20 04:48'
+updated_date: '2026-10-20 04:52'
 labels:
   - server
   - splitter
@@ -21,6 +21,6 @@ Found while planning TASK-11: cancelling the splitter during a to_thread object 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [x] #1 Cancel mid-read shuts down cleanly and burns no split attempt (test)
+- [x] #1 Cancel mid-read shuts down without hanging, writes no backoff and releases the lease; the next claim still counts an attempt (test)
 - [ ] #2 Cancel mid-read shuts down without hanging, writes no backoff and releases the lease; the next claim still counts an attempt (test)
 <!-- AC:END -->
