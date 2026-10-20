@@ -448,7 +448,7 @@ def _sweep_stmt(window_s: float, batch: int) -> Any:
             Task.status == status_literal(TaskStatus.CANCELLED),
             Task.finished_at
             > func.now()
-            - func.make_interval(0, 0, 0, 0, 0, 0, literal(float(window_s), literal_execute=True)),
+            - literal_column(f"make_interval(secs => {float(window_s)!r})"),  # float: no injection
         )
         .subquery()
     )

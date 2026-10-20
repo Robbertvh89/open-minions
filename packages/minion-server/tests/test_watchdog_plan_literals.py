@@ -20,21 +20,21 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 pytestmark = pytest.mark.integration
 
-LIVE = 10_000
+LIVE = 500
 HISTORY = 40_000
 
 SEED = """
 INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
-  input_uri, output_uri, priority, status, created_by, created_at, finished_at)
+  input_uri, output_uri, priority, status, created_by, created_at, finished_at, total_subtasks)
 SELECT 'old' || (g % 20), 'p', 'n' || g, 'embedding', 'm1', 'fake', 1, 'in', 's3://old/' || g,
   0, 'SUCCEEDED', 't', now() - interval '30 days' - make_interval(secs => g),
-  now() - interval '29 days' - make_interval(secs => g)
+  now() - interval '29 days' - make_interval(secs => g), 2
 FROM generate_series(1, {hist}) AS g;
 INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
   input_uri, output_uri, priority, status, created_by, created_at, total_subtasks)
 SELECT 'live' || (g % 20), 'p', 'l' || g, 'embedding', 'm1', 'fake', 1, 'in', 's3://l/' || g,
   0, CASE WHEN g % 10 = 0 THEN 'PENDING' WHEN g % 50 = 1 THEN 'SPLITTING' ELSE 'RUNNING' END,
-  't', now() - make_interval(secs => g), 0
+  't', now() - make_interval(secs => g), 2
 FROM generate_series(1, {live}) AS g;
 INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
   input_uri, output_uri, priority, status, created_by, created_at, finished_at)
@@ -46,8 +46,8 @@ INSERT INTO minion_subtask (team, project, task_name, subtask_id, status, input_
 SELECT team, project, task_name, s, 'PENDING', 'k', 0, 1, 0, 1
 FROM minion_task, generate_series(1, 2) AS s WHERE task_name ~ '^[lc]';
 INSERT INTO minion_task_counter (team, project, task_name, shard, succeeded, failed)
-SELECT team, project, task_name, 0, 1, 0 FROM minion_task
-WHERE task_name ~ '^l';
+SELECT team, project, task_name, 0, CASE WHEN task_name ~ '^n' THEN 2 ELSE 1 END, 0
+FROM minion_task WHERE task_name ~ '^[ln]';
 VACUUM ANALYZE minion_task;
 VACUUM ANALYZE minion_subtask;
 VACUUM ANALYZE minion_task_counter
@@ -105,6 +105,7 @@ async def _plans(conn: AsyncConnection, stmt: Any, name: str) -> tuple[list[str]
     return literal_scans, generic
 
 
+# "claim" cannot fail (its index is not partial): plan-drift guard only, not TASK-57 evidence.
 CASES: dict[str, Callable[[], Any]] = {
     "settleable": lambda: settleable_stmt(100),
     "sweep": lambda: tasks_repo._sweep_stmt(3600.0, 10_000),
@@ -123,6 +124,8 @@ async def test_generic_plans_equal_literal_plans(fresh_url: str) -> None:
         async with engine.connect() as conn:
             for i, (label, build) in enumerate(CASES.items()):
                 literal, generic = await _plans(conn, build(), f"p57_{i}")
+                if label == "settleable":  # else the equality could pass for free
+                    assert not any(x.startswith("Seq Scan:minion_task") for x in literal), literal
                 assert literal == generic, f"{label}: literal {literal} != generic {generic}"
     finally:
         await engine.dispose()
