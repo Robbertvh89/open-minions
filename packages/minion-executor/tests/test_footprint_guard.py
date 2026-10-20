@@ -42,9 +42,18 @@ def test_guard_aborts_a_real_pytest_run_visibly(tmp_path: Path) -> None:
 
     if process_footprint_bytes(os.getpid()) is None:
         pytest.skip("no footprint reader on this OS")
-    (tmp_path / "test_slow.py").write_text("import time\n\ndef test_slow():\n    time.sleep(3)\n")
+    (tmp_path / "test_slow.py").write_text(
+        "import time\n\n"
+        "def test_slow():\n"
+        "    b = b'\\x01' * (700 << 20)\n"
+        "    time.sleep(3)\n"
+        "    assert b\n"
+    )
     root = Path(__file__).resolve().parents[3]
-    env = {**os.environ, "MINION_TEST_MAX_FOOTPRINT_GB": "0.01"}
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("MINION_TEST_RSS_LOG", "PYTEST_ADDOPTS")
+    }
+    env["MINION_TEST_MAX_FOOTPRINT_GB"] = "0.5"  # trips only inside the test's 700 MB allocation
     proc = subprocess.run(  # noqa: S603
         [
             sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(root),
@@ -55,4 +64,4 @@ def test_guard_aborts_a_real_pytest_run_visibly(tmp_path: Path) -> None:
     )  # fmt: skip
     out = proc.stdout + proc.stderr
     assert proc.returncode == 3, out
-    assert "FOOTPRINT GUARD" in out and "test_slow" in out, out
+    assert "FOOTPRINT GUARD" in proc.stderr and "::test_slow reached" in proc.stderr, out

@@ -32,5 +32,5 @@ Measurements (macOS 36 GB, mlx+hf extras, footprint guard on; peak memory footpr
 - -m "gpu or model": 3.79/2.78 GB. -m "not integration": 0.76/0.95 GB.
 - FULL suite incl. integration (2326 passed, 55 skipped, 1 xfailed; gpu tests skip without -m gpu): peak footprint 0.82 GB, max RSS 0.98 GB; top-10 peaks 0.76 GB (watchdog sigterm test, ui tests). Not reproducible: nothing near 101 GB on any selection.
 - Highest single tests under -m gpu: hf test_unload_frees_model_memory 3.16 GB, hf embedding 2.4, mlx completion 2.17.
-Conclusion: the 101 GB run is not reproducible; guard (16 GB default, names the test, dumps stacks to real stderr, exit 3, breach record in MINION_TEST_RSS_LOG) is in place. e2e_*_through_sandboxed_worker fail with JSONDecodeError under the agent sandbox (likely nested Seatbelt, unverified).
+Conclusion: the 101 GB run is not reproducible; guard (16 GB default, names the test, dumps stacks to real stderr, exit 3, breach record in MINION_TEST_RSS_LOG) is in place. e2e_*_through_sandboxed_worker JSONDecodeError failures were a stale multipart stub, fixed on main by TASK-50 (not nested Seatbelt).
 <!-- SECTION:NOTES:END -->

@@ -123,10 +123,15 @@ class _FootprintGuard:
     def start(self) -> None:
         if self.sample() is None:  # unsupported OS: stay out of the way
             return
-        threading.Thread(target=self._run, name="footprint-guard", daemon=True).start()
+        self._thread = threading.Thread(target=self._run, name="footprint-guard", daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            thread.join(5)
+        self._err.close()
 
 
 _guard: _FootprintGuard | None = None
