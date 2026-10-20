@@ -1,10 +1,10 @@
 ---
 id: TASK-52
 title: 'Server: log ResponseValidationError without input values'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-20 00:15'
-updated_date: '2026-10-20 01:37'
+updated_date: '2026-10-20 01:54'
 labels:
   - security
   - server
