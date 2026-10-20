@@ -32,11 +32,14 @@ Rules
   against the margin (`limit = margin`); a sample that straddles the busy -> quiet edge (the edge
   is recorded when it happens, `set_idle`) is allowed the limit in force before the edge for the
   part before it and the margin for the rest, so the busy-mode GPU time of a 1.5-2 s subtask is
-  never charged against the idle margin. (The mirror, idle -> busy, is allowed the busy limit
-  for the whole sample: lenient by at most one interval.) At duty 1.0 the busy limit is above 1
-  and the bucket only drains, except for quiet samples, which still charge against the margin.
-  A worker that is paused or idle after a long step repays it at `margin` GPU-s per second; a
-  gap without a worker drains at the last busy limit.
+  never charged against the idle margin. The mirror edge (idle -> busy, also recorded when it
+  happens) is split the same way: the idle span that falls inside the sample is allowed the
+  margin, the rest the busy limit (a rogue that burns only inside idle gaps shorter than a
+  sample is charged for them, also at duty 1.0). At duty 1.0 the busy limit is above 1 and the
+  bucket only drains, except for quiet samples and idle spans, which still charge against the
+  margin. A worker that is paused or idle after a long step repays it at `margin` GPU-s per
+  second; a gap without a worker, also one after a quiet-mode KILL, drains at the last
+  busy-mode limit (the quiet KILL itself is share-based and immediate).
   Caveat: an unacked pause is judged as busy mode until `window_s + grace_s` have passed (the
   duty in force before the pause stays allowed), then at the margin: a long uncheckpointed
   step under a pause can be killed after about 28 s at light and 37 s at full.
@@ -110,6 +113,7 @@ class GpuDutyGuard:
         self._ack_at: float | None = None  # when the worker first acked the current pause
         self._tick_at: float | None = None  # latest worker tick (control-side monotonic)
         self._idle = False
+        self._quiet_span: tuple[float, float] | None = None  # last idle span (start, end)
         self._acc = 0.0  # excess GPU-seconds; per run, survives worker pids
         self._acc_t: float | None = None  # when `_acc` was last advanced
         self._last_limit = 0.0  # limit used then (drains the bucket across a worker gap)
@@ -133,6 +137,7 @@ class GpuDutyGuard:
             self._pid, self._seen, self._ids = pid, {}, set()
         self._drain_gap(now)
         self._idle = idle
+        self._quiet_span = None
         self._errors = 0
         self._reset_window(now)
 
@@ -150,10 +155,13 @@ class GpuDutyGuard:
         self._idle = idle
         if idle:
             self._started = now
+        else:  # idle -> busy: the idle span is charged at the margin in the next busy sample
+            self._quiet_span = (self._started, now)
 
     def stop(self) -> None:
         """No live worker: forget the pid and the window (the excess bucket stays)."""
         self._pid, self._seen, self._ids = None, {}, set()
+        self._quiet_span = None
         self._errors = 0
         self._reset_window(0.0)
 
@@ -284,6 +292,12 @@ class GpuDutyGuard:
         allow = limit * dt
         if quiet_from is None:
             self._last_limit = limit  # a gap without a worker drains at the duty in force
+            if self._quiet_span is not None:
+                # the sample straddles the idle -> busy edge: the idle part gets the margin only,
+                # the busy tail of the previous subtask and the new busy part the busy limit
+                q = min(self._quiet_span[1], now) - max(self._quiet_span[0], prev_t, now - dt)
+                if q > 0:
+                    allow = cfg.margin * q + limit * (dt - q)
         elif prev_t < quiet_from:
             # the sample straddles the busy -> quiet edge: the part before the edge was busy mode
             # and is allowed at the limit in force then, only the rest at the margin

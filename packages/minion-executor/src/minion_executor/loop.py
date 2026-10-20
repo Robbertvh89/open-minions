@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
 import structlog
@@ -115,6 +116,9 @@ class _Verdict(enum.Enum):
     WATCHER_FAILED = "WATCHER_FAILED"  # the watcher itself crashed: fail closed, release
 
 
+_GPU_VERDICTS = frozenset({_Verdict.GPU_DUTY, _Verdict.GPU_METER})
+
+
 class GovernorStoppedError(RuntimeError):
     """The governor task ended: nothing steers the budget any more, so the executor stops
     (invariant 6) instead of running on a frozen decision."""
@@ -132,7 +136,13 @@ class _DowngradeError(Exception):
 MEMORY_GUARD_FACTOR = 1.10  # D7: footprint over budget x 1.10 on two consecutive samples
 MEMORY_GUARD_SAMPLES = 2
 GPU_VIOLATION_SHOW_S = 600.0  # how long status.json reports the last GPU duty kill
-GPU_KILLS_QUARANTINE = 3  # GPU kills of one engine within GPU_QUARANTINE_S stop it being acquired
+# An engine whose GPU kills add up to GPU_QUARANTINE_POINTS within GPU_QUARANTINE_S is not
+# acquired. A duty / clients kill is evidence against the worker (2 points: 3 kills quarantine);
+# a meter kill is not attributable to it (host IORegistry churn, a stalled read) but a worker
+# that blinds the meter must not churn for ever (1 point: 6 kills quarantine).
+GPU_QUARANTINE_POINTS = 6
+GPU_DUTY_KILL_POINTS = 2
+GPU_METER_KILL_POINTS = 1
 GPU_QUARANTINE_S = 3600.0
 GPU_STREAK_GAP_S = 900.0  # kills further apart than this start a new back-off streak
 GPU_STALL_MIN_S = 1.0  # floor of the no-GPU-sample-for-3x-interval bound
@@ -290,10 +300,12 @@ class ExecutorLoop:
         self._gpu_share: float | None = None  # last measured share of the worker (status.json)
         self._gpu_pid: int | None = None  # worker pid the guard window belongs to
         self._gpu_killed_pid: int | None = None  # last worker pid killed by the guard
+        self._last_engine: Engine | None = None  # engine of the last loaded model (kill charge)
         self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         # sampler KILL for the watcher of that acquirement (tagged: a stale one is dropped)
         self._gpu_pending: tuple[Any, _Verdict] | None = None
-        self._gpu_kills: dict[Engine, list[float]] = {}  # per-engine GPU kill times (clock)
+        self._gpu_kills: dict[Engine, list[float]] = {}  # per-engine duty / clients kill times
+        self._gpu_meter_kills: dict[Engine, list[float]] = {}  # per-engine meter kill times
         self._quarantine_logged: set[Engine] = set()
         self._gpu_streak: list[float] = []  # all GPU kill times, for the back-off exponent
         self._gpu_violation: tuple[str, float] | None = None  # (reason, clock) of the last kill
@@ -882,9 +894,22 @@ class ExecutorLoop:
                     break
                 if stopper.done():
                     # Grace over / second signal: reclaim worker memory, hand the subtask back.
+                    stop_pid = self._worker.pid
                     await self._bounded_thread(self._worker.kill, is_kill=True)
                     if self._cache is not None:
                         self._cache.release_in_use()
+                    if self._gpu is not None:  # a GPU verdict decided in the same wake-up
+                        gv = self._take_gpu_pending(a.acquirement_id)
+                        if (
+                            gv is None
+                            and watch in pending
+                            and watch.done()
+                            and not watch.cancelled()
+                        ):
+                            wv = None if watch.exception() else watch.result()
+                            gv = wv if wv in _GPU_VERDICTS else None
+                        if gv is not None:
+                            self._record_gpu_kill(gv, a.model.engine, stop_pid)
                     finished = work.done()  # raced the kill: its result is still good
                     work.cancel()
                     await asyncio.gather(work, return_exceptions=True)
@@ -915,6 +940,8 @@ class ExecutorLoop:
                         pending.discard(beat)
                         continue
                     return await self._on_signal(a, work, beat.result(), bound)
+            # (the kill waits for the interrupt thread before `complete`: same bound as any kill)
+            await self._flush_gpu_verdict(a, watch if watch in pending else None)
             try:
                 result = work.result()
             except _SignalledError as s:
@@ -963,7 +990,7 @@ class ExecutorLoop:
             if pend is not None and pend[0] == a.acquirement_id:
                 # a kill the watcher never took (the subtask ended first): worker is unmetered
                 with contextlib.suppress(Exception):
-                    await self._gpu_kill_idle(pend[1])
+                    await self._gpu_kill_idle(pend[1], engine=a.model.engine)
 
     async def _push_control(self) -> None:
         """Hand the live duty / pause (and a one-shot trim) to the worker, on change only. The
@@ -1006,9 +1033,10 @@ class ExecutorLoop:
         if self._gpu is not None:
             self._gpu.set_idle(not busy, self._clock())
 
-    async def _gpu_kill_idle(self, v: _Verdict) -> None:
+    async def _gpu_kill_idle(self, v: _Verdict, *, engine: Engine | None = None) -> None:
         """A GPU KILL with no subtask to release: hard-kill the worker, count it, back off.
-        Skipped when there is no worker (a hung read after the kill must not re-kill)."""
+        Skipped when there is no worker (a hung read after the kill must not re-kill).
+        `engine` charges the kill when the loop no longer knows the loaded model."""
         pid = self._worker.pid
         if self._gpu is not None:
             self._gpu.stop()
@@ -1017,16 +1045,56 @@ class ExecutorLoop:
         self._gpu_kick.clear()
         if pid is None or pid == self._gpu_killed_pid:
             return  # no worker, or the one already killed (a dead pid can linger in the handle)
-        self._gpu_killed_pid = pid
+        if engine is None:  # `_loaded` is None during a graceful unload: use the last engine
+            engine = self._loaded.engine if self._loaded is not None else self._last_engine
+        self._record_gpu_kill(v, engine, pid)
+        await self._kill_worker(pid)
+
+    def _record_gpu_kill(self, v: _Verdict, engine: Engine | None, pid: int | None) -> None:
+        """Bookkeeping of one GPU kill on any path: status reason, killed pid, back-off streak,
+        per-engine quarantine; drops a pending verdict and re-baselines the guard."""
         meter = v is _Verdict.GPU_METER
         self._gpu_violation = (
             self._gpu_reason or ("meter" if meter else "over_duty"),
             self._clock(),
         )
-        engine = self._loaded.engine if self._loaded is not None else None
-        self._note_gpu_kill(engine, quarantine=not meter)
+        self._gpu_killed_pid = pid
+        self._note_gpu_kill(engine, meter=meter)
+        if self._gpu is not None:
+            self._gpu.stop()  # the worker is gone: the next one starts a fresh window
+        self._gpu_pid = None
+        self._gpu_pending = None
+        self._gpu_kick.clear()
         self._status_kick.set()
-        await self._kill_worker(pid)
+
+    def _take_gpu_pending(self, acq: UUID) -> _Verdict | None:
+        """The sampler verdict tagged for this acquirement that the watcher never took."""
+        pend = self._gpu_pending
+        if pend is None or pend[0] != acq:
+            return None
+        self._gpu_pending = None
+        self._gpu_kick.clear()
+        return pend[1]
+
+    async def _flush_gpu_verdict(
+        self, a: Assignment, watch: asyncio.Future[_Verdict] | None
+    ) -> None:
+        """A GPU verdict decided while the work ended in the same wake-up is still executed (and
+        counted) before the upload / complete: the result stands (invariant 5), the unmetered
+        worker does not (invariant 6). Never raises."""
+        with contextlib.suppress(Exception):
+            v = self._take_gpu_pending(a.acquirement_id)
+            if (
+                v is None
+                and watch is not None
+                and watch.done()
+                and not watch.cancelled()
+                and watch.exception() is None
+                and watch.result() in _GPU_VERDICTS
+            ):
+                v = watch.result()
+            if v is not None:
+                await self._gpu_kill_idle(v, engine=a.model.engine)
 
     async def _gpu_sampler(self) -> None:
         """One continuous GPU guard per worker pid (ADR-0006 D3): sample at the (jittered) guard
@@ -1094,21 +1162,56 @@ class ExecutorLoop:
         with contextlib.suppress(Exception):
             await asyncio.shield(fut)
 
-    def _note_gpu_kill(self, engine: Engine | None, *, quarantine: bool = True) -> None:
-        """Record a GPU kill: it feeds the back-off exponent and the per-engine quarantine, and
-        a DONE does not reset either (a rogue that completes a subtask between kills gains
-        nothing). The caller's next acquire waits `_gpu_kill_backoff`."""
+    def _note_gpu_kill(self, engine: Engine | None, *, meter: bool = False) -> None:
+        """Record a GPU kill: it feeds the back-off exponent and the per-engine quarantine
+        points (a duty / clients kill counts GPU_DUTY_KILL_POINTS, a meter kill
+        GPU_METER_KILL_POINTS), and a DONE does not reset either (a rogue that completes a
+        subtask between kills gains nothing). The caller's next acquire waits
+        `_gpu_kill_backoff`."""
         now = self._clock()
         self._gpu_backoff = True
         self._gpu_streak = [t for t in self._gpu_streak if now - t < GPU_QUARANTINE_S] + [now]
-        if engine is None or not quarantine:
-            return  # unknown engine / a meter fault: back-off only, never charged to an engine
-        kills = [t for t in self._gpu_kills.get(engine, []) if now - t < GPU_QUARANTINE_S]
-        self._gpu_kills[engine] = [*kills, now]
-        if len(kills) + 1 >= GPU_KILLS_QUARANTINE and engine not in self._quarantine_logged:
+        if engine is None:
+            return  # unknown engine: back-off only, never charged to an engine
+        book = self._gpu_meter_kills if meter else self._gpu_kills
+        kills = [t for t in book.get(engine, []) if now - t < GPU_QUARANTINE_S]
+        book[engine] = [*kills, now]
+        points = self._quarantine_points(engine, now)
+        if points >= GPU_QUARANTINE_POINTS and engine not in self._quarantine_logged:
             self._quarantine_logged.add(engine)
-            until = sorted([*kills, now])[-GPU_KILLS_QUARANTINE] + GPU_QUARANTINE_S - now
-            log.warning("gpu_engine_quarantined", engine=engine.value, until_s=round(until))
+            until = (self._quarantine_until(engine, now) or now) - now
+            log.warning(
+                "gpu_engine_quarantined", engine=engine.value, until_s=round(until), points=points
+            )
+
+    def _quarantine_kills(self, engine: Engine, now: float) -> list[tuple[float, int]]:
+        """(time, points) of the engine's GPU kills within the quarantine window, oldest first."""
+        kills = [
+            (t, GPU_DUTY_KILL_POINTS)
+            for t in self._gpu_kills.get(engine, [])
+            if now - t < GPU_QUARANTINE_S
+        ] + [
+            (t, GPU_METER_KILL_POINTS)
+            for t in self._gpu_meter_kills.get(engine, [])
+            if now - t < GPU_QUARANTINE_S
+        ]
+        return sorted(kills)
+
+    def _quarantine_points(self, engine: Engine, now: float) -> int:
+        return sum(p for _, p in self._quarantine_kills(engine, now))
+
+    def _quarantine_until(self, engine: Engine, now: float) -> float | None:
+        """Clock time at which the engine's points drop below the threshold again (None when
+        they are below it now): the oldest kills age out first."""
+        kills = self._quarantine_kills(engine, now)
+        total = sum(p for _, p in kills)
+        if total < GPU_QUARANTINE_POINTS:
+            return None
+        for t, p in kills:
+            total -= p
+            if total < GPU_QUARANTINE_POINTS:
+                return t + GPU_QUARANTINE_S
+        return None  # unreachable: the sum of no kills is 0
 
     def _gpu_kill_streak(self) -> int:
         """Kills in a row, each within GPU_STREAK_GAP_S of the previous (decays after 15 min
@@ -1130,13 +1233,10 @@ class ExecutorLoop:
         await self._pause(delay * random.uniform(0.5, 1.0))  # noqa: S311
 
     def _quarantined(self) -> list[Engine]:
-        """Engines with >= GPU_KILLS_QUARANTINE GPU kills in the last hour: not acquired."""
+        """Engines with >= GPU_QUARANTINE_POINTS of GPU kills in the last hour: not acquired."""
         now = self._clock()
-        return [
-            e
-            for e, ts in self._gpu_kills.items()
-            if sum(1 for t in ts if now - t < GPU_QUARANTINE_S) >= GPU_KILLS_QUARANTINE
-        ]
+        engines = dict.fromkeys([*self._gpu_kills, *self._gpu_meter_kills])
+        return [e for e in engines if self._quarantine_points(e, now) >= GPU_QUARANTINE_POINTS]
 
     def _acquirable_engines(self) -> list[Engine]:
         bad = set(self._quarantined())
@@ -1330,13 +1430,21 @@ class ExecutorLoop:
         upload and complete (returns None). A verdict that raced the work finishing successfully
         completes it, like the hard-stop path."""
         if self._infer_done.is_set():
+            if self._gpu is not None and v in _GPU_VERDICTS:
+                # the result exists but the worker is unmetered: kill it, the upload carries on
+                bound.warning("gpu_verdict_after_inference", code=v.value)
+                await self._gpu_kill_idle(v, engine=a.model.engine)
+                return None
             bound.info("governor_verdict_ignored_after_inference", code=v.value)
             return None
         bound.warning("governor_interrupt", code=v.value)
         self._forget_loaded()
+        pid = self._worker.pid
         await asyncio.to_thread(self._worker.interrupt)
         if self._cache is not None:
             self._cache.release_in_use()  # the killed worker no longer holds the model
+        if self._gpu is not None and v in _GPU_VERDICTS:
+            self._record_gpu_kill(v, a.model.engine, pid)  # counted whatever the race below does
         if self._infer_ok and not work.done():
             return None  # inference finished while we interrupted: the upload carries on
         finished = work.done()
@@ -1354,12 +1462,6 @@ class ExecutorLoop:
             err = _FailureError(True, "OOM", "worker memory exceeded the budget")
             await self._report_failure(a, err, bound)
             return _Outcome.FAILED
-        if self._gpu is not None and v in (_Verdict.GPU_DUTY, _Verdict.GPU_METER):
-            self._gpu_violation = (self._gpu_reason or "over_duty", self._clock())
-            self._gpu_killed_pid = self._worker.pid
-            self._note_gpu_kill(a.model.engine, quarantine=v is not _Verdict.GPU_METER)
-            self._gpu.stop()  # the worker is gone: the next one starts a fresh window
-            self._gpu_pid = None
         await self._release(a, bound, v.value)
         # a priority violation / crashed watcher is a local fault: back off so it cannot churn;
         # the rest is policy
@@ -1724,6 +1826,8 @@ class ExecutorLoop:
                     self._cache.release_in_use()  # a failed load holds no model: unpin it
                 raise
             self._loaded = a.model
+            self._last_engine = a.model.engine
+            self._gpu_killed_pid = None  # a live worker exists: its pid (maybe reused) is armed
             self._loaded_path = model_path
             self._unloaded = False
             i = 0

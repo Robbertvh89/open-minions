@@ -4081,15 +4081,136 @@ async def test_gpu_kill_without_a_worker_is_not_counted(tmp_path: Path) -> None:
     assert worker.interrupts == 0 and loop._gpu_streak == [] and loop._gpu_violation is None
 
 
-async def test_gpu_meter_kill_backs_off_but_never_quarantines(tmp_path: Path) -> None:
+async def test_gpu_meter_kills_quarantine_at_six_per_hour(tmp_path: Path) -> None:
+    now = [1000.0]
     worker = FakeWorker()
-    loop = make_loop(FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
-    loop._loaded = ModelEntry.model_validate(MODEL)
-    for i in range(4):
+    loop = make_loop(
+        FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        clock=lambda: now[0],
+    )  # fmt: skip
+    for i in range(5):
         worker.fake_pid = 5000 + i  # a fresh worker each time
+        loop._loaded = ModelEntry.model_validate(MODEL)  # a kill unloads: the next life reloads
         await loop._gpu_kill_idle(_Verdict.GPU_METER)
-    assert worker.interrupts == 4 and len(loop._gpu_streak) == 4
-    assert loop._gpu_kills == {} and loop._acquirable_engines() == [Engine.MLX]
+    assert worker.interrupts == 5 and len(loop._gpu_streak) == 5
+    assert loop._acquirable_engines() == [Engine.MLX]
+    worker.fake_pid = 5005
+    loop._loaded = ModelEntry.model_validate(MODEL)
+    await loop._gpu_kill_idle(_Verdict.GPU_METER)
+    assert loop._acquirable_engines() == []
+    assert loop._status_snapshot().gpu_quarantined == ["mlx"]
+    now[0] += 3600
+    assert loop._acquirable_engines() == [Engine.MLX]
+
+
+async def test_gpu_mixed_kills_quarantine_by_points(tmp_path: Path) -> None:
+    def kills(duty: int, meter: int) -> ExecutorLoop:
+        loop = make_loop(
+            FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET)
+        )  # fmt: skip
+        for _ in range(duty):
+            loop._note_gpu_kill(Engine.MLX)
+        for _ in range(meter):
+            loop._note_gpu_kill(Engine.MLX, meter=True)
+        return loop
+
+    assert kills(2, 2)._acquirable_engines() == []  # 4 + 2 points
+    assert kills(2, 1)._acquirable_engines() == [Engine.MLX]  # 5 points
+    assert kills(0, 1)._gpu_kills == {}  # a meter kill is not a duty kill
+
+
+async def test_gpu_quarantine_until_is_when_points_drop_below_threshold(tmp_path: Path) -> None:
+    now = [0.0]
+    loop = make_loop(
+        FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+        clock=lambda: now[0],
+    )  # fmt: skip
+    assert loop._quarantine_until(Engine.MLX, 0.0) is None
+    loop._gpu_meter_kills[Engine.MLX] = [0.0, 10.0, 20.0, 30.0, 40.0]  # 5 points
+    loop._gpu_kills[Engine.MLX] = [100.0]  # +2 = 7 points
+    assert loop._quarantine_points(Engine.MLX, 100.0) == 7
+    # dropping the oldest meter kill leaves 6 (still quarantined), the second leaves 5
+    assert loop._quarantine_until(Engine.MLX, 100.0) == 10.0 + 3600.0
+    loop._gpu_kills[Engine.MLX] = []
+    loop._gpu_meter_kills[Engine.MLX] = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
+    assert loop._quarantine_until(Engine.MLX, 100.0) == 0.0 + 3600.0
+    assert loop._quarantine_until(Engine.MLX, 3601.0) is None  # the first aged out
+
+
+async def test_gpu_meter_churn_ends_in_quarantine(tmp_path: Path) -> None:
+    def broken() -> Any:
+        raise GpuMeterError("no clients")
+
+    client, worker = FakeClient([assignment() for _ in range(10)]), FakeWorker(block=True)
+    worker.gpu_busy = 0.0
+    real_ensure = worker.ensure_model
+
+    def respawn(*args: Any) -> None:
+        worker.interrupted = False  # a new worker process, alive again
+        real_ensure(*args)
+
+    worker.ensure_model = respawn  # type: ignore[method-assign,assignment]
+    loop = _gpu_loop(
+        client, worker, tmp_path, reader=broken, backoff=(0.001, 0.01), failure_pause_s=0.01
+    )
+    task = asyncio.create_task(loop.run())
+    await until(lambda: bool(client.presences), 20)
+    loop.stop()
+    await asyncio.wait_for(task, 10)
+    assert client.release_codes == ["GPU_METER_UNAVAILABLE"] * 6
+    assert loop._acquirable_engines() == []
+    assert client.presences[0].paused_reason == "gpu_violation"
+    assert client.kinds().count("acquire") == 6
+
+
+async def _meter_churn(
+    loop: ExecutorLoop, now: list[float], hours: float
+) -> tuple[list[float], float]:
+    """Worst-case meter-blind churn: every life is unmetered for 8 s (3 samples x 2 s x 1.25 +
+    0.5 s kill), then the kill back-off at its lower jitter bound; a quarantined executor
+    waits 30 s (the loop's wait). Returns the kill times and the unmetered share."""
+    kill_times: list[float] = []
+    unmetered = 0.0
+
+    async def sleep(d: float) -> None:
+        now[0] += d
+
+    loop._sleep_fn = sleep
+    start = now[0]
+    end = start + hours * 3600
+    while now[0] < end:
+        if Engine.MLX not in loop._acquirable_engines():
+            now[0] += 30
+            continue
+        now[0] += 8.0
+        unmetered += 8.0
+        kill_times.append(now[0])
+        loop._note_gpu_kill(Engine.MLX, meter=True)
+        await loop._gpu_kill_backoff()
+    return kill_times, unmetered / (now[0] - start)
+
+
+async def test_gpu_meter_churn_sim_is_bounded_by_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("minion_executor.loop.random.uniform", lambda lo, hi: lo)
+
+    def fresh() -> tuple[ExecutorLoop, list[float]]:
+        now = [1000.0]
+        loop = make_loop(
+            FakeClient([]), FakeWorker(), FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET),
+            clock=lambda: now[0],
+        )  # fmt: skip
+        return loop, now
+
+    loop, now = fresh()
+    times, share = await _meter_churn(loop, now, 4)
+    assert all(sum(1 for u in times if 0 <= t - u < 3600) <= 6 for t in times)
+    assert share <= 6 * 8 / 3600 + 0.002
+    monkeypatch.setattr("minion_executor.loop.GPU_QUARANTINE_POINTS", 10**9)
+    loop2, now2 = fresh()
+    _, share_off = await _meter_churn(loop2, now2, 4)
+    assert share_off >= 2 * share  # the gain over the back-off alone
 
 
 async def test_gpu_kill_with_nothing_loaded_does_not_charge_all_engines(tmp_path: Path) -> None:
@@ -4158,3 +4279,218 @@ async def test_gpu_kill_of_an_already_killed_pid_is_not_repeated(tmp_path: Path)
     worker.fake_pid = 4243  # a respawned worker is killable again
     await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
     assert worker.interrupts == 2
+
+
+# --- TASK-43: a decided GPU KILL is never lost ---------------------------------------------
+
+
+def _fake_result() -> Any:
+    return CompleteRequest(record_count=1, byte_size=1, sha256="0" * 64)
+
+
+def _record_interrupts_at_complete(loop: ExecutorLoop, worker: FakeWorker) -> list[int]:
+    seen: list[int] = []
+    real = loop._complete
+
+    async def complete(a: Any, req: Any, bound: Any) -> Any:
+        seen.append(worker.interrupts)
+        return await real(a, req, bound)
+
+    loop._complete = complete  # type: ignore[method-assign,assignment]
+    return seen
+
+
+async def test_gpu_verdict_taken_when_work_finishes_in_the_same_wakeup_is_not_lost(
+    tmp_path: Path,
+) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+    go = asyncio.Event()
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        await go.wait()
+        loop._infer_done.set()
+        return _fake_result()
+
+    async def watch(a: Any) -> _Verdict:
+        await go.wait()
+        loop._gpu_reason = "over_duty"
+        return _Verdict.GPU_DUTY
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    seen = _record_interrupts_at_complete(loop, worker)
+    asyncio.get_running_loop().call_later(0.05, go.set)
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1
+    assert "complete" in client.kinds()
+    assert seen == [1]  # killed before the (slow) complete
+    assert len(loop._gpu_streak) == 1 and len(loop._gpu_kills[Engine.MLX]) == 1
+    assert loop._gpu_violation is not None and loop._gpu_pending is None
+
+
+async def test_gpu_verdict_after_inference_kills_and_counts_while_the_upload_proceeds(
+    tmp_path: Path,
+) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+    upload_gate = asyncio.Event()
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        loop._infer_ok = True
+        loop._infer_done.set()
+        await upload_gate.wait()
+        return _fake_result()
+
+    async def watch(a: Any) -> _Verdict:
+        await loop._infer_done.wait()
+        return _Verdict.GPU_DUTY
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.interrupts == 1)
+    upload_gate.set()
+    assert await asyncio.wait_for(task, 10) == 1
+    assert "complete" in client.kinds() and "release" not in client.kinds()
+    assert worker.interrupts == 1 and len(loop._gpu_streak) == 1  # not counted twice
+
+
+async def test_gpu_pending_not_taken_before_inference_ended_is_killed_before_complete(
+    tmp_path: Path,
+) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        loop._infer_done.set()
+        loop._gpu_pending = (a.acquirement_id, _Verdict.GPU_DUTY)
+        return _fake_result()
+
+    async def watch(a: Any) -> _Verdict:
+        await asyncio.sleep(3600)
+        return _Verdict.GPU_DUTY
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    seen = _record_interrupts_at_complete(loop, worker)
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1
+    assert seen == [1] and len(loop._gpu_streak) == 1 and loop._gpu_pending is None
+
+
+async def test_gpu_verdict_racing_the_inference_end_is_still_counted(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+
+    def interrupt() -> None:
+        loop._infer_ok = True  # inference ends while the worker is being interrupted
+        worker.interrupts += 1
+
+    worker.interrupt = interrupt  # type: ignore[method-assign]
+
+    after_verdict = asyncio.Event()
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        await after_verdict.wait()  # finishes only after `_on_verdict` returned
+        return _fake_result()
+
+    real_on_verdict = loop._on_verdict
+
+    async def on_verdict(*args: Any) -> Any:
+        out = await real_on_verdict(*args)
+        after_verdict.set()  # the `_infer_ok and not work.done()` early return was taken
+        return out
+
+    loop._on_verdict = on_verdict  # type: ignore[method-assign,assignment]
+
+    async def watch(a: Any) -> _Verdict:
+        await asyncio.sleep(0.05)
+        loop._gpu_reason = "over_duty"
+        return _Verdict.GPU_DUTY
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1
+    assert worker.interrupts == 1 and len(loop._gpu_streak) == 1
+    assert loop._gpu_killed_pid == 4242 and "complete" in client.kinds()
+
+
+async def test_gpu_verdict_with_a_hard_stop_in_the_same_wakeup_is_counted(
+    tmp_path: Path,
+) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+    go = asyncio.Event()
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        await asyncio.sleep(3600)
+        return _fake_result()
+
+    async def watch(a: Any) -> _Verdict:
+        await go.wait()
+        return _Verdict.GPU_DUTY
+
+    async def fire() -> None:
+        await asyncio.sleep(0.05)
+        loop.stop()
+        loop._hard_stop.set()
+        go.set()
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    fire_task = asyncio.create_task(fire())
+    await asyncio.wait_for(loop.run(max_subtasks=1), 10)
+    await fire_task
+    assert client.release_codes == ["STOP"]
+    assert len(loop._gpu_streak) == 1
+
+
+async def test_gpu_killed_pid_rearms_after_a_respawn(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    loop = make_loop(client, worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
+    base = worker.interrupts
+    assert await asyncio.wait_for(loop.run(max_subtasks=1), 10) == 1  # ensure_model: new worker
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)  # the fake reuses pid 4242
+    assert worker.interrupts == base + 1 and len(loop._gpu_streak) == 2
+
+
+async def test_gpu_hard_stop_after_a_handled_verdict_does_not_count_twice(tmp_path: Path) -> None:
+    client, worker = FakeClient([assignment()]), FakeWorker()
+    worker.gpu_busy = None
+    loop = _gpu_loop(client, worker, tmp_path, backoff=(0.001, 0.01))
+
+    async def execute(a: Any, tmp: Any, hb: Any) -> Any:
+        loop._infer_ok = True
+        loop._infer_done.set()
+        await asyncio.sleep(3600)  # the upload hangs
+        return _fake_result()
+
+    async def watch(a: Any) -> _Verdict:
+        await loop._infer_done.wait()
+        return _Verdict.GPU_DUTY
+
+    loop._execute = execute  # type: ignore[method-assign]
+    loop._watch = watch  # type: ignore[method-assign]
+    task = asyncio.create_task(loop.run(max_subtasks=1))
+    await until(lambda: worker.interrupts == 1)  # path B: killed after inference
+    loop.stop()
+    loop._hard_stop.set()
+    await asyncio.wait_for(task, 10)
+    assert client.release_codes == ["STOP"]
+    assert len(loop._gpu_streak) == 1
+    assert loop._quarantine_points(Engine.MLX, loop._clock()) == 2
+
+
+async def test_gpu_idle_kill_during_an_unload_still_charges_the_last_engine(
+    tmp_path: Path,
+) -> None:
+    worker = FakeWorker()
+    loop = make_loop(FakeClient([]), worker, FakeS3(), tmp_path, [], governor=FixedGovernor(BUDGET))
+    loop._last_engine = Engine.MLX  # `_loaded` is None while a graceful unload runs
+    await loop._gpu_kill_idle(_Verdict.GPU_DUTY)
+    assert len(loop._gpu_kills[Engine.MLX]) == 1
