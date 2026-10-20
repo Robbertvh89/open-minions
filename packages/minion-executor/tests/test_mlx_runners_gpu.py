@@ -35,7 +35,7 @@ from minion_common.schemas import (
     ModelEntry,
     PresignedPost,
 )
-from minion_executor.bench_budget import assert_window_headroom
+from minion_executor.bench_budget import assert_window_headroom, max_window_share
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, Record
@@ -580,7 +580,7 @@ def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionR
     params = CompletionParams(max_tokens=300, temperature=0.0)
     completion.run(recs[:2], CompletionParams(max_tokens=4), Ctl())  # warm up kernels
 
-    def measure(d: float) -> tuple[float, float, int]:
+    def measure(d: float) -> tuple[float, float, int, float | None]:
         sampler = make_sampler(os.getpid)
         sampler.start()
         time.sleep(1.0)
@@ -591,15 +591,17 @@ def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionR
         t1 = time.monotonic()
         time.sleep(1.0)
         samples = sampler.stop()
-        return process_gpu_share(samples, t0, t1), t1 - t0, len(out)
+        worst = max_window_share(samples, t0, t1)  # None if the run is shorter than 10 s
+        return process_gpu_share(samples, t0, t1), t1 - t0, len(out), worst
 
-    unpaced, _, n0 = measure(1.0)
-    share, secs, n = measure(duty)
+    unpaced, _, n0, _ = measure(1.0)
+    share, secs, n, worst = measure(duty)
     print(f"gpu share unpaced {unpaced:.3f}, paced {share:.3f} over {secs:.1f}s")
     assert n0 == n == 16
     assert secs > 5, "run too short to measure"
     assert share <= duty + 0.10, f"worker GPU share {share:.2f} exceeds duty {duty}"
-    assert_window_headroom(duty, share)  # TASK-55: honest run, 5 pp under the guard limit
+    if worst is not None:  # TASK-55: worst 10 s window, 5 pp under gate limit
+        assert_window_headroom(duty, worst)
     assert share >= duty * unpaced - 0.10, (
         f"worker GPU share {share:.2f} under-uses the duty (expected ~{duty * unpaced:.2f})"
     )
