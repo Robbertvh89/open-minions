@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import boto3
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
 MAX_PRESIGN_TTL_S = 3600
+PROBE_PREFIX = "_preflight/check-storage/"  # operator `check-storage` probes only
 # Per-subtask outputs are small: promoting one must not hold a DB transaction for minutes.
 COPY_CONNECT_TIMEOUT_S = 5
 COPY_READ_TIMEOUT_S = 30
@@ -158,6 +160,35 @@ class S3Storage:
     async def delete(self, key: str) -> None:
         """Delete one object (idempotent in S3: a missing key is not an error)."""
         await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
+
+    async def discard_stale_probes(self, older_than_s: int) -> None:
+        """Best effort, quiet: delete `check-storage` probe objects older than `older_than_s`.
+
+        Hard-wired to `PROBE_PREFIX` (no caller-chosen prefix), and every listed key is checked
+        against it again, so a backend that ignores `Prefix=` cannot make this delete real data.
+        The cutoff uses this host's clock against the server's `LastModified`: more than 1 h of
+        skew can delete a concurrent run's probe (a false exit 1). Versioned buckets keep old
+        probe versions; an S3 lifecycle rule on the prefix handles those.
+        """
+
+        def _run() -> None:
+            cutoff = datetime.now(UTC) - timedelta(seconds=older_than_s)
+            try:
+                pages = self._client.get_paginator("list_objects_v2").paginate(
+                    Bucket=self._bucket, Prefix=PROBE_PREFIX, PaginationConfig={"MaxItems": 1000}
+                )
+                for page in pages:
+                    for o in page.get("Contents", []):
+                        if o["Key"].startswith(PROBE_PREFIX) and o["LastModified"] < cutoff:
+                            self._client.delete_object(Bucket=self._bucket, Key=o["Key"])
+            except Exception:  # noqa: S110 - housekeeping only
+                pass
+
+        await asyncio.to_thread(_run)
+
+    async def put(self, key: str, data: bytes) -> None:
+        """Write one small object (operator preflight probe; payloads use presigned POST)."""
+        await asyncio.to_thread(self._client.put_object, Bucket=self._bucket, Key=key, Body=data)
 
     async def head(self, key: str) -> int | None:
         """Object size in bytes, or None if it does not exist."""

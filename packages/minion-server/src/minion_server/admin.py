@@ -1,15 +1,18 @@
 """Operator CLI: `generate-api-key | issue/revoke/rotate-executor-token | list-executors`."""
 
 import asyncio
+import http.client
 import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import typer
 import yaml
 from minion_common.schemas import SLUG_PATTERN
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from minion_server.auth import MAX_TEAMS_PER_KEY, sha256_hex
@@ -229,11 +232,59 @@ def generate_api_key_cmd(
     typer.echo(yaml.safe_dump(snippet, sort_keys=False), nl=False)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @app.command("generate-ui-secret")
 def generate_ui_secret_cmd() -> None:
     """Print a random MINION_UI_SESSION_SECRET (UI cookie key); rotating it logs everyone out."""
     typer.echo(f"MINION_UI_SESSION_SECRET={secrets.token_urlsafe(48)}")
+
+
+@app.command("check-storage")
+def check_storage_cmd() -> None:
+    """Preflight: verify the S3 backend enforces the signed Range on input GET URLs (SPEC S-2).
+
+    Run against the production bucket before going live. Exit 0 = enforcing, 1 = not enforcing
+    (observed `(status, body length)` per check is printed), 2 = config/connectivity error.
+    Needs the server settings (MINION_DATABASE_URL is required by ServerSettings even though no
+    DB access happens, plus MINION_S3_*). Run it from a network position like the executors'.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from minion_server.storage import S3Storage
+    from minion_server.storage_check import run_check
+
+    try:
+        settings = ServerSettings()
+        storage = S3Storage(settings)
+    except ValidationError as exc:  # field locations only: values may be secrets
+        locs = ", ".join(sorted({".".join(str(p) for p in e["loc"]) for e in exc.errors()}))
+        typer.echo(f"configuration error in: {locs}", err=True)
+        raise typer.Exit(2) from None
+    except Exception as exc:
+        typer.echo(f"configuration error: {type(exc).__name__}", err=True)
+        raise typer.Exit(2) from None
+    host = urlsplit(settings.public_s3_endpoint_url).netloc
+    typer.echo(f"checking bucket {settings.s3_bucket!r} through endpoint host {host}")
+    try:
+        checks = asyncio.run(
+            run_check(storage, warn=lambda m: typer.echo(f"WARNING: {m}", err=True))
+        )
+    except (OSError, BotoCoreError, ClientError, http.client.HTTPException) as exc:
+        typer.echo(f"storage unreachable or refused: {type(exc).__name__}", err=True)
+        raise typer.Exit(2) from None
+    for c in checks:
+        typer.echo(
+            f"{'ok  ' if c.ok else 'FAIL'} {c.name}: observed (status, length) = "
+            f"{c.observed}, expected {c.expected}"
+        )
+    if not all(c.ok for c in checks):
+        typer.echo(
+            "FAIL: the backend does not enforce the signed Range; input GET URLs are not "
+            "slice-scoped here (SPEC S-2). Do not use it for confidential tasks.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    typer.echo("ok: signed Range enforced")
+
+
+if __name__ == "__main__":
+    app()

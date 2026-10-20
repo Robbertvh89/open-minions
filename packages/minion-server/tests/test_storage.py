@@ -1,6 +1,5 @@
 import urllib.error
 import urllib.request
-import warnings
 from urllib.parse import urlsplit
 
 import pytest
@@ -74,44 +73,7 @@ async def test_presign_get_signs_the_range_header() -> None:
     assert other["X-Amz-Signature"] != ranged["X-Amz-Signature"]
 
 
-@pytest.mark.integration
-async def test_signed_range_get_enforced_by_s3(s3: S3Env) -> None:
-    """The signed-range GET returns exactly the slice; other requests are refused (403) where the
-    backend enforces SigV4 signed headers (AWS S3, MinIO). SeaweedFS may not: then warn loudly."""
-    cfg = ServerSettings(
-        database_url=SecretStr("postgresql+asyncpg://x@h/db"),
-        s3_endpoint_url=s3.endpoint_url,
-        s3_access_key=SecretStr(s3.access_key),
-        s3_secret_key=SecretStr(s3.secret_key),
-        s3_bucket=s3.bucket,
-        s3_region=s3.region,
-    )
-    st = S3Storage(cfg)
-    s3.client.put_object(Bucket=s3.bucket, Key="rng/in", Body=b"0123456789abcdef")
-    url = await st.presign_get("rng/in", None, (4, 10))
-
-    def get(headers: dict[str, str]) -> tuple[int, bytes]:
-        req = urllib.request.Request(url, headers=headers)  # noqa: S310
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310
-                return r.status, bytes(r.read())
-        except urllib.error.HTTPError as exc:
-            return exc.code, b""
-
-    assert get({"Range": "bytes=4-9"}) == (206, b"456789")
-    other, none = get({"Range": "bytes=0-3"})[0], get({})[0]
-    # If-Range is an unsigned header: SigV4 backends may accept it (403 or the same slice is
-    # fine); the risk is a backend that drops the Range on an ETag mismatch (200 / wider body)
-    if_range = get({"Range": "bytes=4-9", "If-Range": '"bogus"'})
-    observed = (other, none, if_range[0])  # (other range, no range, extra If-Range header)
-    if (other, none) != (403, 403) or if_range not in ((403, b""), (206, b"456789")):
-        msg = (
-            "backend does NOT enforce the signed Range / signed-header set "
-            f"(other range, no range, extra If-Range) = {observed}; input GET URLs are not "
-            "slice-scoped on this store (SPEC S-2)"
-        )
-        print(f"WARNING: {msg}")
-        warnings.warn(msg, stacklevel=1)
+# Signed-Range enforcement against a real backend: test_storage_check.py (check-storage).
 
 
 @pytest.mark.integration
