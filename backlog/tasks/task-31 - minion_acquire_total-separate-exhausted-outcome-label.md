@@ -1,10 +1,10 @@
 ---
 id: TASK-31
 title: 'minion_acquire_total: separate exhausted outcome label'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 05:20'
-updated_date: '2026-10-20 01:41'
+updated_date: '2026-10-20 02:08'
 labels:
   - observability
 dependencies: []
