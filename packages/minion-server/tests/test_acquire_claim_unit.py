@@ -121,6 +121,7 @@ async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
     monkeypatch.setattr(repo, "count_open_acquirements", _zero)
     p = ExecutorPrincipal(uuid.uuid4(), "o", "default", "h")
+    trace = svc.AcquireTrace()
     with structlog.testing.capture_logs() as logs:
         got = await svc.acquire(
             _FakeSession(),  # type: ignore[arg-type]
@@ -129,8 +130,10 @@ async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> N
             settings=_cfg(),
             storage=None,  # type: ignore[arg-type]
             models={"m": None},  # type: ignore[dict-item]
+            trace=trace,
         )
     assert got is None and calls["claim"] == svc.MAX_ROUNDS
+    assert trace.exhausted is True
     [ev] = [e for e in logs if e["event"] == "acquire_rounds_exhausted"]
     assert ev["rounds"] == svc.MAX_ROUNDS and "executor_id" not in ev
 

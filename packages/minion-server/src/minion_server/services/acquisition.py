@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -40,6 +41,15 @@ def _log_capped(executor_id: uuid.UUID, open_now: int) -> None:
     _log.warning("acquire_capped", executor_id=str(executor_id), open_acquirements=open_now)
 
 
+@dataclass
+class AcquireTrace:
+    """Out-parameter: `exhausted` is set when an acquire answered "no work" although a pass saw
+    candidates in every round (lost the race each time). Lets the API count it as
+    outcome=exhausted instead of empty (TASK-31)."""
+
+    exhausted: bool = False
+
+
 class _LostRaceError(Exception):
     """Raised inside a transaction to roll it back after losing the race."""
 
@@ -59,6 +69,7 @@ async def acquire(
     models: dict[str, ModelEntry],
     window: int | None = None,
     deadline: float | None = None,
+    trace: AcquireTrace | None = None,
 ) -> Assignment | None:
     """Claim one subtask. `deadline` is an absolute `time.monotonic()` value: a round that gets
     its connection after it answers 503 ACQUIRE_DEADLINE before the claim INSERT, so nothing is
@@ -137,7 +148,9 @@ async def acquire(
                 continue
             model = models[result.candidate.model_id]  # candidates are filtered to registry keys
             return await _assignment(result.candidate, result.won, model, settings, storage)
-        if exhausted:  # every round had work but lost the race: answer "empty", executor re-polls
+        if exhausted:  # every round had work but lost the race: answer 204, executor re-polls
+            if trace is not None:
+                trace.exhausted = True
             _log.warning(
                 "acquire_rounds_exhausted",
                 rounds=MAX_ROUNDS,

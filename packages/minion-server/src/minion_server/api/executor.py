@@ -178,6 +178,7 @@ async def acquire(
     if inflight is not None:
         inflight[eid] = inflight.get(eid, 0) + 1
     outcome = "error"  # one of a few fixed values; a raised acquire is timed too
+    trace = acquisition.AcquireTrace()
     try:
         assignment = await acquisition.acquire(
             session,
@@ -187,8 +188,12 @@ async def acquire(
             storage=storage,
             models=models,
             deadline=deadline,
+            trace=trace,
         )
-        outcome = "empty" if assignment is None else "assigned"
+        if assignment is not None:
+            outcome = "assigned"
+        else:
+            outcome = "exhausted" if trace.exhausted else "empty"
     except PoolTimeoutError:
         outcome = "shed"  # 503 SERVER_BUSY from the app-level handler
         raise

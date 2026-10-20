@@ -4,7 +4,7 @@ title: 'minion_acquire_total: separate exhausted outcome label'
 status: In Progress
 assignee: []
 created_date: '2026-10-18 05:20'
-updated_date: '2026-10-20 01:36'
+updated_date: '2026-10-20 01:39'
 labels:
   - observability
 dependencies: []
@@ -19,6 +19,12 @@ TASK-7.4.3 logs acquire_rounds_exhausted but counts exhausted acquires as 'empty
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Exhausted acquires counted as outcome=exhausted (test)
-- [ ] #2 Grafana panel and docs updated
+- [x] #1 Exhausted acquires counted as outcome=exhausted (test)
+- [x] #2 Grafana panel and docs updated
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+No Grafana panel reads minion_acquire_total (dashboards query PostgreSQL views); docs updated only (SPEC, ARCHITECTURE, ADR-0013). 'error' remains timed in minion_acquire_seconds only, not counted.
+<!-- SECTION:NOTES:END -->
