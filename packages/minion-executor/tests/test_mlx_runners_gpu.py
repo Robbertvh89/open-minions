@@ -17,6 +17,8 @@ import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from email.parser import BytesParser
+from email.policy import HTTP
 from pathlib import Path
 from typing import Any
 
@@ -401,6 +403,22 @@ def _budget_for(model: ModelEntry) -> Budget:
     return BUDGET.model_copy(update={"memory_gb": max(BUDGET.memory_gb, model.memory_gb)})
 
 
+def _multipart_file_part(req: httpx.Request) -> bytes:
+    """Assert the presigned-POST framing (TASK-19) and return the file part (the JSONL)."""
+    assert req.method == "POST" and str(req.url) == "https://s3.test/out"
+    body = req.read()
+    assert int(req.headers["Content-Length"]) == len(body)
+    msg = BytesParser(policy=HTTP).parsebytes(
+        b"Content-Type: " + req.headers["Content-Type"].encode() + b"\r\n\r\n" + body
+    )
+    parts = list(msg.iter_parts())
+    names = [p.get_param("name", header="content-disposition") for p in parts]
+    assert {"key", "policy"} <= set(names) and names[-1] == "file", names  # S3: file last
+    payload = parts[-1].get_payload(decode=True)
+    assert isinstance(payload, bytes)
+    return payload
+
+
 async def _executor_e2e(
     model: ModelEntry, cache: ModelCache, lines: list[dict[str, Any]], tmp: Path
 ) -> list[dict[str, Any]]:
@@ -412,8 +430,8 @@ async def _executor_e2e(
     def s3(req: httpx.Request) -> httpx.Response:
         if req.method == "GET":
             return httpx.Response(206, content=body)
-        puts.append(req.read())
-        return httpx.Response(200)
+        puts.append(_multipart_file_part(req))
+        return httpx.Response(204)
 
     client = _Client([_assignment(model, body, len(lines))])
     worker = WorkerHandle(
