@@ -116,6 +116,8 @@ services:
     <<: *minion-app
     command: ["minion-server"]
     restart: unless-stopped
+    # A shutdown mid-split waits up to 15 s for the S3 read thread (splitter STOP_WAIT_S).
+    stop_grace_period: 30s
     pull_policy: never
     environment:
       <<: *minion-app-env

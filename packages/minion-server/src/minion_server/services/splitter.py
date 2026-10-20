@@ -15,12 +15,12 @@ failed, retry) matches on it, so a holder that lost its lease becomes a no-op. T
 by a background timer every `lease_s / 3`, which also enforces the wall-clock budget, so one long
 blocking object read cannot outlive it; the timer trips a stop flag that the read thread checks per
 S3 chunk. Each batch insert re-checks the lease in its own transaction (the fence). A shutdown
-during a read stops the thread the same way and does not count as a failed attempt.
+during a read stops the thread the same way, does not hang, writes no backoff and releases the
+lease (fenced write) so another server can claim at once; that claim still counts an attempt.
 Only the error class and task id are logged, never payload contents.
 """
 
 import asyncio
-import contextlib
 import threading
 import time
 from collections.abc import AsyncGenerator, Generator, Iterator
@@ -43,7 +43,10 @@ from minion_server.uris import InvalidUriError, parse_s3_uri
 log = structlog.get_logger()
 
 BATCH_SIZE = 1000
-STOP_WAIT_S = 15.0  # > the S3 read timeout (10 s): how long a shutdown waits for the read thread
+# How long a shutdown waits for the read thread. A stalled first read (connect + read timeouts, two
+# attempts) can take ~40 s, so the thread may outlive this wait; it then exits at its next chunk.
+# The server container gets stop_grace_period 30 s (deploy/compose.yml).
+STOP_WAIT_S = 15.0
 EMPTY_INPUT_ERROR = "input prefix contains no records"
 DETERMINISTIC_S3_CODES = frozenset(
     {"AccessDenied", "NoSuchKey", "NoSuchBucket", "InvalidObjectState", "403", "404"}
@@ -269,6 +272,19 @@ async def _insert_batch(
             raise SplitFailedError("INPUT_CHANGED: stored subtasks differ from the split plan")
 
 
+async def _release_lease(sessionmaker: async_sessionmaker[AsyncSession], task: Task) -> None:
+    """Shutdown: make the task claimable now. Fenced, so a lost lease is not touched."""
+
+    async def write() -> None:
+        async with sessionmaker() as s, s.begin():
+            await tasks_repo.schedule_split_retry(s, task, 0)
+
+    try:
+        await asyncio.shield(asyncio.ensure_future(write()))
+    except Exception as exc:  # best effort: the lease then simply expires
+        log.warning("task_split_release_error", task=tid_of(task), error_class=type(exc).__name__)
+
+
 async def _split(
     sessionmaker: async_sessionmaker[AsyncSession],
     storage: S3Storage,
@@ -290,10 +306,10 @@ async def _split(
                 total += len(batch)
     finally:
         renewer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await renewer
+        await asyncio.wait([renewer])  # the renewer's own cancellation is not ours
         current = asyncio.current_task()
         if current is not None and current.cancelling():
+            await _release_lease(sessionmaker, task)
             raise asyncio.CancelledError  # our own cancellation is never swallowed
     if total == 0:
         raise SplitFailedError(EMPTY_INPUT_ERROR)

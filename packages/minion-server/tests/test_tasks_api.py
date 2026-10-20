@@ -854,7 +854,6 @@ async def test_iter_object_multipart_list_and_get_etags_agree(
     )
     ((_, size, etag),) = await storage.list_objects("inputs/fz7c/")
     got = s3.client.get_object(Bucket=s3.bucket, Key=key)["ETag"]
-    print("multipart ETag LIST/GET:", etag, got)
     assert etag.strip('"') == got.strip('"')
     assert b"".join(storage.iter_object(key, etag=etag, size=size)) == data
 
@@ -996,12 +995,33 @@ async def test_cancel_mid_read_is_clean(
             )
         ).scalar_one()
     assert (await _task_row(fresh_engine, "shut"))[:3] == ("SPLITTING", None, 1)
-    assert soon  # no failed-attempt backoff was written
+    assert soon  # no failed-attempt backoff was written (and the lease was released)
     stats["delay"] = 0
-    async with fresh_engine.begin() as conn:
-        await conn.execute(EXPIRE, {"n": "shut"})
+    # The lease was released on shutdown: claimable at once, without waiting for it to expire.
     assert await split_one(sm, storage, _LONG_LEASE, batch_size=100)
     assert (await _task_row(fresh_engine, "shut"))[:4] == ("PENDING", None, 2, 12)
+
+
+@pytest.mark.integration
+async def test_shutdown_after_lease_lost_does_not_touch_the_new_holder(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _ = await _setup_long_read(fresh_engine, s3, "lr6", "lost", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    t = asyncio.create_task(run_splitter(sm, storage, poll_s=3600, limits=_LONG_LEASE))
+    await asyncio.sleep(0.5)
+    async with sm() as other, other.begin():  # a rival claims; its lease is still in the future
+        await other.execute(BUMP)
+    t.cancel()
+    await asyncio.wait_for(asyncio.gather(t, return_exceptions=True), 5)
+    async with fresh_engine.connect() as conn:
+        held = (
+            await conn.execute(
+                text("SELECT next_split_at > now() FROM minion_task WHERE task_name='lost'")
+            )
+        ).scalar_one()
+    assert held  # the fenced release did not shorten the lease of the new holder
+    assert (await _task_row(fresh_engine, "lost"))[:3] == ("SPLITTING", None, 2)
 
 
 @pytest.mark.integration

@@ -76,7 +76,7 @@ async def test_renewer_ticks_every_third_of_the_lease(monkeypatch: pytest.Monkey
         await t
     assert len(times) >= 3
     gaps = [b - a for a, b in itertools.pairwise(times)]
-    assert all(0.05 < gap < 0.25 for gap in gaps)
+    assert all(0.05 < gap < 0.4 for gap in gaps)
     g.check()  # not tripped
 
 

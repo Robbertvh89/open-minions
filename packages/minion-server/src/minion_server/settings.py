@@ -31,7 +31,8 @@ class ServerSettings(BaseSettings):
     # claim INSERT answers 503 ACQUIRE_DEADLINE with nothing committed, so a client that timed out
     # (executor HTTP timeout 30 s) is not left with a ghost acquirement. At most acquire_concurrency
     # acquires run per process (default pool + overflow - 4, min 1); the rest get 503 SERVER_BUSY
-    # and the remaining connections stay free for heartbeat / complete / release.
+    # and the remaining connections stay free for heartbeat / complete / release. A split may hold
+    # 2 connections of the per-worker pool (lease renewer + batch insert).
     db_pool_timeout_s: float = Field(default=5.0, ge=0.5, le=30.0)
     acquire_deadline_s: float = Field(default=10.0, ge=1.0, le=20.0)
     acquire_concurrency: int | None = Field(default=None, ge=1)
@@ -142,7 +143,8 @@ class ServerSettings(BaseSettings):
     split_max_attempts: int = Field(default=5, gt=0)  # transient failures before FAILED
     split_backoff_base_s: float = Field(default=2.0, ge=0)  # doubles per attempt
     split_backoff_max_s: float = Field(default=300.0, ge=0)
-    split_lease_s: float = Field(default=900.0, gt=0)  # claim lease, renewed every lease_s/3; crashed splits retry after
+    # Claim lease, renewed every lease_s/3; a crashed split is retried after it.
+    split_lease_s: float = Field(default=900.0, gt=0)
     split_max_seconds: float = Field(default=3600.0, gt=0)  # wall-clock budget per split attempt
 
     @field_validator("metrics_token", mode="before")

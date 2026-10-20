@@ -355,8 +355,9 @@ retry all match on the claimed value, so a splitter whose lease expired and was 
 a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
 default 3600; exceeding it backs off like any transient error). A claim never hands out a task with
 `split_attempts >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED` (crash loop).
-Server shutdown during a read stops the read thread at its next chunk and does not count as a
-failed attempt.
+Server shutdown during a read stops the read thread at its next chunk, does not hang, writes no
+backoff and releases the lease (fenced write), so another server claims at once; that claim still
+counts an attempt. The server container has `stop_grace_period: 30s` for this.
 
 ### 3.2 Acquire (the core protocol)
 ```
