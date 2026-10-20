@@ -995,18 +995,18 @@ def test_kill_during_an_inflight_run_releases_the_ollama_model_once(
     w.ensure_model(_model(), BUDGET)
     w._ollama_ref = "q:5"
     errors: list[BaseException] = []
-    started = threading.Event()
+    in_flight = threading.Event()
 
     def go() -> None:
-        started.set()
         try:
-            w.run([{"id": 1, "sleep_s": 30}])
+            # record 1 finishes at once (progress tick), record 2 keeps the run in flight
+            w.run([{"id": 1}, {"id": 2, "sleep_s": 30}], on_progress=lambda n: in_flight.set())
         except BaseException as e:
             errors.append(e)
 
     t = threading.Thread(target=go)
     t.start()
-    assert started.wait(5)
+    assert in_flight.wait(15)  # a tick arrived: the run is genuinely in flight
     w.kill()
     t.join(15)
     assert not t.is_alive() and isinstance(errors[0], WorkerCrashed)

@@ -103,15 +103,22 @@ def test_deadline_disarmed_in_time_never_fires_and_close_joins_the_thread() -> N
     assert not thread.is_alive()
 
 
+def _deadline_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "worker-deadline"]
+
+
 def test_deadline_arm_disarm_cycles_use_a_single_thread() -> None:
-    baseline = threading.active_count()
     dl = _Deadline(lambda: pytest.fail("must not fire"))
+    assert _deadline_threads() == []
+    dl.arm(time.monotonic() + 3600)
+    first = dl._thread
+    assert first is not None and _deadline_threads() == [first]
     for _ in range(1000):
         dl.arm(time.monotonic() + 3600)
         assert dl.disarm() is False
-    assert threading.active_count() == baseline + 1
+    assert dl._thread is first and _deadline_threads() == [first]
     dl.close()
-    assert threading.active_count() == baseline
+    assert _deadline_threads() == []
 
 
 def test_shutdown_quietly_ends_blocked_io_despite_a_leaked_peer_fd() -> None:
@@ -373,3 +380,47 @@ def test_a_revision_bump_reloads_the_model_and_the_same_revision_stays_warm() ->
         assert w.loaded_model_id == "fake-embed"
     finally:
         w.close()
+
+
+def test_the_watchdog_shuts_down_via_the_handles_own_dup_not_a_fresh_fd_lookup() -> None:
+    """A fire after the conn was closed (fd number free to be reused) must not touch whatever
+    descriptor now has that number: it shuts down the handle's own dup, which is closed by
+    `_reset`, and then does nothing."""
+    parent, child = _pair()
+    proc = _FakeProc()
+    w = _handle(proc, parent)
+    sock = w._sock_for(parent)
+    assert sock is not None and w._sock_for(parent) is sock  # made once per conn
+    victim_r, victim_w = os.pipe()
+    try:
+        w._reset()
+        assert sock.fileno() == -1 and w._sock is None  # the dup died with the worker
+        w._fire(proc, sock)  # a late fire: closed socket, no effect on anyone else  # type: ignore[arg-type]
+        os.write(victim_w, b"x")
+        assert os.read(victim_r, 1) == b"x"
+    finally:
+        os.close(victim_r)
+        os.close(victim_w)
+        child.close()
+
+
+def test_a_ctl_write_watchdog_fire_shuts_the_socket_down() -> None:
+    parent, child = _pair()
+    proc = _FakeProc(ignores_kill=True)
+    w = _handle(proc, parent)
+    sock = w._sock_for(parent)
+    errors: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            parent.send_bytes(b"x" * (8 * 1024 * 1024))
+        except OSError as e:
+            errors.append(e)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    w._abort_stuck_send(proc, sock, threading.Event())  # type: ignore[arg-type]
+    t.join(5)
+    assert not t.is_alive() and errors and proc.killed
+    child.close()
+    parent.close()

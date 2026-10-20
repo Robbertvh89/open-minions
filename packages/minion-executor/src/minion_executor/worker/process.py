@@ -159,20 +159,33 @@ def _kill_quietly(proc: BaseProcess) -> None:
         proc.kill()
 
 
-def _shutdown_quietly(conn: Connection) -> None:
-    """`shutdown(SHUT_RDWR)` the socketpair end of `conn`: a blocked read or write on it ends
-    (EOF / EPIPE) even if a grandchild of the worker still holds a copy of the peer fd, which a
-    plain kill of the worker pid cannot guarantee. Works on a dup of the fd; shutdown acts on the
-    socket, not the descriptor. A pipe or an already closed conn is ignored."""
+def _dup_socket(conn: Connection) -> socket.socket | None:
+    """A private dup of the socketpair end behind `conn` (None for a pipe or a closed conn).
+    `shutdown` on it acts on the socket, so it ends a blocked read or write on `conn` even if a
+    grandchild of the worker still holds a copy of the peer fd, which a kill of the worker pid
+    cannot guarantee. Owning the dup (instead of dup-ing at fire time) means the descriptor number
+    cannot have been recycled when the watchdog fires."""
     with contextlib.suppress(OSError, ValueError, AttributeError):
         fd = os.dup(conn.fileno())
         try:
-            sock = socket.socket(fileno=fd)
+            return socket.socket(fileno=fd)
         except OSError:  # not a socket: the constructor did not take ownership of the dup
             os.close(fd)
-            raise
-        with sock:
+    return None
+
+
+def _shutdown_sock(sock: socket.socket | None) -> None:
+    if sock is not None:
+        with contextlib.suppress(OSError, ValueError):
             sock.shutdown(socket.SHUT_RDWR)
+
+
+def _shutdown_quietly(conn: Connection) -> None:
+    """One-shot variant of `_dup_socket` + `_shutdown_sock` (closes the dup)."""
+    sock = _dup_socket(conn)
+    if sock is not None:
+        with sock:
+            _shutdown_sock(sock)
 
 
 class _Deadline:
@@ -629,6 +642,9 @@ class WorkerHandle:
         self._model_id: str | None = None
         self._model_revision: str | None = None  # of the loaded model (a bump reloads)
         self._ollama_ref: str | None = None  # set while an Ollama model may be resident
+        self._sock_lock = threading.Lock()
+        self._sock: socket.socket | None = None  # our dup of the control socket end (see _fire)
+        self._sock_conn: Connection | None = None
         self._ref_lock = threading.Lock()  # guards the take-once of _ollama_ref
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
@@ -716,7 +732,7 @@ class WorkerHandle:
             # One watchdog thread for the whole call: armed around the request write and around
             # each frame read. A fire kills the worker AND shuts the socket down, so neither a
             # stalled peer nor a grandchild holding the peer fd can wedge this thread.
-            dl = self._deadline_factory(partial(self._fire, proc, conn))
+            dl = self._deadline_factory(partial(self._fire, proc, self._sock_for(conn)))
             try:
                 start = time.monotonic()
                 deadline = start + timeout_s
@@ -966,10 +982,24 @@ class WorkerHandle:
             self._send_ctl(conn, proc, ctl, wait=True)
         return ctl.gen
 
-    def _fire(self, proc: BaseProcess, conn: Connection) -> None:
+    def _sock_for(self, conn: Connection) -> socket.socket | None:
+        """The handle's own dup of `conn`'s socket, made on first use and closed by `_reset`.
+        Callers hold the call lock, so `conn` is still open here."""
+        with self._sock_lock:
+            if self._sock is None or self._sock_conn is not conn:
+                if self._sock is not None:
+                    self._sock.close()
+                self._sock, self._sock_conn = _dup_socket(conn), conn
+            return self._sock
+
+    def _existing_sock(self, conn: Connection) -> socket.socket | None:
+        with self._sock_lock:
+            return self._sock if self._sock_conn is conn else None
+
+    def _fire(self, proc: BaseProcess, sock: socket.socket | None) -> None:
         """Watchdog action: kill the worker, then end any blocked read/write on its socket."""
         _kill_quietly(proc)
-        _shutdown_quietly(conn)
+        _shutdown_sock(sock)
 
     def _send_ctl(self, conn: Connection, proc: BaseProcess, ctl: WorkerCtl, *, wait: bool) -> bool:
         """Write one ctl frame without ever wedging the caller. True if it was written.
@@ -983,7 +1013,9 @@ class WorkerHandle:
         if not self._send_lock.acquire(blocking=wait, timeout=CTL_SEND_TIMEOUT_S if wait else -1):
             return False  # a newer state will be re-sent by the in-flight call (_flush_unsent)
         done = threading.Event()  # set before cancel(): a timer already firing must stand down
-        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, conn, done))
+        watchdog = threading.Timer(
+            CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, self._existing_sock(conn), done)
+        )
         watchdog.daemon = True
         watchdog.start()
         try:
@@ -1002,7 +1034,9 @@ class WorkerHandle:
                 self._unsent = None
         return True
 
-    def _abort_stuck_send(self, proc: BaseProcess, conn: Connection, done: threading.Event) -> None:
+    def _abort_stuck_send(
+        self, proc: BaseProcess, sock: socket.socket | None, done: threading.Event
+    ) -> None:
         """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
         worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`).
         No-op if the send finished meanwhile. The `done` check narrows the gap but cannot close it:
@@ -1011,7 +1045,7 @@ class WorkerHandle:
         if done.is_set():
             return
         self._interrupt_gen += 1
-        self._fire(proc, conn)
+        self._fire(proc, sock)
 
     def _flush_unsent(self, conn: Connection, proc: BaseProcess) -> None:
         """Re-send a control state whose send found the pipe busy (called by the in-flight call
@@ -1154,18 +1188,24 @@ class WorkerHandle:
         """
         self._closed = True
         proc = self._proc
+        ref = self._ollama_ref  # read before the kill: it belongs to this worker
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 if reap:  # reap now: no <defunct> child until the next _reset
                     proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(self._take_ollama_ref())
+            self._release_ollama(self._take_ollama_ref(only=ref) if ref is not None else None)
 
-    def _take_ollama_ref(self) -> str | None:
+    def _take_ollama_ref(self, *, only: str | None = None) -> str | None:
         """Read and clear the resident Ollama ref once: whoever gets it sends the one release
-        (a hard kill and the failing in-flight call's `_reset` must not both send one)."""
+        (a hard kill and the failing in-flight call's `_reset` must not both send one). With
+        `only`, take it just if it is still that value (compare-and-take): a ref that changed
+        during the kill belongs to a newer worker and is left alone."""
         with self._ref_lock:
-            ref, self._ollama_ref = self._ollama_ref, None
+            ref = self._ollama_ref
+            if only is not None and ref != only:
+                return None
+            self._ollama_ref = None
         return ref
 
     def _release_ollama(self, ref: str | None) -> None:
@@ -1187,12 +1227,13 @@ class WorkerHandle:
         """
         self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
         proc = self._proc
+        ref = self._ollama_ref  # read before the kill: it belongs to this worker
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 # reap now: no <defunct> child until the next _reset
                 proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(self._take_ollama_ref())
+            self._release_ollama(self._take_ollama_ref(only=ref) if ref is not None else None)
 
     def _reset(self) -> None:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
@@ -1209,6 +1250,10 @@ class WorkerHandle:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():
                     proc.kill()
+        with self._sock_lock:
+            sock, self._sock, self._sock_conn = self._sock, None, None
+        if sock is not None:
+            sock.close()  # our dup only; the conn's own fd is closed below
         if conn is not None:
             # a control() write may be mid-flight on this conn (the kill above unblocks it): let it
             # finish before closing the fd; the watchdog bounds it, so proceed anyway on timeout

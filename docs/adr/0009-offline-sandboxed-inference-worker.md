@@ -135,6 +135,12 @@ together with `MINION_EXECUTOR_DEV=1`.
     control end of the socketpair, so a grandchild holding a copy of the peer fd cannot keep a
     blocked read or write alive and wedge the control side. One deadline thread per call serves all
     its reads and writes; a reply that races a fire is discarded (`WorkerTimeout`).
+    The shutdown uses a dup of the socket fd owned by the handle (made when the worker is first used,
+    closed by `_reset`), so a late fire can never hit a recycled descriptor number. `kill()` and
+    `interrupt()` (which take no lock) only kill the worker and do not shut the socket down: without
+    the lock the fd could be closed and reused under them. In the dev-only sandbox-off case a
+    grandchild holding the peer fd can therefore keep an in-flight write blocked after a stop until
+    that call's own deadline fires; accepted (dev only).
   - `needed` and the plan file sizes are child-reported, so a compromised fetch child could force
     eviction of the cache (DoS only, bounded by the free-disk reserve).
   - The localhost deny covers `localhost` only: the rest of 127/8 and the Mac's own LAN IP are not

@@ -742,3 +742,61 @@ def test_release_model_returns_within_its_cap_against_a_dripping_listener() -> N
         stop.set()
         t.join(10)
         srv.close()
+
+
+@pytest.mark.usefixtures("_clean_release_slots")
+def test_release_model_never_reads_the_reply_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+
+    pulled: list[int] = []
+
+    class Endless(httpx.SyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            while True:
+                pulled.append(1)
+                yield b"x" * 65536
+
+    class C(httpx.Client):
+        def __init__(self, **kw: object) -> None:
+            super().__init__(
+                base_url=str(kw["base_url"]),
+                transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=Endless())),
+            )
+
+    monkeypatch.setattr(httpx, "Client", C)
+    assert om.release_model("http://127.0.0.1:11434", REF) is True
+    assert pulled == []  # the body iterator was never advanced
+
+
+@pytest.mark.usefixtures("_clean_release_slots")
+def test_release_model_against_an_endless_body_returns_at_once_and_frees_the_slot() -> None:
+    import socket
+
+    import minion_executor.runners.ollama as om
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(1)
+            with contextlib.suppress(OSError):
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                while not stop.is_set():
+                    conn.sendall(b"10000\r\n" + b"x" * 0x10000 + b"\r\n")
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        t0 = time.monotonic()
+        assert om.release_model(f"http://127.0.0.1:{port}", REF, total_s=5) is True
+        assert time.monotonic() - t0 < 2
+    finally:
+        stop.set()
+        t.join(10)
+        srv.close()

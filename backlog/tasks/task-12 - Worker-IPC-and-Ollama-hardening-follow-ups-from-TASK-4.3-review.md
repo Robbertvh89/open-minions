@@ -275,7 +275,7 @@ Invariants: acks stay advisory; enforcement unchanged (footprint, priority, GPU 
   switches to `duplex=False` (os.pipe), shutdown is a no-op (ENOTSOCK suppressed) and only the kill
   remains; add an assertion-style unit test that the handle's conn is a socket.
 - R2 Request-write bound = call timeout (load: 1800 s). A wedged dev-only worker blocks the loader thread
-  that long unless interrupted; the loop's stop path still interrupts it (kill + shutdown). Alternative:
+  that long unless interrupted; the loop's stop path interrupts it with a kill only (no socket shutdown without the call lock, accepted in ADR-0009: dev-only, sandbox off, the call's own deadline then shuts the socket down). Alternative:
   a fixed 60 s cap for the write; not proposed (new constant, no evidence a healthy worker needs less).
 - R3 Always releasing after a graceful unload adds one loopback POST per model switch/idle unload
   (ms when healthy). Accepted.

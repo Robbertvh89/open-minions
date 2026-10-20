@@ -88,15 +88,27 @@ def _release(detail: str) -> RunnerError:
 
 
 def _post_release(base: str, ref: str) -> bool:
-    """One `keep_alive: 0` POST. True only for a 2xx. Never raises, never logs."""
+    """One `keep_alive: 0` POST. True only for a 2xx. Never raises, never logs.
+
+    Only the status line and headers are read: the body is never iterated, so an endless or huge
+    reply from a hostile listener on the port costs no memory. A timer closes the client at
+    `RELEASE_TOTAL_S`, which ends a request that drips bytes (each byte would reset the per-phase
+    httpx timeouts), so the thread and its slot are always released."""
+    client = httpx.Client(base_url=base, trust_env=False, follow_redirects=False)
+    cutoff = threading.Timer(RELEASE_TOTAL_S, client.close)
+    cutoff.daemon = True
+    cutoff.start()
     try:
-        with httpx.Client(base_url=base, trust_env=False, follow_redirects=False) as client:
-            resp = client.post(
-                "/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_RELEASE_TIMEOUT
-            )
+        with client.stream(
+            "POST", "/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_RELEASE_TIMEOUT
+        ) as resp:
             return resp.is_success
     except Exception:
         return False
+    finally:
+        cutoff.cancel()
+        with contextlib.suppress(Exception):
+            client.close()
 
 
 def release_model(url: str, ref: str, *, total_s: float = RELEASE_TOTAL_S) -> bool:
