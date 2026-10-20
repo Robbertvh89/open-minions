@@ -1,9 +1,10 @@
 ---
 id: TASK-51
 title: Make executor token_hash required end to end (mypy-enforced)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-20 00:14'
+updated_date: '2026-10-20 01:00'
 labels:
   - security
   - server
