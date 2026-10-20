@@ -98,9 +98,20 @@ def parse_usage(reply: Mapping[str, Any]) -> WorkerUsage | None:
     return WorkerUsage(float(busy), float(wall))
 
 
-def parse_ack(reply: Mapping[str, Any], *, issued: int, at: float) -> WorkerAck | None:
-    """The ack inside a tick, or None if the tick carries none. `ValueError` if invalid, or if it
-    acknowledges a generation the control side never issued."""
+def parse_ack(
+    reply: Mapping[str, Any],
+    *,
+    issued: int,
+    at: float,
+    prev: WorkerAck | None = None,
+    expect_paused: tuple[int, bool] | None = None,
+) -> WorkerAck | None:
+    """The ack inside a tick, or None if the tick carries none. `ValueError` if invalid, if it
+    acknowledges a generation the control side never issued, if it goes backwards relative to
+    `prev` (the same worker's previous ack), or if it contradicts what the control side sent:
+    `expect_paused=(gen, paused)` is the state of the newest generation issued, and generation 0
+    (the unpaused budget default) is never paused. Older generations are not checked (no history
+    is kept, so a healthy worker can never be rejected for a lost entry)."""
     if "ack" not in reply:
         if "paused" in reply:
             raise ValueError("paused without ack")
@@ -108,4 +119,10 @@ def parse_ack(reply: Mapping[str, Any], *, issued: int, at: float) -> WorkerAck 
     gen, paused = reply["ack"], reply.get("paused")
     if not (_is_int(gen) and isinstance(paused, bool)) or gen < 0 or gen > issued:
         raise ValueError("invalid ack")
+    if prev is not None and gen < prev.gen:
+        raise ValueError("ack went backwards")
+    if gen == 0 and paused:
+        raise ValueError("ack pauses the default generation")
+    if expect_paused is not None and gen == expect_paused[0] and paused != expect_paused[1]:
+        raise ValueError("ack contradicts the issued state")
     return WorkerAck(gen=gen, at=at, paused=paused)

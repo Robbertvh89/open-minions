@@ -773,7 +773,14 @@ class WorkerHandle:
                         raise WorkerCrashed("unexpected tick outside a run")
                     try:  # new tick fields are validated strictly (a lie is a protocol violation)
                         usage = parse_usage(reply)
-                        ack = parse_ack(reply, issued=self._wire_gen, at=time.monotonic())
+                        in_force = self._ctl
+                        ack = parse_ack(
+                            reply,
+                            issued=self._wire_gen,
+                            at=time.monotonic(),
+                            prev=self._ack,
+                            expect_paused=(in_force.gen, in_force.paused) if in_force else None,
+                        )
                     except ValueError:
                         raise WorkerCrashed("malformed worker reply") from None
                     deadline = time.monotonic() + timeout_s  # liveness: restart the clock

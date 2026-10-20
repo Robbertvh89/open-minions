@@ -34,6 +34,10 @@ Latest-wins; each `run` message also carries it. The worker applies it at the ne
 mid pacer-sleep) and acks with a tick-shaped message, so liveness and the GPU share come from the same
 channel. Outside a run the worker applies ctl silently, never replies. Inference stays in the worker
 (invariant 7); the control side only sends ctl.
+Acks are advisory but cross-checked (TASK-12): a worker's acked generation never goes backwards, and an
+ack for the newest generation issued must carry the `paused` that generation set (generation 0 is never
+paused); a violation is a protocol violation (kill + `WorkerCrashed`). Older generations are not
+checked, so a healthy worker is never rejected for a lost history entry.
 *Implemented in TASK-5.3* (`worker/control.py`, `WorkerHandle.control/last_ack/gpu_share`): `control()`
 assigns the generation, stores the state (re-sent with every `run`, so a respawned worker is never out
 of date) and writes under a send lock, never under the call lock. The ack is a tick,

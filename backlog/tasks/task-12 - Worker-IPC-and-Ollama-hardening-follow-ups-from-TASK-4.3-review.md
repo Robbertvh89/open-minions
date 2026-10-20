@@ -31,7 +31,7 @@ Leftover MINOR/LOW findings from TASK-4.3 review and security rounds 4:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Each item fixed with a test or explicitly accepted in ADR-0009
+- [x] #1 Each item fixed with a test or explicitly accepted in ADR-0009
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -304,4 +304,6 @@ From TASK-5.5 review: WorkerHandle.ensure_model treats a warm worker as reusable
 From TASK-5.6 round 3: Ollama is paced per request only (the daemon owns the GPU queue). Warn at startup / in status when the Ollama engine is enabled and duty < 1 (or force concurrency 1).
 
 From TASK-6.3: ModelEntry nested in Assignment stays extra=forbid (server validates the model registry strictly), so a future new ModelEntry field would break older executors; add a lenient response variant when the first such field is added.
+
+Done (branch fix/task-12-worker-ipc-hardening): one deadline thread per _call, bounded request write and send-lock wait, socket shutdown on every watchdog fire, reply racing a fire is void (WorkerTimeout); result validation inside _call (stats/probe/run); ensure_model honours the revision; Ollama release has a total 3 s cap, max 2 threads, one release per hard kill, always after a graceful unload; startup warning when Ollama is enabled; ack monotonic + paused-in-force check (ADR-0006). Accepted in ADR-0009: Ollama PROMPT_TOO_LONG not detectable (existing acceptance, SPEC FR-13 unchanged), MPSGraph cache write stays denied, sandbox-off grandchildren not reaped (but cannot wedge the pipe). Deferred: lenient ModelEntry variant (TASK-6.3) until the first new ModelEntry field is added.
 <!-- SECTION:NOTES:END -->
