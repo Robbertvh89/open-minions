@@ -635,7 +635,7 @@ def test_gap_burning_rogue_at_full_duty_is_killed() -> None:
     )  # 108 s with seed 0; None before the idle-span split
 
 
-@pytest.mark.parametrize("duty", [1.0, 0.75])
-def test_honest_worker_with_short_gaps_is_never_killed_8h(duty: float) -> None:
-    killed, peak = _edge_sim(duty, duty, 1.8, 0.8, 8 * 3600)
+@pytest.mark.parametrize("duty,rate", [(1.0, 1.0), (0.75, 0.75), (0.75, 0.8)])
+def test_honest_worker_with_short_gaps_is_never_killed_8h(duty: float, rate: float) -> None:
+    killed, peak = _edge_sim(duty, rate, 1.8, 0.8, 8 * 3600)
     assert killed is None and peak < 1.0, (killed, peak)

@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
 import structlog
@@ -299,6 +300,7 @@ class ExecutorLoop:
         self._gpu_share: float | None = None  # last measured share of the worker (status.json)
         self._gpu_pid: int | None = None  # worker pid the guard window belongs to
         self._gpu_killed_pid: int | None = None  # last worker pid killed by the guard
+        self._last_engine: Engine | None = None  # engine of the last loaded model (kill charge)
         self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         # sampler KILL for the watcher of that acquirement (tagged: a stale one is dropped)
         self._gpu_pending: tuple[Any, _Verdict] | None = None
@@ -898,7 +900,12 @@ class ExecutorLoop:
                         self._cache.release_in_use()
                     if self._gpu is not None:  # a GPU verdict decided in the same wake-up
                         gv = self._take_gpu_pending(a.acquirement_id)
-                        if gv is None and watch.done() and not watch.cancelled():
+                        if (
+                            gv is None
+                            and watch in pending
+                            and watch.done()
+                            and not watch.cancelled()
+                        ):
                             wv = None if watch.exception() else watch.result()
                             gv = wv if wv in _GPU_VERDICTS else None
                         if gv is not None:
@@ -933,6 +940,7 @@ class ExecutorLoop:
                         pending.discard(beat)
                         continue
                     return await self._on_signal(a, work, beat.result(), bound)
+            # (the kill waits for the interrupt thread before `complete`: same bound as any kill)
             await self._flush_gpu_verdict(a, watch if watch in pending else None)
             try:
                 result = work.result()
@@ -1037,8 +1045,8 @@ class ExecutorLoop:
         self._gpu_kick.clear()
         if pid is None or pid == self._gpu_killed_pid:
             return  # no worker, or the one already killed (a dead pid can linger in the handle)
-        if engine is None and self._loaded is not None:
-            engine = self._loaded.engine
+        if engine is None:  # `_loaded` is None during a graceful unload: use the last engine
+            engine = self._loaded.engine if self._loaded is not None else self._last_engine
         self._record_gpu_kill(v, engine, pid)
         await self._kill_worker(pid)
 
@@ -1059,7 +1067,7 @@ class ExecutorLoop:
         self._gpu_kick.clear()
         self._status_kick.set()
 
-    def _take_gpu_pending(self, acq: Any) -> _Verdict | None:
+    def _take_gpu_pending(self, acq: UUID) -> _Verdict | None:
         """The sampler verdict tagged for this acquirement that the watcher never took."""
         pend = self._gpu_pending
         if pend is None or pend[0] != acq:
@@ -1818,6 +1826,7 @@ class ExecutorLoop:
                     self._cache.release_in_use()  # a failed load holds no model: unpin it
                 raise
             self._loaded = a.model
+            self._last_engine = a.model.engine
             self._gpu_killed_pid = None  # a live worker exists: its pid (maybe reused) is armed
             self._loaded_path = model_path
             self._unloaded = False
