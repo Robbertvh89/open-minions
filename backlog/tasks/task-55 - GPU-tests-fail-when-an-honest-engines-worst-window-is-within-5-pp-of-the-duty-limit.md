@@ -3,9 +3,10 @@ id: TASK-55
 title: >-
   GPU tests: fail when an honest engine's worst window is within 5 pp of the
   duty limit
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-20 04:26'
+updated_date: '2026-10-20 04:28'
 labels:
   - executor
   - gpu

@@ -1,9 +1,10 @@
 ---
 id: TASK-49
 title: 'perf(server): reduce S3 promote cost at complete'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-19 23:03'
+updated_date: '2026-10-20 04:28'
 labels:
   - perf
   - scale
