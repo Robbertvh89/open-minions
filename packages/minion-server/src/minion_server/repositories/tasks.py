@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm.util import AliasedClass
+from sqlalchemy.sql.dml import ReturningUpdate
 
 from minion_server.db.models import SUBTASK_KEY, Subtask, SubtaskAcquirement, Task, TaskCounter
 from minion_server.repositories.completion import bump_cancelled, shard_sum
@@ -343,7 +344,7 @@ async def cancel_task(
 CANCEL_BATCH = 10_000
 
 
-def _cancel_stmt(team: str, project: str, task_name: str) -> Any:
+def _cancel_stmt(team: str, project: str, task_name: str) -> ReturningUpdate[tuple[int]]:
     """`WITH c AS MATERIALIZED (locking batch) UPDATE ... FROM c WHERE <pk> = c.<pk>`.
 
     The CTE is evaluated exactly once. The former `subtask_id IN (SELECT ... FOR UPDATE SKIP
@@ -385,7 +386,7 @@ async def cancel_pending_subtasks(
     holds an unbounded number of row locks.
     """
     result = await session.execute(_cancel_stmt(team, project, task_name))
-    cancelled_ids = [int(r[0]) for r in result.all()]
+    cancelled_ids = [r.subtask_id for r in result.all()]
     # Shard locks are the last row locks of this txn, sorted (ARCHITECTURE §4).
     await bump_cancelled(session, ((team, project, task_name, i) for i in cancelled_ids))
     return len(cancelled_ids)

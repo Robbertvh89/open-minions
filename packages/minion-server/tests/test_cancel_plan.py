@@ -6,6 +6,7 @@ default selectivity estimates); the shape now pins the plan: a MATERIALIZED lock
 to the UPDATE on the primary key.
 """
 
+import re
 import time
 
 import pytest
@@ -23,7 +24,9 @@ LIMIT_S = 2.0
 
 
 async def test_cancel_fresh_large_task_without_analyze(fresh_url: str) -> None:
-    eng = create_async_engine(fresh_url)
+    eng = create_async_engine(
+        fresh_url, connect_args={"server_settings": {"statement_timeout": "10s"}}
+    )
     sm = async_sessionmaker(eng, expire_on_commit=False)
     try:
         async with sm() as s, s.begin():
@@ -49,7 +52,8 @@ async def test_cancel_fresh_large_task_without_analyze(fresh_url: str) -> None:
             plan = await _explain(s, str(stmt))
             print(plan)
             await s.rollback()
-        assert "loops=25000" not in plan
+        assert "Semi Join" not in plan
+        assert re.search(r"CTE Scan on c .*loops=1\)", plan), plan
 
         t0 = time.monotonic()
         total = 0
@@ -72,6 +76,7 @@ async def test_cancel_fresh_large_task_without_analyze(fresh_url: str) -> None:
                 )
             )
         t0 = time.monotonic()
+        # smoke check only (3k rows); the shape is pinned by the plan assertion above
         swept = await sweep_cancelled(sm)
         assert swept == 3000
         assert time.monotonic() - t0 < LIMIT_S
