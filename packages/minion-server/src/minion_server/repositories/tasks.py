@@ -21,8 +21,11 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+from sqlalchemy.orm.util import AliasedClass
 
-from minion_server.db.models import Subtask, Task
+from minion_server.db.models import Subtask, SubtaskAcquirement, Task, TaskCounter
+from minion_server.repositories.completion import bump_cancelled
 
 OUTPUT_URI_CONSTRAINT = "uq_minion_task_output_uri"
 
@@ -84,24 +87,75 @@ async def insert_task(
         raise
 
 
+def _count_columns(t: type[Task] | AliasedClass[Task]) -> tuple[ColumnElement[int], ...]:
+    """running, succeeded, failed, cancelled of task row `t`, correlated, in the same statement.
+
+    Reads `minion_task_counter` (<= 16 shard rows) and the task's acquirement rows (bounded by
+    executors x MINION_MAX_OPEN_ACQUIREMENTS across all tasks); never `minion_subtask`.
+    """
+
+    def shard_sum(col: Any) -> ColumnElement[int]:
+        return (
+            select(func.coalesce(func.sum(col), 0))
+            .where(
+                TaskCounter.team == t.team,
+                TaskCounter.project == t.project,
+                TaskCounter.task_name == t.task_name,
+            )
+            .scalar_subquery()
+        )
+
+    running = (
+        select(func.count())
+        .select_from(SubtaskAcquirement)
+        .where(
+            SubtaskAcquirement.team == t.team,
+            SubtaskAcquirement.project == t.project,
+            SubtaskAcquirement.task_name == t.task_name,
+        )
+        .scalar_subquery()
+    )
+    return (
+        running,
+        shard_sum(TaskCounter.succeeded),
+        shard_sum(TaskCounter.failed),
+        shard_sum(TaskCounter.cancelled),
+    )
+
+
+def derive_counts(
+    total: int, running: int, succeeded: int, failed: int, cancelled: int
+) -> dict[SubtaskStatus, int]:
+    """Per-status counts; PENDING is what is left of `total`, clamped at 0.
+
+    Exact once the split is done (total = number of rows). While SPLITTING, or if the split
+    never finished, `total` is 0 and PENDING reads 0.
+    """
+    pending = max(0, total - running - succeeded - failed - cancelled)
+    return {
+        SubtaskStatus.PENDING: pending,
+        SubtaskStatus.RUNNING: running,
+        SubtaskStatus.SUCCEEDED: succeeded,
+        SubtaskStatus.FAILED: failed,
+        SubtaskStatus.CANCELLED: cancelled,
+    }
+
+
 async def get_task(
     session: AsyncSession, team: str, project: str, task_name: str
 ) -> tuple[Task, dict[SubtaskStatus, int]] | None:
-    task = (
+    """The task and its per-status counts, in one statement (one snapshot)."""
+    row = (
         await session.execute(
-            select(Task).where(
+            select(Task, *_count_columns(Task)).where(
                 Task.team == team, Task.project == project, Task.task_name == task_name
             )
         )
-    ).scalar_one_or_none()
-    if task is None:
+    ).one_or_none()
+    if row is None:
         return None
-    rows = await session.execute(
-        select(Subtask.status, func.count())
-        .where(Subtask.team == team, Subtask.project == project, Subtask.task_name == task_name)
-        .group_by(Subtask.status)
-    )
-    return task, {SubtaskStatus(s): int(n) for s, n in rows.all()}
+    task = row[0]
+    return task, derive_counts(task.total_subtasks, *(int(n) for n in row[1:]))
 
 
 def _task_key(task: Task) -> tuple[Any, ...]:
@@ -334,8 +388,12 @@ async def cancel_pending_subtasks(
             Subtask.status == SubtaskStatus.PENDING.value,
         )
         .values(status=SubtaskStatus.CANCELLED.value)
+        .returning(Subtask.subtask_id)
     )
-    return int(result.rowcount)  # type: ignore[attr-defined]
+    cancelled_ids = [int(r[0]) for r in result.all()]
+    # Shard locks are the last row locks of this txn, sorted (ARCHITECTURE §4).
+    await bump_cancelled(session, ((team, project, task_name, i) for i in cancelled_ids))
+    return len(cancelled_ids)
 
 
 async def sweep_cancelled(
@@ -381,8 +439,11 @@ async def sweep_cancelled(
             Subtask.status == SubtaskStatus.PENDING.value,
         )
         .values(status=SubtaskStatus.CANCELLED.value)
+        .returning(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
     )
-    return int(result.rowcount)  # type: ignore[attr-defined]
+    rows = [(str(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in result.all()]
+    await bump_cancelled(session, rows)
+    return len(rows)
 
 
 def _after_predicate(team: str, after: tuple[datetime, str, str, str]) -> ColumnElement[bool]:
@@ -455,29 +516,22 @@ async def list_tasks(
 ) -> tuple[list[tuple[Task, dict[SubtaskStatus, int]]], bool]:
     """Keyset page of tasks in `teams`, newest first: `(created_at, team, project, task_name)` DESC.
 
-    Fetches `limit + 1` rows to learn whether another page exists, then one grouped counts
-    query for the whole page (no per-task queries). Returns `(items, has_more)`.
+    Fetches `limit + 1` rows to learn whether another page exists, with the counts
+    (counters + acquirement rows, never `minion_subtask`) in the same statement.
+    Returns `(items, has_more)`.
     """
     if not teams:
         return [], False
-    stmt = _list_tasks_stmt(teams, project, status, after, limit)
-    rows = list((await session.execute(stmt)).scalars())
+    page_sq = _list_tasks_stmt(teams, project, status, after, limit).subquery("page")
+    t = aliased(Task, page_sq)
+    stmt = select(t, *_count_columns(t)).order_by(
+        t.created_at.desc(), t.team.desc(), t.project.desc(), t.task_name.desc()
+    )
+    rows = (await session.execute(stmt)).all()
     has_more = len(rows) > limit
-    page = rows[:limit]
-    counts: dict[tuple[str, str, str], dict[SubtaskStatus, int]] = {}
-    if page:
-        grouped = await session.execute(
-            select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status, func.count())
-            .where(
-                tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
-                    [(t.team, t.project, t.task_name) for t in page]
-                )
-            )
-            .group_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.status)
-        )
-        for team, proj, name, st, n in grouped.all():
-            counts.setdefault((team, proj, name), {})[SubtaskStatus(st)] = int(n)
-    return [(t, counts.get((t.team, t.project, t.task_name), {})) for t in page], has_more
+    return [
+        (r[0], derive_counts(r[0].total_subtasks, *(int(n) for n in r[1:]))) for r in rows[:limit]
+    ], has_more
 
 
 async def task_exists(session: AsyncSession, team: str, project: str, task_name: str) -> bool:

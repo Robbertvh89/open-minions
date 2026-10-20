@@ -324,8 +324,8 @@ async def test_forced_write_skew_last_two_completions_settle_once(
     barrier = asyncio.Barrier(2)
     real_bump = completion_repo.bump_counters
 
-    async def bump(session: AsyncSession, o: Any, *, succeeded: int, failed: int) -> None:
-        await real_bump(session, o, succeeded=succeeded, failed=failed)
+    async def bump(session: AsyncSession, o: Any, **counts: int) -> None:
+        await real_bump(session, o, **counts)
         await asyncio.wait_for(barrier.wait(), 20)  # both uncommitted at once
 
     moves: list[TaskStatus] = []

@@ -187,22 +187,95 @@ async def test_tampered_cursor_is_422(http: tuple[AsyncClient, Any]) -> None:
 
 
 @pytest.mark.integration
-async def test_list_tasks_counts_is_one_grouped_query(http: tuple[AsyncClient, Any]) -> None:
+async def test_list_tasks_counts_one_statement(http: tuple[AsyncClient, Any]) -> None:
     from minion_server.repositories import tasks as repo
     from sqlalchemy import event
 
     _, app = http
     sm = app.state.sessionmaker
-    for i in range(5):
-        await seed_task(sm, f"q{i}", 2, team="ra")
+    for i in range(50):
+        await seed_task(sm, f"q{i:02d}", 2, team="ra")
     stmts: list[str] = []
     engine = app.state.engine.sync_engine
     event.listen(engine, "before_cursor_execute", lambda *a: stmts.append(a[2]))
+    for n in (5, 50):
+        stmts.clear()
+        async with sm() as s, s.begin():
+            rows, _ = await repo.list_tasks(
+                s, teams=["ra"], project=None, status=None, after=None, limit=n
+            )
+        assert len(rows) == n and len(stmts) == 1  # page and counts in one statement
+        assert "minion_subtask " not in stmts[0].replace("minion_subtask_acquirement", "")
+    stmts.clear()
     async with sm() as s, s.begin():
-        rows, _ = await repo.list_tasks(
-            s, teams=["ra"], project=None, status=None, after=None, limit=50
+        got = await repo.get_task(s, "ra", "p", "q00")
+    assert got is not None and len(stmts) == 1
+    assert got[1][SubtaskStatus.PENDING] == 2
+
+
+def test_derive_counts_pending_is_remainder_clamped() -> None:
+    from minion_server.repositories.tasks import derive_counts
+
+    c = derive_counts(10, 2, 3, 1, 1)
+    assert c[SubtaskStatus.PENDING] == 3 and c[SubtaskStatus.RUNNING] == 2
+    # SPLITTING / unfinished split: total is 0, so pending clamps at 0
+    c = derive_counts(0, 0, 0, 0, 3)
+    assert c[SubtaskStatus.PENDING] == 0 and c[SubtaskStatus.CANCELLED] == 3
+
+
+def _relations(plan: Any) -> set[str]:
+    out: set[str] = set()
+    if isinstance(plan, dict):
+        if "Relation Name" in plan:
+            out.add(plan["Relation Name"])
+        for v in plan.values():
+            out |= _relations(v)
+    elif isinstance(plan, list):
+        for v in plan:
+            out |= _relations(v)
+    return out
+
+
+@pytest.mark.integration
+async def test_counts_plans_never_touch_subtasks(http: tuple[AsyncClient, Any]) -> None:
+    import json
+
+    from minion_server.db.models import Task
+    from minion_server.repositories import tasks as repo
+    from sqlalchemy import select
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.orm import aliased
+
+    _, app = http
+    sm = app.state.sessionmaker
+    await seed_task(sm, "big", 1, team="ra")
+    async with sm() as s, s.begin():
+        await s.execute(
+            text(
+                "INSERT INTO minion_subtask (team, project, task_name, subtask_id, status,"
+                " input_object_key, byte_start, byte_end, first_record, record_count)"
+                " SELECT 'ra', 'p', 'big', g, 'PENDING', 'k', 0, 1, g, 1"
+                " FROM generate_series(1, 20000) g"
+            )
         )
-    assert len(rows) == 5 and len(stmts) == 2  # tasks page + one grouped counts query
+        await s.execute(text("UPDATE minion_task SET total_subtasks = 20001 WHERE task_name='big'"))
+        await s.execute(text("ANALYZE minion_subtask"))
+    t = aliased(Task, repo._list_tasks_stmt(["ra"], None, None, None, 10).subquery("page"))
+    list_stmt = select(t, *repo._count_columns(t))
+    detail_stmt = select(Task, *repo._count_columns(Task)).where(
+        Task.team == "ra", Task.project == "p", Task.task_name == "big"
+    )
+    for seqscan in ("on", "off"):
+        for stmt in (list_stmt, detail_stmt):
+            dialect = postgresql.dialect()  # type: ignore[no-untyped-call]
+            sql = str(stmt.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+            async with sm() as s, s.begin():
+                await s.execute(text(f"SET LOCAL enable_seqscan = {seqscan}"))
+                raw = (await s.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"))).scalar_one()
+            plan = raw if isinstance(raw, list) else json.loads(raw)
+            rels = _relations(plan)
+            assert "minion_subtask" not in rels, (seqscan, rels)
+            assert "minion_task_counter" in rels
 
 
 @pytest.mark.integration

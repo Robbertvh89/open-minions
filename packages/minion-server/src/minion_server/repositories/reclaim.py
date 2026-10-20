@@ -35,9 +35,10 @@ from minion_server.db.models import (
 )
 from minion_server.repositories.completion import (
     Owned,
+    ShardKey,
     attempt_row,
     budget_attempt,
-    bump_counters,
+    bump_shard,
     counter_shard,
     subtask_values,
     unacked_expiry,
@@ -261,10 +262,12 @@ async def finish_reclaimed(session: AsyncSession, items: Sequence[Finish]) -> No
             )
             .values(**subtask_values(fs[0].subtask_status, fs[0].error))
         )
-    shards: dict[tuple[str, str, str, int], list[Owned]] = defaultdict(list)
+    shards: dict[ShardKey, list[int]] = defaultdict(lambda: [0, 0])  # [failed, cancelled]
     for f in items:
+        o = f.owned
         if f.subtask_status == SubtaskStatus.FAILED:
-            o = f.owned
-            shards[(o.team, o.project, o.task_name, counter_shard(o.subtask_id))].append(o)
-    for _key, os_ in sorted(shards.items()):
-        await bump_counters(session, os_[0], succeeded=0, failed=len(os_))
+            shards[(o.team, o.project, o.task_name, counter_shard(o.subtask_id))][0] += 1
+        elif f.subtask_status == SubtaskStatus.CANCELLED:
+            shards[(o.team, o.project, o.task_name, counter_shard(o.subtask_id))][1] += 1
+    for key, (failed, cancelled) in sorted(shards.items()):
+        await bump_shard(session, key, failed=failed, cancelled=cancelled)

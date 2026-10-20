@@ -139,7 +139,7 @@ class Task(Base):
 
 
 class TaskCounter(Base):
-    """Succeeded/failed/cancelled subtask counters of a task, sharded by `subtask_id % 16` (ADR-0015).
+    """Succeeded/failed/cancelled subtask counters, sharded by `subtask_id % 16` (ADR-0015).
 
     Summed on read; sharding spreads completions of one task over several rows instead of one
     hot `minion_task` row.

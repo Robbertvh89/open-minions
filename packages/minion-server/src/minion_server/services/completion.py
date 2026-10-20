@@ -124,7 +124,7 @@ async def complete(
             subtask_status=SubtaskStatus.SUCCEEDED,
             output_uri=f"s3://{settings.s3_bucket}/{dst}",
         )
-        await repo.bump_counters(session, o, succeeded=1, failed=0)
+        await repo.bump_counters(session, o, succeeded=1)
     # The retried-complete branch above skips the settle: a lost settle is the watchdog's job.
     await settle_task(session, task_key(o), metrics)
 
@@ -163,7 +163,9 @@ async def finish_failed(
     )
     await repo.finish_attempt(session, o, outcome=outcome, subtask_status=status, error=error)
     if status == SubtaskStatus.FAILED:
-        await repo.bump_counters(session, o, succeeded=0, failed=1)
+        await repo.bump_counters(session, o, failed=1)
+    elif status == SubtaskStatus.CANCELLED:
+        await repo.bump_counters(session, o, cancelled=1)
     return status
 
 
@@ -227,6 +229,7 @@ async def release(
                 subtask_status=SubtaskStatus.CANCELLED,
                 attempt_error=reason,
             )
+            await repo.bump_counters(session, o, cancelled=1)
         elif await repo.released_attempt_count(session, o) >= settings.release_limit:
             # Repeated releases must not livelock a subtask: past the cap they cost budget.
             status = await finish_failed(
