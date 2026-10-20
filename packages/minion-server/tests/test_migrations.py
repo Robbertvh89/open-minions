@@ -398,3 +398,26 @@ def test_0015_split_failures_round_trip(fresh_url: str) -> None:
     assert not asyncio.run(_has_constraint(fresh_url, "ck_minion_task_split_failures_nonneg"))
     assert asyncio.run(_has_column(fresh_url, "minion_task", "split_attempts"))
     command.upgrade(cfg, "head")
+
+
+async def _indexdef(url: str, name: str) -> str:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            res = await conn.execute(
+                text("SELECT indexdef FROM pg_indexes WHERE indexname = :n"), {"n": name}
+            )
+            return str(res.scalar_one())
+    finally:
+        await eng.dispose()
+
+
+def test_0015_live_queue_expression_round_trip(fresh_url: str) -> None:
+    name = "ix_minion_task_live_queue"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert "(- priority)" in asyncio.run(_indexdef(fresh_url, name))
+    command.downgrade(cfg, "0014")
+    assert "priority DESC" in asyncio.run(_indexdef(fresh_url, name))
+    command.upgrade(cfg, "head")
+    assert "(- priority)" in asyncio.run(_indexdef(fresh_url, name))

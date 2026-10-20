@@ -82,11 +82,15 @@ class Task(Base):
     __tablename__ = "minion_task"
     __table_args__ = (
         PrimaryKeyConstraint("team", "project", "task_name"),
+        # Kept (TASK-29): the only status-leading index; the splitter claim (status = SPLITTING)
+        # and the cancel sweep use it. The acquire walk does not.
         Index("ix_minion_task_queue", "status", text("priority DESC"), "created_at"),
         # Serves the acquire candidate query: live tasks in FR-22 order (ARCHITECTURE §3.2).
+        # An expression on -priority so every column sorts ascending: the recursive walk then
+        # advances with ONE row-compare Index Cond (TASK-54, migration 0015).
         Index(
             "ix_minion_task_live_queue",
-            text("priority DESC"),
+            text("(-priority)"),
             "created_at",
             "team",
             "project",
