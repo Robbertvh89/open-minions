@@ -12,27 +12,71 @@ from sqlalchemy import (
     Select,
     and_,
     func,
+    literal_column,
     or_,
     select,
+    text,
     tuple_,
     union_all,
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm.util import AliasedClass
 from sqlalchemy.sql.dml import ReturningUpdate
 
 from minion_server.db.models import SUBTASK_KEY, Subtask, SubtaskAcquirement, Task, TaskCounter
+from minion_server.repositories.acquisition import status_literal
 from minion_server.repositories.completion import bump_cancelled, shard_sum
 
+LIVE_TASK_LOCK_PREFIX = "minion_task_live:"
 OUTPUT_URI_CONSTRAINT = "uq_minion_task_output_uri"
+
+
+class LockTimeoutError(Exception):
+    """The per-team create lock was not free within its timeout."""
 
 
 class OutputUriInUseError(Exception):
     """Another task already writes to this output prefix."""
+
+
+async def lock_team_for_create(session: AsyncSession, team: str) -> None:
+    """Serialise task creation of one team until the transaction ends, so the live-task cap holds
+    exactly: the count that follows is a fresh READ COMMITTED snapshot taken after the lock, so it
+    sees every create that committed before us. Admission only: it never decides subtask ownership
+    (invariant 2, ADR-0020). Waits at most 2 s (`LockTimeoutError` otherwise)."""
+    await session.execute(text("SET LOCAL lock_timeout = '2s'"))
+    try:
+        await _take_lock(session, team)
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "55P03":
+            raise LockTimeoutError from exc
+        raise
+    await session.execute(text("RESET lock_timeout"))
+
+
+async def _take_lock(session: AsyncSession, team: str) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+        {"k": LIVE_TASK_LOCK_PREFIX + team},
+    )
+
+
+async def count_live_tasks(session: AsyncSession, team: str, *, limit: int) -> int:
+    """Live tasks of a team, counted up to `limit` (O(limit) on ix_minion_task_team_status)."""
+    live = [
+        status_literal(TaskStatus.SPLITTING),
+        status_literal(TaskStatus.PENDING),
+        status_literal(TaskStatus.RUNNING),
+    ]
+    inner: Select[Any] = (
+        select(literal_column("1")).where(Task.team == team, Task.status.in_(live)).limit(limit)
+    )
+    result = await session.execute(select(func.count()).select_from(inner.subquery()))
+    return int(result.scalar_one())
 
 
 @dataclass(frozen=True)

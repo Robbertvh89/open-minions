@@ -7,6 +7,7 @@ the error codes are identical. Functions raise `HTTPException` carrying `{code, 
 
 import re
 
+import structlog
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
 from minion_common.schemas import (
     SLUG_PATTERN,
@@ -20,13 +21,15 @@ from minion_common.schemas import (
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from minion_server.auth import KeysConfig, User, resolve_pool
+from minion_server.auth import KeysConfig, TeamPolicy, User, resolve_pool
 from minion_server.db.models import Task
-from minion_server.errors import api_error
+from minion_server.errors import api_error, busy_error
 from minion_server.repositories import tasks as tasks_repo
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
 from minion_server.uris import InvalidUriError, parse_s3_uri
+
+log = structlog.get_logger()
 
 ATTEMPTS_SEGMENT = "_attempts"
 
@@ -115,6 +118,13 @@ async def get_task(session: AsyncSession, team: str, project: str, task_name: st
     return to_out(*result)
 
 
+def live_task_cap(policy: TeamPolicy | None, settings: ServerSettings) -> int:
+    """Live-task cap of a team: its keys-file override, else the global default (FR-9)."""
+    if policy is not None and policy.max_live_tasks is not None:
+        return policy.max_live_tasks
+    return settings.max_live_tasks_per_team
+
+
 async def create_task(
     body: TaskCreate,
     user: User,
@@ -150,6 +160,20 @@ async def create_task(
         raise api_error(422, "EMPTY_INPUT", "no objects under the input prefix")
     try:
         async with session.begin():
+            cap = live_task_cap(keys_config.teams.get(body.team), settings)
+            try:
+                await tasks_repo.lock_team_for_create(session, body.team)
+            except tasks_repo.LockTimeoutError:
+                raise busy_error("SERVER_BUSY", "task creation is busy; retry shortly") from None
+            if await tasks_repo.count_live_tasks(session, body.team, limit=cap) >= cap:
+                log.info("task_create_capped", team=body.team, cap=cap)
+                raise api_error(
+                    429,
+                    "TOO_MANY_LIVE_TASKS",
+                    f"team is at its live-task limit ({cap}); wait for tasks to finish, "
+                    "cancel some (a teammate or operator can too), or ask an operator to raise "
+                    "teams.<slug>.max_live_tasks",
+                )
             created = await tasks_repo.insert_task(
                 session,
                 body,

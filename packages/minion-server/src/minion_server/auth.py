@@ -29,6 +29,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     StringConstraints,
     ValidationError,
     model_validator,
@@ -74,6 +75,7 @@ class TeamPolicy:
 
     default_pool: str | None = None
     allowed_pools: frozenset[str] | None = None
+    max_live_tasks: int | None = None  # per-team live-task cap override (FR-9, ADR-0020)
 
 
 _Slug = Annotated[str, StringConstraints(pattern=SLUG_PATTERN)]
@@ -98,6 +100,7 @@ class _TeamEntry(BaseModel):
 
     default_pool: _Pool | None = None
     allowed_pools: list[_Pool] | None = Field(default=None, min_length=1)
+    max_live_tasks: StrictInt | None = Field(default=None, ge=1, le=10_000)
 
     @model_validator(mode="after")
     def _default_allowed(self) -> Self:
@@ -125,7 +128,17 @@ class KeysConfig:
 
 MAX_KEYS_FILE_BYTES = 1 << 20
 _FIELD_NAMES = frozenset(
-    {"keys", "teams", "name", "sha256", "operator", "expires_at", "default_pool", "allowed_pools"}
+    {
+        "keys",
+        "teams",
+        "name",
+        "sha256",
+        "operator",
+        "expires_at",
+        "default_pool",
+        "allowed_pools",
+        "max_live_tasks",
+    }
 )
 
 
@@ -258,7 +271,9 @@ def parse_keys_config(text: str) -> KeysConfig:
         keys[entry.sha256] = User(entry.name, tuple(entry.teams), entry.operator, entry.expires_at)
     teams = {
         slug: TeamPolicy(
-            t.default_pool, frozenset(t.allowed_pools) if t.allowed_pools is not None else None
+            t.default_pool,
+            frozenset(t.allowed_pools) if t.allowed_pools is not None else None,
+            t.max_live_tasks,
         )
         for slug, t in parsed.teams.items()
     }

@@ -5,7 +5,7 @@ import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -13,7 +13,7 @@ from minion_cli import flows
 from minion_cli.errors import EXIT_UNREACHABLE, EXIT_USAGE, CliError
 from minion_cli.flows import Target
 from minion_cli.settings import CliSettings
-from minion_common.client import UserClient
+from minion_common.client import ApiError, UserClient
 from minion_common.enums import TaskType
 from minion_common.schemas import TaskOut
 from pydantic import SecretStr
@@ -308,3 +308,31 @@ async def test_errors_never_carry_payload(tmp_path: Path) -> None:
     with pytest.raises(CliError) as ei:
         await flows.upload_inputs(store, settings(), T, [f])
     assert SENTINEL not in str(ei.value)
+
+
+async def test_submit_429_live_task_cap_is_usage_error_and_not_retried(tmp_path: Path) -> None:
+    f = tmp_path / "a.jsonl"
+    f.write_text("{}\n")
+
+    class Capped:
+        creates = 0
+
+        async def get_task(self, *a: Any) -> Any:
+            raise ApiError(404, "NOT_FOUND", "no")
+
+        async def create_task(self, req: Any) -> Any:
+            Capped.creates += 1
+            raise ApiError(429, "TOO_MANY_LIVE_TASKS", "team is at its live-task limit (500)")
+
+    with pytest.raises(CliError) as ei:
+        await flows.submit_task(
+            cast("UserClient", Capped()),
+            FakeStore(),
+            settings(),
+            T,
+            [f],
+            type=TaskType.EMBEDDING,
+            model="m",
+        )
+    assert ei.value.exit_code == EXIT_USAGE and "TOO_MANY_LIVE_TASKS" in str(ei.value)
+    assert Capped.creates == 1

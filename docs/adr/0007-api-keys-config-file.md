@@ -39,7 +39,7 @@ authorized by team.
 
 - Entries gain `operator: bool` (default false) and `expires_at` (timezone-aware ISO timestamp;
   an expired key gets `401`). A top-level `teams: {slug: {default_pool, allowed_pools}}` map holds
-  per-team pool policy (SPEC S-1). Parsing stays strict (`extra=forbid`); a v1 file is valid unchanged.
+  per-team pool policy (SPEC S-1); `max_live_tasks` (1..10000) joins it in TASK-30 (ADR-0020). Parsing stays strict (`extra=forbid`); a v1 file is valid unchanged.
 - **Live reload replaces "loaded once at startup".** `KeyStore` stats the file at most every
   `MINION_API_KEYS_RELOAD_S` (default 5) on the next request and re-reads it when mtime, size or
   inode changed. The file is read through one file descriptor (fstat then read), must be a regular

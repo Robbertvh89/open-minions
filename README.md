@@ -379,6 +379,10 @@ apps and start again, or probe only one engine with `--engines mlx`.
 **`401` or `403` from `minion`.** Wrong or expired API key, or `MINION_CLI_TEAM` is not one of your
 key's teams. A key you add to the keys file works within 5 s.
 
+**`429 TOO_MANY_LIVE_TASKS` on `minion submit` (exit 2).** Your team already has the maximum number
+of live (splitting, pending or running) tasks. Wait for some to finish or cancel some (`minion cancel
+NAME`); an operator can raise the limit for your team in the keys file.
+
 **`429` and `503` (`SERVER_BUSY`, `TOO_MANY_ACQUIREMENTS`, `ACQUIRE_DEADLINE`).** The server is
 protecting itself. The executor waits for the `Retry-After` and retries by itself, so this only needs
 action if it never ends. `minion` reports an unreachable server as exit 4.
