@@ -16,9 +16,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from minion_common.schemas import range_header
 
-from minion_server.storage import S3Storage
+from minion_server.storage import PROBE_PREFIX, S3Storage
 
-PROBE_PREFIX = "_preflight/check-storage/"
 STALE_PROBE_AGE_S = 3600
 IF_RANGE_DATE = "Thu, 01 Jan 1970 00:00:00 GMT"
 PROBE_BODY = b"0123456789abcdef"
@@ -102,7 +101,7 @@ async def run_check(
     warn: Callable[[str], None] = lambda _msg: None,
 ) -> list[Check]:
     """Run the probe; always tries to delete it. Connectivity errors propagate (OSError)."""
-    await storage.discard_stale(PROBE_PREFIX, STALE_PROBE_AGE_S)
+    await storage.discard_stale_probes(STALE_PROBE_AGE_S)
     key = f"{PROBE_PREFIX}{uuid.uuid4().hex}"
     try:
         await storage.put(key, PROBE_BODY)

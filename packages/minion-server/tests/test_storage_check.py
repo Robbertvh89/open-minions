@@ -5,7 +5,7 @@ from minion_server import storage_check
 from minion_server.admin import app
 from minion_server.settings import ServerSettings
 from minion_server.storage import S3Storage
-from minion_server.storage_check import PROBE_BODY, SLICE_BODY, run_check
+from minion_server.storage_check import PROBE_BODY, PROBE_PREFIX, SLICE_BODY, run_check
 from pydantic import SecretStr
 from typer.testing import CliRunner
 
@@ -34,7 +34,7 @@ class FakeStorage(S3Storage):
         self.deletes: list[str] = []
         self.fail_put = False
 
-    async def discard_stale(self, prefix: str, older_than_s: int) -> None:
+    async def discard_stale_probes(self, older_than_s: int) -> None:
         pass
 
     async def put(self, key: str, data: bytes) -> None:
@@ -182,7 +182,7 @@ def test_cli_http_client_error_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     assert CliRunner().invoke(app, ["check-storage"]).exit_code == 2
 
 
-async def test_discard_stale_deletes_only_old_objects() -> None:
+async def test_discard_stale_probes_deletes_only_old_probe_objects() -> None:
     from datetime import UTC, datetime, timedelta
     from unittest.mock import MagicMock
 
@@ -200,13 +200,16 @@ async def test_discard_stale_deletes_only_old_objects() -> None:
     client.get_paginator.return_value.paginate.return_value = [
         {
             "Contents": [
-                {"Key": "old", "LastModified": now - timedelta(hours=2)},
-                {"Key": "new", "LastModified": now},
+                {"Key": f"{PROBE_PREFIX}old", "LastModified": now - timedelta(hours=2)},
+                {"Key": f"{PROBE_PREFIX}new", "LastModified": now},
+                # a backend that ignores Prefix= must not get real data deleted
+                {"Key": "inputs/team/x.jsonl", "LastModified": now - timedelta(days=9)},
             ]
         }
     ]
     st._client = client
-    await st.discard_stale("p/", 3600)
-    client.delete_object.assert_called_once_with(Bucket=st.bucket, Key="old")
+    await st.discard_stale_probes(3600)
+    client.delete_object.assert_called_once_with(Bucket=st.bucket, Key=f"{PROBE_PREFIX}old")
+    assert client.get_paginator.return_value.paginate.call_args.kwargs["Prefix"] == PROBE_PREFIX
     client.get_paginator.side_effect = OSError  # best effort and quiet
-    await st.discard_stale("p/", 3600)
+    await st.discard_stale_probes(3600)

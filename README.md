@@ -409,7 +409,9 @@ ends as `FAILED` or `PARTIAL`. See `minion status NAME` and the executor log.
   the same proxy). There must be no caching layer in front of the presigned S3 endpoint (a cache
   could serve a slice or body to a request whose signature was never checked). A crashed run can
   leave a probe object; the next run removes probes older than 1 h, and an S3 lifecycle rule
-  expiring `_preflight/check-storage/` after 1 day is a good backstop.
+  expiring `_preflight/check-storage/` after 1 day is a good backstop (it also clears old probe
+  versions in a versioned bucket). The cleanup compares this host's clock with the store's
+  `LastModified`: over 1 h of skew can delete a concurrent run's probe (a false exit 1).
 - **API keys:** `uv run minion-server-admin generate-api-key --name <who> --teams a,b
   [--operator] [--expires-days N]`; add the entry to the keys file (live-reloaded within 5 s); delete
   the entry to revoke.
