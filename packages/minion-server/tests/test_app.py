@@ -10,6 +10,12 @@ from minion_server import app as app_module
 from minion_server.app import create_app
 
 
+@pytest.fixture(autouse=True)
+def _keep_capture_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # main() configures JSON logging, which would replace structlog.testing.capture_logs
+    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+
+
 async def test_healthz() -> None:
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

@@ -679,3 +679,12 @@ def serve_status(status: int) -> Iterator[str]:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_structlog_after_test() -> Iterator[None]:
+    """`minion_server.logging_config.configure_logging` is process-global; undo it per test."""
+    yield
+    import structlog
+
+    structlog.reset_defaults()

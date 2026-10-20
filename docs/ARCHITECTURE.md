@@ -264,7 +264,7 @@ listed under the worker bullets below), model cache and worker sandbox (TASK-4.2
   the interval (3× recommended) so one lost beat does not get a live executor reclaimed.
 - **Housekeeping**: temp dirs are `minion-exec-<pid>-*`; at startup dirs of dead pids owned by the
   user are removed. File I/O in the data path runs in threads (`asyncio.to_thread`).
-- **Logging**: `structlog`, ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
+- **Logging**: `structlog` JSON lines on stdout (`timestamp` ISO UTC, `level`, `event`), configured by `minion_server.logging_config.configure_logging` in server `main()`, the uvicorn worker factory and the watchdog; stdlib loggers (uvicorn errors) use the same format, the uvicorn access log is off; ids only (acquirement, team/project/task, subtask id, attempt); no payloads.
 
 ### 2.3 minion-watchdog
 - Separate process (`minion_watchdog.main:main`, `uv run minion-watchdog`) that reuses the server's

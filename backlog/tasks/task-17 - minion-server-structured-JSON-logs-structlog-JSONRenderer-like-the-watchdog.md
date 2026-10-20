@@ -19,6 +19,6 @@ The server never configures structlog, so it logs with the default console rende
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 minion-server main() configures structlog JSON output (timestamps, level)
-- [ ] #2 No payload/secret fields in server logs (test)
+- [x] #1 minion-server main() configures structlog JSON output (timestamps, level)
+- [x] #2 No payload/secret fields in server logs (test)
 <!-- AC:END -->

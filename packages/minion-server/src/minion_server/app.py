@@ -16,6 +16,7 @@ from minion_server.auth import ExecutorPrincipal, KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.errors import ExecutorRevokedError, busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
+from minion_server.logging_config import configure_logging
 from minion_server.metrics import (
     MULTIPROC_ENV,
     Metrics,
@@ -60,6 +61,9 @@ async def _preload_tokens(app: FastAPI) -> None:
 
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     """Build the app. With no settings, they are read from the environment at startup."""
+    if settings is None:
+        # uvicorn factory path (workers > 1): a fresh interpreter, so configure JSON logs here
+        configure_logging()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -183,6 +187,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 def main() -> None:
     import uvicorn
 
+    configure_logging()
     settings = ServerSettings()
     if settings.connection_budget >= settings.connection_limit:
         structlog.get_logger().warning(
@@ -203,7 +208,13 @@ def main() -> None:
         inherited = os.environ.get(MULTIPROC_ENV)
         if inherited:
             os.environ[MULTIPROC_ENV], _ = prepare_metrics_dir(inherited)
-        uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+        uvicorn.run(
+            create_app(settings),
+            host=settings.host,
+            port=settings.port,
+            log_config=None,  # keep our JSON root handler
+            access_log=False,  # no request lines (paths carry ids); errors still logged as JSON
+        )
         return
     metrics_dir: str | None = None
     remove_dir = False
@@ -218,6 +229,8 @@ def main() -> None:
             workers=settings.server_workers,
             host=settings.host,
             port=settings.port,
+            log_config=None,
+            access_log=False,
         )
     finally:
         if metrics_dir is not None and remove_dir:
