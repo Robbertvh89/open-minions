@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy import false, func, null, select, update
+from sqlalchemy import false, func, null, select, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -316,21 +316,31 @@ async def set_task_terminal(session: AsyncSession, key: TaskKey, status: TaskSta
 
 
 def settleable_stmt(limit: int) -> Any:
-    """The settleable-tasks select (shared with `minion-scale explain`)."""
+    """The settleable-tasks select (shared with `minion-scale explain`).
+
+    Drives from the live tasks and sums each one's counter shards in a lateral subquery (one PK
+    range scan per live task), so the cost follows the live set and not the table of finished
+    tasks (TASK-34: the plain join + GROUP BY let the planner scan `minion_task` by primary key and
+    filter out the history). A task without counter rows sums to NULL and is not settleable.
+    """
+    done = (
+        select(func.sum(TaskCounter.succeeded + TaskCounter.failed).label("done"))
+        .where(
+            TaskCounter.team == Task.team,
+            TaskCounter.project == Task.project,
+            TaskCounter.task_name == Task.task_name,
+        )
+        .correlate(Task)
+        .lateral("c")
+    )
     return (
         select(Task.team, Task.project, Task.task_name)
-        .join(
-            TaskCounter,
-            (TaskCounter.team == Task.team)
-            & (TaskCounter.project == Task.project)
-            & (TaskCounter.task_name == Task.task_name),
-        )
+        .join(done, true())
         .where(
             Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
             Task.total_subtasks > 0,
+            done.c.done >= Task.total_subtasks,
         )
-        .group_by(Task.team, Task.project, Task.task_name, Task.total_subtasks)
-        .having(func.sum(TaskCounter.succeeded + TaskCounter.failed) >= Task.total_subtasks)
         .limit(limit)
     )
 

@@ -19,8 +19,8 @@ Follow-up from TASK-7.4.8 review/security (LOW/NIT). settleable_tasks sums shard
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 EXPLAIN of settleable_tasks and Grafana status panel in minion-scale explain set
-- [ ] #2 Bounded or justified by measurement
+- [x] #1 EXPLAIN of settleable_tasks and Grafana status panel in minion-scale explain set
+- [x] #2 Bounded or justified by measurement
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -220,3 +220,16 @@ Record the verdict per query in the bench doc and tick AC#2 with the doc link.
 Size: Step 1 one implementer pass; Step 2 a verifier/test-engineer bench pass; Step 4 at most one pass each for
 3a / 3b. No sub-tasks needed.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Measured at 1M subtasks, L live tasks x H history (docs/bench/m-task34-settle-scan-apple-m3-pro.md).
+- settleable_tasks: BOUNDED. The join + GROUP BY plan scanned minion_task by PK and filtered out history
+  (13.6 ms at L=1,000/H=100k, 2.97x the H=0 cost). Rewritten as a lateral driven from the live tasks
+  (ix_minion_task_live_queue + counter PK): 5.3 ms, 1.10x. Same result set, no migration, ADR-0015 semantics unchanged.
+- grafana_task_status: JUSTIFIED, the planner removes the lateral join (no counter node), about 19 ms seq scan at 101k tasks.
+- grafana_live_tasks: JUSTIFIED (4.2 ms at L=10,000/H=100k; 85-96 ms at H<=10k, noted in the doc).
+- grafana_subtask_status: informational, 41-66 ms.
+Caveat: a CI pytest run on another branch shared the machine. The optional pg_stat_statements generic-plan cross-check was not run.
+<!-- SECTION:NOTES:END -->

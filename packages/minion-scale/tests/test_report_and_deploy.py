@@ -88,7 +88,7 @@ def test_hot_statements_compile_to_literal_sql() -> None:
         sql = stmt if isinstance(stmt, str) else compile_literal(stmt)
         assert ":" not in sql.replace("::", "") and "%(" not in sql, name
     settle = compile_literal(settleable_stmt(100))
-    assert "HAVING" in settle and "LIMIT 100" in settle
+    assert "JOIN LATERAL" in settle and "LIMIT 100" in settle  # live-driven, TASK-34
     small = hot_statements(
         model_ids=["m"], team="t", heartbeat_timeout_s=1.0, max_lease_s=1.0, settle_batch=7
     )["settleable_tasks"]
