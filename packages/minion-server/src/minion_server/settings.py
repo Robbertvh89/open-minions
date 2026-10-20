@@ -141,6 +141,8 @@ class ServerSettings(BaseSettings):
     split_max_objects: int = Field(default=10_000, gt=0)  # input objects per task
     split_max_subtasks: int = Field(default=100_000, gt=0)  # subtasks per task
     split_max_attempts: int = Field(default=5, gt=0)  # transient failures before FAILED
+    # Hard cap on claims (crash loops that never record a failure); >= split_max_attempts.
+    split_claim_cap: int = Field(default=15, ge=1, le=1000)
     split_backoff_base_s: float = Field(default=2.0, ge=0)  # doubles per attempt
     split_backoff_max_s: float = Field(default=300.0, ge=0)
     # Claim lease, renewed every lease_s/3; a crashed split is retried after it.
@@ -245,6 +247,12 @@ class ServerSettings(BaseSettings):
             for o in self.s3_output_prefixes:
                 if i.startswith(o) or o.startswith(i):
                     raise ValueError(f"input prefix {i!r} and output prefix {o!r} overlap")
+        return self
+
+    @model_validator(mode="after")
+    def _claim_cap_covers_attempts(self) -> Self:
+        if self.split_claim_cap < self.split_max_attempts:
+            raise ValueError("MINION_SPLIT_CLAIM_CAP must be >= MINION_SPLIT_MAX_ATTEMPTS")
         return self
 
     @model_validator(mode="after")

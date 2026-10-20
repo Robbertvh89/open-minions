@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import structlog
 from minion_common.enums import SubtaskStatus, TaskStatus
 from minion_common.schemas import ModelEntry, TaskCreate
 from sqlalchemy import (
@@ -197,10 +198,12 @@ def _task_key(task: Task) -> tuple[Any, ...]:
     return (Task.team == task.team, Task.project == task.project, Task.task_name == task.task_name)
 
 
+log = structlog.get_logger(__name__)
+
 SPLIT_ATTEMPTS_EXHAUSTED = "SPLIT_ATTEMPTS_EXHAUSTED"
-# Hard safety cap on claims, as a multiple of the failure limit: a crash loop that dies before it
-# can record a failure (OOM kill, segfault) would otherwise never exhaust `split_failures`.
-SPLIT_CLAIM_CAP_FACTOR = 10
+# Default hard cap on claims (MINION_SPLIT_CLAIM_CAP): a crash loop that dies before it can record
+# a failure (OOM kill, segfault) would otherwise never exhaust `split_failures`.
+DEFAULT_SPLIT_CLAIM_CAP = 15
 
 
 def claim_select_stmt() -> Select[Any]:
@@ -217,7 +220,12 @@ def claim_select_stmt() -> Select[Any]:
     )
 
 
-async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: int) -> Task | None:
+async def claim_splitting(
+    session: AsyncSession,
+    lease_s: float,
+    max_attempts: int,
+    claim_cap: int = DEFAULT_SPLIT_CLAIM_CAP,
+) -> Task | None:
     """Claim one due SPLITTING task with a lease; the caller commits straight away.
 
     `FOR NO KEY UPDATE SKIP LOCKED` serialises concurrent claimers only for the instant of the
@@ -226,7 +234,7 @@ async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: i
     claimable again once the lease expires. `split_attempts` counts claims only and doubles as
     the fencing token for every later write by the claim holder (never decrement it). Exhaustion
     is based on `split_failures` (real split failures, bumped by `schedule_split_retry`): a task
-    with `max_attempts` failures, or with `SPLIT_CLAIM_CAP_FACTOR * max_attempts` claims (a crash
+    with `max_attempts` failures, or with `claim_cap` claims (a crash
     loop that never records a failure), is marked FAILED (`SPLIT_ATTEMPTS_EXHAUSTED`) instead of
     being handed out again. Restarts, lease losses and cancels consume claims, not failures.
     """
@@ -234,10 +242,11 @@ async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: i
         task: Task | None = (await session.execute(claim_select_stmt())).scalar_one_or_none()
         if task is None:
             return None
-        if (
-            task.split_failures >= max_attempts
-            or task.split_attempts >= max_attempts * SPLIT_CLAIM_CAP_FACTOR
-        ):
+        by_cap = task.split_failures < max_attempts and task.split_attempts >= claim_cap
+        if task.split_failures >= max_attempts or by_cap:
+            if by_cap:
+                tid = f"{task.team}/{task.project}/{task.task_name}"
+                log.warning("split_claim_cap_reached", task=tid, claim_cap=claim_cap)
             await session.execute(
                 update(Task)
                 .where(*_task_key(task), Task.status == status_literal(TaskStatus.SPLITTING))
@@ -345,11 +354,15 @@ async def mark_split_done(session: AsyncSession, task: Task, total: int) -> bool
     return bool(res.rowcount)  # type: ignore[attr-defined]
 
 
-async def mark_split_failed(session: AsyncSession, task: Task, error: str) -> bool:
+async def mark_split_failed(
+    session: AsyncSession, task: Task, error: str, *, count_failure: bool = False
+) -> bool:
+    extra: dict[str, Any] = {"split_failures": Task.split_failures + 1} if count_failure else {}
     res = await session.execute(
         update(Task)
         .where(*_held(task))
         .values(
+            **extra,
             status=TaskStatus.FAILED.value,
             error=error,
             finished_at=datetime.now(UTC),

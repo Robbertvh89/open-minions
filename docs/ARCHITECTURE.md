@@ -355,12 +355,15 @@ retry all match on the claimed value, so a splitter whose lease expired and was 
 a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
 default 3600; exceeding it backs off like any transient error). `split_attempts` only counts claims
 (it is the fencing token and is never decremented); exhaustion uses a separate `split_failures`
-counter (migration 0016), incremented only by real failures routed through the retry path (S3 or
+counter (migration 0015), incremented only by real failures routed through the retry path (S3 or
 read errors, the wall-clock budget). Restarts, lease losses, cancels and rival claims do not count,
 so rolling restarts cannot exhaust a valid task. A claim never hands out a task with
 `split_failures >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED`. As a
 backstop for a crash loop that dies before recording a failure (OOM kill), a task is also failed
-at `10 x max_attempts` claims (`SPLIT_CLAIM_CAP_FACTOR`).
+at `MINION_SPLIT_CLAIM_CAP` claims (default 15, 1..1000, must be >= `MINION_SPLIT_MAX_ATTEMPTS`). That
+path keeps the code `SPLIT_ATTEMPTS_EXHAUSTED` but logs `split_claim_cap_reached` (task key only),
+which tells a crash loop from real failures. Cost of a crash loop: about cap x `split_lease_s`
+(default 15 x 900 s, roughly 3.75 h) before the task is failed.
 Server shutdown during a read stops the read thread at its next chunk, does not hang, writes no
 backoff and releases the lease (fenced write), so another server claims at once; that claim
 counts as a claim but not as a failure. The server container has `stop_grace_period: 30s` for this.

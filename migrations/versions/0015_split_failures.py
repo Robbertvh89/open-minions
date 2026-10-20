@@ -1,13 +1,11 @@
 """minion_task.split_failures: real split failures, separate from claims (TASK-56)
 
-Revision ID: 0016_split_failures
+Revision ID: 0015
 Revises: 0014
 Create Date: 2026-10-20 13:00:00
 
 `split_attempts` counts claims and is the lease fencing token; it must never be decremented.
 Exhaustion (SPLIT_ATTEMPTS_EXHAUSTED) now counts `split_failures`.
-
-NOTE: down_revision is 0014 because 0015 (TASK-54) is not on main yet; re-chain at merge.
 """
 
 from collections.abc import Sequence
@@ -15,7 +13,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0016_split_failures"
+revision: str = "0015"
 down_revision: str | None = "0014"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
