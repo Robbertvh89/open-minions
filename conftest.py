@@ -498,6 +498,60 @@ async def make_executors(
     return out
 
 
+async def assert_counts_match(
+    sm: async_sessionmaker[AsyncSession], team: str, project: str, name: str
+) -> dict[str, int]:
+    """TASK-16 AC#2: API counts (counters + acquirements) equal a direct `minion_subtask`
+    aggregate, both read in ONE REPEATABLE READ snapshot, so the check is exact mid-storm.
+
+    Returns the per-status counts it verified (status name -> n)."""
+    async with sm() as s:
+        await s.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        got = await tasks_repo.get_task(s, team, project, name)
+        if got is None:
+            raise AssertionError(f"task {name} missing")
+        task, counts = got
+        total = task.total_subtasks
+        key = {"t": team, "p": project, "n": name}
+        agg = {
+            str(st): int(n)
+            for st, n in (
+                await s.execute(
+                    text(
+                        "SELECT status, count(*) FROM minion_subtask "
+                        "WHERE team=:t AND project=:p AND task_name=:n GROUP BY status"
+                    ),
+                    key,
+                )
+            ).all()
+        }
+        acq = (
+            await s.execute(
+                text(
+                    "SELECT count(*) FROM minion_subtask_acquirement "
+                    "WHERE team=:t AND project=:p AND task_name=:n"
+                ),
+                key,
+            )
+        ).scalar_one()
+        await s.rollback()
+    api = {st.value: n for st, n in counts.items()}
+    rows = sum(agg.values())
+    if total > 0:  # split done: total is the row count, so PENDING is exact
+        if total != rows:
+            raise AssertionError(f"total_subtasks {total} != rows {rows}: {agg}")
+        expected = {st: agg.get(st, 0) for st in api}
+        if api != expected:
+            raise AssertionError(f"counter drift: api={api} aggregate={expected}")
+    else:  # SPLITTING / never split: PENDING reads 0 by design, the rest must still match
+        expected = {st: agg.get(st, 0) for st in api if st != "PENDING"}
+        if {k: v for k, v in api.items() if k != "PENDING"} != expected:
+            raise AssertionError(f"counter drift while unsplit: api={api} aggregate={agg}")
+    if acq != agg.get("RUNNING", 0):
+        raise AssertionError(f"acquirements {acq} != RUNNING {agg}")
+    return api
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 

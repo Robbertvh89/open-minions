@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-17 07:22'
-updated_date: '2026-10-20 01:45'
+updated_date: '2026-10-20 02:18'
 labels:
   - server
   - performance
@@ -23,8 +23,10 @@ GET /tasks aggregates every subtask of up to 100 tasks per page (up to ~10M rows
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 List/detail counts read O(1) per task
-- [ ] #2 Counters stay consistent under concurrent acquire/complete/reclaim (integration test)
+- [x] #2 Counters stay consistent under concurrent acquire/complete/reclaim (integration test)
 <!-- AC:END -->
+
+
 
 ## Implementation Plan
 

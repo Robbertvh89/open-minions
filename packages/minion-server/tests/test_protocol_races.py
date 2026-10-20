@@ -37,7 +37,16 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import TEST_MODELS_FILE, S3Env, _auth, _budget, _req, make_executors, seed_task
+from conftest import (
+    TEST_MODELS_FILE,
+    S3Env,
+    _auth,
+    _budget,
+    _req,
+    assert_counts_match,
+    make_executors,
+    seed_task,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -497,6 +506,8 @@ async def test_cancel_concurrent_with_last_completions(
         assert status in ("CANCELLED", "SUCCEEDED")  # CANCELLED xor derived, never anything else
         ok, bad = await _subtask_counts(sm, name)
         assert (await _shard_sums(sm, name))[:2] == (ok, bad) == (8, 0)
+        counts = await assert_counts_match(sm, "e2e", "p", name)
+        assert (counts["SUCCEEDED"], counts["CANCELLED"], counts["RUNNING"]) == (8, 0, 0)
         await tick(
             sm,
             WatchdogSettings(database_url=SecretStr("postgresql+asyncpg://x/x")),
