@@ -96,32 +96,40 @@ def test_httpx_and_httpcore_do_not_log_urls(capsys: pytest.CaptureFixture[str]) 
     assert _lines(capsys) == []
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
 @asynccontextmanager
 async def _serve(app: FastAPI) -> AsyncIterator[str]:
-    port = _free_port()
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=port,
-        log_config=None,
-        access_log=True,
-        lifespan="off",
-    )
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))  # keep the bound socket: no port race
+    port = int(sock.getsockname()[1])
+    config = uvicorn.Config(app, log_config=None, access_log=True, lifespan="off")
     server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    while not server.started:  # noqa: ASYNC110
-        await asyncio.sleep(0.01)
+    task = asyncio.create_task(server.serve(sockets=[sock]))
     try:
+        async with asyncio.timeout(10):
+            while not server.started and not task.done():  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+        assert server.started, "uvicorn did not start"
         yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
-        await task
+        try:
+            await asyncio.wait_for(task, 10)
+        finally:
+            sock.close()
+
+
+def test_uvicorn_default_log_config_does_not_hide_lines(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A prior uvicorn.Config (default LOGGING_CONFIG) must not keep uvicorn loggers off root."""
+    uvicorn.Config(FastAPI(), log_level="warning")
+    configure_logging()
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d', "1.2.3.4", "GET", "/x?a=b", "1.1", 200
+    )
+    logging.getLogger("uvicorn.error").info("started")
+    recs = _lines(capsys)
+    assert [r["event"] for r in recs] == ['1.2.3.4 - "GET /x HTTP/1.1" 200', "started"]
 
 
 async def test_real_requests_log_json_without_secrets(
@@ -150,14 +158,14 @@ async def test_real_requests_log_json_without_secrets(
     async with _serve(app) as base, httpx.AsyncClient(base_url=base) as client:
         r401 = await client.get(f"/api/v1/executors?{SIGNATURE}", headers=headers)
         r500 = await client.post(f"/boom?{SIGNATURE}", headers=headers, content=PAYLOAD.encode())
-    assert r401.status_code in (401, 403, 404, 500)
+    assert r401.status_code == 401
     assert r500.status_code == 500
     out = capsys.readouterr().out
     recs = [json.loads(line) for line in out.splitlines() if line.strip()]
     assert recs, "no log lines emitted"
     assert all("timestamp" in r and "level" in r for r in recs)
     errors = [r for r in recs if "exception" in r]
-    assert errors and "RuntimeError: handler exploded" in str(errors[0]["exception"])
+    assert any("RuntimeError: handler exploded" in str(r["exception"]) for r in errors)
     access = [r for r in recs if "/boom" in str(r["event"])]
     assert access and all("?" not in str(r["event"]) for r in access)
     low = out.lower()

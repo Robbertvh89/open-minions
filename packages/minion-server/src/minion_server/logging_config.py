@@ -53,6 +53,13 @@ def configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
     for noisy in ("httpx", "httpcore"):  # httpx logs full URLs (incl. X-Amz-Signature) at INFO
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # uvicorn's default LOGGING_CONFIG (any earlier uvicorn.Config, or the `uvicorn` CLI) leaves
+    # these with their own plain handlers and propagate=False: hand them back to the root handler.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        lg.handlers[:] = []
+        lg.propagate = True
+        lg.setLevel(logging.NOTSET)
     access = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _StripQueryFilter) for f in access.filters):
         access.addFilter(_StripQueryFilter())
