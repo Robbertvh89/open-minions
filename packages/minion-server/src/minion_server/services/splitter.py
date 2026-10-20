@@ -10,14 +10,20 @@ input changed underneath us (`INPUT_CHANGED`).
 Failure policy per task, so one bad task never blocks the queue:
 - deterministic problems (bad URI, empty input, limits, unreadable S3 4xx) -> FAILED at once;
 - anything else -> exponential backoff via `next_split_at`; FAILED after `max_attempts`.
-The claim is a lease fenced by `split_attempts`: every write by the holder (lease renewal per
-batch, done, failed, retry) matches on it, so a holder that lost its lease becomes a no-op.
+The claim is a lease fenced by `split_attempts`: every write by the holder (lease renewal, done,
+failed, retry) matches on it, so a holder that lost its lease becomes a no-op. The lease is renewed
+by a background timer every `lease_s / 3`, which also enforces the wall-clock budget, so one long
+blocking object read cannot outlive it; the timer trips a stop flag that the read thread checks per
+S3 chunk. Each batch insert re-checks the lease in its own transaction (the fence). A shutdown
+during a read stops the thread the same way and does not count as a failed attempt.
 Only the error class and task id are logged, never payload contents.
 """
 
 import asyncio
+import contextlib
+import threading
 import time
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Generator, Iterator
 from contextlib import aclosing
 from dataclasses import dataclass
 from itertools import islice
@@ -37,6 +43,7 @@ from minion_server.uris import InvalidUriError, parse_s3_uri
 log = structlog.get_logger()
 
 BATCH_SIZE = 1000
+STOP_WAIT_S = 15.0  # > the S3 read timeout (10 s): how long a shutdown waits for the read thread
 EMPTY_INPUT_ERROR = "input prefix contains no records"
 DETERMINISTIC_S3_CODES = frozenset(
     {"AccessDenied", "NoSuchKey", "NoSuchBucket", "InvalidObjectState", "403", "404"}
@@ -85,12 +92,77 @@ class SplitTimeoutError(Exception):
 INPUT_CHANGED_DURING_SPLIT = "INPUT_CHANGED: input object changed while it was being split"
 
 
+class _SplitAbortedError(Exception):
+    """Internal: the read thread was asked to stop (shutdown); never escapes `_plan_batches`."""
+
+
+class _SplitGuard:
+    """Stop flag for one split attempt: set on the event loop, checked by the read thread."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._reason: type[Exception] = _SplitAbortedError
+
+    def trip(self, reason: type[Exception]) -> None:
+        if not self._event.is_set():  # the first reason wins (only the event loop trips)
+            self._reason = reason
+            self._event.set()
+
+    def check(self) -> None:
+        if self._event.is_set():
+            raise self._reason
+
+    def chunks(self, it: Iterator[bytes]) -> Generator[bytes]:
+        """Pass `it` through, but stop at the next chunk once tripped."""
+        for chunk in it:
+            self.check()
+            yield chunk
+
+
 def _take(it: Iterator[Slice], n: int) -> list[Slice]:
     return list(islice(it, n))
 
 
+class _ThreadReader:
+    """Reads slices in a worker thread, cancellation-safe.
+
+    A cancelled await must not close the generator while the thread is still inside it (that turns
+    the `CancelledError` into `ValueError: generator already executing`): stop the thread through
+    the guard, wait for it, and only then let the caller close.
+    """
+
+    def __init__(
+        self, raw: Generator[bytes], guard: _SplitGuard, records_per_subtask: int, max_line: int
+    ) -> None:
+        self._guard = guard
+        self._raw = raw
+        self._chunks = guard.chunks(raw)
+        self._slices = slice_jsonl(self._chunks, 0, records_per_subtask, max_line)
+        self._fut: asyncio.Future[list[Slice]] | None = None
+
+    async def take(self, n: int) -> list[Slice]:
+        fut: asyncio.Future[list[Slice]] = asyncio.ensure_future(
+            asyncio.to_thread(_take, self._slices, n)
+        )
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())  # never "not retrieved"
+        self._fut = fut
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            self._guard.trip(_SplitAbortedError)  # the thread stops at its next chunk
+            await asyncio.wait([fut], timeout=STOP_WAIT_S)
+            raise
+
+    def close(self) -> None:
+        if self._fut is not None and not self._fut.done():
+            return  # the thread is still in the generators: leave them to the GC
+        self._slices.close()
+        self._chunks.close()
+        self._raw.close()
+
+
 async def _plan_batches(
-    storage: S3Storage, task: Task, limits: SplitLimits, batch_size: int
+    storage: S3Storage, task: Task, limits: SplitLimits, batch_size: int, guard: _SplitGuard
 ) -> AsyncGenerator[list[NewSubtask]]:
     """Stream the plan in batches; memory is bounded by `batch_size` and the object listing."""
     prefix = parse_s3_uri(task.input_uri, bucket=storage.bucket, prefixes=("",)).key
@@ -105,14 +177,15 @@ async def _plan_batches(
     for key, size, etag in listing:  # sorted -> deterministic ids
         if size == 0:
             continue
-        slices = slice_jsonl(
+        reader = _ThreadReader(
             storage.iter_object(key, etag=etag, size=size),
-            0,
+            guard,
             task.records_per_subtask,
             limits.max_line_bytes,
         )
         try:
-            while chunk := await asyncio.to_thread(_take, slices, batch_size):
+            while chunk := await reader.take(batch_size):
+                guard.check()
                 for sl in chunk:
                     batch.append(
                         NewSubtask(
@@ -135,9 +208,39 @@ async def _plan_batches(
                 f"LINE_TOO_LONG: a line in an input object exceeds {limits.max_line_bytes} bytes"
             ) from exc
         finally:
-            slices.close()
+            reader.close()
     if batch:
         yield batch
+
+
+async def _renew_lease(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    task: Task,
+    limits: SplitLimits,
+    deadline: float,
+    guard: _SplitGuard,
+) -> None:
+    """Extend the lease every `lease_s / 3` and enforce the wall-clock budget, until tripped.
+
+    Runs on the event loop, so it keeps ticking while a worker thread blocks on an S3 read. Each
+    tick is one fenced UPDATE in its own short transaction. A database error is only logged:
+    every holder write is fenced, so a lapsed lease is detected at the next write.
+    """
+    interval = limits.lease_s / 3
+    while True:
+        await asyncio.sleep(max(0.0, min(interval, deadline - time.monotonic())))
+        if time.monotonic() > deadline:
+            guard.trip(SplitTimeoutError)
+            return
+        try:
+            async with sessionmaker() as s, s.begin():
+                held = await tasks_repo.renew_split_lease(s, task, limits.lease_s)
+        except Exception as exc:
+            log.warning("task_split_renew_error", task=tid_of(task), error_class=type(exc).__name__)
+            continue
+        if not held:  # re-claimed by another splitter, or the task was cancelled
+            guard.trip(LeaseLostError)
+            return
 
 
 async def _insert_batch(
@@ -175,12 +278,23 @@ async def _split(
 ) -> int:
     total = 0
     deadline = time.monotonic() + limits.max_seconds
-    async with aclosing(_plan_batches(storage, task, limits, batch_size)) as batches:
-        async for batch in batches:
-            if time.monotonic() > deadline:
-                raise SplitTimeoutError
-            await _insert_batch(sessionmaker, task, batch, limits.lease_s)
-            total += len(batch)
+    guard = _SplitGuard()
+    renewer = asyncio.create_task(_renew_lease(sessionmaker, task, limits, deadline, guard))
+    try:
+        async with aclosing(_plan_batches(storage, task, limits, batch_size, guard)) as batches:
+            async for batch in batches:
+                guard.check()
+                if time.monotonic() > deadline:
+                    raise SplitTimeoutError
+                await _insert_batch(sessionmaker, task, batch, limits.lease_s)
+                total += len(batch)
+    finally:
+        renewer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renewer
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise asyncio.CancelledError  # our own cancellation is never swallowed
     if total == 0:
         raise SplitFailedError(EMPTY_INPUT_ERROR)
     async with sessionmaker() as s, s.begin():
