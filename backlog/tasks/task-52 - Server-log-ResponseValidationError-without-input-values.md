@@ -4,7 +4,7 @@ title: 'Server: log ResponseValidationError without input values'
 status: In Progress
 assignee: []
 created_date: '2026-10-20 00:15'
-updated_date: '2026-10-20 01:36'
+updated_date: '2026-10-20 01:37'
 labels:
   - security
   - server
@@ -20,6 +20,6 @@ From TASK-17 security audit (LOW, pre-existing): an unhandled FastAPI ResponseVa
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 ResponseValidationError logged with class + loc/type only; test with a presigned-URL-like value asserts it is absent
-- [ ] #2 Client gets a generic 500 body
+- [x] #1 ResponseValidationError logged with class + loc/type only; test with a presigned-URL-like value asserts it is absent
+- [x] #2 Client gets a generic 500 body
 <!-- AC:END -->
