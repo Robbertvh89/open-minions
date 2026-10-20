@@ -315,7 +315,7 @@ async def set_task_terminal(session: AsyncSession, key: TaskKey, status: TaskSta
     return bool(result.rowcount == 1)  # type: ignore[attr-defined]
 
 
-def settleable_stmt(limit: int) -> Any:
+def settleable_stmt(limit: int) -> Any:  # Select[...]: the SQLAlchemy stubs here reject a typed row
     """The settleable-tasks select (shared with `minion-scale explain`).
 
     Drives from the live tasks and sums each one's counter shards in a lateral subquery (one PK

@@ -41,8 +41,13 @@ Decision rule (a) warm <= 20 ms at L = 1,000 and <= 200 ms at L = 10,000: BEFORE
 Why: BEFORE the planner reached `minion_task` with a parallel scan of the primary key and filtered the
 history out ("Rows Removed by Filter: 33333" per worker at L = 1,000, H = 100k) instead of using the partial
 index `ix_minion_task_live_queue`. AFTER the statement is driven from the live tasks and sums each task's
-counter shards in a lateral subquery (one `pk_minion_task_counter` range scan per live task; the plan is
-`Index Scan using ix_minion_task_live_queue` + `Aggregate` over the counter PK, no history read).
+counter shards in a lateral subquery (one `pk_minion_task_counter` range scan per live task). The plan
+depends on the live share: at L = 100 and L = 1,000 with H >= 10k it reaches `minion_task` through
+`ix_minion_task_live_queue`; at L = 10,000 (all H) and L = 1,000 / H = 10k the planner seq-scans `minion_task`
+(at L = 10,000 / H = 100k: Rows Removed by Filter 100000, about 12.8 of 89.6 ms, a cheap 110k-row filter).
+Cost is O(live x 16) plus at most one seq scan of `minion_task`; rule (b) passes on the measured ratio, not on
+plan shape. AFTER is slightly slower than BEFORE at H = 0 (68.4 -> 77.4 ms at L = 10,000, 4.56 -> 4.83 ms at
+L = 1,000): a lateral nested loop instead of a parallel group-aggregate.
 Verdict: **BOUNDED** by a query rewrite, no migration, same result set (a live task without counter rows sums
 to NULL and is not settleable, as the inner join excluded it). Remaining cost is O(live tasks x 16 shards)
 (5 ms per 1,000 live tasks per tick, 60 s default interval); no keyset rotation needed, so the ADR-0015
@@ -83,7 +88,7 @@ cell, far below the 500 ms follow-up threshold. No change.
 
 | Query | Verdict | Change |
 |---|---|---|
-| settleable_tasks | BOUNDED (rewrite) | lateral, driven from live tasks: 13.6 -> 5.3 ms at L = 1,000, H = 100k; history-independent |
+| settleable_tasks | BOUNDED (rewrite) | lateral, driven from live tasks: 13.6 -> 5.3 ms at L = 1,000, H = 100k; cost grows <= 1.15x with history (plan shape varies with live share) |
 | grafana_task_status | JUSTIFIED | none (join removed by the planner) |
 | grafana_live_tasks | JUSTIFIED | none |
 | grafana_subtask_status | informational, ok | none |
