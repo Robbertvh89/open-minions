@@ -61,9 +61,6 @@ async def _preload_tokens(app: FastAPI) -> None:
 
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     """Build the app. With no settings, they are read from the environment at startup."""
-    if settings is None:
-        # uvicorn factory path (workers > 1): a fresh interpreter, so configure JSON logs here
-        configure_logging()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -184,6 +181,12 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     return app
 
 
+def create_app_from_env() -> FastAPI:
+    """uvicorn factory for workers > 1: fresh interpreters, so configure JSON logs first."""
+    configure_logging()
+    return create_app()
+
+
 def main() -> None:
     import uvicorn
 
@@ -213,7 +216,7 @@ def main() -> None:
             host=settings.host,
             port=settings.port,
             log_config=None,  # keep our JSON root handler
-            access_log=False,  # no request lines (paths carry ids); errors still logged as JSON
+            access_log=settings.server_access_log,
         )
         return
     metrics_dir: str | None = None
@@ -224,13 +227,13 @@ def main() -> None:
         os.environ[MULTIPROC_ENV] = metrics_dir
     try:
         uvicorn.run(
-            "minion_server.app:create_app",
+            "minion_server.app:create_app_from_env",
             factory=True,
             workers=settings.server_workers,
             host=settings.host,
             port=settings.port,
             log_config=None,
-            access_log=False,
+            access_log=settings.server_access_log,
         )
     finally:
         if metrics_dir is not None and remove_dir:

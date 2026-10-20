@@ -67,7 +67,7 @@ def test_main_multi_worker_uses_the_factory_string_and_prepares_metrics(
     finally:
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
     [(args, kwargs)] = calls
-    assert args == ("minion_server.app:create_app",)
+    assert args == ("minion_server.app:create_app_from_env",)
     assert kwargs["factory"] is True
     assert kwargs["workers"] == 4
     assert list(d.iterdir()) == []

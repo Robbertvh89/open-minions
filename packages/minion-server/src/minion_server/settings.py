@@ -76,6 +76,10 @@ class ServerSettings(BaseSettings):
     # An attempt object above this is never promoted (422 OUTPUT_TOO_LARGE on complete, S-2).
     max_output_bytes: int = Field(default=MAX_OUTPUT_BYTES_DEFAULT, gt=0, le=MAX_OUTPUT_BYTES_LIMIT)
 
+    # uvicorn access log (off by default): lines carry client IP, method, path (ids) and status;
+    # query strings are stripped by logging_config.
+    server_access_log: bool = False
+
     # Prometheus /metrics (FR-41): off by default. The same port serves it, so with a token set
     # only `Authorization: Bearer <token>` scrapes it (>= 32 chars; empty = unset); without one,
     # restrict it at the proxy (a warning is logged at startup when the host is not loopback).
