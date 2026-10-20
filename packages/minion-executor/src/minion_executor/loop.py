@@ -51,6 +51,8 @@ from pydantic import ValidationError
 from minion_executor import io
 from minion_executor.capacity.governor import Decision
 from minion_executor.capacity.gpu_guard import GpuAction, GpuDutyGuard, GpuGuardConfig
+from minion_executor.capacity.gpu_quarantine import load_ages as load_quarantine_ages
+from minion_executor.capacity.gpu_quarantine import save_kills as save_quarantine_kills
 from minion_executor.capacity.profiles import GIB
 from minion_executor.capacity.runtime import FixedGovernor, Governor
 from minion_executor.capacity.safefile import SafeFileError
@@ -279,6 +281,7 @@ class ExecutorLoop:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         idle_unload_s: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         model_cache: ModelCache | None = None,
         stop_grace_s: float = 0.0,
         governor: Governor | None = None,
@@ -307,6 +310,8 @@ class ExecutorLoop:
         self._gpu_kills: dict[Engine, list[float]] = {}  # per-engine duty / clients kill times
         self._gpu_meter_kills: dict[Engine, list[float]] = {}  # per-engine meter kill times
         self._quarantine_logged: set[Engine] = set()
+        self._wall_clock = wall_clock  # epoch seconds: the persisted quarantine book (TASK-43.1)
+        self._quarantine_note: str | None = None
         self._gpu_streak: list[float] = []  # all GPU kill times, for the back-off exponent
         self._gpu_violation: tuple[str, float] | None = None  # (reason, clock) of the last kill
         self._gpu_reason = ""  # reason of the latest KILL verdict
@@ -382,6 +387,7 @@ class ExecutorLoop:
         self._idle_unload_s = idle_unload_s
         self._clock = clock
         self._last_work = clock()
+        self._load_quarantine()
         self._unloaded = False
         self._ensure_started = False
 
@@ -1176,6 +1182,7 @@ class ExecutorLoop:
         book = self._gpu_meter_kills if meter else self._gpu_kills
         kills = [t for t in book.get(engine, []) if now - t < GPU_QUARANTINE_S]
         book[engine] = [*kills, now]
+        self._save_quarantine(now)
         points = self._quarantine_points(engine, now)
         if points >= GPU_QUARANTINE_POINTS and engine not in self._quarantine_logged:
             self._quarantine_logged.add(engine)
@@ -1183,6 +1190,62 @@ class ExecutorLoop:
             log.warning(
                 "gpu_engine_quarantined", engine=engine.value, until_s=round(until), points=points
             )
+
+    def _load_quarantine(self) -> None:
+        """Restore the kill book from gpu_quarantine.json (wall-clock ages -> this clock). Any
+        problem is logged once and treated as an empty book; a corrupt file never extends a
+        quarantine (a backward clock step can, by at most that step, capped at the 1 h window)."""
+        if self._status_dir is None:
+            return
+        ages, note = load_quarantine_ages(self._status_dir, self._wall_clock(), GPU_QUARANTINE_S)
+        if note is not None:
+            log.warning("gpu_quarantine_load_failed", reason=note)
+        now = self._clock()
+        for name, (duty, meter) in ages.items():
+            try:
+                engine = Engine(name)
+            except ValueError:
+                continue
+            if duty:
+                self._gpu_kills[engine] = sorted(now - a for a in duty)
+            if meter:
+                self._gpu_meter_kills[engine] = sorted(now - a for a in meter)
+        for engine in self._quarantined():
+            self._quarantine_logged.add(engine)
+            log.warning("gpu_engine_quarantine_restored", engine=engine.value)
+
+    def _save_quarantine(self, now: float) -> None:
+        """Persist the kill book as wall-clock instants. Best effort: failure is logged once.
+
+        The blocking fsync on the event loop is intentional: kills are bounded by the GPU
+        back-off and the state dir is local."""
+        if self._status_dir is None:
+            return
+        wall = self._wall_clock()
+        names = dict.fromkeys([*self._gpu_kills, *self._gpu_meter_kills])
+        book = {
+            e.value: (
+                [
+                    wall - (now - t)
+                    for t in self._gpu_kills.get(e, [])
+                    if now - t < GPU_QUARANTINE_S
+                ],
+                [
+                    wall - (now - t)
+                    for t in self._gpu_meter_kills.get(e, [])
+                    if now - t < GPU_QUARANTINE_S
+                ],
+            )
+            for e in names
+        }
+        try:
+            save_quarantine_kills(self._status_dir, book)
+        except SafeFileError as exc:
+            if str(exc) != self._quarantine_note:
+                self._quarantine_note = str(exc)
+                log.warning("gpu_quarantine_save_failed", reason=str(exc))
+        else:
+            self._quarantine_note = None
 
     def _quarantine_kills(self, engine: Engine, now: float) -> list[tuple[float, int]]:
         """(time, points) of the engine's GPU kills within the quarantine window, oldest first."""
