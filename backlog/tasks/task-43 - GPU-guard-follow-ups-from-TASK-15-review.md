@@ -19,8 +19,8 @@ From TASK-15 final review/security: (1) a GPU verdict already taken by the watch
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Taken GPU verdicts are never lost (tests for both paths)
-- [ ] #2 Meter-failure churn is bounded by quarantine (test + sim)
+- [x] #1 Taken GPU verdicts are never lost (tests for both paths)
+- [x] #2 Meter-failure churn is bounded by quarantine (test + sim)
 <!-- AC:END -->
 
 ## Implementation Plan
