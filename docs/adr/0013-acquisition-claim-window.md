@@ -61,8 +61,8 @@ ROLLBACK plus a pool checkout). The server saturated on these round trips while 
 - A round now makes one attempt (the old loop tried several candidates per transaction). Under heavy
   contention a round can lose, so an acquire may exhaust `MAX_ROUNDS` while work exists and answer
   `204`; the executor re-polls. This trade-off is accepted (each round is one cheap statement) and is
-  visible as the `acquire_rounds_exhausted` log event (rounds, window, pass; no identities). Exhausted acquires are logged (`acquire_rounds_exhausted`) and counted as "empty" in
-  `minion_acquire_total`; a separate `exhausted` label is a tracked follow-up.
+  visible as the `acquire_rounds_exhausted` log event (rounds, window, pass; no identities). Exhausted acquires are logged (`acquire_rounds_exhausted`) and counted as
+  `minion_acquire_total{outcome="exhausted"}` (TASK-31), separate from `empty`.
 - The claim returns the inserted key next to the picked key and refuses to serve a mismatch.
 
 See also ADR-0019: each claim round now first locks the executor row and checks the per-executor open-acquirement cap; the claim statement itself is unchanged.

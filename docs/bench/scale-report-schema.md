@@ -84,7 +84,7 @@ Quantiles are the upper bound of the bucket holding them (the observed max in th
 bucket). `bucket_counts` has one more entry than finite bounds (`null` = overflow). `statuses`
 maps the HTTP status to a count, `"0"` meaning a transport error.
 
-The server side has a matching `minion_acquire_seconds{outcome=assigned|empty|error}` Prometheus
+The server side has a matching `minion_acquire_seconds{outcome}` (outcomes as `minion_acquire_total` in SPEC FR-41, plus `error`) Prometheus
 histogram (`/metrics`, `MINION_METRICS_ENABLED=true`; outcome is the only label).
 
 ## `db`

@@ -111,6 +111,32 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
 
 
 @pytest.mark.integration
+async def test_exhausted_acquire_counts_as_exhausted_not_empty(
+    fresh_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.repositories import acquisition as repo
+
+    async def lost(*_a: Any, **_k: Any) -> repo.Claim:
+        return repo.Claim(3)  # work exists, the pick always loses the race
+
+    monkeypatch.setattr(repo, "claim", lost)
+    cfg = _settings(fresh_url).model_copy(update={"metrics_enabled": True})
+    app = create_app(cfg)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c,
+    ):
+        ((_p, tok),) = await make_executors(app.state.sessionmaker, 1, pool="metrics-pool")
+        body = _req().model_dump(mode="json")
+        r = await c.post("/api/v1/executor/acquire", json=body, headers=_auth(tok))
+        assert r.status_code == 204
+        text: Any = (await c.get("/metrics")).text
+    assert 'minion_acquire_total{outcome="exhausted"} 1.0' in text
+    assert 'minion_acquire_total{outcome="empty"}' not in text
+    assert 'minion_acquire_seconds_count{outcome="exhausted"} 1.0' in text
+
+
+@pytest.mark.integration
 async def test_acquire_error_outcome_is_timed(
     fresh_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

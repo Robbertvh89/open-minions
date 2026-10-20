@@ -377,7 +377,8 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
                   INSERT minion_executor_heartbeat(...); UPDATE task PENDING -> RUNNING (same txn)
                   re-check failed -> ROLLBACK, next round; else COMMIT -> return assignment + presigned URLs
   return 204   (pass 2 starts when pass 1 finds nothing or exhausts MAX_ROUNDS; exhausting every
-                round with work present is logged as `acquire_rounds_exhausted`)
+                round with work present is logged as `acquire_rounds_exhausted` and counted as
+                `minion_acquire_total{outcome="exhausted"}`)
 ```
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is

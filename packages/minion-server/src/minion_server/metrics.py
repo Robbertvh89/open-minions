@@ -112,6 +112,8 @@ class Metrics:
         self.acquires = Counter(
             "minion_acquire_total",
             "Executor acquire calls by outcome (assigned: got a subtask, empty: no work, "
+            "exhausted: no work won although at least one pass used all MAX_ROUNDS with "
+            "candidates and lost every race, "
             "shed: 503 SERVER_BUSY or ACQUIRE_DEADLINE, rate_limited: 429 per-executor "
             "in-flight cap, capped: 429 TOO_MANY_ACQUIREMENTS per-executor open-acquirement cap; "
             "a raised acquire (error) is timed in minion_acquire_seconds, "
