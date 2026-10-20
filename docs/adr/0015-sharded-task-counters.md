@@ -62,3 +62,22 @@ repeated measurements: B-20k drained about 14% slower in this run (165.7 s vs 14
 was about 5% lower, so throughput was not improved. The bottleneck moved to the acquire candidate
 query (2.7-3.0 ms mean, top entry) and the 503 acquire back-pressure; run-to-run variance was not
 measured, so no difference is claimed either way.
+
+## Addendum (TASK-16): list and detail counts without touching `minion_subtask`
+
+- New shard column `cancelled` (migration 0013, backfilled). Bumped by every transition into
+  CANCELLED: fail/release/reclaim on a cancelled task, cancel txn 2 and the cancelled sweep (per
+  task and shard, sorted, after the subtask row locks).
+- `running` is the number of the task's `minion_subtask_acquirement` rows, not a counter. RUNNING
+  holds exactly when an acquirement exists, and every way in and out changes both in one
+  transaction. This adds no write to acquire (the measured bottleneck). The scan is bounded by
+  executors x `MINION_MAX_OPEN_ACQUIREMENTS` across all tasks, so the read is O(1) in subtasks, not
+  strictly O(1).
+- `pending = max(0, total - running - succeeded - failed - cancelled)`. Exact after the split. While
+  SPLITTING (or if the split never finished) `total` is 0 and pending reads 0.
+- `GET /tasks` and the detail read counters, acquirements and the task row in one statement (one
+  snapshot), so the derived pending is consistent.
+- Rejected: shard columns `running`/`pending`, which add an upsert to acquire and make acquire and
+  complete contend on the same 16 rows.
+- Deploy: stop servers and watchdog, migrate, start the new image (an old server would not bump
+  `cancelled`).

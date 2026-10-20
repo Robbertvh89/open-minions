@@ -139,7 +139,7 @@ class Task(Base):
 
 
 class TaskCounter(Base):
-    """Succeeded/failed subtask counters of a task, sharded by `subtask_id % 16` (ADR-0015).
+    """Succeeded/failed/cancelled subtask counters, sharded by `subtask_id % 16` (ADR-0015).
 
     Summed on read; sharding spreads completions of one task over several rows instead of one
     hot `minion_task` row.
@@ -155,6 +155,7 @@ class TaskCounter(Base):
         ),
         CheckConstraint("succeeded >= 0", name="succeeded_nonneg"),
         CheckConstraint("failed >= 0", name="failed_nonneg"),
+        CheckConstraint("cancelled >= 0", name="cancelled_nonneg"),
     )
 
     team: Mapped[str] = mapped_column(String(64))
@@ -163,6 +164,7 @@ class TaskCounter(Base):
     shard: Mapped[int] = mapped_column(SmallInteger)
     succeeded: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     failed: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    cancelled: Mapped[int] = mapped_column(Integer, server_default=text("0"))
 
 
 class Subtask(Base):

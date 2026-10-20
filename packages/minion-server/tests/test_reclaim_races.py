@@ -29,7 +29,15 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import TEST_MODELS_FILE, S3Env, _auth, _req, make_executors, seed_task
+from conftest import (
+    TEST_MODELS_FILE,
+    S3Env,
+    _auth,
+    _req,
+    assert_counts_match,
+    make_executors,
+    seed_task,
+)
 
 BASE = "/api/v1/executor"
 DATA = b'{"id":"a"}\n{"id":"b"}\n'
@@ -734,6 +742,7 @@ async def test_unacked_reclaim_of_cancelled_task_stays_cancelled(
         await s.execute(text("UPDATE minion_task SET status = 'CANCELLED'"))
     await _ghost_age(sm)
     assert await _reclaim_cap(sm, a["acquirement_id"]) == ReclaimResult.EXPIRED_CANCELLED
+    assert (await assert_counts_match(sm, "canc", "p", "canc"))["CANCELLED"] == 1
 
 
 # --- chunked reclaim (TASK-35) ------------------------------------------------------------------

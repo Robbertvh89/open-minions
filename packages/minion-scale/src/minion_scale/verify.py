@@ -96,19 +96,22 @@ _COUNTERS = text(
     SELECT t.team, t.project, t.task_name, 0
     FROM minion_task t
     LEFT JOIN (
-        SELECT team, project, task_name, sum(succeeded) AS ok, sum(failed) AS failed
+        SELECT team, project, task_name, sum(succeeded) AS ok, sum(failed) AS failed,
+               sum(cancelled) AS cancelled
         FROM minion_task_counter WHERE team = :team GROUP BY team, project, task_name
     ) k USING (team, project, task_name)
     LEFT JOIN (
         SELECT team, project, task_name, count(*) AS total,
                count(*) FILTER (WHERE status = 'SUCCEEDED') AS sok,
-               count(*) FILTER (WHERE status = 'FAILED') AS sfailed
+               count(*) FILTER (WHERE status = 'FAILED') AS sfailed,
+               count(*) FILTER (WHERE status = 'CANCELLED') AS scancelled
         FROM minion_subtask WHERE team = :team GROUP BY team, project, task_name
     ) c USING (team, project, task_name)
     WHERE t.team = :team
       AND (t.total_subtasks <> coalesce(c.total, 0)
         OR coalesce(k.ok, 0) <> coalesce(c.sok, 0)
-        OR coalesce(k.failed, 0) <> coalesce(c.sfailed, 0))
+        OR coalesce(k.failed, 0) <> coalesce(c.sfailed, 0)
+        OR coalesce(k.cancelled, 0) <> coalesce(c.scancelled, 0))
     ORDER BY 1, 2, 3
     """
 )

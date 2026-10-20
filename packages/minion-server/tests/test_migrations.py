@@ -325,3 +325,53 @@ def test_0012_executor_id_index_round_trip(fresh_url: str) -> None:
     assert not asyncio.run(_index_exists(fresh_url, name))
     command.upgrade(cfg, "head")
     assert asyncio.run(_index_exists(fresh_url, name))
+
+
+def test_0013_cancelled_backfill_and_round_trip(fresh_url: str) -> None:
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0012")
+    asyncio.run(
+        _exec(
+            fresh_url,
+            "INSERT INTO minion_task (team, project, task_name, type, model_id, engine,"
+            " model_memory_gb, input_uri, output_uri, created_by, status, total_subtasks)"
+            " VALUES ('t', 'p', 'c', 'embedding', 'm', 'mlx', 1, 's3://i', 's3://o/c', 'u',"
+            " 'RUNNING', 40)",
+        )
+    )
+    # 40 subtasks; CANCELLED on every id except multiples of 5; shard 3 has a prior counter row
+    asyncio.run(
+        _exec(
+            fresh_url,
+            "INSERT INTO minion_subtask (team, project, task_name, subtask_id, status,"
+            " input_object_key, byte_start, byte_end, first_record, record_count)"
+            " SELECT 't', 'p', 'c', g, CASE WHEN g % 5 = 0 THEN 'PENDING' ELSE 'CANCELLED' END,"
+            " 'k', 0, 1, 0, 1 FROM generate_series(0, 39) g",
+        )
+    )
+    asyncio.run(_exec(fresh_url, "INSERT INTO minion_task_counter VALUES ('t', 'p', 'c', 3, 2, 0)"))
+    expected = asyncio.run(
+        _scalar(fresh_url, "SELECT count(*) FROM minion_subtask WHERE status = 'CANCELLED'")
+    )
+
+    command.upgrade(cfg, "0013")
+    assert asyncio.run(_scalar(fresh_url, "SELECT sum(cancelled) FROM minion_task_counter")) == (
+        expected
+    )
+    # per shard equal to the grouped aggregate (no mismatching shard)
+    mismatch = (
+        "SELECT count(*) FROM minion_task_counter c WHERE c.cancelled <> ("
+        "SELECT count(*) FROM minion_subtask s WHERE s.status = 'CANCELLED'"
+        " AND s.subtask_id % 16 = c.shard)"
+    )
+    assert asyncio.run(_scalar(fresh_url, mismatch)) == 0
+    assert (
+        asyncio.run(_scalar(fresh_url, "SELECT succeeded FROM minion_task_counter WHERE shard = 3"))
+        == 2
+    )
+    assert asyncio.run(_has_column(fresh_url, "minion_task_counter", "cancelled"))
+
+    command.downgrade(cfg, "0012")
+    assert not asyncio.run(_has_column(fresh_url, "minion_task_counter", "cancelled"))
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_has_column(fresh_url, "minion_task_counter", "cancelled"))

@@ -32,6 +32,7 @@ from conftest import (
     _auth,
     _req,
     acquire_after_claim,
+    assert_counts_match,
     make_executors,
     seed_task,
 )
@@ -277,6 +278,7 @@ async def test_running_owner_sees_cancel_and_releases(env: tuple[AsyncClient, An
     assert (status, failed, subs) == ("CANCELLED", 0, ["CANCELLED"] * 3)
     (att,) = await _rows(sm, "SELECT outcome FROM minion_subtask_attempt")
     assert att[0] == "CANCELLED"
+    assert (await assert_counts_match(sm, "acq", "p", "run1"))["CANCELLED"] == 3
 
 
 @pytest.mark.integration
@@ -294,6 +296,7 @@ async def test_fail_on_cancelled_task_is_cancelled_without_budget(
     assert (status, failed, subs) == ("CANCELLED", 0, ["CANCELLED"])
     (att,) = await _rows(sm, "SELECT outcome FROM minion_subtask_attempt")
     assert att[0] == "FAILED"
+    assert (await assert_counts_match(sm, "acq", "p", "f1"))["CANCELLED"] == 1
 
 
 @pytest.mark.integration
@@ -309,6 +312,7 @@ async def test_complete_after_cancel_is_accepted(env: tuple[AsyncClient, Any], s
     assert (await _call(c, a, tok, "complete")).status_code == 204
     status, _, subs = await _task_state(sm, "c1")
     assert (status, subs) == ("CANCELLED", ["SUCCEEDED"])  # work kept, task stays CANCELLED
+    assert (await assert_counts_match(sm, "acq", "p", "c1"))["SUCCEEDED"] == 1
     got = await c.get(f"{TASKS}/acq/p/c1", headers=USER)
     assert got.json()["status"] == "CANCELLED" and got.json()["counts"]["succeeded"] == 1
 
@@ -325,6 +329,7 @@ async def test_reclaim_on_cancelled_task_is_cancelled(env: tuple[AsyncClient, An
     res = await reclaim_stale(sm, timeout_s=900, batch_size=10)
     assert res == {ReclaimResult.EXPIRED_CANCELLED: 1}
     assert await _task_state(sm, "rc") == ("CANCELLED", 0, ["CANCELLED"])
+    assert (await assert_counts_match(sm, "acq", "p", "rc"))["CANCELLED"] == 1
     (att,) = await _rows(sm, "SELECT outcome FROM minion_subtask_attempt")
     assert att[0] == "EXPIRED"
 
@@ -385,6 +390,7 @@ async def test_cancel_concurrent_with_acquires(env: tuple[AsyncClient, Any]) -> 
         assert (await _call(c, a, t, "heartbeat")).json()["cancel"] is True
         assert (await _call(c, a, t, "release")).status_code == 204
     assert (await _task_state(sm, "cc"))[2] == ["CANCELLED"] * 20
+    assert (await assert_counts_match(sm, "acq", "p", "cc"))["CANCELLED"] == 20
 
 
 @pytest.mark.integration

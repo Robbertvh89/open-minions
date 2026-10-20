@@ -5,6 +5,8 @@ acquirement (`SELECT ... FOR UPDATE`) that serializes against the watchdog (ARCH
 """
 
 import uuid
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -241,15 +243,27 @@ def counter_shard(subtask_id: int) -> int:
     return subtask_id % TASK_COUNTER_SHARDS
 
 
-async def bump_counters(session: AsyncSession, o: Owned, *, succeeded: int, failed: int) -> None:
-    """Add to this subtask's counter shard (upsert); the row lock is per shard, not per task."""
+ShardKey = tuple[str, str, str, int]  # team, project, task_name, shard
+
+
+async def bump_shard(
+    session: AsyncSession,
+    key: ShardKey,
+    *,
+    succeeded: int = 0,
+    failed: int = 0,
+    cancelled: int = 0,
+) -> None:
+    """Add to one counter shard (a single upsert). Shard locks are the last row locks of a txn."""
+    team, project, task_name, shard = key
     ins = pg_insert(TaskCounter).values(
-        team=o.team,
-        project=o.project,
-        task_name=o.task_name,
-        shard=counter_shard(o.subtask_id),
+        team=team,
+        project=project,
+        task_name=task_name,
+        shard=shard,
         succeeded=succeeded,
         failed=failed,
+        cancelled=cancelled,
     )
     await session.execute(
         ins.on_conflict_do_update(
@@ -257,9 +271,37 @@ async def bump_counters(session: AsyncSession, o: Owned, *, succeeded: int, fail
             set_={
                 "succeeded": TaskCounter.succeeded + ins.excluded.succeeded,
                 "failed": TaskCounter.failed + ins.excluded.failed,
+                "cancelled": TaskCounter.cancelled + ins.excluded.cancelled,
             },
         )
     )
+
+
+async def bump_counters(
+    session: AsyncSession, o: Owned, *, succeeded: int = 0, failed: int = 0, cancelled: int = 0
+) -> None:
+    """Add to this subtask's counter shard (upsert); the row lock is per shard, not per task."""
+    await bump_shard(
+        session,
+        (o.team, o.project, o.task_name, counter_shard(o.subtask_id)),
+        succeeded=succeeded,
+        failed=failed,
+        cancelled=cancelled,
+    )
+
+
+def shard_totals(keys: Iterable[tuple[str, str, str, int]]) -> list[tuple[ShardKey, int]]:
+    """(team, project, task_name, subtask_id) rows -> [(shard key, n)] sorted by shard key."""
+    counts: Counter[ShardKey] = Counter()
+    for team, project, task_name, subtask_id in keys:
+        counts[(team, project, task_name, counter_shard(subtask_id))] += 1
+    return sorted(counts.items())
+
+
+async def bump_cancelled(session: AsyncSession, keys: Iterable[tuple[str, str, str, int]]) -> None:
+    """Add `cancelled` per (task, shard), in sorted shard-key order (deadlock-free)."""
+    for key, n in shard_totals(keys):
+        await bump_shard(session, key, cancelled=n)
 
 
 @dataclass(frozen=True)
@@ -269,26 +311,27 @@ class TaskKey:
     task_name: str
 
 
+def shard_sum(t: Any, col: Any) -> Any:
+    """Correlated scalar subquery: sum of counter column `col` over the shards of task row `t`."""
+    return (
+        select(func.coalesce(func.sum(col), 0))
+        .where(
+            TaskCounter.team == t.team,
+            TaskCounter.project == t.project,
+            TaskCounter.task_name == t.task_name,
+        )
+        .scalar_subquery()
+    )
+
+
 async def task_counts(session: AsyncSession, key: TaskKey) -> TaskCounts | None:
     """Task status, total and the shard sums; None if the task is gone."""
     row = (
         await session.execute(
             select(
                 Task.total_subtasks,
-                select(func.coalesce(func.sum(TaskCounter.succeeded), 0))
-                .where(
-                    TaskCounter.team == Task.team,
-                    TaskCounter.project == Task.project,
-                    TaskCounter.task_name == Task.task_name,
-                )
-                .scalar_subquery(),
-                select(func.coalesce(func.sum(TaskCounter.failed), 0))
-                .where(
-                    TaskCounter.team == Task.team,
-                    TaskCounter.project == Task.project,
-                    TaskCounter.task_name == Task.task_name,
-                )
-                .scalar_subquery(),
+                shard_sum(Task, TaskCounter.succeeded),
+                shard_sum(Task, TaskCounter.failed),
                 Task.status,
             ).where(
                 Task.team == key.team, Task.project == key.project, Task.task_name == key.task_name
