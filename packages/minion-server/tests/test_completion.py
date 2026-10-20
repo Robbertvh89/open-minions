@@ -198,6 +198,51 @@ async def test_oversize_attempt_never_promoted_then_failed(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_oversize_delete_runs_after_the_transaction(
+    http: tuple[AsyncClient, Any], s3: S3Env, monkeypatch: pytest.MonkeyPatch, delete_fails: bool
+) -> None:
+    """The best-effort delete must not run under the acquirement row lock (TASK-20), and a
+    failing delete must not change the 422 answer."""
+    c, app = http
+    sm = app.state.sessionmaker
+    app.state.settings = app.state.settings.model_copy(update={"max_output_bytes": len(DATA) - 1})
+    name = f"bigd{int(delete_fails)}"
+    team = f"cmpd{int(delete_fails)}"
+    await seed_task(sm, name, 1, team=team)
+    ((p, tok),) = await make_executors(sm, 1)
+    a = await _own(c, sm, team, tok, p.executor_id)
+    src, _ = _put(s3, team, name, a)
+    lock_free: list[bool] = []
+    real_delete = app.state.storage.delete
+
+    async def spy(key: str) -> None:
+        async with sm() as other, other.begin():
+            try:  # NOWAIT fails at once if the complete() transaction still holds the row
+                await other.execute(
+                    text(
+                        "SELECT 1 FROM minion_subtask_acquirement"
+                        " WHERE acquirement_id=:a FOR UPDATE NOWAIT"
+                    ),
+                    {"a": a["acquirement_id"]},
+                )
+                lock_free.append(True)
+            except Exception:
+                lock_free.append(False)
+        if delete_fails:
+            raise OSError("s3 down")
+        await real_delete(key)
+
+    monkeypatch.setattr(app.state.storage, "delete", spy)
+    r = await c.post(
+        f"{BASE}/subtasks/{a['acquirement_id']}/complete", json=_complete_body(), headers=_auth(tok)
+    )
+    assert (r.status_code, r.json()["detail"]["code"]) == (422, "OUTPUT_TOO_LARGE")
+    assert lock_free == [True]
+    assert _exists(s3, src) is delete_fails
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("route", ["complete", "fail", "release"])
 async def test_stale_and_foreign_acquirement_409(
     http: tuple[AsyncClient, Any], s3: S3Env, route: str

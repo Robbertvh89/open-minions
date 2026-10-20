@@ -229,11 +229,48 @@ def generate_api_key_cmd(
     typer.echo(yaml.safe_dump(snippet, sort_keys=False), nl=False)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @app.command("generate-ui-secret")
 def generate_ui_secret_cmd() -> None:
     """Print a random MINION_UI_SESSION_SECRET (UI cookie key); rotating it logs everyone out."""
     typer.echo(f"MINION_UI_SESSION_SECRET={secrets.token_urlsafe(48)}")
+
+
+@app.command("check-storage")
+def check_storage_cmd() -> None:
+    """Preflight: verify the S3 backend enforces the signed Range on input GET URLs (SPEC S-2).
+
+    Run against the production bucket before going live. Exit 0 = enforcing, 1 = not enforcing
+    (observed `(status, body length)` per check is printed), 2 = config/connectivity error.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from minion_server.storage import S3Storage
+    from minion_server.storage_check import run_check
+
+    try:
+        storage = S3Storage(ServerSettings())
+    except Exception as exc:
+        typer.echo(f"configuration error: {type(exc).__name__}", err=True)
+        raise typer.Exit(2) from None
+    try:
+        checks = asyncio.run(run_check(storage))
+    except (OSError, BotoCoreError, ClientError) as exc:
+        typer.echo(f"storage unreachable or refused: {type(exc).__name__}", err=True)
+        raise typer.Exit(2) from None
+    for c in checks:
+        typer.echo(
+            f"{'ok  ' if c.ok else 'FAIL'} {c.name}: observed (status, length) = "
+            f"{c.observed}, expected {c.expected}"
+        )
+    if not all(c.ok for c in checks):
+        typer.echo(
+            "FAIL: the backend does not enforce the signed Range; input GET URLs are not "
+            "slice-scoped here (SPEC S-2). Do not use it for confidential tasks.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    typer.echo("ok: signed Range enforced")
+
+
+if __name__ == "__main__":
+    app()

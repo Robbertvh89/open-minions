@@ -159,6 +159,10 @@ class S3Storage:
         """Delete one object (idempotent in S3: a missing key is not an error)."""
         await asyncio.to_thread(self._client.delete_object, Bucket=self._bucket, Key=key)
 
+    async def put(self, key: str, data: bytes) -> None:
+        """Write one small object (operator preflight probe; payloads use presigned POST)."""
+        await asyncio.to_thread(self._client.put_object, Bucket=self._bucket, Key=key, Body=data)
+
     async def head(self, key: str) -> int | None:
         """Object size in bytes, or None if it does not exist."""
         st = await self.stat(key)

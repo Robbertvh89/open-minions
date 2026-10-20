@@ -4,7 +4,7 @@ title: 'minion-server-admin check-storage: verify the S3 backend enforces signed
 status: In Progress
 assignee: []
 created_date: '2026-10-17 13:16'
-updated_date: '2026-10-20 02:28'
+updated_date: '2026-10-20 02:37'
 labels:
   - server
   - security
@@ -20,7 +20,7 @@ Input GET URLs are slice-scoped only if the S3 backend enforces SigV4 signed hea
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 check-storage exits 0 on an enforcing backend and non-zero (with the observed tuple) on a non-enforcing one
-- [ ] #2 Deploy docs require running it before production
-- [ ] #3 Oversize delete runs after the transaction
+- [x] #1 check-storage exits 0 on an enforcing backend and non-zero (with the observed tuple) on a non-enforcing one
+- [x] #2 Deploy docs require running it before production
+- [x] #3 Oversize delete runs after the transaction
 <!-- AC:END -->

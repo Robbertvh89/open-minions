@@ -4,6 +4,7 @@ import re
 import uuid
 
 import structlog
+from fastapi import HTTPException
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
 from minion_common.schemas import CompleteRequest, FailRequest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,41 +91,49 @@ async def complete(
     storage: S3Storage,
     metrics: Metrics | None = None,
 ) -> None:
-    async with session.begin():
-        o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
-        if o is None:
-            # A retried complete whose first response was lost: already done, same owner.
-            if await repo.completed_by(session, acquirement_id) == principal.executor_id:
-                return
-            raise stale_error()
-        if req.record_count != o.record_count:
-            raise api_error(422, "RECORD_COUNT_MISMATCH", "record_count differs from the subtask")
-        out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
-        src = attempt_key(out.key, o.subtask_id, o.attempt)
-        dst = f"{out.key.rstrip('/')}/{o.subtask_id:06d}.jsonl"
-        stat = await storage.stat(src)
-        if stat is None:
-            raise api_error(422, "OUTPUT_MISSING", "attempt output object not found")
-        if stat.size > settings.max_output_bytes:  # HEAD only; never promoted or downloaded
-            await _discard_oversize(storage, src)
-            raise api_error(422, "OUTPUT_TOO_LARGE", "attempt output exceeds the size cap")
-        if stat.size != req.byte_size:
-            raise api_error(422, "OUTPUT_SIZE_MISMATCH", "attempt output size differs")
-        try:
-            # If-Match on the HEAD ETag closes the check-then-copy window (TOCTOU).
-            await storage.copy(src, dst, if_match=stat.etag)  # idempotent if the commit fails
-        except PreconditionFailedError as exc:
-            raise api_error(
-                422, "OUTPUT_CHANGED", "attempt output changed while being verified"
-            ) from exc
-        await repo.finish_attempt(
-            session,
-            o,
-            outcome=AttemptOutcome.SUCCEEDED,
-            subtask_status=SubtaskStatus.SUCCEEDED,
-            output_uri=f"s3://{settings.s3_bucket}/{dst}",
-        )
-        await repo.bump_counters(session, o, succeeded=1)
+    oversize_src: str | None = None
+    try:
+        async with session.begin():
+            o = await repo.lock_owned(session, acquirement_id, principal.executor_id)
+            if o is None:
+                # A retried complete whose first response was lost: already done, same owner.
+                if await repo.completed_by(session, acquirement_id) == principal.executor_id:
+                    return
+                raise stale_error()
+            if req.record_count != o.record_count:
+                raise api_error(
+                    422, "RECORD_COUNT_MISMATCH", "record_count differs from the subtask"
+                )
+            out = parse_s3_uri(o.task_output_uri, bucket=settings.s3_bucket, prefixes=("",))
+            src = attempt_key(out.key, o.subtask_id, o.attempt)
+            dst = f"{out.key.rstrip('/')}/{o.subtask_id:06d}.jsonl"
+            stat = await storage.stat(src)
+            if stat is None:
+                raise api_error(422, "OUTPUT_MISSING", "attempt output object not found")
+            if stat.size > settings.max_output_bytes:  # HEAD only; never promoted or downloaded
+                oversize_src = src  # deleted after the transaction ends (row lock released)
+                raise api_error(422, "OUTPUT_TOO_LARGE", "attempt output exceeds the size cap")
+            if stat.size != req.byte_size:
+                raise api_error(422, "OUTPUT_SIZE_MISMATCH", "attempt output size differs")
+            try:
+                # If-Match on the HEAD ETag closes the check-then-copy window (TOCTOU).
+                await storage.copy(src, dst, if_match=stat.etag)  # idempotent if the commit fails
+            except PreconditionFailedError as exc:
+                raise api_error(
+                    422, "OUTPUT_CHANGED", "attempt output changed while being verified"
+                ) from exc
+            await repo.finish_attempt(
+                session,
+                o,
+                outcome=AttemptOutcome.SUCCEEDED,
+                subtask_status=SubtaskStatus.SUCCEEDED,
+                output_uri=f"s3://{settings.s3_bucket}/{dst}",
+            )
+            await repo.bump_counters(session, o, succeeded=1)
+    except HTTPException:
+        if oversize_src is not None:
+            await _discard_oversize(storage, oversize_src)
+        raise
     # The retried-complete branch above skips the settle: a lost settle is the watchdog's job.
     await settle_task(session, task_key(o), metrics)
 

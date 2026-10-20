@@ -450,8 +450,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
   via heartbeat) **[ours]**. The input GET URL signs the subtask's `Range: bytes=byte_start-(byte_end-1)` header, so
   on backends that enforce SigV4 signed headers (AWS S3, MinIO) it can read only that slice (403 to a
-  missing or different Range); verify for others (SeaweedFS: see the CI warning of
-  `test_signed_range_get_enforced_by_s3`). The boundary is per URL, not per executor: an executor
+  missing or different Range); verify every backend before production with `minion-server-admin check-storage` (a required deploy step; exit 1 if the signed Range is not enforced; the dev SeaweedFS passes, see `test_storage_check.py`). The boundary is per URL, not per executor: an executor
   holds URLs only for subtasks it owns, and `allowed_pool` is the control for confidential tasks. The output is a presigned POST scoped to
   one attempt key whose signed policy carries `content-length-range 0..MINION_MAX_OUTPUT_BYTES`, so S3
   itself refuses a larger upload (ADR-0017). The HEAD check at complete stays as defence in depth: an attempt object above `MINION_MAX_OUTPUT_BYTES` (default 4 GiB) is never promoted: `422 OUTPUT_TOO_LARGE`, after which the

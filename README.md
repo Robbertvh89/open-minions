@@ -398,6 +398,12 @@ ends as `FAILED` or `PARTIAL`. See `minion status NAME` and the executor log.
 
 - **Logs:** `docker compose -f deploy/compose.yml --profile app logs -f server watchdog`; executor:
   `~/Library/Logs/open-minions/executor.log` (service) or its terminal.
+- **Storage preflight (required before production):** `uv run minion-server-admin check-storage`
+  puts a probe object under `_preflight/check-storage/`, presigns it like production and checks that
+  the S3 backend enforces the signed `Range` (signed Range 206, none/other 403, `If-Range` never
+  widens). Exit 0 = enforcing, 1 = not (the observed `(status, length)` per check is printed; input
+  URLs are not slice-scoped then, SPEC S-2), 2 = config/connectivity error. Rerun after changing the
+  S3 backend or proxy.
 - **API keys:** `uv run minion-server-admin generate-api-key --name <who> --teams a,b
   [--operator] [--expires-days N]`; add the entry to the keys file (live-reloaded within 5 s); delete
   the entry to revoke.
