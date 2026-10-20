@@ -75,7 +75,11 @@ async def test_cap_rejects_third_and_other_team_unaffected(capped: Live) -> None
         assert r.status_code == 429
         detail = r.json()["detail"]
         assert detail["code"] == "TOO_MANY_LIVE_TASKS"
-        assert "limit 2" in detail["message"] and "Retry-After" not in r.headers
+        assert (
+            "limit (2)" in detail["message"]
+            and "max_live_tasks" in detail["message"]
+            and "Retry-After" not in r.headers
+        )
         assert await capped.rows("SELECT 1 FROM minion_task WHERE task_name='c'") == []
         assert (await _post(c, capped, OTHER, "x")).status_code == 202
 
@@ -133,23 +137,32 @@ async def test_concurrent_creates_hold_cap_exactly(
         assert await _live_count(lv, TEAM) == 5
 
 
-async def test_count_plan_uses_partial_index(capped: Live) -> None:
+async def test_count_plan_uses_team_status_index(capped: Live) -> None:
     async with capped.sm() as s, s.begin():
         await s.execute(
             text(
                 "INSERT INTO minion_task (team, project, task_name, type, model_id, engine,"
                 " model_memory_gb, input_uri, output_uri, created_by, status)"
-                " SELECT 'big', 'p', 'n' || g, 'embedding', 'm', 'mlx', 1, 's3://i',"
-                " 's3://o/' || g, 'u', CASE WHEN g < 400 THEN 'RUNNING' ELSE 'SUCCEEDED' END"
-                " FROM generate_series(0, 20399) g"
+                " SELECT CASE WHEN g < 400 OR g >= 5400 THEN 'big' ELSE 'other' || (g % 20) END,"
+                " 'p', 'n' || g, 'embedding', 'm', 'mlx', 1, 's3://i',"
+                " 's3://o/' || g, 'u', CASE WHEN g < 5400 THEN 'RUNNING' ELSE 'SUCCEEDED' END"
+                " FROM generate_series(0, 25399) g"
             )
         )
     async with capped.sm() as s:
         await s.execute(text("ANALYZE minion_task"))
-        sql = (
-            "EXPLAIN SELECT count(*) FROM (SELECT 1 FROM minion_task WHERE team='big'"
+        base = (
+            "SELECT count(*) FROM (SELECT 1 FROM minion_task WHERE team={t}"
             " AND status IN ('SPLITTING','PENDING','RUNNING') LIMIT 500) s"
         )
-        plan = "\n".join(r[0] for r in (await s.execute(text(sql))).all())
-    assert "ix_minion_task_team_live" in plan, plan
-    assert "Seq Scan on minion_task" not in plan, plan
+        plan = "\n".join(
+            r[0] for r in (await s.execute(text("EXPLAIN " + base.format(t="'big'")))).all()
+        )
+        await s.execute(text("SET plan_cache_mode = force_generic_plan"))
+        await s.execute(text("PREPARE cnt(text) AS " + base.format(t="$1")))
+        generic = "\n".join(
+            r[0] for r in (await s.execute(text("EXPLAIN EXECUTE cnt('big')"))).all()
+        )
+    for p in (plan, generic):
+        assert "ix_minion_task_team_status" in p, p
+        assert "Seq Scan on minion_task" not in p, p

@@ -93,12 +93,10 @@ class Task(Base):
             "task_name",
             postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
         ),
-        # Bounded per-team live count for the create cap (FR-9, ADR-0020).
-        Index(
-            "ix_minion_task_team_live",
-            "team",
-            postgresql_where=text("status IN ('SPLITTING', 'PENDING', 'RUNNING')"),
-        ),
+        # Bounded per-team live count for the create cap (FR-9, ADR-0020). Deliberately not
+        # partial: a partial index on the live statuses is usable by the acquire candidate query
+        # and displaced its ordered walk (~120x slower at 10k same-priority live tasks).
+        Index("ix_minion_task_team_status", "team", "status"),
         # Serves `GET /tasks` keyset pages (single-team listing, newest first).
         Index(
             "ix_minion_task_team_created",

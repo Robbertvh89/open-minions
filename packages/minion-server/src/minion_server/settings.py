@@ -110,7 +110,7 @@ class ServerSettings(BaseSettings):
 
     # Live (SPLITTING/PENDING/RUNNING) tasks one team may hold (TASK-30, FR-9, ADR-0020); above it
     # create answers 429 TOO_MANY_LIVE_TASKS. A team can override it in the keys file.
-    max_live_tasks_per_team: int = Field(default=500, ge=1, le=100_000)
+    max_live_tasks_per_team: int = Field(default=500, ge=1, le=10_000)
 
     # Retry budget guard: RELEASED attempts per subtask before a release counts as a FAILED one.
     # Upper bound 100; the watchdog reads the same MINION_RELEASE_LIMIT and must use the same value.

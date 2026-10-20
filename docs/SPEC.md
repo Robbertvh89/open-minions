@@ -79,7 +79,7 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 - FR-7. Users can query task status, per-subtask status, progress counts, and the output location **[paper]**.
 - FR-8. Users can cancel a task; pending subtasks become `CANCELLED`, running ones are told to stop on
   their next heartbeat **[ours]**. Status: implemented (TASK-3.2).
-- FR-9. A team may hold at most `MINION_MAX_LIVE_TASKS_PER_TEAM` (default 500, 1..100000) live tasks
+- FR-9. A team may hold at most `MINION_MAX_LIVE_TASKS_PER_TEAM` (default 500, 1..10000) live tasks
   (`SPLITTING`, `PENDING`, `RUNNING`). Task creation above it answers `429 TOO_MANY_LIVE_TASKS` (no
   `Retry-After`; slots free as tasks finish or are cancelled), for REST and UI alike. A team can override
   the limit with `teams.<slug>.max_live_tasks` in the API keys file (S-1, live-reloaded). The limit is
@@ -387,7 +387,7 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 
 **Executor endpoint rate limits (NF-5).** One executor calling `register`, `acquire`, `presence` or `PUT /preference` closer together than `MINION_REGISTER_MIN_INTERVAL_S` (5), `MINION_ACQUIRE_MIN_INTERVAL_S` (0.2), `MINION_PRESENCE_MIN_INTERVAL_S` (5) or `MINION_PREFERENCE_MIN_INTERVAL_S` (1; `0` disables each) gets `429 TOO_MANY_REQUESTS` with `Retry-After` (whole seconds, >= 1), checked after authentication and before any DB write or acquisition; a rejected call changes nothing. In-memory, per replica, bounded LRU (`MINION_RATE_LIMIT_MAX_ENTRIES`, 40 000); per-IP limits stay at the reverse proxy. A healthy executor never trips them: idle acquires are >= 5 s apart (back-off 10 s base, jitter 0.5..1), presence goes out on a pause, a changed reason/budget or every `--presence-interval` (60 s), the executor keeps at least `MINION_EXECUTOR_ACQUIRE_PACE_S` (0.4, 0 or >= 0.2; the 0.2 s margin over the server interval absorbs network jitter) between acquire calls by sleeping only the remainder, so instant subtasks never trip the limit; a fast release/flap can still see a 429 (handled as back-off). The executor waits at least `Retry-After` (capped at 300 s), also across a pause. `minion-executor prefer --server URL (--team T [--project P] [--task-name N] | --clear)` calls `PUT /executor/preference` (G4/FR-22; exit 2 on bad input, missing token or an insecure URL).
 
-**Live-task cap (FR-9, TASK-30).** `POST /tasks` (and `POST /ui/tasks`) above the team's live-task limit answers `429 TOO_MANY_LIVE_TASKS` with no `Retry-After` and inserts nothing; the message never echoes payload. `minion submit` exits 2 with the code in the message.
+**Live-task cap (FR-9, TASK-30).** `POST /tasks` (and `POST /ui/tasks`) above the team's live-task limit answers `429 TOO_MANY_LIVE_TASKS` with no `Retry-After` and inserts nothing; the message never echoes payload. Creates of one team are serialised by a per-team advisory lock with a 2 s wait; past it create answers `503 SERVER_BUSY` + `Retry-After`. `minion submit` exits 2 with the code in the message.
 
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. The first beat after a claim (the ack) is exempt from the limit (ADR-0014). Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
@@ -456,7 +456,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   (`teams: {slug: {default_pool, allowed_pools, max_live_tasks}}`): a task without `allowed_pool` gets the team default,
   a pool outside `allowed_pools` is `403 POOL_NOT_ALLOWED`, and a team with `allowed_pools` but no default
   needs an explicit pool (`422 POOL_REQUIRED`). Teams without a policy are unrestricted. `max_live_tasks`
-  (1..100000) overrides the global live-task cap for that team (FR-9) and does not affect pool policy.
+  (1..10000) overrides the global live-task cap for that team (FR-9) and does not affect pool policy.
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
   via heartbeat) **[ours]**. The input GET URL signs the subtask's `Range: bytes=byte_start-(byte_end-1)` header, so
   on backends that enforce SigV4 signed headers (AWS S3, MinIO) it can read only that slice (403 to a

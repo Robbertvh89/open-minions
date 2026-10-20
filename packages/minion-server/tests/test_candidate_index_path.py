@@ -267,11 +267,7 @@ def assert_index_paths(plan: dict[str, Any], *, live_index: bool = True) -> None
     text_plan = json.dumps(plan)
     assert "ix_minion_subtask_pending" in text_plan, text_plan
     if live_index:
-        # TASK-30: ix_minion_task_team_live (same predicate + SPLITTING) may serve a small live set
-        # through a bitmap scan; either way no table scan of minion_task.
-        assert (
-            "ix_minion_task_live_queue" in text_plan or "ix_minion_task_team_live" in text_plan
-        ), text_plan
+        assert "ix_minion_task_live_queue" in text_plan, text_plan
     for n in nodes:
         if n["Node Type"] == "Seq Scan":
             assert n.get("Relation Name") != "minion_subtask", text_plan
@@ -381,11 +377,11 @@ FROM generate_series(1, {n}) AS t, generate_series(1, 3) AS s;
 ANALYZE minion_task;
 ANALYZE minion_subtask;
 """
-# Measured: 110 buffers, 2 subtask probes, ~1 ms (both plan kinds; PG16 bitmap-scans the 5,012 live
-# tasks on ix_minion_task_team_live, filters them in the heap and sorts the 12 runnable ones).
-# Bound = ~1.8x measured, so a regression to one subtask probe per junk task (>= 5,000 x 3
+# Measured: ~151 buffers, 2 subtask probes, <1 ms (both plan kinds; the ordered walk on
+# ix_minion_task_live_queue filters the junk in the heap and stops at the 12 runnable ones).
+# Bound = ~1.5x measured, so a regression to one subtask probe per junk task (>= 5,000 x 3
 # buffers) or a Seq Scan over the subtasks fails loudly.
-UNRUNNABLE_BUFFER_BOUND = 200
+UNRUNNABLE_BUFFER_BOUND = 230
 UNRUNNABLE_SUBTASK_PROBES = 12  # one per eligible (runnable) task at most, never per junk task
 
 
@@ -472,3 +468,63 @@ async def test_candidate_rows_equal_oracle_and_claim_wins_with_5k_unrunnable(
         assert res.won is not None
     finally:
         await eng.dispose()
+
+
+# --- TASK-30 guard: the live-cap index must not displace the ordered live-queue walk -----------
+
+GUARD_SEED = """
+INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
+  input_uri, output_uri, priority, status, created_by, created_at)
+SELECT 'g' || (g % 4), 'p', 'g' || g, 'embedding', 'm1', 'fake', 1, 'in', 's3://g/' || g,
+  0, CASE WHEN g % 2 = 0 THEN 'RUNNING' ELSE 'PENDING' END, 't',
+  now() - make_interval(secs => g)
+FROM generate_series(1, 200) AS g;
+INSERT INTO minion_subtask (team, project, task_name, subtask_id, status, input_object_key,
+  byte_start, byte_end, first_record, record_count)
+SELECT 'g' || (t % 4), 'p', 'g' || t, s, 'PENDING', 'k', 0, 1, 0, 1
+FROM generate_series(1, 200) AS t, generate_series(1, 500) AS s;
+ANALYZE minion_task;
+ANALYZE minion_subtask;
+"""
+GUARD_BUFFER_BOUND = 30
+
+
+@pytest.mark.parametrize("kind", ["analyze", "generic"])
+async def test_cap_index_does_not_displace_live_queue_walk(fresh_url: str, kind: str) -> None:
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with eng.connect() as conn:
+            await _seed_big(conn, 100)
+            await conn.execute(text("DELETE FROM minion_task WHERE team = 'big'"))
+            for stmt in GUARD_SEED.split(";"):
+                if stmt.strip():
+                    await conn.execute(text(stmt))
+            idx = (
+                await conn.execute(
+                    text("SELECT 1 FROM pg_indexes WHERE indexname = 'ix_minion_task_team_status'")
+                )
+            ).all()
+            assert idx, "the cap index must exist for this guard to mean anything"
+            if kind == "analyze":
+                plan = _json_plan(
+                    await conn.execute(
+                        text("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + _literal_sql(None))
+                    )
+                )
+            else:
+                prep, args = _prepared(None)
+                await conn.execute(text("SET plan_cache_mode = force_generic_plan"))
+                await conn.exec_driver_sql(prep)
+                plan = _json_plan(
+                    await conn.exec_driver_sql(
+                        f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q({args})"
+                    )
+                )
+    finally:
+        await eng.dispose()
+    text_plan = json.dumps(plan)
+    print(f"TASK-30 guard {kind}: buffers={_buffers(plan)} ms={plan['Execution Time']:.2f}")
+    assert "ix_minion_task_live_queue" in text_plan, text_plan
+    assert "ix_minion_task_team_status" not in text_plan, text_plan
+    assert_index_paths(plan)
+    assert _buffers(plan) <= GUARD_BUFFER_BOUND, _buffers(plan)

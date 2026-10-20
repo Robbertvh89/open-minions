@@ -23,10 +23,10 @@ def _settings(**kw: object) -> ServerSettings:
 
 def test_default_and_bounds() -> None:
     assert _settings().max_live_tasks_per_team == 500
-    for bad in (0, 100_001):
+    for bad in (0, 10_001):
         with pytest.raises(ValidationError):
             _settings(max_live_tasks_per_team=bad)
-    assert _settings(max_live_tasks_per_team=100_000).max_live_tasks_per_team == 100_000
+    assert _settings(max_live_tasks_per_team=10_000).max_live_tasks_per_team == 10_000
 
 
 def test_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,7 +42,7 @@ def test_keys_file_override_parses() -> None:
     assert cfg.teams["t1"].max_live_tasks == 3
 
 
-@pytest.mark.parametrize("bad", ["true", "0", "-1", "'5'", "2.5", "100001"])
+@pytest.mark.parametrize("bad", ["true", "0", "-1", "'5'", "2.5", "10001"])
 def test_keys_file_rejects_bad_value(bad: str) -> None:
     with pytest.raises(ValueError):
         parse_keys_config(HEAD + f"teams:\n  t1: {{max_live_tasks: {bad}}}\n")

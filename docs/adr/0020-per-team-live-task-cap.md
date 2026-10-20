@@ -14,18 +14,22 @@ leave `models.yaml` later) and slow every acquire (TASK-7.4.2 security finding, 
 
 ## Decision
 
-1. At most `MINION_MAX_LIVE_TASKS_PER_TEAM` (500, 1..100000) tasks in `SPLITTING`, `PENDING` or
+1. At most `MINION_MAX_LIVE_TASKS_PER_TEAM` (500, 1..10000) tasks in `SPLITTING`, `PENDING` or
    `RUNNING` per team. Create above it answers `429 TOO_MANY_LIVE_TASKS`, no `Retry-After`. The keys
    file can override it per team (`teams.<slug>.max_live_tasks`, live-reloaded). There is no 0 switch
    and no operator bypass.
 2. Enforcement, inside the existing create transaction, before the INSERT:
    `pg_advisory_xact_lock(hashtextextended('minion_task_live:' || team, 0))`, then a count bounded by
-   `LIMIT cap` over the new partial index `ix_minion_task_team_live (team) WHERE status IN
-   ('SPLITTING','PENDING','RUNNING')` (migration 0014; status values are SQL literals so generic
-   plans match the predicate). The lock is transaction-scoped (never leaked by the pool) and held for
-   the count and INSERT only; the S3 existence check stays before the transaction. Hash collisions
-   between teams only serialise their creates. Without the lock a count-then-insert under READ
-   COMMITTED would overshoot by the number of concurrent creates.
+   `LIMIT cap` over the new index `ix_minion_task_team_status (team, status)` (migration 0014; status
+   values are SQL literals). The index is deliberately **not partial** and has mcv extended statistics
+   `st_minion_task_team_status`, so the planner knows a team with a long finished history has few live
+   tasks and does not choose a Seq Scan (checked for literal and generic plans). The lock is transaction-scoped (never leaked by the pool) and held for
+   the count and INSERT only; the S3 existence check stays before the transaction. The lock wait is
+   capped by `SET LOCAL lock_timeout = '2s'`; on timeout create answers `503 SERVER_BUSY` +
+   `Retry-After`. Hash collisions between teams only serialise their creates. The cap is exact under
+   READ COMMITTED because the count runs after the lock and takes a fresh statement snapshot, so it
+   sees every create committed before; without the lock a count-then-insert would overshoot by the
+   number of concurrent creates.
 3. **Admission only.** The advisory lock guards a quota on task creation. It never decides who owns a
    subtask attempt: the `INSERT ... ON CONFLICT DO NOTHING` into `minion_subtask_acquirement` is still
    the only arbiter (invariant 2 is unchanged), and nothing on the acquire path takes this lock.
@@ -45,7 +49,13 @@ unrunnable tasks need 10 teams at their cap. Measured with 5,000 such tasks
   (plus a custom value), and the server only knows the fleet that is registered now, so a fleet check
   would reject tasks submitted before executors come online. It also misses the vectors users control
   (`allowed_pool`, priority, engines nobody runs, a model removed later).
-- **Index change.** The order needs `(priority DESC, created_at, team, project, task_name)` leading;
+- **A partial index on the live statuses** (first implementation). It has the same predicate as
+  `ix_minion_task_live_queue` plus SPLITTING, so the acquire candidate query could use it and the
+  planner replaced the ordered live-queue walk with a bitmap scan plus sort: about 120x slower at
+  10,000 same-priority live tasks (0.1 -> 13.5 ms, reviewer measurement). The shipped index is
+  `(team, status)`, which the candidate query cannot use (no `team` equality, wrong order); a guard
+  test (`test_cap_index_does_not_displace_live_queue_walk`) pins the walk with the cap index present.
+- **Index change on the candidate query.** The order needs `(priority DESC, created_at, team, project, task_name)` leading;
   `model_id IN`, `engine IN`, `memory <=` and `pool IS NULL OR =` are not prefix equalities, so they
   stay Filters. A leading `model_id` loses FR-22 order. `INCLUDE` columns help only an Index Only Scan,
   and the walk selects `output_uri` and `params`; the gain is a constant factor.
@@ -56,5 +66,4 @@ unrunnable tasks need 10 teams at their cap. Measured with 5,000 such tasks
 - `minion submit` uploads inputs before creating the task, so a rejected create leaves uploaded parts;
   a re-run reuses identical parts. It exits 2 with the code in the message.
 - The cap is per team, not per key.
-- `ix_minion_task_team_live` has the same predicate as `ix_minion_task_live_queue` plus `SPLITTING`, so
-  the planner may serve a small live set through a bitmap scan on it (still O(live), no table scan).
+- Write cost: one extra index on `minion_task` (status changes touch it; `(team, status)` is small).

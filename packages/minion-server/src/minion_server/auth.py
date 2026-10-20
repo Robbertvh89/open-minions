@@ -100,7 +100,7 @@ class _TeamEntry(BaseModel):
 
     default_pool: _Pool | None = None
     allowed_pools: list[_Pool] | None = Field(default=None, min_length=1)
-    max_live_tasks: StrictInt | None = Field(default=None, ge=1, le=100_000)
+    max_live_tasks: StrictInt | None = Field(default=None, ge=1, le=10_000)
 
     @model_validator(mode="after")
     def _default_allowed(self) -> Self:

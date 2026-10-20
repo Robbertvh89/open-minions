@@ -378,7 +378,7 @@ def test_0013_cancelled_backfill_and_round_trip(fresh_url: str) -> None:
 
 
 def test_0014_team_live_index_round_trip(fresh_url: str) -> None:
-    name = "ix_minion_task_team_live"
+    name = "ix_minion_task_team_status"
     cfg = alembic_config(fresh_url)
     command.upgrade(cfg, "head")
     assert asyncio.run(_index_exists(fresh_url, name))
