@@ -22,6 +22,8 @@ Raw data: [`m-task34-settle-scan-apple-m3-pro.json`](m-task34-settle-scan-apple-
   project only). BEFORE = join + GROUP BY/HAVING (e92e3ea); AFTER = lateral rewrite below.
 - Not done: the optional `pg_stat_statements` cross-check of the generic plan (the statement has only
   constants and a LIMIT, so custom and generic plans should coincide).
+  Update (TASK-57): they did not coincide: the status values were bound parameters, so the generic plan
+  seq-scanned `minion_task`; the statuses are SQL literals now and `test_watchdog_plan_literals.py` pins it.
 
 ## Result: settleable_tasks (median execution ms, BEFORE -> AFTER)
 

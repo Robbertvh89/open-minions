@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from minion_common.enums import AttemptOutcome, SubtaskStatus, TaskStatus
-from sqlalchemy import false, func, null, select, true, update
+from sqlalchemy import false, func, literal_column, null, select, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from minion_server.db.models import (
     Task,
     TaskCounter,
 )
+from minion_server.repositories.acquisition import status_literal
 
 TASK_COUNTER_SHARDS = 16  # ADR-0015
 BUDGET_OUTCOMES = (AttemptOutcome.FAILED.value, AttemptOutcome.EXPIRED.value)
@@ -351,7 +352,9 @@ async def set_task_terminal(session: AsyncSession, key: TaskKey, status: TaskSta
             Task.team == key.team,
             Task.project == key.project,
             Task.task_name == key.task_name,
-            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+            Task.status.in_(
+                [status_literal(TaskStatus.PENDING), status_literal(TaskStatus.RUNNING)]
+            ),
         )
         .values(status=status.value, finished_at=func.now())
     )
@@ -380,8 +383,10 @@ def settleable_stmt(limit: int) -> Any:  # Select[...]: the SQLAlchemy stubs her
         select(Task.team, Task.project, Task.task_name)
         .join(done, true())
         .where(
-            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
-            Task.total_subtasks > 0,
+            Task.status.in_(
+                [status_literal(TaskStatus.PENDING), status_literal(TaskStatus.RUNNING)]
+            ),
+            Task.total_subtasks > literal_column("0"),
             done.c.done >= Task.total_subtasks,
         )
         .limit(limit)

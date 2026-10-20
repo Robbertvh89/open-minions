@@ -12,6 +12,7 @@ from sqlalchemy import (
     Select,
     and_,
     func,
+    literal,
     literal_column,
     or_,
     select,
@@ -199,6 +200,20 @@ def _task_key(task: Task) -> tuple[Any, ...]:
 SPLIT_ATTEMPTS_EXHAUSTED = "SPLIT_ATTEMPTS_EXHAUSTED"
 
 
+def claim_select_stmt() -> Select[Any]:
+    """The splitter's claim select (shared with the plan test)."""
+    return (
+        select(Task)
+        .where(
+            Task.status == status_literal(TaskStatus.SPLITTING),
+            or_(Task.next_split_at.is_(None), Task.next_split_at <= func.now()),
+        )
+        .order_by(Task.next_split_at.asc().nulls_first(), Task.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True, key_share=True)
+    )
+
+
 async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: int) -> Task | None:
     """Claim one due SPLITTING task with a lease; the caller commits straight away.
 
@@ -211,24 +226,13 @@ async def claim_splitting(session: AsyncSession, lease_s: float, max_attempts: i
     FAILED (`SPLIT_ATTEMPTS_EXHAUSTED`) instead of being handed out again.
     """
     while True:
-        task = (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.status == TaskStatus.SPLITTING.value,
-                    or_(Task.next_split_at.is_(None), Task.next_split_at <= func.now()),
-                )
-                .order_by(Task.next_split_at.asc().nulls_first(), Task.created_at)
-                .limit(1)
-                .with_for_update(skip_locked=True, key_share=True)
-            )
-        ).scalar_one_or_none()
+        task: Task | None = (await session.execute(claim_select_stmt())).scalar_one_or_none()
         if task is None:
             return None
         if task.split_attempts >= max_attempts:
             await session.execute(
                 update(Task)
-                .where(*_task_key(task), Task.status == TaskStatus.SPLITTING.value)
+                .where(*_task_key(task), Task.status == status_literal(TaskStatus.SPLITTING))
                 .values(
                     status=TaskStatus.FAILED.value,
                     error=SPLIT_ATTEMPTS_EXHAUSTED,
@@ -256,7 +260,7 @@ def _held(task: Task) -> tuple[Any, ...]:
     """WHERE clauses: still SPLITTING and still the claim identified by `split_attempts`."""
     return (
         *_task_key(task),
-        Task.status == TaskStatus.SPLITTING.value,
+        Task.status == status_literal(TaskStatus.SPLITTING),
         Task.split_attempts == task.split_attempts,
     )
 
@@ -402,7 +406,7 @@ def _cancel_stmt(team: str, project: str, task_name: str) -> ReturningUpdate[tup
             Subtask.team == team,
             Subtask.project == project,
             Subtask.task_name == task_name,
-            Subtask.status == SubtaskStatus.PENDING.value,
+            Subtask.status == status_literal(SubtaskStatus.PENDING),
         )
         .order_by(Subtask.subtask_id)
         .limit(CANCEL_BATCH)
@@ -414,7 +418,7 @@ def _cancel_stmt(team: str, project: str, task_name: str) -> ReturningUpdate[tup
         update(Subtask)
         .where(
             *(getattr(Subtask, k) == c.c[k] for k in SUBTASK_KEY),
-            Subtask.status == SubtaskStatus.PENDING.value,
+            Subtask.status == status_literal(SubtaskStatus.PENDING),
         )
         .values(status=SubtaskStatus.CANCELLED.value)
         .returning(Subtask.subtask_id)
@@ -436,6 +440,43 @@ async def cancel_pending_subtasks(
     return len(cancelled_ids)
 
 
+def _sweep_stmt(window_s: float, batch: int) -> Any:
+    """The sweep UPDATE (shared with the plan test)."""
+    recent = (
+        select(Task.team, Task.project, Task.task_name)
+        .where(
+            Task.status == status_literal(TaskStatus.CANCELLED),
+            Task.finished_at
+            > func.now()
+            - literal_column(f"make_interval(secs => {float(window_s)!r})"),  # float: no injection
+        )
+        .subquery()
+    )
+    ids = (
+        select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+        .where(
+            Subtask.status == status_literal(SubtaskStatus.PENDING),
+            tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
+                select(recent.c.team, recent.c.project, recent.c.task_name)
+            ),
+        )
+        .order_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+        .limit(literal(batch, literal_execute=True))
+        .with_for_update(skip_locked=True)
+        .cte("batch")
+        .prefix_with("MATERIALIZED")  # evaluate LIMIT/SKIP LOCKED once, not per outer row
+    )
+    return (
+        update(Subtask)
+        .where(
+            *(getattr(Subtask, k) == ids.c[k] for k in SUBTASK_KEY),
+            Subtask.status == status_literal(SubtaskStatus.PENDING),
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+        .returning(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
+    )
+
+
 async def sweep_cancelled(
     session: AsyncSession, window_s: float = 3600, batch: int = CANCEL_BATCH
 ) -> int:
@@ -448,37 +489,7 @@ async def sweep_cancelled(
     fewer than `batch` rows come back. Stragglers older than the window are healed only by
     re-cancelling.
     """
-    recent = (
-        select(Task.team, Task.project, Task.task_name)
-        .where(
-            Task.status == TaskStatus.CANCELLED.value,
-            Task.finished_at > func.now() - func.make_interval(0, 0, 0, 0, 0, 0, window_s),
-        )
-        .subquery()
-    )
-    ids = (
-        select(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
-        .where(
-            Subtask.status == SubtaskStatus.PENDING.value,
-            tuple_(Subtask.team, Subtask.project, Subtask.task_name).in_(
-                select(recent.c.team, recent.c.project, recent.c.task_name)
-            ),
-        )
-        .order_by(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
-        .limit(batch)
-        .with_for_update(skip_locked=True)
-        .cte("batch")
-        .prefix_with("MATERIALIZED")  # evaluate LIMIT/SKIP LOCKED once, not per outer row
-    )
-    result = await session.execute(
-        update(Subtask)
-        .where(
-            *(getattr(Subtask, k) == ids.c[k] for k in SUBTASK_KEY),
-            Subtask.status == SubtaskStatus.PENDING.value,
-        )
-        .values(status=SubtaskStatus.CANCELLED.value)
-        .returning(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id)
-    )
+    result = await session.execute(_sweep_stmt(window_s, batch))
     rows = [(str(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in result.all()]
     await bump_cancelled(session, rows)
     return len(rows)

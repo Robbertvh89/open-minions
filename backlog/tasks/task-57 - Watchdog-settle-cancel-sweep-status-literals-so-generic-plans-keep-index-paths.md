@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-20 04:54'
-updated_date: '2026-10-20 05:06'
+updated_date: '2026-10-20 05:20'
 labels:
   - perf
 dependencies: []
@@ -21,5 +21,5 @@ settleable_stmt (completion.py) binds status IN params: generic plan Seq Scan on
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Generic and literal plans equal for both statements (EXPLAIN test)
+- [x] #1 Generic and literal plans equal for both statements (EXPLAIN test)
 <!-- AC:END -->
