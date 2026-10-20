@@ -256,3 +256,120 @@ def test_a_busy_send_lock_fails_the_call_instead_of_waiting_forever(
     finally:
         w._send_lock.release()
         child.close()
+
+
+# --- result validation inside _call (items 5, 8) --------------------------------------------
+
+
+def _queued(result: object) -> tuple[WorkerHandle, _FakeProc, Connection]:
+    parent, child = _pair()
+    child.send_bytes(_frame({"ok": True, "result": result}))  # sits in the socket buffer
+    proc = _FakeProc()
+    return _handle(proc, parent), proc, child
+
+
+GOOD_STATS = {"active_bytes": 1, "peak_bytes": 2, "max_rss_bytes": 3, "trim_errors": 0}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [1, 2],
+        {},
+        {**GOOD_STATS, "active_bytes": True},
+        {**GOOD_STATS, "peak_bytes": -1},
+        {**GOOD_STATS, "max_rss_bytes": "3"},
+        {k: v for k, v in GOOD_STATS.items() if k != "trim_errors"},
+    ],
+)
+def test_stats_result_of_the_wrong_shape_is_a_crash(bad: object) -> None:
+    w, proc, child = _queued(bad)
+    try:
+        with pytest.raises(WorkerCrashed, match="malformed"):
+            w.stats()
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        child.close()
+
+
+def test_a_valid_stats_result_passes() -> None:
+    w, proc, child = _queued(GOOD_STATS)
+    try:
+        assert w.stats() == GOOD_STATS
+        assert proc.is_alive()
+    finally:
+        child.close()
+
+
+@pytest.mark.parametrize("bad", [[1, 2], {"mlx": 3}, {"mlx": ["x"]}])
+def test_probe_result_of_the_wrong_shape_is_a_crash(bad: object) -> None:
+    w, _proc, child = _queued(bad)
+    try:
+        with pytest.raises(WorkerCrashed, match="malformed"):
+            w.probe()
+    finally:
+        child.close()
+
+
+def test_a_valid_probe_result_passes() -> None:
+    w, _proc, child = _queued({"mlx": "0.1", "hf": None})
+    try:
+        assert w.probe() == {"mlx": "0.1", "hf": None}
+    finally:
+        child.close()
+
+
+@pytest.mark.parametrize("bad", [[1, 2], [{"id": 1}, "x"], {"id": 1}])
+def test_run_requires_a_list_of_dicts(bad: object) -> None:
+    w, proc, child = _queued(bad)
+    try:
+        with pytest.raises(WorkerCrashed, match="malformed"):
+            w.run([{"id": 1}])
+        assert not proc.is_alive() and w.pid is None
+    finally:
+        child.close()
+
+
+def test_run_returns_the_records_of_a_good_reply() -> None:
+    w, _proc, child = _queued([{"id": 1, "x": 2}])
+    try:
+        assert w.run([{"id": 1}]) == [{"id": 1, "x": 2}]
+    finally:
+        child.close()
+
+
+# --- ensure_model honours the revision (N3) --------------------------------------------------
+
+
+def _fake_model(revision: str) -> Any:
+    from minion_common.enums import TaskType
+    from minion_common.schemas import ModelEntry
+
+    return ModelEntry(
+        model_id="fake-embed",
+        type=TaskType.EMBEDDING,
+        engine=Engine.FAKE,
+        ref="o/m",
+        revision=revision,
+        memory_gb=1,
+    )
+
+
+def test_a_revision_bump_reloads_the_model_and_the_same_revision_stays_warm() -> None:
+    from minion_common.enums import CapacityProfile
+    from minion_common.schemas import Budget
+
+    budget = Budget(
+        profile=CapacityProfile.BALANCED, memory_gb=8, gpu_duty_cycle=0.5, max_batch_size=8
+    )
+    w = WorkerHandle([Engine.FAKE])
+    try:
+        w.ensure_model(_fake_model("a" * 40), budget)
+        first = w.pid
+        w.ensure_model(_fake_model("a" * 40), budget)
+        assert w.pid == first
+        w.ensure_model(_fake_model("b" * 40), budget)
+        assert w.pid is not None and w.pid != first
+        assert w.loaded_model_id == "fake-embed"
+    finally:
+        w.close()

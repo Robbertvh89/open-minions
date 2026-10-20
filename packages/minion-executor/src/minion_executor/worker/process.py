@@ -88,6 +88,29 @@ class _SelfTestFailedError(Exception):
     """The worker exited with `SELF_TEST_EXIT_CODE`: its sandbox did not confine it."""
 
 
+def _is_count(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _is_records(r: object) -> bool:
+    """A run result: a list of dicts."""
+    return isinstance(r, list) and all(isinstance(x, dict) for x in r)
+
+
+def _is_stats(r: object) -> bool:
+    """A stats result: the four non-negative integer counters."""
+    return isinstance(r, dict) and all(
+        _is_count(r.get(k)) for k in ("active_bytes", "peak_bytes", "max_rss_bytes", "trim_errors")
+    )
+
+
+def _is_probe(r: object) -> bool:
+    """A probe result: `{engine: version | None}`."""
+    return isinstance(r, dict) and all(
+        isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in r.items()
+    )
+
+
 class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
     """The worker process died or its pipe closed unexpectedly."""
 
@@ -604,6 +627,7 @@ class WorkerHandle:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
+        self._model_revision: str | None = None  # of the loaded model (a bump reloads)
         self._ollama_ref: str | None = None  # set while an Ollama model may be resident
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
@@ -674,10 +698,12 @@ class WorkerHandle:
         on_progress: Callable[[int], None] | None = None,
         *,
         hard_deadline: float | None = None,
+        expect: Callable[[object], bool] | None = None,
     ) -> dict[str, Any]:
         """Send `msg`, wait for the reply. `timeout_s` is an inactivity limit: every tick from
         the worker resets it, and ticks are forwarded to `on_progress`. `hard_deadline` (absolute
-        `time.monotonic()`) is a total cap that ticks cannot extend."""
+        `time.monotonic()`) is a total cap that ticks cannot extend. `expect` validates the `result`
+        of an ok reply (under the call lock); a reply it rejects resets the worker."""
         with self._lock:
             gen = self._seen_gen
             conn = self._ensure_started()
@@ -789,7 +815,7 @@ class WorkerHandle:
                 if ok
                 else isinstance(code, str) and isinstance(message, str)
             )
-            if not valid:
+            if not valid or (ok and expect is not None and not expect(reply.get("result"))):
                 self._reset()
                 raise WorkerCrashed("malformed worker reply")
             if op not in ("run", "shutdown"):  # back in the worker's main loop, reading
@@ -813,7 +839,12 @@ class WorkerHandle:
             if g != self._seen_gen:
                 self._seen_gen = g  # re-arm: later interrupts abort this call
                 self._reset()
-            if self._model_id == model.model_id and self._proc and self._proc.is_alive():
+            if (
+                self._model_id == model.model_id
+                and self._model_revision == model.revision
+                and self._proc
+                and self._proc.is_alive()
+            ):
                 return
             if self._model_id is not None and self._proc and self._proc.is_alive():
                 self._graceful_reset()  # model switch: let the runner free external memory
@@ -833,7 +864,7 @@ class WorkerHandle:
                 },
                 self._load_timeout_s,
             )
-            self._model_id = model.model_id
+            self._model_id, self._model_revision = model.model_id, model.revision
 
     def _sandbox_spec(
         self, model_path: Path | None, model: ModelEntry | None
@@ -889,17 +920,13 @@ class WorkerHandle:
             msg["ctl"] = ctl.to_msg()
         self._usage = None
         try:
-            reply = self._call(msg, self._step_timeout_s, on_progress)
+            reply = self._call(msg, self._step_timeout_s, on_progress, expect=_is_records)
         except RunnerError as exc:
             if exc.code == MODEL_INTEGRITY:  # a bad tag must not stay warm and churn
                 with self._lock:
                     self._graceful_reset()
             raise
-        result = reply["result"]
-        if not isinstance(result, list) or not all(isinstance(r, dict) for r in result):
-            with self._lock:
-                self._reset()
-            raise WorkerCrashed("malformed worker reply")
+        result: list[Record] = reply["result"]
         return result
 
     def control(self, *, duty: float, paused: bool, trim: bool = False) -> int:
@@ -1058,7 +1085,8 @@ class WorkerHandle:
 
     def stats(self) -> dict[str, int]:
         """Worker memory: runner `active_bytes`/`peak_bytes` plus process `max_rss_bytes`."""
-        stats: dict[str, int] = self._call({"op": "stats"}, self._step_timeout_s)["result"]
+        reply = self._call({"op": "stats"}, self._step_timeout_s, expect=_is_stats)
+        stats: dict[str, int] = reply["result"]
         return stats
 
     def probe(self, timeout_s: float = 90.0) -> dict[str, str | None]:
@@ -1073,6 +1101,7 @@ class WorkerHandle:
                         "sandbox": self._sandbox_spec(None, None),
                     },
                     timeout_s,
+                    expect=_is_probe,
                 )
                 result: dict[str, str | None] = reply["result"]
                 return result
@@ -1155,7 +1184,7 @@ class WorkerHandle:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
         proc, conn = self._proc, self._conn
         self._proc = self._conn = None
-        self._model_id = None
+        self._model_id = self._model_revision = None
         self._ack = None
         self._tick_at = None
         with self._ctl_lock:

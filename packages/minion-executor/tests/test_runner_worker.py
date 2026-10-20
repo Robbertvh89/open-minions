@@ -934,17 +934,6 @@ def test_deeply_nested_json_reply_is_a_crash_not_an_exception() -> None:
     assert not proc.is_alive()
 
 
-def test_run_requires_a_list_of_dicts(monkeypatch: pytest.MonkeyPatch) -> None:
-    w = WorkerHandle([Engine.FAKE])
-    w.ensure_model(_model(), BUDGET)
-    proc = w._proc
-    assert proc is not None
-    monkeypatch.setattr(w, "_call", lambda *a, **k: {"ok": True, "result": [1, 2]})
-    with pytest.raises(WorkerCrashed, match="malformed"):
-        w.run([{"id": 1}])
-    assert not proc.is_alive()
-
-
 def test_hard_reset_releases_an_ollama_model_and_graceful_unload_does_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
