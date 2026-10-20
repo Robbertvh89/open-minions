@@ -4,7 +4,7 @@ title: Timer-based split lease renewal for large single-object inputs
 status: In Progress
 assignee: []
 created_date: '2026-10-15 16:51'
-updated_date: '2026-10-20 04:21'
+updated_date: '2026-10-20 04:37'
 labels:
   - M2
 dependencies: []
@@ -19,10 +19,12 @@ From TASK-2.2 review (MINOR): split lease is renewed and wall-clock budget check
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Lease renewed at least every lease_s/3 during a single long object read
-- [ ] #2 Test: lease_s shorter than one batch's read time still completes with 2 concurrent splitters
-- [ ] #3 GET response ETag compared to listed ETag
+- [x] #1 Lease renewed at least every lease_s/3 during a single long object read
+- [x] #2 Test: lease_s shorter than one batch's read time still completes with 2 concurrent splitters
+- [x] #3 GET response ETag compared to listed ETag
 <!-- AC:END -->
+
+
 
 ## Implementation Plan
 
