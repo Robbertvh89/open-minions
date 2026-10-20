@@ -111,6 +111,7 @@ class Task(Base):
         # Two tasks sharing an output prefix would share attempt and promoted keys.
         UniqueConstraint("output_uri"),
         CheckConstraint("split_attempts >= 0", name="split_attempts_nonneg"),
+        CheckConstraint("split_failures >= 0", name="split_failures_nonneg"),
     )
 
     team: Mapped[str] = mapped_column(String(64))
@@ -135,7 +136,10 @@ class Task(Base):
     created_by: Mapped[str] = mapped_column(String(128))
     error: Mapped[str | None] = mapped_column(Text)  # task-level failure (e.g. empty input)
     # Splitter lease/backoff: a SPLITTING task is only claimable once next_split_at has passed.
+    # `split_attempts` counts claims and is the lease fencing token (never decrement);
+    # `split_failures` counts real split failures and drives SPLIT_ATTEMPTS_EXHAUSTED.
     split_attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    split_failures: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     next_split_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _updated_at()

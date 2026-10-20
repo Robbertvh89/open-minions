@@ -9,14 +9,15 @@ input changed underneath us (`INPUT_CHANGED`).
 
 Failure policy per task, so one bad task never blocks the queue:
 - deterministic problems (bad URI, empty input, limits, unreadable S3 4xx) -> FAILED at once;
-- anything else -> exponential backoff via `next_split_at`; FAILED after `max_attempts`.
+- anything else -> exponential backoff via `next_split_at`; FAILED after `max_attempts` real
+  failures (`split_failures`) or, for a crash loop that records none, `claim_cap` claims.
 The claim is a lease fenced by `split_attempts`: every write by the holder (lease renewal, done,
 failed, retry) matches on it, so a holder that lost its lease becomes a no-op. The lease is renewed
 by a background timer every `lease_s / 3`, which also enforces the wall-clock budget, so one long
 blocking object read cannot outlive it; the timer trips a stop flag that the read thread checks per
 S3 chunk. Each batch insert re-checks the lease in its own transaction (the fence). A shutdown
 during a read stops the thread the same way, does not hang, writes no backoff and releases the
-lease (fenced write) so another server can claim at once; that claim still counts an attempt.
+lease (fenced write) so another server can claim at once; that claim counts a claim, not a failure.
 Only the error class and task id are logged, never payload contents.
 """
 
@@ -60,6 +61,7 @@ class SplitLimits:
     max_objects: int = 10_000
     max_subtasks: int = 100_000
     max_attempts: int = 5
+    claim_cap: int = 15
     backoff_base_s: float = 2.0
     backoff_max_s: float = 300.0
     lease_s: float = 900.0
@@ -73,6 +75,7 @@ class SplitLimits:
             max_objects=s.split_max_objects,
             max_subtasks=s.split_max_subtasks,
             max_attempts=s.split_max_attempts,
+            claim_cap=s.split_claim_cap,
             backoff_base_s=s.split_backoff_base_s,
             backoff_max_s=s.split_backoff_max_s,
             lease_s=s.split_lease_s,
@@ -332,7 +335,9 @@ async def split_one(
     """Claim and split one due task. Returns False if nothing was due."""
     limits = limits or SplitLimits()
     async with sessionmaker() as claim, claim.begin():
-        task = await tasks_repo.claim_splitting(claim, limits.lease_s, limits.max_attempts)
+        task = await tasks_repo.claim_splitting(
+            claim, limits.lease_s, limits.max_attempts, limits.claim_cap
+        )
     if task is None:
         return False
     tid = f"{task.team}/{task.project}/{task.task_name}"
@@ -369,9 +374,15 @@ def tid_of(task: Task) -> str:
     return f"{task.team}/{task.project}/{task.task_name}"
 
 
-async def _fail(sessionmaker: async_sessionmaker[AsyncSession], task: Task, error: str) -> None:
+async def _fail(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    task: Task,
+    error: str,
+    *,
+    count_failure: bool = False,
+) -> None:
     async with sessionmaker() as s, s.begin():
-        if not await tasks_repo.mark_split_failed(s, task, error):
+        if not await tasks_repo.mark_split_failed(s, task, error, count_failure=count_failure):
             log.warning("task_split_lease_lost", task=tid_of(task))
 
 
@@ -382,14 +393,17 @@ async def _retry(
     error_class: str,
     tid: str,
 ) -> None:
-    # `task.split_attempts` already includes this attempt (bumped by the claim).
-    if task.split_attempts >= limits.max_attempts:
-        await _fail(sessionmaker, task, f"splitting failed after {task.split_attempts} attempts")
+    # A real failure: count it. The claim is fenced, so `task.split_failures` is exact.
+    failures = task.split_failures + 1
+    if failures >= limits.max_attempts:
+        await _fail(
+            sessionmaker, task, f"splitting failed after {failures} attempts", count_failure=True
+        )
         log.error("task_split_gave_up", task=tid, error_class=error_class)
         return
-    delay = backoff_s(task.split_attempts, limits)
+    delay = backoff_s(failures, limits)
     async with sessionmaker() as s, s.begin():
-        if not await tasks_repo.schedule_split_retry(s, task, delay):
+        if not await tasks_repo.schedule_split_retry(s, task, delay, failed=True):
             log.warning("task_split_lease_lost", task=tid)
             return
     log.warning("task_split_retry", task=tid, error_class=error_class, delay_s=delay)

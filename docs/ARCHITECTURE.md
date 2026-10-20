@@ -326,7 +326,7 @@ User ─POST /tasks─▶ Server: validate (team membership, model allow-list + 
                     `{prefix}{team}/…`, input prefix non-empty, no `_attempts` segment in output;
                     at least one object under the input prefix, else `422 EMPTY_INPUT`)
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
-Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
+Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1 = claim/fencing token, next_split_at=now+lease)
                     list input objects → scan JSONL → stream batches of slices of N records
                     background timer: renew the lease every lease_s/3 and enforce the wall-clock budget,
                       also during one long object read (the read thread checks a stop flag per chunk)
@@ -340,7 +340,7 @@ Splitting is bounded (line length, total bytes, objects, subtasks per task; see 
 and no transaction is held open while reading S3. Deterministic problems (bad URI, empty input,
 limit exceeded, `LINE_TOO_LONG`, `INPUT_CHANGED`, S3 `AccessDenied`/`NoSuchKey`/`InvalidObjectState`)
 mark the task `FAILED` with `error`. Anything else backs off exponentially via `next_split_at` and
-fails the task after `split_max_attempts`, so one bad task never blocks the queue. `output_uri` is
+fails the task after `split_max_attempts` real failures (`split_failures`), so one bad task never blocks the queue. `output_uri` is
 unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it. Stored
 URIs are canonical (`s3://{bucket}/{key}/`); a non-lowercase scheme is `422 INVALID_URI`.
 
@@ -353,11 +353,20 @@ ETag, multipart `-N` ETags included (integration-tested against SeaweedFS).
 The claim is a lease fenced by `split_attempts`: lease renewal (timer, every `lease_s/3`, and in each batch insert), done, failed and
 retry all match on the claimed value, so a splitter whose lease expired and was re-claimed becomes
 a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
-default 3600; exceeding it backs off like any transient error). A claim never hands out a task with
-`split_attempts >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED` (crash loop).
+default 3600; exceeding it backs off like any transient error). `split_attempts` only counts claims
+(it is the fencing token and is never decremented); exhaustion uses a separate `split_failures`
+counter (migration 0015), incremented only by real failures routed through the retry path (S3 or
+read errors, the wall-clock budget). Restarts, lease losses, cancels and rival claims do not count,
+so rolling restarts cannot exhaust a valid task. A claim never hands out a task with
+`split_failures >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED`. As a
+backstop for a crash loop that dies before recording a failure (OOM kill), a task is also failed
+at `MINION_SPLIT_CLAIM_CAP` claims (default 15, 1..1000, must be >= `MINION_SPLIT_MAX_ATTEMPTS`). That
+path keeps the code `SPLIT_ATTEMPTS_EXHAUSTED` but logs `split_claim_cap_reached` (task key only),
+which tells a crash loop from real failures. Cost of a crash loop: about cap x `split_lease_s`
+(default 15 x 900 s, roughly 3.75 h) before the task is failed.
 Server shutdown during a read stops the read thread at its next chunk, does not hang, writes no
-backoff and releases the lease (fenced write), so another server claims at once; that claim still
-counts an attempt. The server container has `stop_grace_period: 30s` for this.
+backoff and releases the lease (fenced write), so another server claims at once; that claim
+counts as a claim but not as a failure. The server container has `stop_grace_period: 30s` for this.
 
 ### 3.2 Acquire (the core protocol)
 ```

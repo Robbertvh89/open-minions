@@ -427,8 +427,8 @@ async def _task_row(engine: AsyncEngine, name: str) -> tuple[Any, ...]:
         row = (
             await conn.execute(
                 text(
-                    "SELECT status, error, split_attempts, total_subtasks FROM minion_task"
-                    " WHERE task_name=:n"
+                    "SELECT status, error, split_attempts, total_subtasks, split_failures"
+                    " FROM minion_task WHERE task_name=:n"
                 ),
                 {"n": name},
             )
@@ -444,7 +444,7 @@ async def test_line_too_long_fails_task(engine: AsyncEngine, storage: S3Storage,
     lim = SplitLimits(max_line_bytes=1024)
     while await split_one(sm, storage, lim):
         pass
-    status, error, attempts, _ = await _task_row(engine, "long")
+    status, error, attempts, _, _ = await _task_row(engine, "long")
     assert status == "FAILED" and error.startswith("LINE_TOO_LONG") and attempts == 1
 
 
@@ -467,7 +467,7 @@ async def test_input_limits_fail_task(
     sm = create_sessionmaker(engine)
     while await split_one(sm, storage, limits):
         pass
-    status, error, _, _ = await _task_row(engine, name)
+    status, error, _, _, _ = await _task_row(engine, name)
     assert status == "FAILED" and needle in error
 
 
@@ -502,7 +502,7 @@ async def test_bad_task_does_not_block_queue(
         await conn.execute(text("UPDATE minion_task SET next_split_at=now() WHERE task_name='bad'"))
     while await split_one(sm, storage, lim0):
         pass
-    status, error, attempts, _ = await _task_row(engine, "bad")
+    status, error, attempts, _, _ = await _task_row(engine, "bad")
     assert (status, attempts) == ("FAILED", 3) and "3 attempts" in error
     assert "outage" not in error  # error text never echoes exception details
 
@@ -523,7 +523,7 @@ async def test_deterministic_s3_error_fails_immediately(
     sm = create_sessionmaker(engine)
     while await split_one(sm, storage):
         pass
-    status, error, attempts, _ = await _task_row(engine, "denied")
+    status, error, attempts, _, _ = await _task_row(engine, "denied")
     assert (status, attempts) == ("FAILED", 1) and "AccessDenied" in error
 
 
@@ -557,7 +557,7 @@ async def test_resume_detects_changed_input(
         "FAILED",
         "INPUT_CHANGED: input differs from a previous split attempt",
     )
-    status, error, _, _ = await _task_row(engine, "shrunk")
+    status, error, _, _, _ = await _task_row(engine, "shrunk")
     assert status == "FAILED" and error.startswith("INPUT_CHANGED")
 
 
@@ -742,8 +742,9 @@ async def test_lost_lease_aborts_quietly(
 
     monkeypatch.setattr(tasks_repo, "renew_split_lease", steal)
     assert await split_one(sm, storage, SplitLimits(), batch_size=1)
-    status, error, attempts, _ = await _task_row(fresh_engine, "lost")
+    status, error, attempts, _, failures = await _task_row(fresh_engine, "lost")
     assert (status, error, attempts) == ("SPLITTING", None, 2)  # untouched by the old holder
+    assert failures == 0
     assert n == 3 and len(await _subtasks(fresh_engine, "lost")) == 2  # stopped at renewal 3
 
 
@@ -757,25 +758,114 @@ async def test_split_wall_clock_budget_backs_off(
     assert await split_one(
         sm, storage, SplitLimits(max_seconds=-1, backoff_base_s=1000), batch_size=1
     )
-    status, error, attempts, _ = await _task_row(fresh_engine, "budget")
-    assert (status, error, attempts) == ("SPLITTING", None, 1)
+    status, error, attempts, _, failures = await _task_row(fresh_engine, "budget")
+    assert (status, error, attempts, failures) == ("SPLITTING", None, 1, 1)
     assert not await split_one(sm, storage)  # backing off
 
 
 @pytest.mark.integration
-async def test_claim_fails_exhausted_tasks_crash_loop(fresh_engine: AsyncEngine) -> None:
+async def test_claim_hard_cap_fails_crash_loop_without_recorded_failures(
+    fresh_engine: AsyncEngine,
+) -> None:
     await _insert_task(fresh_engine, "fz5", "loop")
     sm = create_sessionmaker(fresh_engine)
-    for expected in (1, 2):  # claims whose holder crashed before any retry/fail bookkeeping
+    cap = 6
+    for expected in range(1, cap + 1):  # holders that crashed before any retry/fail bookkeeping
         async with sm() as s, s.begin():
-            t = await tasks_repo.claim_splitting(s, 900, 2)
+            t = await tasks_repo.claim_splitting(s, 900, 2, cap)
         assert t is not None and t.split_attempts == expected
         async with fresh_engine.begin() as conn:
             await conn.execute(EXPIRE, {"n": "loop"})
     async with sm() as s, s.begin():
+        assert await tasks_repo.claim_splitting(s, 900, 2, cap) is None
+    status, error, attempts, _, _ = await _task_row(fresh_engine, "loop")
+    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", cap)
+
+
+@pytest.mark.integration
+async def test_restarts_and_released_leases_never_exhaust_a_valid_task(
+    fresh_engine: AsyncEngine,
+) -> None:
+    await _insert_task(fresh_engine, "fz7", "restarts")
+    sm = create_sessionmaker(fresh_engine)
+    limit = 3
+    for expected in range(1, 3 * limit + 1):  # many more claims than the failure limit
+        async with sm() as s, s.begin():
+            t = await tasks_repo.claim_splitting(s, 900, limit)
+        assert t is not None and t.split_attempts == expected
+        if expected % 2:  # shutdown: fenced release, no failure recorded
+            async with sm() as s, s.begin():
+                assert await tasks_repo.schedule_split_retry(s, t, 0)
+        else:  # crashed holder: the lease just expires
+            async with fresh_engine.begin() as conn:
+                await conn.execute(EXPIRE, {"n": "restarts"})
+    status, error, attempts, _, _ = await _task_row(fresh_engine, "restarts")
+    assert (status, error, attempts) == ("SPLITTING", None, 3 * limit)
+    async with fresh_engine.connect() as conn:
+        failures = (await conn.execute(text("SELECT split_failures FROM minion_task"))).scalar_one()
+    assert failures == 0
+
+
+@pytest.mark.integration
+async def test_real_split_failures_exhaust_at_the_limit(
+    fresh_engine: AsyncEngine, storage: S3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _insert_task(fresh_engine, "fz8", "flaky")
+    sm = create_sessionmaker(fresh_engine)
+
+    async def boom(*_: Any, **__: Any) -> Any:
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(S3Storage, "list_objects", boom)
+    lim = SplitLimits(max_attempts=3, backoff_base_s=0)
+    for n in (1, 2):
+        assert await split_one(sm, storage, lim)
+        async with fresh_engine.connect() as conn:
+            row = (await conn.execute(text("SELECT status, split_failures FROM minion_task"))).one()
+        assert tuple(row) == ("SPLITTING", n)
+    assert await split_one(sm, storage, lim)  # third real failure
+    status, error, attempts, _, _ = await _task_row(fresh_engine, "flaky")
+    assert status == "FAILED" and error == "splitting failed after 3 attempts" and attempts == 3
+    assert (await _task_row(fresh_engine, "flaky"))[4] == 3  # final row is accurate
+
+
+@pytest.mark.integration
+async def test_stale_holder_failure_is_not_counted_and_rival_lease_untouched(
+    fresh_engine: AsyncEngine, storage: S3Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _insert_task(fresh_engine, "fz10", "stale")
+    sm = create_sessionmaker(fresh_engine)
+    bump = text(
+        "UPDATE minion_task SET split_attempts=split_attempts+1, next_split_at=now()"
+        " + interval '900 seconds' WHERE task_name='stale'"
+    )
+    nxt = text("SELECT next_split_at FROM minion_task WHERE task_name='stale'")
+
+    async def rival_then_boom(*_: Any, **__: Any) -> Any:
+        async with fresh_engine.begin() as conn:  # a rival claims while we are in S3
+            await conn.execute(bump)
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(S3Storage, "list_objects", rival_then_boom)
+    assert await split_one(sm, storage, SplitLimits(backoff_base_s=0))
+    async with fresh_engine.connect() as conn:
+        rival_next = (await conn.execute(nxt)).scalar_one()
+    row = await _task_row(fresh_engine, "stale")
+    assert row[0] == "SPLITTING" and row[2] == 2 and row[4] == 0  # stale failure not counted
+    async with fresh_engine.connect() as conn:
+        assert (await conn.execute(nxt)).scalar_one() == rival_next
+
+
+@pytest.mark.integration
+async def test_claim_fails_task_with_exhausted_failures(fresh_engine: AsyncEngine) -> None:
+    await _insert_task(fresh_engine, "fz9", "spent")
+    async with fresh_engine.begin() as conn:
+        await conn.execute(text("UPDATE minion_task SET split_failures=2"))
+    sm = create_sessionmaker(fresh_engine)
+    async with sm() as s, s.begin():
         assert await tasks_repo.claim_splitting(s, 900, 2) is None
-    status, error, attempts, _ = await _task_row(fresh_engine, "loop")
-    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", 2)
+    status, error, attempts, _, _ = await _task_row(fresh_engine, "spent")
+    assert (status, error, attempts) == ("FAILED", "SPLIT_ATTEMPTS_EXHAUSTED", 0)
 
 
 @pytest.mark.integration
@@ -795,7 +885,7 @@ async def test_object_replaced_after_listing_is_input_changed(
 
     monkeypatch.setattr(S3Storage, "list_objects", list_then_swap)
     assert await split_one(sm, storage, batch_size=2)
-    status, error, attempts, _ = await _task_row(fresh_engine, "swap")
+    status, error, attempts, _, _ = await _task_row(fresh_engine, "swap")
     assert status == "FAILED" and error.startswith("INPUT_CHANGED") and attempts == 1
 
 
@@ -961,6 +1051,7 @@ async def test_deadline_mid_read_backs_off(
     assert time.monotonic() - t0 < 2.0
     assert stats["chunks"] < 12
     assert (await _task_row(fresh_engine, "dl"))[:3] == ("SPLITTING", None, 1)
+    assert (await _task_row(fresh_engine, "dl"))[4] == 1  # the deadline is a real failure
     async with fresh_engine.connect() as conn:
         far = (
             await conn.execute(
@@ -995,6 +1086,7 @@ async def test_cancel_mid_read_is_clean(
             )
         ).scalar_one()
     assert (await _task_row(fresh_engine, "shut"))[:3] == ("SPLITTING", None, 1)
+    assert (await _task_row(fresh_engine, "shut"))[4] == 0  # a shutdown is not a failure
     assert soon  # no failed-attempt backoff was written (and the lease was released)
     stats["delay"] = 0
     # The lease was released on shutdown: claimable at once, without waiting for it to expire.
@@ -1022,6 +1114,7 @@ async def test_shutdown_after_lease_lost_does_not_touch_the_new_holder(
         ).scalar_one()
     assert held  # the fenced release did not shorten the lease of the new holder
     assert (await _task_row(fresh_engine, "lost"))[:3] == ("SPLITTING", None, 2)
+    assert (await _task_row(fresh_engine, "lost"))[4] == 0
 
 
 @pytest.mark.integration
@@ -1057,7 +1150,7 @@ async def test_insert_readback_detects_mismatch(
 
     monkeypatch.setattr(tasks_repo, "insert_subtasks", partial)
     assert await split_one(sm, storage, batch_size=2)
-    status, error, _, _ = await _task_row(fresh_engine, "rb")
+    status, error, _, _, _ = await _task_row(fresh_engine, "rb")
     assert status == "FAILED" and error.startswith("INPUT_CHANGED")
 
 
