@@ -4,8 +4,8 @@ import pytest
 from minion_server import storage_check
 from minion_server.admin import app
 from minion_server.settings import ServerSettings
-from minion_server.storage import S3Storage
-from minion_server.storage_check import PROBE_BODY, PROBE_PREFIX, SLICE_BODY, run_check
+from minion_server.storage import PROBE_PREFIX, S3Storage
+from minion_server.storage_check import PROBE_BODY, SLICE_BODY, run_check
 from pydantic import SecretStr
 from typer.testing import CliRunner
 
@@ -56,7 +56,7 @@ async def test_enforcing_backend_passes_and_probe_deleted() -> None:
     st = FakeStorage()
     checks = await run_check(st, _enforcing)
     assert all(c.ok for c in checks) and len(checks) == 7
-    assert st.puts == st.deletes and st.puts[0].startswith(storage_check.PROBE_PREFIX)
+    assert st.puts == st.deletes and st.puts[0].startswith(PROBE_PREFIX)
 
 
 async def test_non_enforcing_backend_fails_with_observed_tuples() -> None:
@@ -140,7 +140,7 @@ async def test_seaweedfs_observed_behaviour(s3: S3Env) -> None:
     )
     checks = await run_check(S3Storage(cfg))
     print({c.name: (c.observed, c.ok) for c in checks})
-    leftovers = s3.client.list_objects_v2(Bucket=s3.bucket, Prefix=storage_check.PROBE_PREFIX)
+    leftovers = s3.client.list_objects_v2(Bucket=s3.bucket, Prefix=PROBE_PREFIX)
     assert not leftovers.get("Contents")
     # SeaweedFS (dev stack) enforces signed Range (observed): 206 slice / 403 / 403 / 206 slice
     assert {c.name: c.observed for c in checks} == {
