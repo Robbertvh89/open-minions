@@ -2,8 +2,11 @@
 
 import asyncio
 import contextlib
+import faulthandler
 import hashlib
 import http.server
+import json
+import os
 import socket
 import sys
 import threading
@@ -14,7 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 import boto3
 import pytest
@@ -43,6 +46,140 @@ from sqlalchemy.ext.asyncio import (
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
+
+
+# --- memory footprint guard (TASK-44): a runaway test must die loudly, not eat the Mac ---
+
+_GB = 1024**3
+_DEFAULT_MAX_FOOTPRINT_GB = 16.0
+_SAMPLE_INTERVAL_S = 1.0
+
+
+def _check(
+    footprint: int | None,
+    limit_bytes: int,
+    nodeid: str,
+    exit_fn: Callable[[int], Any],
+    out: TextIO | None = None,
+) -> bool:
+    """True (after reporting to `out`, default stderr, and calling `exit_fn(3)`) when `footprint`
+    exceeds `limit_bytes`. `limit_bytes <= 0` or an unknown footprint never trips."""
+    if footprint is None or limit_bytes <= 0 or footprint <= limit_bytes:
+        return False
+    out = out or sys.stderr
+    out.write(
+        f"\nFOOTPRINT GUARD: {nodeid} reached {footprint / _GB:.2f} GB "
+        f"(limit {limit_bytes / _GB:.2f} GB, MINION_TEST_MAX_FOOTPRINT_GB); aborting pytest\n"
+    )
+    out.flush()
+    with contextlib.suppress(Exception):  # no real fd (unit test): the message above stands
+        faulthandler.dump_traceback(file=out, all_threads=True)
+    exit_fn(3)
+    return True
+
+
+def _append_log(path: str, rec: dict[str, Any]) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+class _FootprintGuard:
+    def __init__(self, limit_gb: float, log_path: str | None) -> None:
+        from minion_executor.worker.footprint import process_footprint_bytes
+
+        self._read = process_footprint_bytes
+        self.limit = int(limit_gb * _GB)
+        self.log_path = log_path
+        self.nodeid = "<session>"
+        self.peak = 0
+        self._stop = threading.Event()
+        self.pid = os.getpid()
+        # The real stderr, saved before pytest's fd capture replaces fd 2: a breach must be
+        # visible even though os._exit discards the capture tmpfile.
+        self._err = os.fdopen(os.dup(2), "w")
+
+    def sample(self) -> int | None:
+        fp = self._read(self.pid)
+        if fp is not None:
+            self.peak = max(self.peak, fp)
+        return fp
+
+    def _run(self) -> None:
+        while not self._stop.wait(_SAMPLE_INTERVAL_S):
+            fp = self.sample()
+            if fp is not None and 0 < self.limit < fp and self.log_path:
+                with contextlib.suppress(OSError):
+                    _append_log(
+                        self.log_path,
+                        {
+                            "nodeid": self.nodeid,
+                            "breach_gb": round(fp / _GB, 3),
+                            "peak_gb": round(fp / _GB, 3),
+                        },
+                    )
+            _check(fp, self.limit, self.nodeid, os._exit, self._err)
+
+    def start(self) -> None:
+        if self.sample() is None:  # unsupported OS: stay out of the way
+            return
+        self._thread = threading.Thread(target=self._run, name="footprint-guard", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            thread.join(5)
+        self._err.close()
+
+
+_guard: _FootprintGuard | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    global _guard
+    try:
+        limit = float(os.environ.get("MINION_TEST_MAX_FOOTPRINT_GB", _DEFAULT_MAX_FOOTPRINT_GB))
+    except ValueError:
+        sys.stderr.write(
+            f"MINION_TEST_MAX_FOOTPRINT_GB is not a number: using {_DEFAULT_MAX_FOOTPRINT_GB:g}\n"
+        )
+        limit = _DEFAULT_MAX_FOOTPRINT_GB
+    log_path = os.environ.get("MINION_TEST_RSS_LOG") or None
+    if limit <= 0 and not log_path:
+        return
+    try:
+        _guard = _FootprintGuard(limit, log_path)
+    except ImportError:
+        return
+    _guard.start()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _guard is not None:
+        _guard.stop()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    g = _guard
+    if g is None:
+        return (yield)
+    start = g.sample() or 0
+    g.nodeid, g.peak = item.nodeid, start
+    try:
+        return (yield)
+    finally:
+        end = g.sample() or 0
+        if g.log_path:
+            rec = {
+                "nodeid": item.nodeid,
+                "peak_gb": round(g.peak / _GB, 3),
+                "delta_gb": round((end - start) / _GB, 3),
+            }
+            _append_log(g.log_path, rec)
+        g.nodeid = "<between tests>"
 
 
 @pytest.fixture(autouse=True)
