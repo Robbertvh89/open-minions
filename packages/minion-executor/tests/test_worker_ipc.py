@@ -395,7 +395,7 @@ def test_the_watchdog_shuts_down_via_the_handles_own_dup_not_a_fresh_fd_lookup()
     try:
         w._reset()
         assert sock.fileno() == -1 and w._sock is None  # the dup died with the worker
-        w._fire(proc, sock)  # a late fire: closed socket, no effect on anyone else  # type: ignore[arg-type]
+        w._fire(proc, sock)  # type: ignore[arg-type]  # late fire: closed socket, no effect
         os.write(victim_w, b"x")
         assert os.read(victim_r, 1) == b"x"
     finally:
