@@ -1,9 +1,10 @@
 ---
 id: TASK-43.1
 title: Persist GPU quarantine expiry across executor restarts
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-20 00:16'
+updated_date: '2026-10-20 02:28'
 labels:
   - executor
   - gpu
