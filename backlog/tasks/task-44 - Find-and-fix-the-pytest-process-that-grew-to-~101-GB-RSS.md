@@ -1,10 +1,10 @@
 ---
 id: TASK-44
 title: Find and fix the pytest process that grew to ~101 GB RSS
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-19 18:32'
-updated_date: '2026-10-20 00:17'
+updated_date: '2026-10-20 00:43'
 labels:
   - bug
 dependencies: []
