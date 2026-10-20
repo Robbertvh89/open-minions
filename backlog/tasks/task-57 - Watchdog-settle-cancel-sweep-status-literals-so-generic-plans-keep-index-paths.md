@@ -3,9 +3,10 @@ id: TASK-57
 title: >-
   Watchdog settle + cancel sweep: status literals so generic plans keep index
   paths
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-20 04:54'
+updated_date: '2026-10-20 05:06'
 labels:
   - perf
 dependencies: []
