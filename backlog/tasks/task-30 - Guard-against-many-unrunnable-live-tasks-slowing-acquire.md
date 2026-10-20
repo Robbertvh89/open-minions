@@ -1,10 +1,10 @@
 ---
 id: TASK-30
 title: Guard against many unrunnable live tasks slowing acquire
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 04:08'
-updated_date: '2026-10-20 03:07'
+updated_date: '2026-10-20 04:13'
 labels:
   - security
 dependencies: []
