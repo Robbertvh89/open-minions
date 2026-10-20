@@ -562,9 +562,11 @@ def _edge_sim(
     horizon: float,
     *,
     seed: int = 0,
+    gap_rate: float = 0.0,
 ) -> tuple[float | None, float]:
     """Subtasks of `sub_s` at GPU `rate` separated by idle gaps of `gap_s`; the busy/idle edges
-    are reported to the guard when they happen (like the loop), samples are jittered 2 s."""
+    are reported to the guard when they happen (like the loop), samples are jittered 2 s. A
+    rogue burns `gap_rate` of the GPU inside the idle gaps."""
     import random
 
     rnd = random.Random(seed)  # noqa: S311
@@ -582,7 +584,11 @@ def _edge_sim(
 
     def cum(x: float) -> float:
         full, rem = divmod(x, cycle)
-        return (full * sub_s + min(rem, sub_s)) * rate
+        return (
+            full * (sub_s * rate + gap_s * gap_rate)
+            + min(rem, sub_s) * rate
+            + max(rem - sub_s, 0.0) * gap_rate
+        )
 
     t, mx, ei = 0.0, 0.0, 0
     g.observe(0.0, {"a": 0}, interval_s=STEP)
@@ -605,8 +611,12 @@ def test_honest_full_duty_worker_with_short_subtasks_is_never_killed() -> None:
     assert killed is None and peak < 1.0, (killed, peak)
 
 
-def test_honest_paced_worker_with_short_subtasks_is_never_killed() -> None:
-    killed, peak = _edge_sim(0.75, 0.75, 1.8, 0.3, 8 * 3600)
+@pytest.mark.parametrize("duty,rate", [(0.75, 0.8), (0.5, 0.55)])
+def test_honest_paced_worker_with_short_subtasks_is_never_killed(duty: float, rate: float) -> None:
+    """Paced slightly above its duty inside 1.8 s subtasks with 0.3 s gaps (the repay lands in
+    the gaps): without the busy -> quiet edge split this is killed (checked by disabling the
+    straddle branch: 176 s at 0.75 / 0.8, 3381 s at 0.5 / 0.55)."""
+    killed, peak = _edge_sim(duty, rate, 1.8, 0.3, 8 * 3600)
     assert killed is None and peak < 1.0, (killed, peak)
 
 
@@ -614,3 +624,18 @@ def test_honest_paced_worker_with_short_subtasks_is_never_killed() -> None:
 def test_rogue_through_short_subtasks_is_killed_within_bounds(duty: float, bound: float) -> None:
     killed, _ = _edge_sim(duty, 1.0, 1.8, 0.3, 600)
     assert killed is not None and killed <= bound, killed
+
+
+def test_gap_burning_rogue_at_full_duty_is_killed() -> None:
+    """Busy at 100 % in 1.8 s subtasks and in the 0.8 s idle gaps, duty 1.0: the idle part of the
+    sample at the idle -> busy edge is charged at the margin, so the gaps add up."""
+    killed, _ = _edge_sim(1.0, 1.0, 1.8, 0.8, 1800, gap_rate=1.0)
+    assert killed is not None and killed <= 300.0, (
+        killed
+    )  # 108 s with seed 0; None before the idle-span split
+
+
+@pytest.mark.parametrize("duty", [1.0, 0.75])
+def test_honest_worker_with_short_gaps_is_never_killed_8h(duty: float) -> None:
+    killed, peak = _edge_sim(duty, duty, 1.8, 0.8, 8 * 3600)
+    assert killed is None and peak < 1.0, (killed, peak)
