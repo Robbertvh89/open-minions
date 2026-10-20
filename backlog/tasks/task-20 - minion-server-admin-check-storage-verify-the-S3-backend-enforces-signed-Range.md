@@ -1,10 +1,10 @@
 ---
 id: TASK-20
 title: 'minion-server-admin check-storage: verify the S3 backend enforces signed Range'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-17 13:16'
-updated_date: '2026-10-20 02:37'
+updated_date: '2026-10-20 03:27'
 labels:
   - server
   - security
