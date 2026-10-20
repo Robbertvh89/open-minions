@@ -4,7 +4,7 @@ title: Persist GPU quarantine expiry across executor restarts
 status: In Progress
 assignee: []
 created_date: '2026-10-20 00:16'
-updated_date: '2026-10-20 02:28'
+updated_date: '2026-10-20 02:30'
 labels:
   - executor
   - gpu
@@ -21,6 +21,6 @@ Deferred from TASK-43 (see scratchpad plan / TASK-43 notes): persist per-engine 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Quarantine expiry survives an executor restart
-- [ ] #2 State file 0600, refused on unsafe state dir
+- [x] #1 Quarantine expiry survives an executor restart
+- [x] #2 State file 0600, refused on unsafe state dir
 <!-- AC:END -->
