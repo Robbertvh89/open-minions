@@ -10,10 +10,17 @@ from typing import Any, cast
 import pytest
 from minion_common.enums import Engine, SubtaskStatus, TaskStatus
 from minion_server.db.models import Subtask, Task
-from minion_server.repositories.acquisition import candidates_stmt
-from sqlalchemy import Select, select, text
+from minion_server.repositories.acquisition import candidates_stmt, claim
+from sqlalchemy import Select, event, func, or_, select, text
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from conftest import make_executors
 
 pytestmark = pytest.mark.integration
 
@@ -260,14 +267,19 @@ def _buffers(plan: dict[str, Any]) -> int:
     return int(root.get("Shared Hit Blocks", 0)) + int(root.get("Shared Read Blocks", 0))
 
 
-def assert_index_paths(plan: dict[str, Any]) -> None:
+def assert_index_paths(plan: dict[str, Any], *, pending_index: bool = True) -> None:
     """The recursive ordered walk (TASK-54): a Recursive Union whose steps are Index Scans on the
     live-queue index with a row-compare Index Cond; the pending probes use
     ix_minion_subtask_pending; no Seq Scan on either table; no Sort ever sees more rows than the
     window (a Sort over all live tasks or all pending subtasks is the failure this guards)."""
     nodes = _nodes(plan["Plan"])
     text_plan = json.dumps(plan)
-    assert "ix_minion_subtask_pending" in text_plan, text_plan
+    if pending_index:
+        assert "ix_minion_subtask_pending" in text_plan, text_plan
+    else:  # large live queues: per-task probes may use ix_minion_subtask_progress + a tiny Sort
+        assert any(
+            n.get("Relation Name") == "minion_subtask" and "Index" in n["Node Type"] for n in nodes
+        ), text_plan
     assert any(n["Node Type"] == "Recursive Union" for n in nodes), text_plan
     steps = [n for n in nodes if n.get("Index Name") == "ix_minion_task_live_queue"]
     assert steps, text_plan
@@ -538,3 +550,365 @@ async def test_cap_index_does_not_displace_live_queue_walk(fresh_url: str, kind:
     assert "ix_minion_task_team_status" not in text_plan, text_plan
     assert_index_paths(plan)
     assert _buffers(plan) <= GUARD_BUFFER_BOUND, _buffers(plan)
+
+
+# --- TASK-54: the recursive walk from 12 to 10k live tasks, literal and generic plans ---------
+# Buffers and probes are the assertions; timings are only a loose sanity check. TASK-29: the
+# `ix_minion_task_queue` index is kept for the splitter claim and no candidate plan names it.
+
+NOCACHE = {"prepared_statement_cache_size": 0}  # we PREPARE by hand
+WALK_SEED = """
+INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
+  input_uri, output_uri, priority, status, created_by, created_at)
+SELECT 'old' || (g % 20), 'p', 'n' || g, 'embedding', 'm1', 'fake', 1, 'in', 's3://old/' || g,
+  0, 'SUCCEEDED', 't', now() - interval '30 days' - make_interval(secs => g)
+FROM generate_series(1, {hist}) AS g;
+INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
+  input_uri, output_uri, priority, status, created_by, created_at)
+SELECT 'live' || (g % 20), 'p', 'l' || g, 'embedding', {model}, 'fake', 1, 'in', 's3://l/' || g,
+  {prio}, CASE WHEN g % 10 = 0 THEN 'PENDING' ELSE 'RUNNING' END, 't',
+  now() - make_interval(secs => g)
+FROM generate_series(1, {n}) AS g;
+INSERT INTO minion_subtask (team, project, task_name, subtask_id, status, input_object_key,
+  byte_start, byte_end, first_record, record_count)
+SELECT 'live' || (t % 20), 'p', 'l' || t, s, 'PENDING', 'k', 0, 1, 0, 1
+FROM generate_series(1, {n}) AS t, generate_series(1, {per}) AS s WHERE {pending_where}
+"""
+ANALYZE = ("ANALYZE minion_task", "ANALYZE minion_subtask")
+
+ALL_MODELS = ["m1"]
+TEN_MODEL_SERVED = ["m1", "m2", "m3"]  # tasks spread over m0..m9, this executor serves three
+
+WALK_BUFFER_BOUND = 150  # measured 20-98
+PROBE_BOUND = 15  # measured 12
+Pref = tuple[str | None, str | None, str | None] | None
+
+
+async def seed(
+    conn: AsyncConnection,
+    *,
+    n: int,
+    hist: int = 20_000,
+    per: int = 5,
+    prio: str = "0",
+    model: str = "'m1'",
+    pending_where: str = "true",
+    analyze: bool = True,
+) -> None:
+    await conn.execute(text("TRUNCATE minion_task CASCADE"))
+    sql = WALK_SEED.format(
+        hist=hist, n=n, per=per, prio=prio, model=model, pending_where=pending_where
+    )
+    for stmt in sql.split(";"):
+        if stmt.strip():
+            await conn.execute(text(stmt))
+    if analyze:
+        for stmt in ANALYZE:
+            await conn.execute(text(stmt))
+
+
+def _kwargs(pref: Pref, models: list[str], limit: int) -> dict[str, Any]:
+    return {
+        "engines": [Engine.FAKE],
+        "model_ids": models,
+        "memory_gb": 8.0,
+        "pool": "default",
+        "preference": pref,
+        "limit": limit,
+    }
+
+
+async def explain_both(conn: AsyncConnection, stmt: Select[Any]) -> dict[str, dict[str, Any]]:
+    """EXPLAIN (ANALYZE, BUFFERS) of `stmt` as a literal (custom) plan and as a generic plan."""
+    literal = str(
+        stmt.compile(
+            dialect=postgresql.dialect(),  # type: ignore[no-untyped-call]
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    out = {
+        "literal": _json_plan(
+            await conn.exec_driver_sql("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + literal)
+        )
+    }
+    compiled = stmt.compile(
+        dialect=postgresql.asyncpg.dialect(),  # type: ignore[no-untyped-call]
+        compile_kwargs={"render_postcompile": True},
+    )
+    assert compiled.positiontup is not None
+    values = [compiled.params[name] for name in compiled.positiontup]
+    args = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in values)
+    await conn.exec_driver_sql("SET plan_cache_mode = force_generic_plan")
+    await conn.exec_driver_sql("DEALLOCATE ALL")
+    await conn.exec_driver_sql("PREPARE q AS " + str(compiled))
+    out["generic"] = _json_plan(
+        await conn.exec_driver_sql(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q({args})")
+    )
+    await conn.exec_driver_sql("RESET plan_cache_mode")
+    return out
+
+
+def outline(node: dict[str, Any], depth: int = 0) -> str:
+    """Indented node list of a plan: readable assertion messages."""
+    line = (
+        "  " * depth
+        + f"{node['Node Type']} {node.get('Relation Name', '')} {node.get('Index Name', '')}"
+        + f" rows={node.get('Actual Rows')}x{node.get('Actual Loops')}\n"
+    )
+    return line + "".join(outline(c, depth + 1) for c in node.get("Plans", []))
+
+
+def check_walk(
+    label: str, plan: dict[str, Any], n: int, *, buffers: int = WALK_BUFFER_BOUND
+) -> None:
+    text_plan = json.dumps(plan)
+    assert "ix_minion_task_queue" not in text_plan, (label, outline(plan["Plan"]))  # TASK-29
+    # At 12 live tasks a generic plan may use a bitmap per step on the tiny set (<= 34 buffers
+    # measured): the shape is asserted from 200 up, the bounds always.
+    if n >= 200:
+        assert_index_paths(plan, pending_index=False)
+    got = _buffers(plan)
+    probes = _subtask_probes(plan)
+    print(f"{label}: buffers={got} probes={probes} ms={plan['Execution Time']:.2f}")
+    assert got <= buffers, (label, got)
+    assert probes <= PROBE_BOUND, (label, probes)
+    assert plan["Execution Time"] < 100, (label, plan["Execution Time"])
+
+
+async def assert_rows_equal_oracle(url: str, **kw: Any) -> None:
+    eng = create_async_engine(url)
+    try:
+        async with eng.connect() as conn:
+            old_kw = {k: v for k, v in kw.items() if k != "model_ids"}
+            old = (
+                await conn.execute(old_candidates_stmt(model_ids=list(kw["model_ids"]), **old_kw))
+            ).all()
+            new = (await conn.execute(candidates_stmt(**kw))).all()
+        assert [tuple(r) for r in new] == [tuple(r) for r in old]
+        assert old, "the case must return rows"
+    finally:
+        await eng.dispose()
+
+
+SCENARIOS = {
+    "mixed": {"prio": "g % 3", "model": "'m1'"},
+    "same": {"prio": "0", "model": "'m1'"},
+    "ten_models": {"prio": "g % 3", "model": "'m' || (g % 10)"},
+}
+
+
+@pytest.mark.parametrize("n", [12, 200, 1_000, 2_000, 5_000, 10_000])
+@pytest.mark.parametrize("scenario", list(SCENARIOS))
+async def test_walk_plan_shape_and_bounds(fresh_url: str, n: int, scenario: str) -> None:
+    models = TEN_MODEL_SERVED if scenario == "ten_models" else ALL_MODELS
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(
+                conn,
+                n=n,
+                prio=SCENARIOS[scenario]["prio"],
+                model=SCENARIOS[scenario]["model"],
+            )
+            kw = _kwargs(None, models, 16)
+            plans = await explain_both(conn, candidates_stmt(**kw))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        check_walk(f"{scenario} n={n} {kind}", plan, n)
+    await assert_rows_equal_oracle(fresh_url, **kw)
+
+
+async def test_walk_at_10k_with_40k_history(fresh_url: str) -> None:
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(conn, n=10_000, hist=40_000, prio="g % 3")
+            plans = await explain_both(conn, candidates_stmt(**_kwargs(None, ALL_MODELS, 16)))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        check_walk(f"h40000 n=10000 {kind}", plan, 10_000)
+
+
+async def test_walk_all_drained_costs_one_probe_per_live_task(fresh_url: str) -> None:
+    n = 10_000
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(conn, n=n, pending_where="false")
+            plans = await explain_both(conn, candidates_stmt(**_kwargs(None, ALL_MODELS, 16)))
+            rows = (await conn.execute(text("SELECT 1"))).all()
+            assert rows
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        probes, got = _subtask_probes(plan), _buffers(plan)
+        print(f"drained {kind}: buffers={got} probes={probes} ms={plan['Execution Time']:.1f}")
+        assert n <= probes <= n + 20, probes  # inherent: one pending check per live task
+        assert got <= n // 10 + 50, got  # measured 654
+        assert any(x["Node Type"] == "Recursive Union" for x in _nodes(plan["Plan"]))
+        assert "ix_minion_task_queue" not in json.dumps(plan)
+
+
+async def test_walk_with_team_preference(fresh_url: str) -> None:
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(conn, n=10_000, prio="g % 3")
+            kw = _kwargs(("live3", None, None), ALL_MODELS, 16)
+            plans = await explain_both(conn, candidates_stmt(**kw))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        check_walk(f"preference n=10000 {kind}", plan, 10_000)
+    await assert_rows_equal_oracle(fresh_url, **kw)
+
+
+async def test_walk_window_256_with_one_pending_per_task(fresh_url: str) -> None:
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(conn, n=10_000, per=1)
+            kw = _kwargs(None, ALL_MODELS, 256)
+            plans = await explain_both(conn, candidates_stmt(**kw))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        probes, got = _subtask_probes(plan), _buffers(plan)
+        print(f"window256 {kind}: buffers={got} probes={probes} ms={plan['Execution Time']:.1f}")
+        assert probes <= 3 * 256, probes  # measured 768: three probes per contributing task
+        assert got <= 3_500, got
+        assert_index_paths(plan, pending_index=False)
+    await assert_rows_equal_oracle(fresh_url, **kw)
+
+
+@pytest.mark.parametrize("live_at_analyze", [0, 1])
+async def test_walk_survives_stale_statistics(fresh_url: str, live_at_analyze: int) -> None:
+    """Statistics describe an (almost) empty queue, then 10k live tasks arrive without ANALYZE
+    (autovacuum off): the plan must stay the walk."""
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            for table in ("minion_task", "minion_subtask"):
+                await conn.execute(text(f"ALTER TABLE {table} SET (autovacuum_enabled = false)"))
+            await seed(conn, n=live_at_analyze)  # 20k history, also ANALYZEs
+            await seed_without_analyze(conn)
+            kw = _kwargs(None, ALL_MODELS, 16)
+            plans = await explain_both(conn, candidates_stmt(**kw))
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        check_walk(f"stale({live_at_analyze}) n=10000 {kind}", plan, 10_000, buffers=250)
+
+
+async def seed_without_analyze(conn: AsyncConnection) -> None:
+    """10k more live tasks (own keys 'z..') with 5 pending subtasks each; no ANALYZE."""
+    sql = WALK_SEED.format(
+        hist=0, n=10_000, per=5, prio="g % 3", model="'m1'", pending_where="true"
+    )
+    sql = sql.replace("'l' || g", "'z' || g").replace("'l' || t", "'z' || t")
+    sql = sql.replace("'s3://l/' || g", "'s3://z/' || g")
+    for stmt in sql.split(";"):
+        if stmt.strip():
+            await conn.execute(text(stmt))
+
+
+async def test_full_claim_statement_walks_in_the_generic_plan(fresh_url: str) -> None:
+    eng = create_async_engine(fresh_url)
+    captured: list[tuple[str, Any]] = []
+
+    @event.listens_for(eng.sync_engine, "before_cursor_execute")
+    def _capture(
+        conn: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool
+    ) -> None:
+        if "WITH RECURSIVE" in statement:
+            captured.append((statement, parameters))
+
+    sm = async_sessionmaker(eng, expire_on_commit=False)
+    raw = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with raw.connect() as conn:
+            await seed(conn, n=10_000)
+        ((principal, _),) = await make_executors(sm, 1)
+        for _ in range(7):  # > 5 executions: PG may switch to the generic plan if cheaper
+            async with sm() as s:
+                res = await claim(
+                    s,
+                    principal.executor_id,
+                    engines=[Engine.FAKE],
+                    model_ids=["m1"],
+                    memory_gb=8.0,
+                    pool="default",
+                    preference=None,
+                    window=16,
+                )
+                assert res.won is not None
+                await s.rollback()
+        stmt, params = captured[-1]
+        args = ", ".join(f"'{v}'" if not isinstance(v, int | float) else str(v) for v in params)
+        async with raw.connect() as conn:
+            for mode in ("force_custom_plan", "force_generic_plan"):
+                await conn.exec_driver_sql(f"SET plan_cache_mode = {mode}")
+                await conn.exec_driver_sql("BEGIN")
+                try:
+                    await conn.exec_driver_sql(f"PREPARE cq AS {stmt}")
+                    plan = _json_plan(
+                        await conn.exec_driver_sql(
+                            f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE cq({args})"
+                        )
+                    )
+                finally:
+                    await conn.exec_driver_sql("ROLLBACK")
+                    await conn.exec_driver_sql("DEALLOCATE ALL")
+                got = _buffers(plan)
+                print(f"claim {mode}: buffers={got} ms={plan['Execution Time']:.2f}")
+                assert any(x["Node Type"] == "Recursive Union" for x in _nodes(plan["Plan"]))
+                assert "ix_minion_task_live_queue" in json.dumps(plan)
+                assert got <= 250, (mode, got)  # measured 113-137
+    finally:
+        await eng.dispose()
+        await raw.dispose()
+
+
+def _splitter_select() -> Select[Any]:
+    """The splitter claim's SELECT (repositories/tasks.py claim_splitting), same predicates."""
+    return (
+        select(Task)
+        .where(
+            Task.status == TaskStatus.SPLITTING.value,
+            or_(Task.next_split_at.is_(None), Task.next_split_at <= func.now()),
+        )
+        .order_by(Task.next_split_at.asc().nulls_first(), Task.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True, key_share=True)
+    )
+
+
+async def test_task29_splitter_claim_needs_ix_minion_task_queue(fresh_url: str) -> None:
+    """TASK-29 evidence: the index is kept because the splitter poll uses it (O(SPLITTING))."""
+    eng = create_async_engine(fresh_url, isolation_level="AUTOCOMMIT", connect_args=NOCACHE)
+    try:
+        async with eng.connect() as conn:
+            await seed(conn, n=10_000, hist=40_000)
+            await conn.execute(
+                text(
+                    "INSERT INTO minion_task (team, project, task_name, type, model_id, engine,"
+                    " model_memory_gb, input_uri, output_uri, status, created_by)"
+                    " SELECT 'sp', 'p', 's' || g, 'embedding', 'm1', 'fake', 1, 'in',"
+                    " 's3://sp/' || g, 'SPLITTING', 't' FROM generate_series(1, 3) g"
+                )
+            )
+            await conn.execute(text("ANALYZE minion_task"))
+            await conn.exec_driver_sql("BEGIN")
+            try:
+                plans = await explain_both(conn, _splitter_select())
+            finally:
+                await conn.exec_driver_sql("ROLLBACK")
+    finally:
+        await eng.dispose()
+    for kind, plan in plans.items():
+        got = _buffers(plan)
+        print(f"splitter {kind}: buffers={got} ms={plan['Execution Time']:.2f}")
+        assert "ix_minion_task_queue" in json.dumps(plan), (kind, json.dumps(plan))
+        assert got <= 20, (kind, got)  # measured 6

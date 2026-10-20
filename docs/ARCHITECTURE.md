@@ -404,23 +404,31 @@ Executor ─POST /executor/acquire {engines, budget}─▶ Server
 Notes:
 - The unique constraint is the *only* mutual-exclusion mechanism **[paper]**. The candidate SELECT is
   deliberately unlocked; losing an insert race is cheap.
-- Candidate query is index-driven in two steps (TASK-7.4.2; window = MINION_ACQUIRE_WINDOW, default 16), O(window + live tasks) regardless of queue
-  length: eligible live tasks are walked in queue order on the partial index
-  `ix_minion_task_live_queue (priority DESC, created_at, team, project, task_name) WHERE status IN
-  ('PENDING','RUNNING')`, and for each a `LATERAL ... ORDER BY subtask_id LIMIT window` range scan runs on
-  `ix_minion_subtask_pending (team, project, task_name, subtask_id) WHERE status = 'PENDING'`; the
-  outer `ORDER BY` (same keys + `subtask_id`) `LIMIT window` yields exactly the FR-22 order of the old
-  single join (the task key is unique, so the order is total and the global top window holds at most window
-  rows per task, each within that task's top window). Status values are SQL literals, not bind
-  parameters, so asyncpg's generic plans still match the partial-index predicates. Residual cost:
-  ~1 us / ~3 buffers per eligible live task that has no PENDING subtasks ahead of the first match
-  (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms). Live tasks that sort ahead but
-  fail the model / engine / memory / pool filters (heap Filter, not Index Cond) cost the same walk and
-  never a subtask probe; their number is bounded by the per-team live-task cap (FR-9, ADR-0020):
-  extra cost <= sum over teams of cap x cost per filtered task. With 5,000 such tasks the planner
-  bitmap-scans the ~5,012 live tasks on `ix_minion_task_queue`, filters them in the heap and sorts the
-  12 runnable ones: ~151 buffers, 2 subtask probes, <1 ms
-  (`test_candidate_bounded_with_5k_unrunnable_live_tasks`).
+- Candidate query is a recursive ordered walk (TASK-54, ADR-0021; window = MINION_ACQUIRE_WINDOW,
+  default 16). `WITH RECURSIVE walk` visits the eligible live tasks in queue order, one `LIMIT 1` index
+  step per task, on the partial expression index `ix_minion_task_live_queue ((-priority), created_at,
+  team, project, task_name) WHERE status IN ('PENDING','RUNNING')` (migration 0015; `-priority` makes
+  every column ascend, so the cursor is one row-compare Index Cond:
+  `(-priority, created_at, team, project, task_name) > (cursor)`). A step skips tasks without a PENDING
+  subtask (a per-task probe `ORDER BY subtask_id LIMIT 1`), adds `min(window, pending count)` to a running
+  total and the recursion stops once the total reaches the window, so no plan can read every live task and
+  sort them (the former bitmap-plus-sort flip from about 1k live tasks, 310 buffers / 5-13 ms at 10k).
+  The final SELECT takes each visited task's first `window` PENDING subtasks (`LATERAL ... ORDER BY
+  subtask_id LIMIT window`) and sorts by the FR-22 keys + `subtask_id` `LIMIT window`: the task key is
+  unique so the order is total, and the visited tasks hold the global first window rows (same order as the
+  old single join; `test_new_statement_matches_old_order` is the oracle). All LIMITs and status values are
+  SQL literals (no 10 % LIMIT heuristic in generic plans, partial-index predicates always match). Every
+  probe has an `ORDER BY` so the planner never seq-scans subtasks or flattens an `EXISTS` into a semi-join.
+  Measured at 10k live tasks (20k or 40k finished history), literal and generic plans alike: 96 buffers,
+  12 subtask probes, ~0.3 ms (also under stale statistics, team preference, ten models); a full drain of
+  10k pending-free live tasks costs one probe each (291 buffers, ~7 ms, bounded by teams x the FR-9 cap);
+  window 256 with one pending subtask per task: 3074 buffers, ~2 ms
+  (`test_walk_*` in `test_candidate_index_path.py`). Live tasks that fail the model / engine / memory /
+  pool filters (heap Filter) cost one index entry each and never a subtask probe; their number is bounded
+  by the per-team live-task cap (FR-9, ADR-0020). 5,000 such tasks: ~161 buffers, 3 subtask probes, <1 ms
+  (`test_candidate_bounded_with_5k_unrunnable_live_tasks`). `ix_minion_task_queue` is no longer used by
+  acquire; it stays for the splitter claim (`status = 'SPLITTING'`, 5 buffers vs a full
+  `ix_minion_task_team_status` scan without it) and the cancel sweep (TASK-29).
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
   paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).
 
