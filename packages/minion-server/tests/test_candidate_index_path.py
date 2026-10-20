@@ -267,7 +267,11 @@ def assert_index_paths(plan: dict[str, Any], *, live_index: bool = True) -> None
     text_plan = json.dumps(plan)
     assert "ix_minion_subtask_pending" in text_plan, text_plan
     if live_index:
-        assert "ix_minion_task_live_queue" in text_plan, text_plan
+        # TASK-30: ix_minion_task_team_live (same predicate + SPLITTING) may serve a small live set
+        # through a bitmap scan; either way no table scan of minion_task.
+        assert (
+            "ix_minion_task_live_queue" in text_plan or "ix_minion_task_team_live" in text_plan
+        ), text_plan
     for n in nodes:
         if n["Node Type"] == "Seq Scan":
             assert n.get("Relation Name") != "minion_subtask", text_plan
@@ -354,3 +358,117 @@ async def test_candidate_buffers_bounded_with_many_empty_live_tasks(fresh_url: s
 
 
 BUFFER_BOUND = 15_000
+
+
+# --- TASK-30 AC#2: 5,000 live tasks no executor here can run ------------------------------------
+
+UNRUNNABLE = 5_000
+UNRUNNABLE_SEED = """
+INSERT INTO minion_task (team, project, task_name, type, model_id, engine, model_memory_gb,
+  input_uri, output_uri, allowed_pool, priority, status, created_by, created_at)
+SELECT 'junk' || (g % 10), 'p', 'u' || g, 'embedding',
+  CASE WHEN g % 4 = 3 THEN 'm-removed' ELSE 'm1' END,
+  CASE WHEN g % 4 = 1 THEN 'ollama' ELSE 'fake' END,
+  CASE WHEN g % 4 = 0 THEN 512 ELSE 1 END,
+  'in', 's3://u/' || g,
+  CASE WHEN g % 4 = 2 THEN 'nowhere' ELSE NULL END,
+  1000, 'RUNNING', 't', now() - interval '1 day' - make_interval(secs => g)
+FROM generate_series(1, {n}) AS g;
+INSERT INTO minion_subtask (team, project, task_name, subtask_id, status, input_object_key,
+  byte_start, byte_end, first_record, record_count)
+SELECT 'junk' || (t % 10), 'p', 'u' || t, s, 'PENDING', 'k', 0, 1, 0, 1
+FROM generate_series(1, {n}) AS t, generate_series(1, 3) AS s;
+ANALYZE minion_task;
+ANALYZE minion_subtask;
+"""
+# Measured: 110 buffers, 2 subtask probes, ~1 ms (both plan kinds; PG16 bitmap-scans the 5,012 live
+# tasks on ix_minion_task_team_live, filters them in the heap and sorts the 12 runnable ones).
+# Bound = ~1.8x measured, so a regression to one subtask probe per junk task (>= 5,000 x 3
+# buffers) or a Seq Scan over the subtasks fails loudly.
+UNRUNNABLE_BUFFER_BOUND = 200
+UNRUNNABLE_SUBTASK_PROBES = 12  # one per eligible (runnable) task at most, never per junk task
+
+
+async def _unrunnable_plans(url: str) -> dict[str, dict[str, Any]]:
+    eng = create_async_engine(url, isolation_level="AUTOCOMMIT")
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        async with eng.connect() as conn:
+            await _seed_big(conn, 100)
+            for stmt in UNRUNNABLE_SEED.format(n=UNRUNNABLE).split(";"):
+                if stmt.strip():
+                    await conn.execute(text(stmt))
+            sql = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + _literal_sql(None)
+            runs = [_json_plan(await conn.execute(text(sql))) for _ in range(5)]
+            runs.sort(key=lambda p: p["Execution Time"])
+            out["analyze"] = runs[2]  # median of 5
+            prep, args = _prepared(None)
+            await conn.execute(text("SET plan_cache_mode = force_generic_plan"))
+            await conn.exec_driver_sql(prep)
+            out["generic"] = _json_plan(
+                await conn.exec_driver_sql(
+                    f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q({args})"
+                )
+            )
+    finally:
+        await eng.dispose()
+    return out
+
+
+def _subtask_probes(plan: dict[str, Any]) -> int:
+    return sum(
+        int(n.get("Actual Loops", 1))
+        for n in _nodes(plan["Plan"])
+        if n.get("Relation Name") == "minion_subtask"
+        or n.get("Index Name") == ("ix_minion_subtask_pending")
+    )
+
+
+@pytest.mark.parametrize("kind", ["analyze", "generic"])
+async def test_candidate_bounded_with_5k_unrunnable_live_tasks(fresh_url: str, kind: str) -> None:
+    plan = (await _unrunnable_plans(fresh_url))[kind]
+    # No Seq Scan / Sort over minion_subtask; the 5k junk tasks sort first but are filtered out.
+    assert_index_paths(plan, live_index=False)
+    probes = _subtask_probes(plan)
+    buffers = _buffers(plan)
+    print(f"TASK-30 {kind}: probes={probes} buffers={buffers} ms={plan['Execution Time']:.1f}")
+    assert probes <= UNRUNNABLE_SUBTASK_PROBES, probes  # never one probe per unrunnable task
+    assert buffers <= UNRUNNABLE_BUFFER_BOUND, buffers
+    assert plan["Execution Time"] < 50, plan["Execution Time"]  # loose; NF-1 budget is 200 ms
+
+
+async def test_candidate_rows_equal_oracle_and_claim_wins_with_5k_unrunnable(
+    fresh_url: str,
+) -> None:
+    from minion_server.repositories.acquisition import claim
+
+    from conftest import make_executors
+
+    eng = create_async_engine(fresh_url)
+    sm = async_sessionmaker(eng, expire_on_commit=False)
+    try:
+        async with eng.connect() as raw:
+            raw = await raw.execution_options(isolation_level="AUTOCOMMIT")
+            await _seed_big(raw, 100)
+            for stmt in UNRUNNABLE_SEED.format(n=UNRUNNABLE).split(";"):
+                if stmt.strip():
+                    await raw.execute(text(stmt))
+        kwargs: dict[str, Any] = {
+            "engines": [Engine.FAKE],
+            "model_ids": ["m1"],
+            "memory_gb": 8.0,
+            "pool": "default",
+            "preference": None,
+        }
+        async with sm() as s:
+            old = (await s.execute(old_candidates_stmt(**kwargs, limit=16))).all()
+            new = (await s.execute(candidates_stmt(**kwargs, limit=16))).all()
+        assert [tuple(r) for r in new] == [tuple(r) for r in old]
+        assert len(new) == 16 and {r[0] for r in new} == {"big"}  # none of the junk
+        ((principal, _),) = await make_executors(sm, 1)
+        async with sm() as s:
+            res = await claim(s, principal.executor_id, **kwargs, window=16)
+            await s.rollback()
+        assert res.won is not None
+    finally:
+        await eng.dispose()

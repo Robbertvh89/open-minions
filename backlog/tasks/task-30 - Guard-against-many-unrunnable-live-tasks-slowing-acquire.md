@@ -19,8 +19,8 @@ Security LOW from TASK-7.4.2: the live-task walk filters engine/model/memory/poo
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A per-team live-task cap or submit-time feasibility check exists with a clear error code
-- [ ] #2 Test: 5k unrunnable tasks don't push acquire beyond a stated bound
+- [x] #1 A per-team live-task cap or submit-time feasibility check exists with a clear error code
+- [x] #2 Test: 5k unrunnable tasks don't push acquire beyond a stated bound
 <!-- AC:END -->
 
 ## Implementation Plan

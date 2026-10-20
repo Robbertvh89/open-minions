@@ -393,7 +393,12 @@ Notes:
   rows per task, each within that task's top window). Status values are SQL literals, not bind
   parameters, so asyncpg's generic plans still match the partial-index predicates. Residual cost:
   ~1 us / ~3 buffers per eligible live task that has no PENDING subtasks ahead of the first match
-  (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms).
+  (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms). Live tasks that sort ahead but
+  fail the model / engine / memory / pool filters (heap Filter, not Index Cond) cost the same walk and
+  never a subtask probe; their number is bounded by the per-team live-task cap (FR-9, ADR-0020):
+  extra cost <= sum over teams of cap x cost per filtered task. With 5,000 such tasks the planner
+  bitmap-scans the live set on `ix_minion_task_team_live`, filters in the heap and sorts the runnable
+  ones: 110 buffers, 2 subtask probes, ~1 ms median (`test_candidate_bounded_with_5k_unrunnable_live_tasks`).
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
   paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).
 
@@ -608,6 +613,8 @@ race, stale-acquirement rejection, splitter restart.
 - `minion_subtask_acquirement`: `ix_minion_subtask_acquirement_acquired_at` on `acquired_at` serves the watchdog max-lease scan (migration 0008); `ix_minion_subtask_acquirement_executor_id` on `executor_id` serves the per-executor open-acquirement count of the acquire path and the fleet join (migration 0012).
 - `minion_task`: index on `(status, priority DESC, created_at)`.
 - `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
+
+- `minion_task`: `ix_minion_task_team_live` on `(team) WHERE status IN ('SPLITTING','PENDING','RUNNING')` serves the bounded per-team live count of the create cap (migration 0014, ADR-0020).
 
 - `minion_task_counter` (ADR-0015, migration 0011): PK `(team, project, task_name, shard)`, `succeeded` / `failed` / `cancelled` (migration 0013) per shard, `shard = subtask_id % 16`; the task counters are the sum over shards (`minion_ro.task` still exposes `succeeded_subtasks` / `failed_subtasks`). A completion upserts one shard row instead of updating the task row; the terminal task status is set by a post-commit settle (and healed by the watchdog), so `minion_task.updated_at` no longer moves per completion.
 

@@ -79,6 +79,13 @@ that sit idle most of the day. open-minions pools those idle GPUs into a *virtua
 - FR-7. Users can query task status, per-subtask status, progress counts, and the output location **[paper]**.
 - FR-8. Users can cancel a task; pending subtasks become `CANCELLED`, running ones are told to stop on
   their next heartbeat **[ours]**. Status: implemented (TASK-3.2).
+- FR-9. A team may hold at most `MINION_MAX_LIVE_TASKS_PER_TEAM` (default 500, 1..100000) live tasks
+  (`SPLITTING`, `PENDING`, `RUNNING`). Task creation above it answers `429 TOO_MANY_LIVE_TASKS` (no
+  `Retry-After`; slots free as tasks finish or are cancelled), for REST and UI alike. A team can override
+  the limit with `teams.<slug>.max_live_tasks` in the API keys file (S-1, live-reloaded). The limit is
+  checked in the create transaction under a per-team advisory lock, so it is exact across workers and
+  replicas (NF-5); the check runs after validation, so a team at its limit gets 429 even for a duplicate
+  name. It bounds the acquire candidate walk over tasks no executor can run (NF-1; ADR-0020) **[ours]**.
 
 ### 4.2 Execution (Executor)
 - FR-10. Executor registers with the server using a pre-issued token and reports host capabilities
@@ -380,6 +387,8 @@ and all of §6.2 (including `presence`, TASK-5.1); TASK-3.1 adds `heartbeat` and
 
 **Executor endpoint rate limits (NF-5).** One executor calling `register`, `acquire`, `presence` or `PUT /preference` closer together than `MINION_REGISTER_MIN_INTERVAL_S` (5), `MINION_ACQUIRE_MIN_INTERVAL_S` (0.2), `MINION_PRESENCE_MIN_INTERVAL_S` (5) or `MINION_PREFERENCE_MIN_INTERVAL_S` (1; `0` disables each) gets `429 TOO_MANY_REQUESTS` with `Retry-After` (whole seconds, >= 1), checked after authentication and before any DB write or acquisition; a rejected call changes nothing. In-memory, per replica, bounded LRU (`MINION_RATE_LIMIT_MAX_ENTRIES`, 40 000); per-IP limits stay at the reverse proxy. A healthy executor never trips them: idle acquires are >= 5 s apart (back-off 10 s base, jitter 0.5..1), presence goes out on a pause, a changed reason/budget or every `--presence-interval` (60 s), the executor keeps at least `MINION_EXECUTOR_ACQUIRE_PACE_S` (0.4, 0 or >= 0.2; the 0.2 s margin over the server interval absorbs network jitter) between acquire calls by sleeping only the remainder, so instant subtasks never trip the limit; a fast release/flap can still see a 429 (handled as back-off). The executor waits at least `Retry-After` (capped at 300 s), also across a pause. `minion-executor prefer --server URL (--team T [--project P] [--task-name N] | --clear)` calls `PUT /executor/preference` (G4/FR-22; exit 2 on bad input, missing token or an insecure URL).
 
+**Live-task cap (FR-9, TASK-30).** `POST /tasks` (and `POST /ui/tasks`) above the team's live-task limit answers `429 TOO_MANY_LIVE_TASKS` with no `Retry-After` and inserts nothing; the message never echoes payload. `minion submit` exits 2 with the code in the message.
+
 **Heartbeat rate limit.** Beats for one acquirement closer together than `MINION_HEARTBEAT_MIN_INTERVAL_S` (default 1 s, `0` disables) get `429 TOO_MANY_HEARTBEATS` with `Retry-After`; the beat is not recorded. The first beat after a claim (the ack) is exempt from the limit (ADR-0014). Executors treat 429 as non-fatal. Per-IP limiting stays a reverse-proxy concern.
 
 **Overload shedding (TASK-7.4.4).** When the server is saturated it fails fast and safely instead of timing out: (a) a request that waits more than `MINION_DB_POOL_TIMEOUT_S` (5, 0.5..30) for a DB connection, on any endpoint, answers `503 SERVER_BUSY` with a jittered `Retry-After` (never 500); (b) at most `MINION_ACQUIRE_CONCURRENCY` (default pool + overflow - 4, min 1) acquires run per process, the rest answer `503 SERVER_BUSY` + `Retry-After` before any candidate work, which keeps connections free for heartbeat / complete / release; (c) an acquire that has used `MINION_ACQUIRE_DEADLINE_S` (10, 1..20, always below the executor's 30 s HTTP timeout) by the time it holds its connection answers `503 ACQUIRE_DEADLINE` + `Retry-After` before the claim INSERT (the deadline clock starts at request arrival; the claim statement itself is cancelled by `statement_timeout` at the deadline, same 503), so no acquirement is committed for a client that has already given up; `MINION_DB_POOL_TIMEOUT_S` + `MINION_ACQUIRE_DEADLINE_S` must be <= 25 s; one executor may have at most 2 acquires in flight (429); (d) a token never seen by this process is looked up on a separate auth pool (`MINION_DB_AUTH_POOL_SIZE`, 2, no overflow); waiting more than `MINION_AUTH_LOOKUP_TIMEOUT_S` (1.0, 0.1..5) for it answers `503 SERVER_BUSY` + `Retry-After` (counted in `minion_executor_auth_total{outcome=busy}`, not logged per request), so a flood of garbage bearer tokens cannot take connections owner operations need (ADR-0018); (e) an executor holding `MINION_MAX_OPEN_ACQUIREMENTS` acquirements answers `429 TOO_MANY_ACQUIREMENTS` + `Retry-After: 30` (FR-23, counted as `minion_acquire_total{outcome="capped"}`), and a missing, revoked or rotated-away executor row is also re-checked in every claim round and answers `401` (ADR-0019). Executors treat a 503 with `Retry-After` like a 429: acquire waits at least that long; `complete` waits it between retries without using up its retry count, bounded by `MINION_EXECUTOR_COMPLETE_SHED_BUDGET_S` (120, >0..300, heartbeats continue meanwhile); past the budget the executor releases the subtask with code `SERVER_BUSY` (a shed 503 committed nothing; RELEASED is not budget-counted, `MINION_RELEASE_LIMIT` bounds a livelock, the re-run is idempotent), falling back to the watchdog only if the release fails (no COMPLETE_FAILED).
@@ -444,9 +453,10 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
 - S-1. Executors run on personal work laptops: data confidentiality is the main risk **[paper]**.
   Mitigation: deploy per team/org with dedicated DB and isolated executor pools **[paper]**; tasks may be
   restricted to an executor pool via `allowed_pool` **[ours]**. Per-team policy in the API keys file
-  (`teams: {slug: {default_pool, allowed_pools}}`): a task without `allowed_pool` gets the team default,
+  (`teams: {slug: {default_pool, allowed_pools, max_live_tasks}}`): a task without `allowed_pool` gets the team default,
   a pool outside `allowed_pools` is `403 POOL_NOT_ALLOWED`, and a team with `allowed_pools` but no default
-  needs an explicit pool (`422 POOL_REQUIRED`). Teams without a policy are unrestricted.
+  needs an explicit pool (`422 POOL_REQUIRED`). Teams without a policy are unrestricted. `max_live_tasks`
+  (1..100000) overrides the global live-task cap for that team (FR-9) and does not affect pool policy.
 - S-2. Executors never hold DB or S3 credentials; only per-subtask presigned URLs (TTL ≤ 1 h, refreshed
   via heartbeat) **[ours]**. The input GET URL signs the subtask's `Range: bytes=byte_start-(byte_end-1)` header, so
   on backends that enforce SigV4 signed headers (AWS S3, MinIO) it can read only that slice (403 to a
