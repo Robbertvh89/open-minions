@@ -174,7 +174,10 @@ async def test_stale_token_hash_is_refused_pre_claim(
     async def noop(*a: Any, **kw: Any) -> None:
         return None
 
+    seen: list[Any] = []
+
     async def stale(*a: Any, **kw: Any) -> bool:
+        seen.append(a[2] if len(a) > 2 else kw.get("token_hash"))
         return False  # the row no longer carries this digest (rotated away / revoked)
 
     async def boom(*a: Any, **kw: Any) -> Any:
@@ -194,3 +197,4 @@ async def test_stale_token_hash_is_refused_pre_claim(
             storage=None,  # type: ignore[arg-type]
             models={"m": None},  # type: ignore[dict-item]
         )
+    assert seen == ["stale"]  # the lock filters on the principal's own digest

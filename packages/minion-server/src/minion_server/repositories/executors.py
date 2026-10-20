@@ -153,7 +153,7 @@ async def touch(
     token_hash: str,
 ) -> bool:
     """Acquire-time refresh of the reported budget and liveness. False = no live executor row
-    with this id (and token, when given): revoked or rotated away, the caller must refuse."""
+    with this id and token: revoked or rotated away, the caller must refuse."""
     result = await session.execute(
         update(Executor)
         .where(
