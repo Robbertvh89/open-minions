@@ -183,15 +183,16 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 
 def create_app_from_env() -> FastAPI:
     """uvicorn factory for workers > 1: fresh interpreters, so configure JSON logs first."""
-    configure_logging()
-    return create_app()
+    settings = ServerSettings()
+    configure_logging(access_log=settings.server_access_log)
+    return create_app(settings)
 
 
 def main() -> None:
     import uvicorn
 
-    configure_logging()
     settings = ServerSettings()
+    configure_logging(access_log=settings.server_access_log)
     if settings.connection_budget >= settings.connection_limit:
         structlog.get_logger().warning(
             "db_connection_budget_exceeded",

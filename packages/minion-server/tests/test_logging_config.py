@@ -180,10 +180,32 @@ def test_main_disables_access_log_by_default_and_keeps_json_config(
     _env(monkeypatch)
     seen: dict[str, object] = {}
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: seen.update(kw))
-    monkeypatch.setattr(app_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(app_module, "configure_logging", lambda **_: None)
     app_module.main()
     assert seen["access_log"] is False
     assert seen["log_config"] is None
     monkeypatch.setenv("MINION_SERVER_ACCESS_LOG", "true")
     app_module.main()
     assert seen["access_log"] is True
+
+
+@pytest.mark.parametrize("access_log", [False, True])
+def test_worker_startup_sequence_honours_access_log_setting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], access_log: bool
+) -> None:
+    """Replays what a uvicorn worker does: Config.configure_logging() then load() -> factory."""
+    _env(monkeypatch)
+    monkeypatch.setenv("MINION_SERVER_ACCESS_LOG", "true" if access_log else "false")
+    config = uvicorn.Config(
+        "minion_server.app:create_app_from_env",
+        factory=True,
+        log_config=None,
+        access_log=access_log,
+    )
+    config.configure_logging()
+    config.load()
+    access = logging.getLogger("uvicorn.access")
+    assert access.hasHandlers() is access_log
+    if access_log:
+        access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4", "GET", "/x", "1.1", 200)
+        assert [r["event"] for r in _lines(capsys)] == ['1.2.3.4 - "GET /x HTTP/1.1" 200']

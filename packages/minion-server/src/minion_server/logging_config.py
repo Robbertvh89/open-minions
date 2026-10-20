@@ -31,8 +31,12 @@ class _StripQueryFilter(logging.Filter):
         return True
 
 
-def configure_logging(level: int = logging.INFO) -> None:
-    """Route structlog and stdlib logging (uvicorn, sqlalchemy) to JSON on stdout. Idempotent."""
+def configure_logging(level: int = logging.INFO, *, access_log: bool = True) -> None:
+    """Route structlog and stdlib logging (uvicorn, sqlalchemy) to JSON on stdout. Idempotent.
+
+    With `access_log=False`, `uvicorn.access` stays detached from root: uvicorn's protocols emit
+    access lines whenever that logger `hasHandlers()`, so propagating would re-enable them.
+    """
     structlog.configure(
         processors=[*_SHARED, structlog.processors.JSONRenderer()],
         logger_factory=structlog.PrintLoggerFactory(sys.stdout),
@@ -61,5 +65,7 @@ def configure_logging(level: int = logging.INFO) -> None:
         lg.propagate = True
         lg.setLevel(logging.NOTSET)
     access = logging.getLogger("uvicorn.access")
+    if not access_log:
+        access.propagate = False
     if not any(isinstance(f, _StripQueryFilter) for f in access.filters):
         access.addFilter(_StripQueryFilter())
