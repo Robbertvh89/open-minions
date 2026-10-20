@@ -114,13 +114,12 @@ async def test_acquire_outcome_counter(fresh_url: str) -> None:
 async def test_exhausted_acquire_counts_as_exhausted_not_empty(
     fresh_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from minion_server.services import acquisition
+    from minion_server.repositories import acquisition as repo
 
-    async def exhausted(*_a: Any, trace: Any = None, **_k: Any) -> None:
-        trace.exhausted = True  # as the service does when every round lost the race
-        return None
+    async def lost(*_a: Any, **_k: Any) -> repo.Claim:
+        return repo.Claim(3)  # work exists, the pick always loses the race
 
-    monkeypatch.setattr(acquisition, "acquire", exhausted)
+    monkeypatch.setattr(repo, "claim", lost)
     cfg = _settings(fresh_url).model_copy(update={"metrics_enabled": True})
     app = create_app(cfg)
     async with (

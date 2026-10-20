@@ -138,6 +138,36 @@ async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> N
     assert ev["rounds"] == svc.MAX_ROUNDS and "executor_id" not in ev
 
 
+async def test_preferred_pass_exhausted_then_fifo_empty_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def live(*a: Any, **kw: Any) -> bool:
+        return True
+
+    async def pref(*a: Any, **kw: Any) -> object:
+        return object()  # a preference exists -> two passes
+
+    async def claim(*a: Any, preference: Any = None, **kw: Any) -> repo.Claim:
+        return repo.Claim(3) if preference is not None else repo.Claim(0)
+
+    monkeypatch.setattr(executors_repo, "touch", live)
+    monkeypatch.setattr(executors_repo, "get_preference", pref)
+    monkeypatch.setattr(repo, "claim", claim)
+    monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
+    monkeypatch.setattr(repo, "count_open_acquirements", _zero)
+    trace = svc.AcquireTrace()
+    got = await svc.acquire(
+        _FakeSession(),  # type: ignore[arg-type]
+        ExecutorPrincipal(uuid.uuid4(), "o", "default", "h"),
+        _req(),
+        settings=_cfg(),
+        storage=None,  # type: ignore[arg-type]
+        models={"m": None},  # type: ignore[dict-item]
+        trace=trace,
+    )
+    assert got is None and trace.exhausted is True
+
+
 async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
     async def noop(*a: Any, **kw: Any) -> None:
         return None
