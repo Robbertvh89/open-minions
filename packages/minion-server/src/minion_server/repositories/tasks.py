@@ -12,8 +12,10 @@ from sqlalchemy import (
     Select,
     and_,
     func,
+    literal_column,
     or_,
     select,
+    text,
     tuple_,
     union_all,
     update,
@@ -26,13 +28,34 @@ from sqlalchemy.orm.util import AliasedClass
 from sqlalchemy.sql.dml import ReturningUpdate
 
 from minion_server.db.models import SUBTASK_KEY, Subtask, SubtaskAcquirement, Task, TaskCounter
+from minion_server.repositories.acquisition import _lit
 from minion_server.repositories.completion import bump_cancelled, shard_sum
 
+LIVE_TASK_LOCK_PREFIX = "minion_task_live:"
 OUTPUT_URI_CONSTRAINT = "uq_minion_task_output_uri"
 
 
 class OutputUriInUseError(Exception):
     """Another task already writes to this output prefix."""
+
+
+async def lock_team_for_create(session: AsyncSession, team: str) -> None:
+    """Serialise task creation of one team until the transaction ends, so the live-task cap holds
+    exactly. Admission only: it never decides subtask ownership (invariant 2, ADR-0020)."""
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+        {"k": LIVE_TASK_LOCK_PREFIX + team},
+    )
+
+
+async def count_live_tasks(session: AsyncSession, team: str, *, limit: int) -> int:
+    """Live tasks of a team, counted up to `limit` (O(limit) on ix_minion_task_team_live)."""
+    live = [_lit(TaskStatus.SPLITTING), _lit(TaskStatus.PENDING), _lit(TaskStatus.RUNNING)]
+    inner: Select[Any] = (
+        select(literal_column("1")).where(Task.team == team, Task.status.in_(live)).limit(limit)
+    )
+    result = await session.execute(select(func.count()).select_from(inner.subquery()))
+    return int(result.scalar_one())
 
 
 @dataclass(frozen=True)

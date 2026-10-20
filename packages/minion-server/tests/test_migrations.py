@@ -375,3 +375,14 @@ def test_0013_cancelled_backfill_and_round_trip(fresh_url: str) -> None:
     assert not asyncio.run(_has_column(fresh_url, "minion_task_counter", "cancelled"))
     command.upgrade(cfg, "head")
     assert asyncio.run(_has_column(fresh_url, "minion_task_counter", "cancelled"))
+
+
+def test_0014_team_live_index_round_trip(fresh_url: str) -> None:
+    name = "ix_minion_task_team_live"
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))
+    command.downgrade(cfg, "0013")
+    assert not asyncio.run(_index_exists(fresh_url, name))
+    command.upgrade(cfg, "head")
+    assert asyncio.run(_index_exists(fresh_url, name))

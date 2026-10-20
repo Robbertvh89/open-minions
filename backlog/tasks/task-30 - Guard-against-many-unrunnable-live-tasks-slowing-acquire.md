@@ -183,7 +183,11 @@ Default 500 means 5,000 unrunnable tasks need 10 teams at the cap. That is the A
   cap = live_task_cap(keys_config.teams.get(body.team), settings)
   await tasks_repo.lock_team_for_create(session, body.team)
   if await tasks_repo.count_live_tasks(session, body.team, limit=cap) >= cap:
-      raise api_error(429, "TOO_MANY_LIVE_TASKS", f"team has {cap} live tasks (limit {cap}); wait for tasks to finish or cancel some")
+      raise api_error(
+          429,
+          "TOO_MANY_LIVE_TASKS",
+          f"team has {cap} live tasks (limit {cap}); wait for tasks to finish or cancel some",
+      )
   ```
   Log `task_create_capped` (team, cap; no task name or payload) at info level. No new metric (keep simple).
 - Integration tests (`packages/minion-server/tests/test_live_task_cap.py`, `integration`; use the

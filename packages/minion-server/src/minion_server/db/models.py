@@ -93,6 +93,12 @@ class Task(Base):
             "task_name",
             postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
         ),
+        # Bounded per-team live count for the create cap (FR-9, ADR-0020).
+        Index(
+            "ix_minion_task_team_live",
+            "team",
+            postgresql_where=text("status IN ('SPLITTING', 'PENDING', 'RUNNING')"),
+        ),
         # Serves `GET /tasks` keyset pages (single-team listing, newest first).
         Index(
             "ix_minion_task_team_created",

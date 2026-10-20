@@ -26,11 +26,12 @@ def _h(k: str) -> str:
 
 
 KEYS = f"""keys:
-  - {{name: alice, sha256: {_h(ALICE)}, teams: [ui1, ui2]}}
+  - {{name: alice, sha256: {_h(ALICE)}, teams: [ui1, ui2, ui4]}}
   - {{name: oper, sha256: {_h(OPER)}, teams: [ui1], operator: true}}
   - {{name: bob, sha256: {_h(BOB)}, teams: [ui3]}}
 teams:
   ui2: {{default_pool: pa, allowed_pools: [pa, pb]}}
+  ui4: {{max_live_tasks: 1}}
 """
 
 
@@ -321,3 +322,28 @@ async def test_ui_fleet_is_operator_only_with_summary_and_paging(
     assert (await c.get("/ui/fleet?limit=0")).status_code == 422
     assert (await c.get("/ui/fleet?status=bogus")).status_code == 422
     assert (await c.get("/ui/fleet?cursor=zzz")).status_code == 422
+
+
+@pytest.mark.integration
+async def test_ui_create_at_live_task_cap_shows_code(
+    ui: tuple[AsyncClient, Any], s3: S3Env
+) -> None:
+    c, app = ui
+    for n in ("a", "b"):
+        _put(s3, f"inputs/ui4/{n}/a.jsonl")
+    csrf = await _login(c, ALICE)
+
+    async def post(name: str) -> Response:
+        data = _form(
+            csrf,
+            name,
+            team="ui4",
+            input_uri=f"s3://minion/inputs/ui4/{name}",
+            output_uri=f"s3://minion/outputs/ui4/{name}",
+        )
+        return await c.post("/ui/tasks", data=data, headers=ORIGIN)
+
+    assert (await post("a")).status_code == 303
+    r = await post("b")
+    assert r.status_code == 429 and "TOO_MANY_LIVE_TASKS:" in r.text
+    assert await _task_row(app, "ui4", "b") is None
