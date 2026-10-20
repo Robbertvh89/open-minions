@@ -3,9 +3,10 @@ id: TASK-16
 title: >-
   Per-status subtask counters on minion_task (avoid aggregating subtasks on
   list/detail)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 07:22'
+updated_date: '2026-10-20 01:36'
 labels:
   - server
   - performance
