@@ -45,6 +45,13 @@ _TABLES = text(
     """
 )
 
+_INDEXES = text(
+    """
+    SELECT relname, indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+    FROM pg_stat_user_indexes WHERE relname LIKE 'minion\\_%' ORDER BY relname, indexrelname
+    """
+)
+
 _CONNECTIONS = text(
     """
     SELECT coalesce(state, 'background'), count(*)
@@ -110,11 +117,22 @@ async def snapshot(sm: Sm) -> dict[str, Any]:
             }
             for r in (await s.execute(_TABLES)).all()
         ]
+        indexes = [
+            {
+                "table": r[0],
+                "index": r[1],
+                "idx_scan": int(r[2] or 0),
+                "idx_tup_read": int(r[3] or 0),
+                "idx_tup_fetch": int(r[4] or 0),
+            }
+            for r in (await s.execute(_INDEXES)).all()
+        ]
         conns = {r[0]: int(r[1]) for r in (await s.execute(_CONNECTIONS)).all()}
         max_conns = int((await s.execute(_MAX_CONNECTIONS)).scalar_one())
     return {
         "statements": statements,
         "tables": tables,
+        "indexes": indexes,
         "connections": {"by_state": conns, "total": sum(conns.values()), "max": max_conns},
     }
 
@@ -148,6 +166,26 @@ def statement_deltas(
     return out[:TOP_STATEMENTS]
 
 
+def index_deltas(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-index scan/tuple counts between two snapshots, indexes with no scans included (an
+    index nobody scanned is the evidence for dropping it, TASK-29). Sorted by scans, then name."""
+    prev = {(i["table"], i["index"]): i for i in before}
+    out = []
+    for a in after:
+        b = prev.get((a["table"], a["index"]))
+        out.append(
+            {
+                "table": a["table"],
+                "index": a["index"],
+                "idx_scan": a["idx_scan"] - (b["idx_scan"] if b else 0),
+                "idx_tup_read": a["idx_tup_read"] - (b["idx_tup_read"] if b else 0),
+                "idx_tup_fetch": a["idx_tup_fetch"] - (b["idx_tup_fetch"] if b else 0),
+            }
+        )
+    out.sort(key=lambda d: (-d["idx_scan"], d["table"], d["index"]))
+    return out
+
+
 def db_report(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     """Delta report from two snapshots (table counters are cumulative: both ends are kept)."""
     return {
@@ -158,6 +196,7 @@ def db_report(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
         ),
         "tables_before": before["tables"],
         "tables_after": after["tables"],
+        "index_usage": index_deltas(before.get("indexes", []), after.get("indexes", [])),
         "connections_before": before["connections"],
         "connections_after": after["connections"],
     }

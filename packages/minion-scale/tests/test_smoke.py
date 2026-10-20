@@ -146,6 +146,8 @@ async def test_smoke_20_sims_1k_subtasks_with_faults(
     assert {e["name"] for e in report["explain"]} == {
         "candidate",
         "candidate_preference",
+        "candidate_generic",
+        "candidate_preference_generic",
         "stale_heartbeat",
         "over_lease",
         "settleable_tasks",
@@ -154,6 +156,10 @@ async def test_smoke_20_sims_1k_subtasks_with_faults(
         "grafana_subtask_status",
     }
     assert all(e["execution_ms"] is not None for e in report["explain"])
+    kinds = {e["name"]: e["plan_kind"] for e in report["explain"]}
+    assert kinds["candidate_generic"] == kinds["candidate_preference_generic"] == "generic"
+    assert kinds["candidate"] == "custom"
+    assert report["run"] and report["db"]["index_usage"]
     assert run["calls"]["acquire_assigned"]["count"] >= 1000
 
     # no credentials or payload anywhere in what the harness printed or wrote

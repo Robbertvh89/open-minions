@@ -1,7 +1,15 @@
 """Database statistics (TASK-7.2 b)."""
 
+from typing import Any
+
 import pytest
-from minion_scale.dbstats import db_report, docker_stats, snapshot, statement_deltas
+from minion_scale.dbstats import (
+    db_report,
+    docker_stats,
+    index_deltas,
+    snapshot,
+    statement_deltas,
+)
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -29,6 +37,43 @@ def test_statement_deltas_subtract_the_baseline_and_sort_by_time() -> None:
     assert statement_deltas(before, None) is None
 
 
+def _ix(table: str, index: str, scans: int, read: int = 0) -> dict[str, object]:
+    return {
+        "table": table,
+        "index": index,
+        "idx_scan": scans,
+        "idx_tup_read": read,
+        "idx_tup_fetch": read,
+    }
+
+
+def test_index_deltas_subtract_and_keep_unused_indexes() -> None:
+    before = [_ix("minion_task", "a", 5, 50), _ix("minion_task", "b", 0)]
+    after = [
+        _ix("minion_task", "a", 12, 80),
+        _ix("minion_task", "b", 0),
+        _ix("minion_task", "c", 3, 9),  # created during the run
+    ]
+    out = index_deltas(before, after)
+    assert [(d["index"], d["idx_scan"], d["idx_tup_read"]) for d in out] == [
+        ("a", 7, 30),
+        ("c", 3, 9),
+        ("b", 0, 0),  # unused index stays visible (TASK-29 evidence)
+    ]
+    assert index_deltas([], []) == []
+
+
+def test_db_report_has_index_usage() -> None:
+    snap: dict[str, Any] = {
+        "statements": None,
+        "tables": [],
+        "indexes": [_ix("minion_task", "a", 4)],
+        "connections": {},
+    }
+    base = {**snap, "indexes": [_ix("minion_task", "a", 1)]}
+    assert db_report(base, snap)["index_usage"][0]["idx_scan"] == 3
+
+
 def test_docker_stats_needs_a_project_name() -> None:
     assert docker_stats("") is None
 
@@ -44,9 +89,13 @@ async def test_snapshot_without_pg_stat_statements(fresh_url: str) -> None:
     assert before["statements"] is None  # extension not preloaded in the test container
     names = {t["table"] for t in before["tables"]}
     assert {"minion_subtask", "minion_task", "minion_subtask_acquirement"} <= names
+    ix = {(i["table"], i["index"]) for i in before["indexes"]}
+    assert ("minion_task", "ix_minion_task_live_queue") in ix
+    assert ("minion_task", "ix_minion_task_queue") in ix
     assert before["connections"]["total"] >= 1 and before["connections"]["max"] > 0
     report = db_report(before, after)
     assert report["pg_stat_statements"] is None
+    assert {i["index"] for i in report["index_usage"]} >= {"ix_minion_task_live_queue"}
 
 
 @pytest.mark.integration

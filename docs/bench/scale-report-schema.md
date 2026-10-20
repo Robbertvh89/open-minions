@@ -100,6 +100,9 @@ histogram (`/metrics`, `MINION_METRICS_ENABLED=true`; outcome is the only label)
   `table`, `live_tuples`, `dead_tuples`, `seq_scans`, `idx_scans`, `inserts`, `updates`,
   `deletes`, `hot_updates`, `autovacuum_count`, `autoanalyze_count`, `last_autovacuum`
   (cumulative counters: subtract the two for the run).
+* `index_usage`: per `minion_*` index from `pg_stat_user_indexes`, the delta of the run:
+  `table`, `index`, `idx_scan`, `idx_tup_read`, `idx_tup_fetch`; sorted by scans, unused indexes
+  included with 0 (TASK-29 evidence: which index no statement of the run needed).
 * `connections_before`, `connections_after`: `{by_state: {active: n, idle: n, ...}, total, max}`
   from `pg_stat_activity` for this database and `max_connections`.
 
@@ -111,7 +114,8 @@ One entry per container of the compose project given with `--docker-project`
 
 ## `explain`
 
-One entry per hot query: `candidate`, `candidate_preference`, `stale_heartbeat`, `over_lease`,
+One entry per hot query: `candidate`, `candidate_preference`, `candidate_generic`,
+`candidate_preference_generic` (the same two statements as a generic plan, TASK-54), `stale_heartbeat`, `over_lease`,
 `settleable_tasks` (the watchdog backstop of ADR-0015; `--settle-batch`, default 100 = the `settle_stuck`
 batch), `grafana_task_status`, `grafana_live_tasks` and `grafana_subtask_status`. The first five are the
 repository's own statements; the `grafana_*` entries are the panel SQL of
@@ -119,7 +123,7 @@ repository's own statements; the `grafana_*` entries are the panel SQL of
 `EXPLAIN (ANALYZE, BUFFERS)` in a read-only transaction after `ANALYZE`. `seq_scan` is expected for the
 count panels; judge them by whether `minion_task_counter` appears in the plan.
 
-`name`, `plan_kind` (always `custom`: literals are inlined so the plan is for those values; the server's asyncpg prepared statements may switch to a generic plan after five executions), `sql` (inline literals), `planning_ms`, `execution_ms`, `top_buffers` (first
+`name`, `plan_kind` (`custom`: literals are inlined so the plan is for those values; `generic` for the `*_generic` entries: `PREPARE` of the asyncpg-compiled SQL, `plan_cache_mode = force_generic_plan`, `EXPLAIN EXECUTE` with the same values, as the server's asyncpg prepared statements run after five executions), `sql` (inline literals; for `generic` the `PREPARE ... $n` text), `planning_ms`, `execution_ms`, `top_buffers` (first
 `Buffers: shared ...` line), `seq_scan` (any `Seq Scan` node), `plan` (the plan text lines).
 
 ## `verify`

@@ -675,6 +675,11 @@ def outline(node: dict[str, Any], depth: int = 0) -> str:
     return line + "".join(outline(c, depth + 1) for c in node.get("Plans", []))
 
 
+# check_walk labels whose plan really has a Bitmap Heap Scan on minion_task (seen when the 10k/200
+# grid was run; every other label must be a pure index walk).
+BITMAP_OBSERVED = {"ten_models n=200 generic"}
+
+
 def check_walk(
     label: str, plan: dict[str, Any], n: int, *, buffers: int = WALK_BUFFER_BOUND
 ) -> None:
@@ -683,10 +688,13 @@ def check_walk(
     # At 12 live tasks a generic plan may use a bitmap per step on the tiny set (<= 34 buffers
     # measured): the shape is asserted from 200 up, the bounds always.
     if n >= 200:
-        # A few hundred to ~2k live tasks: a per-step bitmap + top-N sort of them is the planner's
-        # pick and bounded by n (about 5 steps); from 5k up only the ordered index walk is allowed.
+        # The ordered walk everywhere, except the one case where a per-step bitmap + top-N sort of
+        # 200 tasks was observed (generic plan, ten models; bounded by n): BITMAP_OBSERVED.
         assert_index_paths(
-            plan, pending_index=False, allow_bitmap=n < 5000, sort_input=max(2_000, 6 * n)
+            plan,
+            pending_index=False,
+            allow_bitmap=label in BITMAP_OBSERVED,
+            sort_input=max(2_000, 6 * n),
         )
     got = _buffers(plan)
     probes = _subtask_probes(plan)

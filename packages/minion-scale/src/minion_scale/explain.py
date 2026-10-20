@@ -7,9 +7,13 @@ names and row estimates, no row values.
 Plan kind: literals are inlined, so PostgreSQL plans each statement for those exact values (a
 "custom" plan). The server runs the same statements through asyncpg prepared statements, which
 switch to a generic plan after five executions; a generic plan can differ (the report says
-`plan_kind: custom`). Compare with the `pg_stat_statements` timings of the real run.
+`plan_kind: custom`). The candidate statements are therefore also run as a generic plan
+(`plan_kind: generic`, entries `candidate_generic` / `candidate_preference_generic`): PREPARE of
+the asyncpg-compiled SQL, `plan_cache_mode = force_generic_plan`, EXPLAIN EXECUTE with the same
+values (TASK-54). Compare with the `pg_stat_statements` timings of the real run.
 """
 
+import enum
 import re
 from typing import Any
 
@@ -44,6 +48,8 @@ GRAFANA_STATEMENTS: dict[str, str] = {
 }
 
 EXPLAIN = "EXPLAIN (ANALYZE, BUFFERS) "
+# Statements that are also EXPLAINed as a generic plan (name -> report name suffix `_generic`).
+GENERIC_PLAN_STATEMENTS = ("candidate", "candidate_preference")
 STATEMENT_TIMEOUT_MS = 60_000
 _PLANNING = re.compile(r"Planning Time: ([0-9.]+) ms")
 _EXECUTION = re.compile(r"Execution Time: ([0-9.]+) ms")
@@ -57,6 +63,26 @@ def compile_literal(stmt: Select[Any]) -> str:
             compile_kwargs={"literal_binds": True},
         )
     )
+
+
+def _sql_value(v: Any) -> str:
+    if isinstance(v, enum.Enum):
+        v = v.value
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int | float):
+        return repr(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def compile_generic(stmt: Select[Any]) -> tuple[str, str]:
+    """`(PREPARE q AS <sql with $n>, "v1, v2, ...")` for the asyncpg dialect (bind params kept)."""
+    compiled = stmt.compile(
+        dialect=postgresql.asyncpg.dialect(),  # type: ignore[no-untyped-call]
+        compile_kwargs={"render_postcompile": True},
+    )
+    names = compiled.positiontup or []
+    return "PREPARE q AS " + str(compiled), ", ".join(_sql_value(compiled.params[n]) for n in names)
 
 
 def hot_statements(
@@ -106,6 +132,25 @@ def parse_plan(lines: list[str]) -> dict[str, Any]:
 async def explain_all(sm: Sm, statements: dict[str, Statement]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for name, stmt in statements.items():
+        if name in GENERIC_PLAN_STATEMENTS and not isinstance(stmt, str):
+            prepare, args = compile_generic(stmt)
+            async with sm() as session, session.begin():
+                await session.execute(text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+                await session.execute(text("SET TRANSACTION READ ONLY"))
+                await session.execute(text("SET LOCAL plan_cache_mode = force_generic_plan"))
+                conn = await session.connection()
+                await conn.exec_driver_sql(prepare)
+                res = await conn.exec_driver_sql(f"{EXPLAIN}EXECUTE q({args})")
+                lines = [r[0] for r in res.all()]
+                await conn.exec_driver_sql("DEALLOCATE q")
+            out.append(
+                {
+                    "name": f"{name}_generic",
+                    "plan_kind": "generic",
+                    "sql": " ".join(prepare.split()),
+                    **parse_plan(lines),
+                }
+            )
         sql = stmt if isinstance(stmt, str) else compile_literal(stmt)
         async with sm() as session, session.begin():
             await session.execute(text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))

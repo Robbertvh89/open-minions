@@ -7,7 +7,13 @@ from typing import Any
 import pytest
 import yaml
 from minion_scale import report
-from minion_scale.explain import GRAFANA_STATEMENTS, compile_literal, hot_statements, parse_plan
+from minion_scale.explain import (
+    GRAFANA_STATEMENTS,
+    compile_generic,
+    compile_literal,
+    hot_statements,
+    parse_plan,
+)
 from minion_scale.metrics import Recorder
 from minion_server.repositories.completion import settleable_stmt
 
@@ -97,6 +103,19 @@ def test_hot_statements_compile_to_literal_sql() -> None:
     assert not isinstance(pref, str) and not isinstance(cand, str)
     assert "minion_task.team = 'scale'" in compile_literal(pref)
     assert "scale-fake" in compile_literal(cand)
+
+
+def test_compile_generic_keeps_bind_parameters() -> None:
+    stmts = hot_statements(
+        model_ids=["scale-fake", "o'neil"], team="scale", heartbeat_timeout_s=20.0, max_lease_s=1.0
+    )
+    stmt = stmts["candidate_preference"]
+    assert not isinstance(stmt, str)
+    prepare, args = compile_generic(stmt)
+    assert prepare.startswith("PREPARE q AS ") and "$1" in prepare
+    assert "scale-fake" not in prepare and "'scale'" not in prepare  # values are bound
+    assert "'scale-fake'" in args and "'o''neil'" in args and "'scale'" in args
+    assert "LIMIT 16" in prepare  # window stays a literal (TASK-54)
 
 
 def _raw_sqls(node: Any) -> list[str]:
