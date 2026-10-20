@@ -1,5 +1,8 @@
 import asyncio
 import hashlib
+import io
+import itertools
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -7,7 +10,7 @@ from typing import Any, cast
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from minion_common.enums import Engine, TaskType
+from minion_common.enums import Engine, TaskStatus, TaskType
 from minion_common.schemas import ModelEntry, TaskCreate
 from minion_server.api.tasks import create_task
 from minion_server.app import create_app
@@ -15,7 +18,7 @@ from minion_server.auth import KeysConfig, User
 from minion_server.db.models import Subtask
 from minion_server.db.session import create_sessionmaker
 from minion_server.repositories import tasks as tasks_repo
-from minion_server.services.splitter import SplitLimits, split_one
+from minion_server.services.splitter import SplitLimits, run_splitter, split_one
 from minion_server.services.tasks import validate_uris
 from minion_server.settings import ServerSettings
 from minion_server.splitting import slice_jsonl
@@ -810,6 +813,233 @@ async def test_iter_object_guards(storage: S3Storage, s3: S3Env) -> None:
         b"".join(storage.iter_object("inputs/fz7/g.jsonl", size=size + 1))
     with pytest.raises(PreconditionFailedError):  # If-Match with a stale ETag
         b"".join(storage.iter_object("inputs/fz7/g.jsonl", etag='"deadbeef"'))
+
+
+@pytest.mark.integration
+async def test_iter_object_get_etag_backstop_when_if_match_ignored(
+    storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.storage import PreconditionFailedError
+
+    key = "inputs/fz7b/g.jsonl"
+    _put(s3, key, _jsonl(5, "a"))
+    ((_, size, etag),) = await storage.list_objects("inputs/fz7b/")
+    _put(s3, key, _jsonl(5, "b"))  # same size, different bytes, after listing
+    real_get = storage._client.get_object
+
+    def ignore_if_match(**kw: Any) -> Any:
+        kw.pop("IfMatch", None)  # a backend that does not honour If-Match
+        return real_get(**kw)
+
+    monkeypatch.setattr(storage._client, "get_object", ignore_if_match)
+    with pytest.raises(PreconditionFailedError):
+        b"".join(storage.iter_object(key, etag=etag, size=size))
+
+
+@pytest.mark.integration
+async def test_iter_object_multipart_list_and_get_etags_agree(
+    storage: S3Storage, s3: S3Env
+) -> None:
+    """Guards against a false INPUT_CHANGED: LIST and GET must report the same multipart ETag."""
+    from boto3.s3.transfer import TransferConfig
+
+    key = "inputs/fz7c/big.jsonl"
+    data = _jsonl(200_000, "m")  # ~7 MiB, two parts at the 5 MiB threshold
+    assert len(data) > 5 * 1024 * 1024
+    s3.client.upload_fileobj(
+        io.BytesIO(data),
+        s3.bucket,
+        key,
+        Config=TransferConfig(multipart_threshold=5 << 20, multipart_chunksize=5 << 20),
+    )
+    ((_, size, etag),) = await storage.list_objects("inputs/fz7c/")
+    got = s3.client.get_object(Bucket=s3.bucket, Key=key)["ETag"]
+    assert etag.strip('"') == got.strip('"')
+    assert b"".join(storage.iter_object(key, etag=etag, size=size)) == data
+
+
+# --- TASK-11 / TASK-11.1: lease renewal on a timer, clean shutdown during a long read ------------
+
+_LONG_LEASE = SplitLimits(lease_s=1.0, backoff_base_s=1000)
+
+
+def _slow_reads(monkeypatch: pytest.MonkeyPatch, delay_s: float) -> dict[str, float]:
+    """Make every 32-byte S3 chunk take `delay_s`: one `_take` call blocks a thread for seconds."""
+    stats: dict[str, float] = {"chunks": 0, "delay": delay_s}
+    real = S3Storage.iter_object
+
+    def slow(self: S3Storage, key: str, chunk_size: int = 1 << 20, **kw: Any) -> Any:
+        gen = real(self, key, 32, **kw)
+        try:
+            for c in gen:
+                time.sleep(stats["delay"])
+                stats["chunks"] += 1
+                yield c
+        finally:
+            gen.close()
+
+    monkeypatch.setattr(S3Storage, "iter_object", slow)
+    return stats
+
+
+async def _setup_long_read(
+    engine: AsyncEngine, s3: S3Env, team: str, name: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[bytes, dict[str, float]]:
+    data = _jsonl(12, "s")  # ~12 chunks of 32 B, records_per_subtask=1, batch_size=100: one _take
+    _put(s3, f"inputs/{team}/{name}/a.jsonl", data)
+    await _insert_task(engine, team, name, 1)
+    return data, _slow_reads(monkeypatch, 0.25)  # read takes ~3 s, lease is 1 s
+
+
+@pytest.mark.integration
+async def test_long_single_read_keeps_lease_with_rival_splitter(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, _ = await _setup_long_read(fresh_engine, s3, "lr1", "long", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    renewals: list[float] = []
+    inserts: list[float] = []
+    real_renew = tasks_repo.renew_split_lease
+    real_insert = tasks_repo.insert_subtasks
+
+    async def spy_renew(session: Any, task: Any, lease_s: float) -> bool:
+        renewals.append(time.monotonic())
+        return await real_renew(session, task, lease_s)
+
+    async def spy_insert(session: Any, task: Any, rows: Any) -> None:
+        inserts.append(time.monotonic())
+        await real_insert(session, task, rows)
+
+    monkeypatch.setattr(tasks_repo, "renew_split_lease", spy_renew)
+    monkeypatch.setattr(tasks_repo, "insert_subtasks", spy_insert)
+    started = time.monotonic()
+    first = asyncio.create_task(split_one(sm, storage, _LONG_LEASE, batch_size=100))
+    await asyncio.sleep(0.2)  # the first splitter holds the claim; the rival polls from now on
+    claimed_by_rival = 0
+    while not first.done():
+        claimed_by_rival += await split_one(sm, storage, _LONG_LEASE, batch_size=100)
+        await asyncio.sleep(0.05)
+    assert await first
+    assert claimed_by_rival == 0
+    assert (await _task_row(fresh_engine, "long"))[:4] == ("PENDING", None, 1, 12)
+    rows = await _subtasks(fresh_engine, "long")
+    expected = list(slice_jsonl([data], 0, 1))
+    assert [(r[2], r[3]) for r in rows] == [(e.byte_start, e.byte_end) for e in expected]
+    before_insert = [t for t in renewals if t < inserts[0]]
+    assert len(before_insert) >= 5  # timer renewals during the single blocking read
+    ticks = [started, *before_insert]
+    assert max(b - a for a, b in itertools.pairwise(ticks)) < 0.7  # lease_s / 3 + slack
+
+
+@pytest.mark.integration
+async def test_lease_lost_mid_read_stops_read(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, stats = await _setup_long_read(fresh_engine, s3, "lr2", "lost", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    first = asyncio.create_task(split_one(sm, storage, _LONG_LEASE, batch_size=100))
+    await asyncio.sleep(0.5)
+    async with sm() as other, other.begin():  # someone else claims while we are reading
+        await other.execute(BUMP)
+    t0 = time.monotonic()
+    assert await asyncio.wait_for(first, 10)
+    assert time.monotonic() - t0 < 1.5  # the remaining read alone would take ~2.5 s
+    assert stats["chunks"] < 12
+    assert (await _task_row(fresh_engine, "lost"))[:3] == ("SPLITTING", None, 2)
+    assert await _subtasks(fresh_engine, "lost") == []
+
+
+@pytest.mark.integration
+async def test_deadline_mid_read_backs_off(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, stats = await _setup_long_read(fresh_engine, s3, "lr3", "dl", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    lim = SplitLimits(lease_s=1.0, max_seconds=0.8, backoff_base_s=1000)
+    t0 = time.monotonic()
+    assert await split_one(sm, storage, lim, batch_size=100)
+    assert time.monotonic() - t0 < 2.0
+    assert stats["chunks"] < 12
+    assert (await _task_row(fresh_engine, "dl"))[:3] == ("SPLITTING", None, 1)
+    async with fresh_engine.connect() as conn:
+        far = (
+            await conn.execute(
+                text(
+                    "SELECT next_split_at > now() + interval '200 seconds'"
+                    " FROM minion_task WHERE task_name='dl'"
+                )
+            )
+        ).scalar_one()
+    assert far  # backoff, not the lease
+    assert await _subtasks(fresh_engine, "dl") == []
+
+
+@pytest.mark.integration
+async def test_cancel_mid_read_is_clean(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, stats = await _setup_long_read(fresh_engine, s3, "lr4", "shut", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    t = asyncio.create_task(run_splitter(sm, storage, poll_s=3600, limits=_LONG_LEASE))
+    await asyncio.sleep(0.6)
+    t.cancel()
+    result = await asyncio.wait_for(asyncio.gather(t, return_exceptions=True), 5)
+    assert isinstance(result[0], asyncio.CancelledError)  # not ValueError, and shutdown returns
+    async with fresh_engine.connect() as conn:
+        soon = (
+            await conn.execute(
+                text(
+                    "SELECT next_split_at < now() + interval '100 seconds'"
+                    " FROM minion_task WHERE task_name='shut'"
+                )
+            )
+        ).scalar_one()
+    assert (await _task_row(fresh_engine, "shut"))[:3] == ("SPLITTING", None, 1)
+    assert soon  # no failed-attempt backoff was written (and the lease was released)
+    stats["delay"] = 0
+    # The lease was released on shutdown: claimable at once, without waiting for it to expire.
+    assert await split_one(sm, storage, _LONG_LEASE, batch_size=100)
+    assert (await _task_row(fresh_engine, "shut"))[:4] == ("PENDING", None, 2, 12)
+
+
+@pytest.mark.integration
+async def test_shutdown_after_lease_lost_does_not_touch_the_new_holder(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _ = await _setup_long_read(fresh_engine, s3, "lr6", "lost", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    t = asyncio.create_task(run_splitter(sm, storage, poll_s=3600, limits=_LONG_LEASE))
+    await asyncio.sleep(0.5)
+    async with sm() as other, other.begin():  # a rival claims; its lease is still in the future
+        await other.execute(BUMP)
+    t.cancel()
+    await asyncio.wait_for(asyncio.gather(t, return_exceptions=True), 5)
+    async with fresh_engine.connect() as conn:
+        held = (
+            await conn.execute(
+                text("SELECT next_split_at > now() FROM minion_task WHERE task_name='lost'")
+            )
+        ).scalar_one()
+    assert held  # the fenced release did not shorten the lease of the new holder
+    assert (await _task_row(fresh_engine, "lost"))[:3] == ("SPLITTING", None, 2)
+
+
+@pytest.mark.integration
+async def test_cancelled_task_stops_long_read(
+    fresh_engine: AsyncEngine, storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, stats = await _setup_long_read(fresh_engine, s3, "lr5", "cx", monkeypatch)
+    sm = create_sessionmaker(fresh_engine)
+    first = asyncio.create_task(split_one(sm, storage, _LONG_LEASE, batch_size=100))
+    await asyncio.sleep(0.5)
+    async with sm() as s, s.begin():
+        assert await tasks_repo.cancel_task(s, "lr5", "p", "cx") == TaskStatus.CANCELLED
+    t0 = time.monotonic()
+    assert await asyncio.wait_for(first, 10)
+    assert time.monotonic() - t0 < 1.5
+    assert stats["chunks"] < 12
+    assert (await _task_row(fresh_engine, "cx"))[0] == "CANCELLED"
+    assert await _subtasks(fresh_engine, "cx") == []
 
 
 @pytest.mark.integration
