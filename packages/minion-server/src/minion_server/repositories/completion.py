@@ -315,24 +315,27 @@ async def set_task_terminal(session: AsyncSession, key: TaskKey, status: TaskSta
     return bool(result.rowcount == 1)  # type: ignore[attr-defined]
 
 
+def settleable_stmt(limit: int) -> Any:
+    """The settleable-tasks select (shared with `minion-scale explain`)."""
+    return (
+        select(Task.team, Task.project, Task.task_name)
+        .join(
+            TaskCounter,
+            (TaskCounter.team == Task.team)
+            & (TaskCounter.project == Task.project)
+            & (TaskCounter.task_name == Task.task_name),
+        )
+        .where(
+            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+            Task.total_subtasks > 0,
+        )
+        .group_by(Task.team, Task.project, Task.task_name, Task.total_subtasks)
+        .having(func.sum(TaskCounter.succeeded + TaskCounter.failed) >= Task.total_subtasks)
+        .limit(limit)
+    )
+
+
 async def settleable_tasks(session: AsyncSession, limit: int) -> list[TaskKey]:
     """Live tasks whose counters already cover every subtask (a lost or crashed settle)."""
-    rows = (
-        await session.execute(
-            select(Task.team, Task.project, Task.task_name)
-            .join(
-                TaskCounter,
-                (TaskCounter.team == Task.team)
-                & (TaskCounter.project == Task.project)
-                & (TaskCounter.task_name == Task.task_name),
-            )
-            .where(
-                Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
-                Task.total_subtasks > 0,
-            )
-            .group_by(Task.team, Task.project, Task.task_name, Task.total_subtasks)
-            .having(func.sum(TaskCounter.succeeded + TaskCounter.failed) >= Task.total_subtasks)
-            .limit(limit)
-        )
-    ).all()
+    rows = (await session.execute(settleable_stmt(limit))).all()
     return [TaskKey(r[0], r[1], r[2]) for r in rows]

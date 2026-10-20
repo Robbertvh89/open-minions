@@ -112,8 +112,12 @@ One entry per container of the compose project given with `--docker-project`
 ## `explain`
 
 One entry per hot query: `candidate`, `candidate_preference`, `stale_heartbeat`, `over_lease`,
-built from the repository's own statements and run as `EXPLAIN (ANALYZE, BUFFERS)` in a read-only
-transaction after `ANALYZE`:
+`settleable_tasks` (the watchdog backstop of ADR-0015; `--settle-batch`, default 100 = the `settle_stuck`
+batch), `grafana_task_status`, `grafana_live_tasks` and `grafana_subtask_status`. The first five are the
+repository's own statements; the `grafana_*` entries are the panel SQL of
+`deploy/grafana/dashboards/tasks.json` copied verbatim (a unit test fails on drift). Each is run as
+`EXPLAIN (ANALYZE, BUFFERS)` in a read-only transaction after `ANALYZE`. `seq_scan` is expected for the
+count panels; judge them by whether `minion_task_counter` appears in the plan.
 
 `name`, `plan_kind` (always `custom`: literals are inlined so the plan is for those values; the server's asyncpg prepared statements may switch to a generic plan after five executions), `sql` (inline literals), `planning_ms`, `execution_ms`, `top_buffers` (first
 `Buffers: shared ...` line), `seq_scan` (any `Seq Scan` node), `plan` (the plan text lines).

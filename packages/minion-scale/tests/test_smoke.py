@@ -148,6 +148,10 @@ async def test_smoke_20_sims_1k_subtasks_with_faults(
         "candidate_preference",
         "stale_heartbeat",
         "over_lease",
+        "settleable_tasks",
+        "grafana_task_status",
+        "grafana_live_tasks",
+        "grafana_subtask_status",
     }
     assert all(e["execution_ms"] is not None for e in report["explain"])
     assert run["calls"]["acquire_assigned"]["count"] >= 1000

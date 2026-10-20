@@ -394,10 +394,14 @@ def explain_cmd(
     team: str = DEFAULT_TEAM,
     heartbeat_timeout_s: Annotated[float, typer.Option(help="Watchdog timeout in use")] = 900.0,
     max_lease_s: float = 6 * 3600.0,
+    settle_batch: Annotated[
+        int, typer.Option(min=1, help="LIMIT of settleable_tasks (settle_stuck batch)")
+    ] = 100,
     out: Annotated[Path | None, typer.Option(help="Write the JSON report here")] = None,
     yes_scale_db: YesScaleDb = False,
 ) -> None:
-    """EXPLAIN (ANALYZE, BUFFERS) the candidate, stale-heartbeat and over-lease queries."""
+    """EXPLAIN (ANALYZE, BUFFERS) the candidate, stale-heartbeat, over-lease, settleable_tasks
+    and Grafana task/subtask status queries."""
     cfg = _settings()
     check_scale_host(cfg.database_url.get_secret_value(), yes_scale_db)
     stmts = hot_statements(
@@ -406,6 +410,7 @@ def explain_cmd(
         heartbeat_timeout_s=heartbeat_timeout_s,
         max_lease_s=max_lease_s,
         pool=DEFAULT_POOL,
+        settle_batch=settle_batch,
     )
 
     async def go() -> list[dict[str, Any]]:

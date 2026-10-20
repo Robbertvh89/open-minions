@@ -7,8 +7,9 @@ from typing import Any
 import pytest
 import yaml
 from minion_scale import report
-from minion_scale.explain import compile_literal, hot_statements, parse_plan
+from minion_scale.explain import GRAFANA_STATEMENTS, compile_literal, hot_statements, parse_plan
 from minion_scale.metrics import Recorder
+from minion_server.repositories.completion import settleable_stmt
 
 from conftest import REPO_ROOT
 
@@ -73,12 +74,45 @@ def test_hot_statements_compile_to_literal_sql() -> None:
     stmts = hot_statements(
         model_ids=["scale-fake"], team="scale", heartbeat_timeout_s=20.0, max_lease_s=3600.0
     )
-    assert set(stmts) == {"candidate", "candidate_preference", "stale_heartbeat", "over_lease"}
+    assert set(stmts) == {
+        "candidate",
+        "candidate_preference",
+        "stale_heartbeat",
+        "over_lease",
+        "settleable_tasks",
+        "grafana_task_status",
+        "grafana_live_tasks",
+        "grafana_subtask_status",
+    }
     for name, stmt in stmts.items():
-        sql = compile_literal(stmt)
+        sql = stmt if isinstance(stmt, str) else compile_literal(stmt)
         assert ":" not in sql.replace("::", "") and "%(" not in sql, name
-    assert "minion_task.team = 'scale'" in compile_literal(stmts["candidate_preference"])
-    assert "scale-fake" in compile_literal(stmts["candidate"])
+    settle = compile_literal(settleable_stmt(100))
+    assert "HAVING" in settle and "LIMIT 100" in settle
+    small = hot_statements(
+        model_ids=["m"], team="t", heartbeat_timeout_s=1.0, max_lease_s=1.0, settle_batch=7
+    )["settleable_tasks"]
+    assert not isinstance(small, str) and "LIMIT 7" in compile_literal(small)
+    pref, cand = stmts["candidate_preference"], stmts["candidate"]
+    assert not isinstance(pref, str) and not isinstance(cand, str)
+    assert "minion_task.team = 'scale'" in compile_literal(pref)
+    assert "scale-fake" in compile_literal(cand)
+
+
+def _raw_sqls(node: Any) -> list[str]:
+    if isinstance(node, dict):
+        found = [node["rawSql"]] if isinstance(node.get("rawSql"), str) else []
+        return found + [x for v in node.values() for x in _raw_sqls(v)]
+    if isinstance(node, list):
+        return [x for v in node for x in _raw_sqls(v)]
+    return []
+
+
+def test_grafana_statements_match_dashboard() -> None:
+    dash = json.loads((REPO_ROOT / "deploy/grafana/dashboards/tasks.json").read_text())
+    panel_sql = {" ".join(s.split()) for s in _raw_sqls(dash)}
+    for name, sql in GRAFANA_STATEMENTS.items():
+        assert " ".join(sql.split()) in panel_sql, f"{name} drifted from tasks.json"
 
 
 def test_parse_plan_extracts_timings() -> None:
