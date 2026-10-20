@@ -433,7 +433,7 @@ The paper states 7 tables (we add an eighth, `minion_task_counter`, ADR-0015) an
 5. `minion_executor` — executor_id, token_hash, hostname, owner, pool, chip, total_memory_gb, os_version, engines, status, **profile, budget jsonb, paused_reason**, registered_at, last_seen_at, token_expires_at (NULL = no expiry; auth rejects tokens past it).
 6. `minion_executor_preference` — executor_id, team, project, task_name (nullable for wildcards).
 7. `minion_subtask_attempt` — history: one row per finished attempt (executor, outcome `SUCCEEDED|FAILED|EXPIRED|RELEASED|CANCELLED`, duration, error). Feeds Grafana.
-8. `minion_task_counter` **[ours]** — `(team, project, task_name, shard)` PK, `succeeded`, `failed`; sharded by `subtask_id % 16` so concurrent completions of one task do not serialize on one `minion_task` row; counts are the sum over shards ([ADR-0015](adr/0015-sharded-task-counters.md)). `minion_ro.task` exposes the sums as `succeeded_subtasks` / `failed_subtasks`.
+8. `minion_task_counter` **[ours]** — `(team, project, task_name, shard)` PK, `succeeded`, `failed`, `cancelled`; sharded by `subtask_id % 16` so concurrent completions of one task do not serialize on one `minion_task` row; counts are the sum over shards ([ADR-0015](adr/0015-sharded-task-counters.md)). `minion_ro.task` exposes the sums as `succeeded_subtasks` / `failed_subtasks`.
 
 The model allow-list is configuration (`models.yaml`, loaded by the server at start), not a table.
 
@@ -528,7 +528,7 @@ Full DDL lives in Alembic migrations; ARCHITECTURE §5 explains indexes and the 
   use `ignore`). `on_call = "light"` on a pinned executor reveals calls the same way. `on_call = "pause"` reveals it outright (`paused_reason = in_call`); `"light"` caps pinned
   profiles too. Set `on_call = "ignore"` in `executor.toml` to avoid it. The microphone/camera state
   itself is never sent (the local status file only).
-- S-12. Read-endpoint cost **[ours]**. `GET /tasks` aggregates subtask counts per page and `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter. Per-status counters on `minion_task` are tracked in the backlog.
+- S-12. Read-endpoint cost **[ours]**. `GET /tasks` and the task detail read the per-status counts from the counter shards and the task's acquirement rows (bounded by executors x `MINION_MAX_OPEN_ACQUIREMENTS`), never from `minion_subtask`; `pending` is derived as `max(0, total - running - succeeded - failed - cancelled)`, so it reads 0 while a task is SPLITTING (total is not set yet). ` `GET /executors` joins heartbeats; both are paginated and capped but not free. Deployments must rate-limit the read endpoints (`/api/v1/tasks`, `/api/v1/executors`) at the reverse proxy (per key / per IP); the server has no built-in limiter.
 - S-13. Web UI **[ours]** (ADR-0010). Off (`404`) unless `MINION_UI_SESSION_SECRET` (>= 32 bytes) is set. Login with
   a user API key (checked like an API request; wrong, expired and removed keys all get one `401` page; the
   key is never logged or echoed) sets `minion_session`, a stateless cookie HMAC-SHA256-signed over the key

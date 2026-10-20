@@ -585,7 +585,7 @@ throttle tested with a fake clock; budget adherence (NF-8) measured by `minion-e
 | Worker crash (Metal / OOM) | Control process survives, reports `fail(retryable)`; attempt counter bounds retries |
 
 **Lock order (all owner ops and reclaim):** acquirement → heartbeat row → subtask → counter shard
-(`minion_task_counter`, one of 16 rows per task; the task row is not row-locked for update by completions; the first insert per shard takes an FK KEY SHARE on it). The
+(`minion_task_counter`, one of 16 rows per task; shards are always the last row locks of a transaction, taken in sorted shard-key order, also by cancel txn 2 and the cancelled sweep, which bump `cancelled`; the task row is not row-locked for update by completions; the first insert per shard takes an FK KEY SHARE on it). The
 executor row (`minion_executor`) is written after the acquirement lock, never before it. The acquire claim round takes the
 executor row first (`FOR NO KEY UPDATE`, ADR-0019), then the new acquirement, subtask, heartbeat and task rows. No
 cycle: the claim never waits on a lock an owner op holds (it inserts a new acquirement row, and `ON CONFLICT DO NOTHING`
@@ -609,7 +609,7 @@ race, stale-acquirement rejection, splitter restart.
 - `minion_task`: index on `(status, priority DESC, created_at)`.
 - `minion_task`: `ix_minion_task_team_created` on `(team, created_at DESC, project DESC, task_name DESC)` serves `GET /tasks` keyset pages; the multi-team listing runs one capped (`limit + 1`) index-ordered branch per team (UNION ALL) and merge-sorts, so cost is O(teams x limit).
 
-- `minion_task_counter` (ADR-0015, migration 0011): PK `(team, project, task_name, shard)`, `succeeded` / `failed` per shard, `shard = subtask_id % 16`; the task counters are the sum over shards (`minion_ro.task` still exposes `succeeded_subtasks` / `failed_subtasks`). A completion upserts one shard row instead of updating the task row; the terminal task status is set by a post-commit settle (and healed by the watchdog), so `minion_task.updated_at` no longer moves per completion.
+- `minion_task_counter` (ADR-0015, migration 0011): PK `(team, project, task_name, shard)`, `succeeded` / `failed` / `cancelled` (migration 0013) per shard, `shard = subtask_id % 16`; the task counters are the sum over shards (`minion_ro.task` still exposes `succeeded_subtasks` / `failed_subtasks`). A completion upserts one shard row instead of updating the task row; the terminal task status is set by a post-commit settle (and healed by the watchdog), so `minion_task.updated_at` no longer moves per completion.
 
 ### 5.2 Input slicing **[ours]**
 Splitter records `(object_key, byte_start, byte_end, first_record, record_count)` per subtask, aligned to

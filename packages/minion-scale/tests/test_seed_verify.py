@@ -295,6 +295,11 @@ async def test_verify_passes_clean_and_detects_double_success_and_orphan(sm: Sm,
     assert _failed(await verify(sm, team="vfyteam")) == ["task_counters_match_subtasks"]
     async with sm() as s, s.begin():
         await s.execute(text("UPDATE minion_task_counter SET succeeded=4"))
+    async with sm() as s, s.begin():  # a cancelled counter with no CANCELLED subtask is drift
+        await s.execute(text("UPDATE minion_task_counter SET cancelled=1 WHERE shard=0"))
+    assert "task_counters_match_subtasks" in _failed(await verify(sm, team="vfyteam"))
+    async with sm() as s, s.begin():
+        await s.execute(text("UPDATE minion_task_counter SET cancelled=0"))
     s3.client.delete_object(Bucket=S3_BUCKET, Key="outputs/vfyteam/vfy-00001/000002.jsonl")
     gone = await verify(sm, team="vfyteam", s3=s3.client, bucket=S3_BUCKET)
     assert _failed(gone) == ["nf2_final_objects_match_succeeded"]

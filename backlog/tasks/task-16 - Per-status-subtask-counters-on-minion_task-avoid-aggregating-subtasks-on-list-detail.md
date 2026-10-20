@@ -214,8 +214,10 @@ Files and interfaces:
       coalesce(sum(cancelled),0) FROM minion_task_counter WHERE key = t.key)
       + scalar (SELECT count(*) FROM minion_subtask_acquirement WHERE key = t.key)."""
 
-  def derive_counts(total: int, running: int, succeeded: int, failed: int,
-                    cancelled: int) -> dict[SubtaskStatus, int]:
+
+  def derive_counts(
+      total: int, running: int, succeeded: int, failed: int, cancelled: int
+  ) -> dict[SubtaskStatus, int]:
       """PENDING = max(0, total - running - succeeded - failed - cancelled); pure."""
   ```
 - `get_task` (`repositories/tasks.py:87-104`): one `select(Task, *counts).where(key)`. Return type
