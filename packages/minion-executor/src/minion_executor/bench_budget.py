@@ -83,6 +83,39 @@ CPU_LIMIT_PCT = 1.0  # NF-4
 
 # -- verdicts (pure) --
 
+GUARD_MARGIN = 0.10  # ADR-0006 D17: the run-time guard's limit is the allowed duty + 10 pp
+HEADROOM = 0.05  # TASK-55: an honest worst 10 s window must stay 5 pp under that limit
+
+
+def window_headroom(duty: float, worst_window_share: float, margin: float = GUARD_MARGIN) -> float:
+    """Distance (fraction of GPU time, may be negative) from the worst 10 s window share to the
+    guard's kill limit `duty + margin`."""
+    for name, v in (("duty", duty), ("worst_window_share", worst_window_share)):
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+    return duty + margin - worst_window_share
+
+
+def within_headroom(
+    duty: float, worst_window_share: float, margin: float = GUARD_MARGIN, headroom: float = HEADROOM
+) -> bool:
+    """True when the worst window is at least `headroom` below the limit (honest runs)."""
+    return window_headroom(duty, worst_window_share, margin) >= headroom - 1e-9
+
+
+def assert_window_headroom(
+    duty: float, worst_window_share: float, margin: float = GUARD_MARGIN, headroom: float = HEADROOM
+) -> None:
+    """For honest-engine gpu tests: fail when the worst window is within `headroom` of the kill
+    limit, so a regression toward the kill threshold shows before field kills. Rogue-worker tests
+    keep their own semantics (they expect the limit to be crossed)."""
+    if not within_headroom(duty, worst_window_share, margin, headroom):
+        raise AssertionError(
+            f"worst 10 s GPU window {worst_window_share:.3f} leaves "
+            f"{window_headroom(duty, worst_window_share, margin):.3f} below the guard limit "
+            f"{duty + margin:.2f} (duty {duty} + {margin}); need >= {headroom} headroom"
+        )
+
 
 @dataclass(frozen=True)
 class Nf8Verdict:
@@ -157,6 +190,8 @@ class BudgetCheckResult:
     accuracy_ok: bool | None = None
     memory_ok: bool | None = None
     passed: bool | None = None
+    window_headroom: float | None = None  # duty + 10 pp - max_window_share (TASK-55)
+    headroom_warning: bool | None = None  # headroom < 5 pp: warning only, never changes `passed`
 
 
 @dataclass
@@ -402,6 +437,9 @@ def _judge(res: BudgetCheckResult, budget: Budget) -> None:
         v.memory_ok,
         v.passed,
     )
+    if res.max_window_share is not None:
+        res.window_headroom = window_headroom(budget.gpu_duty_cycle, res.max_window_share)
+        res.headroom_warning = not within_headroom(budget.gpu_duty_cycle, res.max_window_share)
 
 
 def _check_one(
@@ -545,6 +583,12 @@ def _verdict(v: bool | None) -> str:
     return "-" if v is None else ("pass" if v else "FAIL")
 
 
+def _headroom(r: BudgetCheckResult) -> str:
+    if r.window_headroom is None:
+        return "-"
+    return f"{r.window_headroom * 100:.1f}pp" + (" WARN" if r.headroom_warning else "")
+
+
 def _dev(r: BudgetCheckResult) -> str:
     def one(v: float | None) -> str:
         return "-" if v is None else f"{v:.0f}"
@@ -559,9 +603,10 @@ def render_budget_table(report: BudgetCheckReport) -> str:
         "| model | profile | rep | status | duty | unpaced | expected | measured "
         "| max 10 s window | GPU clients | pacer-reported | device idle/unpaced/paced (info) "
         "| footprint GB | budget GB "
+        "| window headroom (warn < 5pp) "
         "| hard (<= duty+10pp) | accuracy (+-10pp) | memory (<= 1.1x) |"
     )
-    lines = [head, "|" + "---|" * 17]
+    lines = [head, "|" + "---|" * 18]
     for r in report.results:
         status = r.status if not r.detail else f"{r.status} ({r.detail})"
         lines.append(
@@ -569,7 +614,8 @@ def render_budget_table(report: BudgetCheckReport) -> str:
             f"| {_pct(r.unpaced_share)} | {_pct(r.expected_share)} | {_pct(r.measured_share)} "
             f"| {_pct(r.max_window_share)} | {'-' if r.gpu_clients is None else r.gpu_clients} "
             f"| {_pct(r.worker_reported_share)} | {_dev(r)} | {_f(r.footprint_peak_gb)} "
-            f"| {_f(r.budget_memory_gb, 1)} | {_verdict(r.hard_ok)} | {_verdict(r.accuracy_ok)} "
+            f"| {_f(r.budget_memory_gb, 1)} | {_headroom(r)} | {_verdict(r.hard_ok)} "
+            f"| {_verdict(r.accuracy_ok)} "
             f"| {_verdict(r.memory_ok)} |"
         )
     return "\n".join(lines)

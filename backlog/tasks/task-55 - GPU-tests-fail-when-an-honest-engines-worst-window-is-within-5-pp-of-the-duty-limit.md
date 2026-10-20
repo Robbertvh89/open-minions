@@ -23,5 +23,5 @@ Cheap early-warning guard from the TASK-15.1 deferral: honest gpu-marked tests/b
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Honest gpu tests assert worst window <= limit - 5 pp
+- [x] #1 Honest gpu tests assert worst window <= limit - 5 pp
 <!-- AC:END -->
