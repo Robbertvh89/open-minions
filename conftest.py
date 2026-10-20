@@ -679,3 +679,30 @@ def serve_status(status: int) -> Iterator[str]:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_structlog_after_test() -> Iterator[None]:
+    """`minion_server.logging_config.configure_logging` is process-global; undo it per test."""
+    import logging
+
+    import structlog
+
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    levels = {n: logging.getLogger(n).level for n in ("httpx", "httpcore")}
+    uv = {
+        n: (lg.handlers[:], lg.propagate, lg.level, lg.filters[:])
+        for n in ("uvicorn", "uvicorn.error", "uvicorn.access")
+        for lg in [logging.getLogger(n)]
+    }
+    yield
+    for n, (hs, prop, lv, fs) in uv.items():
+        lg = logging.getLogger(n)
+        lg.handlers[:], lg.propagate, lg.filters[:] = hs, prop, fs
+        lg.setLevel(lv)
+    root.handlers[:] = handlers
+    root.setLevel(level)
+    for n, lv in levels.items():
+        logging.getLogger(n).setLevel(lv)
+    structlog.reset_defaults()

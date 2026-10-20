@@ -6,13 +6,13 @@ Safe to run as several replicas (SKIP LOCKED + re-check per row).
 
 import asyncio
 import contextlib
-import logging
 import os
 import signal
 import time
 
 import structlog
 from minion_server.db.session import create_engine, create_sessionmaker
+from minion_server.logging_config import configure_logging
 from minion_server.services.reclaim import (
     ReclaimResult,
     reclaim_stale,
@@ -143,18 +143,6 @@ async def run_watchdog(
         )
         await _sleep(stop, delay)
     log.info("watchdog_stopped")
-
-
-def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    )
 
 
 async def _amain() -> None:

@@ -16,6 +16,7 @@ from minion_server.auth import ExecutorPrincipal, KeyStore
 from minion_server.db.session import create_engine, create_sessionmaker
 from minion_server.errors import ExecutorRevokedError, busy_error
 from minion_server.limits import ArrivalStampMiddleware, BodyLimitMiddleware
+from minion_server.logging_config import configure_logging
 from minion_server.metrics import (
     MULTIPROC_ENV,
     Metrics,
@@ -180,10 +181,18 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     return app
 
 
+def create_app_from_env() -> FastAPI:
+    """uvicorn factory for workers > 1: fresh interpreters, so configure JSON logs first."""
+    settings = ServerSettings()
+    configure_logging(access_log=settings.server_access_log)
+    return create_app(settings)
+
+
 def main() -> None:
     import uvicorn
 
     settings = ServerSettings()
+    configure_logging(access_log=settings.server_access_log)
     if settings.connection_budget >= settings.connection_limit:
         structlog.get_logger().warning(
             "db_connection_budget_exceeded",
@@ -203,7 +212,13 @@ def main() -> None:
         inherited = os.environ.get(MULTIPROC_ENV)
         if inherited:
             os.environ[MULTIPROC_ENV], _ = prepare_metrics_dir(inherited)
-        uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+        uvicorn.run(
+            create_app(settings),
+            host=settings.host,
+            port=settings.port,
+            log_config=None,  # keep our JSON root handler
+            access_log=settings.server_access_log,
+        )
         return
     metrics_dir: str | None = None
     remove_dir = False
@@ -213,11 +228,13 @@ def main() -> None:
         os.environ[MULTIPROC_ENV] = metrics_dir
     try:
         uvicorn.run(
-            "minion_server.app:create_app",
+            "minion_server.app:create_app_from_env",
             factory=True,
             workers=settings.server_workers,
             host=settings.host,
             port=settings.port,
+            log_config=None,
+            access_log=settings.server_access_log,
         )
     finally:
         if metrics_dir is not None and remove_dir:

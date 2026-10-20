@@ -10,6 +10,12 @@ from minion_server import app as app_module
 from minion_server.app import create_app
 
 
+@pytest.fixture(autouse=True)
+def _keep_capture_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # main() configures JSON logging, which would replace structlog.testing.capture_logs
+    monkeypatch.setattr(app_module, "configure_logging", lambda **_: None)
+
+
 async def test_healthz() -> None:
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -61,7 +67,7 @@ def test_main_multi_worker_uses_the_factory_string_and_prepares_metrics(
     finally:
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
     [(args, kwargs)] = calls
-    assert args == ("minion_server.app:create_app",)
+    assert args == ("minion_server.app:create_app_from_env",)
     assert kwargs["factory"] is True
     assert kwargs["workers"] == 4
     assert list(d.iterdir()) == []
