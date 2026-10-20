@@ -1,10 +1,10 @@
 ---
 id: TASK-11.1
 title: Splitter shutdown mid-read burns a split attempt and hangs
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-20 04:22'
-updated_date: '2026-10-20 04:55'
+updated_date: '2026-10-20 05:20'
 labels:
   - server
   - splitter

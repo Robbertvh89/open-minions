@@ -1,10 +1,10 @@
 ---
 id: TASK-11
 title: Timer-based split lease renewal for large single-object inputs
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-15 16:51'
-updated_date: '2026-10-20 04:37'
+updated_date: '2026-10-20 05:20'
 labels:
   - M2
 dependencies: []
