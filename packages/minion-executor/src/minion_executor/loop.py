@@ -135,7 +135,13 @@ class _DowngradeError(Exception):
 MEMORY_GUARD_FACTOR = 1.10  # D7: footprint over budget x 1.10 on two consecutive samples
 MEMORY_GUARD_SAMPLES = 2
 GPU_VIOLATION_SHOW_S = 600.0  # how long status.json reports the last GPU duty kill
-GPU_KILLS_QUARANTINE = 3  # GPU kills of one engine within GPU_QUARANTINE_S stop it being acquired
+# An engine whose GPU kills add up to GPU_QUARANTINE_POINTS within GPU_QUARANTINE_S is not
+# acquired. A duty / clients kill is evidence against the worker (2 points: 3 kills quarantine);
+# a meter kill is not attributable to it (host IORegistry churn, a stalled read) but a worker
+# that blinds the meter must not churn for ever (1 point: 6 kills quarantine).
+GPU_QUARANTINE_POINTS = 6
+GPU_DUTY_KILL_POINTS = 2
+GPU_METER_KILL_POINTS = 1
 GPU_QUARANTINE_S = 3600.0
 GPU_STREAK_GAP_S = 900.0  # kills further apart than this start a new back-off streak
 GPU_STALL_MIN_S = 1.0  # floor of the no-GPU-sample-for-3x-interval bound
@@ -296,7 +302,8 @@ class ExecutorLoop:
         self._gpu_kick = asyncio.Event()  # set with `_gpu_pending`: wakes the watcher
         # sampler KILL for the watcher of that acquirement (tagged: a stale one is dropped)
         self._gpu_pending: tuple[Any, _Verdict] | None = None
-        self._gpu_kills: dict[Engine, list[float]] = {}  # per-engine GPU kill times (clock)
+        self._gpu_kills: dict[Engine, list[float]] = {}  # per-engine duty / clients kill times
+        self._gpu_meter_kills: dict[Engine, list[float]] = {}  # per-engine meter kill times
         self._quarantine_logged: set[Engine] = set()
         self._gpu_streak: list[float] = []  # all GPU kill times, for the back-off exponent
         self._gpu_violation: tuple[str, float] | None = None  # (reason, clock) of the last kill
@@ -1044,7 +1051,7 @@ class ExecutorLoop:
             self._clock(),
         )
         self._gpu_killed_pid = pid
-        self._note_gpu_kill(engine, quarantine=not meter)
+        self._note_gpu_kill(engine, meter=meter)
         if self._gpu is not None:
             self._gpu.stop()  # the worker is gone: the next one starts a fresh window
         self._gpu_pid = None
@@ -1147,21 +1154,56 @@ class ExecutorLoop:
         with contextlib.suppress(Exception):
             await asyncio.shield(fut)
 
-    def _note_gpu_kill(self, engine: Engine | None, *, quarantine: bool = True) -> None:
-        """Record a GPU kill: it feeds the back-off exponent and the per-engine quarantine, and
-        a DONE does not reset either (a rogue that completes a subtask between kills gains
-        nothing). The caller's next acquire waits `_gpu_kill_backoff`."""
+    def _note_gpu_kill(self, engine: Engine | None, *, meter: bool = False) -> None:
+        """Record a GPU kill: it feeds the back-off exponent and the per-engine quarantine
+        points (a duty / clients kill counts GPU_DUTY_KILL_POINTS, a meter kill
+        GPU_METER_KILL_POINTS), and a DONE does not reset either (a rogue that completes a
+        subtask between kills gains nothing). The caller's next acquire waits
+        `_gpu_kill_backoff`."""
         now = self._clock()
         self._gpu_backoff = True
         self._gpu_streak = [t for t in self._gpu_streak if now - t < GPU_QUARANTINE_S] + [now]
-        if engine is None or not quarantine:
-            return  # unknown engine / a meter fault: back-off only, never charged to an engine
-        kills = [t for t in self._gpu_kills.get(engine, []) if now - t < GPU_QUARANTINE_S]
-        self._gpu_kills[engine] = [*kills, now]
-        if len(kills) + 1 >= GPU_KILLS_QUARANTINE and engine not in self._quarantine_logged:
+        if engine is None:
+            return  # unknown engine: back-off only, never charged to an engine
+        book = self._gpu_meter_kills if meter else self._gpu_kills
+        kills = [t for t in book.get(engine, []) if now - t < GPU_QUARANTINE_S]
+        book[engine] = [*kills, now]
+        points = self._quarantine_points(engine, now)
+        if points >= GPU_QUARANTINE_POINTS and engine not in self._quarantine_logged:
             self._quarantine_logged.add(engine)
-            until = sorted([*kills, now])[-GPU_KILLS_QUARANTINE] + GPU_QUARANTINE_S - now
-            log.warning("gpu_engine_quarantined", engine=engine.value, until_s=round(until))
+            until = (self._quarantine_until(engine, now) or now) - now
+            log.warning(
+                "gpu_engine_quarantined", engine=engine.value, until_s=round(until), points=points
+            )
+
+    def _quarantine_kills(self, engine: Engine, now: float) -> list[tuple[float, int]]:
+        """(time, points) of the engine's GPU kills within the quarantine window, oldest first."""
+        kills = [
+            (t, GPU_DUTY_KILL_POINTS)
+            for t in self._gpu_kills.get(engine, [])
+            if now - t < GPU_QUARANTINE_S
+        ] + [
+            (t, GPU_METER_KILL_POINTS)
+            for t in self._gpu_meter_kills.get(engine, [])
+            if now - t < GPU_QUARANTINE_S
+        ]
+        return sorted(kills)
+
+    def _quarantine_points(self, engine: Engine, now: float) -> int:
+        return sum(p for _, p in self._quarantine_kills(engine, now))
+
+    def _quarantine_until(self, engine: Engine, now: float) -> float | None:
+        """Clock time at which the engine's points drop below the threshold again (None when
+        they are below it now): the oldest kills age out first."""
+        kills = self._quarantine_kills(engine, now)
+        total = sum(p for _, p in kills)
+        if total < GPU_QUARANTINE_POINTS:
+            return None
+        for t, p in kills:
+            total -= p
+            if total < GPU_QUARANTINE_POINTS:
+                return t + GPU_QUARANTINE_S
+        return None  # unreachable: the sum of no kills is 0
 
     def _gpu_kill_streak(self) -> int:
         """Kills in a row, each within GPU_STREAK_GAP_S of the previous (decays after 15 min
@@ -1183,13 +1225,10 @@ class ExecutorLoop:
         await self._pause(delay * random.uniform(0.5, 1.0))  # noqa: S311
 
     def _quarantined(self) -> list[Engine]:
-        """Engines with >= GPU_KILLS_QUARANTINE GPU kills in the last hour: not acquired."""
+        """Engines with >= GPU_QUARANTINE_POINTS of GPU kills in the last hour: not acquired."""
         now = self._clock()
-        return [
-            e
-            for e, ts in self._gpu_kills.items()
-            if sum(1 for t in ts if now - t < GPU_QUARANTINE_S) >= GPU_KILLS_QUARANTINE
-        ]
+        engines = dict.fromkeys([*self._gpu_kills, *self._gpu_meter_kills])
+        return [e for e in engines if self._quarantine_points(e, now) >= GPU_QUARANTINE_POINTS]
 
     def _acquirable_engines(self) -> list[Engine]:
         bad = set(self._quarantined())
