@@ -161,3 +161,31 @@ async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.Monkey
             models={"m": None},  # type: ignore[dict-item]
         )
     assert got is None and logs == []
+
+
+async def test_principal_without_token_hash_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from minion_server.errors import ExecutorRevokedError
+
+    async def live(*a: Any, **kw: Any) -> bool:
+        return True
+
+    async def noop(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def boom(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("must not be reached without a token digest")
+
+    monkeypatch.setattr(executors_repo, "touch", live)
+    monkeypatch.setattr(executors_repo, "get_preference", noop)
+    monkeypatch.setattr(repo, "lock_executor_for_claim", boom)
+    monkeypatch.setattr(repo, "claim", boom)
+    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", token_hash=None)
+    with pytest.raises(ExecutorRevokedError):
+        await svc.acquire(
+            _FakeSession(),  # type: ignore[arg-type]
+            p,
+            _req(),
+            settings=_cfg(),
+            storage=None,  # type: ignore[arg-type]
+            models={"m": None},  # type: ignore[dict-item]
+        )
