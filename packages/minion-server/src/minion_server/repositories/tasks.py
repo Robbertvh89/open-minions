@@ -23,8 +23,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm.util import AliasedClass
+from sqlalchemy.sql.dml import ReturningUpdate
 
-from minion_server.db.models import Subtask, SubtaskAcquirement, Task, TaskCounter
+from minion_server.db.models import SUBTASK_KEY, Subtask, SubtaskAcquirement, Task, TaskCounter
 from minion_server.repositories.completion import bump_cancelled, shard_sum
 
 OUTPUT_URI_CONSTRAINT = "uq_minion_task_output_uri"
@@ -343,9 +344,16 @@ async def cancel_task(
 CANCEL_BATCH = 10_000
 
 
-def _pending_of(team: str, project: str, task_name: str) -> Select[Any]:
-    return (
-        select(Subtask.subtask_id)
+def _cancel_stmt(team: str, project: str, task_name: str) -> ReturningUpdate[tuple[int]]:
+    """`WITH c AS MATERIALIZED (locking batch) UPDATE ... FROM c WHERE <pk> = c.<pk>`.
+
+    The CTE is evaluated exactly once. The former `subtask_id IN (SELECT ... FOR UPDATE SKIP
+    LOCKED LIMIT n)` was planned as a semi join whose subquery ran once per outer row (quadratic:
+    ~60 s for 25k rows before the first ANALYZE, when row estimates are 1). Joining on the full
+    primary key does not depend on statistics. PENDING is re-checked in the UPDATE.
+    """
+    c = (
+        select(*(getattr(Subtask, k) for k in SUBTASK_KEY))
         .where(
             Subtask.team == team,
             Subtask.project == project,
@@ -355,6 +363,17 @@ def _pending_of(team: str, project: str, task_name: str) -> Select[Any]:
         .order_by(Subtask.subtask_id)
         .limit(CANCEL_BATCH)
         .with_for_update(skip_locked=True)
+        .cte("c")
+        .prefix_with("MATERIALIZED")
+    )
+    return (
+        update(Subtask)
+        .where(
+            *(getattr(Subtask, k) == c.c[k] for k in SUBTASK_KEY),
+            Subtask.status == SubtaskStatus.PENDING.value,
+        )
+        .values(status=SubtaskStatus.CANCELLED.value)
+        .returning(Subtask.subtask_id)
     )
 
 
@@ -366,20 +385,8 @@ async def cancel_pending_subtasks(
     The caller loops (one transaction per call) until this returns 0 so no single transaction
     holds an unbounded number of row locks.
     """
-    ids = _pending_of(team, project, task_name).scalar_subquery()
-    result = await session.execute(
-        update(Subtask)
-        .where(
-            Subtask.team == team,
-            Subtask.project == project,
-            Subtask.task_name == task_name,
-            Subtask.subtask_id.in_(ids),
-            Subtask.status == SubtaskStatus.PENDING.value,
-        )
-        .values(status=SubtaskStatus.CANCELLED.value)
-        .returning(Subtask.subtask_id)
-    )
-    cancelled_ids = [int(r[0]) for r in result.all()]
+    result = await session.execute(_cancel_stmt(team, project, task_name))
+    cancelled_ids = [r.subtask_id for r in result.all()]
     # Shard locks are the last row locks of this txn, sorted (ARCHITECTURE §4).
     await bump_cancelled(session, ((team, project, task_name, i) for i in cancelled_ids))
     return len(cancelled_ids)
@@ -422,9 +429,7 @@ async def sweep_cancelled(
     result = await session.execute(
         update(Subtask)
         .where(
-            tuple_(Subtask.team, Subtask.project, Subtask.task_name, Subtask.subtask_id).in_(
-                select(ids.c.team, ids.c.project, ids.c.task_name, ids.c.subtask_id)
-            ),
+            *(getattr(Subtask, k) == ids.c[k] for k in SUBTASK_KEY),
             Subtask.status == SubtaskStatus.PENDING.value,
         )
         .values(status=SubtaskStatus.CANCELLED.value)
