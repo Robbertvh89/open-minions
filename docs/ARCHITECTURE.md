@@ -328,8 +328,11 @@ User ─POST /tasks─▶ Server: validate (team membership, model allow-list + 
                     INSERT minion_task(status=SPLITTING)  ──▶ 202
 Splitter (async):   claim one due SPLITTING task with a lease (split_attempts+1, next_split_at=now+lease)
                     list input objects → scan JSONL → stream batches of slices of N records
-                    per batch: renew the lease, compare with existing rows (key, byte range;
-                    mismatch → INPUT_CHANGED), GET pinned by listed ETag + size (change → INPUT_CHANGED),
+                    background timer: renew the lease every lease_s/3 and enforce the wall-clock budget,
+                      also during one long object read (the read thread checks a stop flag per chunk)
+                    per batch: renew the lease in the insert transaction (fence), compare with existing
+                    rows (key, byte range; mismatch → INPUT_CHANGED), GET pinned by listed ETag + size
+                    (change → INPUT_CHANGED),
                     INSERT minion_subtask(status=PENDING, attempt=0) ON CONFLICT DO NOTHING
                     UPDATE minion_task SET status=PENDING, total_subtasks=k
 ```
@@ -341,11 +344,19 @@ fails the task after `split_max_attempts`, so one bad task never blocks the queu
 unique per task (`409 OUTPUT_URI_IN_USE`): attempt and promoted keys are derived from it. Stored
 URIs are canonical (`s3://{bucket}/{key}/`); a non-lowercase scheme is `422 INVALID_URI`.
 
-The claim is a lease fenced by `split_attempts`: lease renewal (once per batch), done, failed and
+The S3 backend **must honour `If-Match` on GetObject** (inputs are immutable, ADR-0004). As a
+backstop the splitter also compares the GET response's `ETag` with the listed one, because a
+backend that ignores `If-Match` would otherwise serve a same-size replacement unnoticed; a
+mismatch (or a GET without `ETag`) is `INPUT_CHANGED`, with no retry. LIST and GET report the same
+ETag, multipart `-N` ETags included (integration-tested against SeaweedFS).
+
+The claim is a lease fenced by `split_attempts`: lease renewal (timer, every `lease_s/3`, and in each batch insert), done, failed and
 retry all match on the claimed value, so a splitter whose lease expired and was re-claimed becomes
 a no-op and aborts quietly. Each attempt has a wall-clock budget (`MINION_SPLIT_MAX_SECONDS`,
 default 3600; exceeding it backs off like any transient error). A claim never hands out a task with
 `split_attempts >= max_attempts`: it is marked `FAILED` with `SPLIT_ATTEMPTS_EXHAUSTED` (crash loop).
+Server shutdown during a read stops the read thread at its next chunk and does not count as a
+failed attempt.
 
 ### 3.2 Acquire (the core protocol)
 ```

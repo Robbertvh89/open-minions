@@ -142,7 +142,7 @@ class ServerSettings(BaseSettings):
     split_max_attempts: int = Field(default=5, gt=0)  # transient failures before FAILED
     split_backoff_base_s: float = Field(default=2.0, ge=0)  # doubles per attempt
     split_backoff_max_s: float = Field(default=300.0, ge=0)
-    split_lease_s: float = Field(default=900.0, gt=0)  # claim lease; crashed splits retry after
+    split_lease_s: float = Field(default=900.0, gt=0)  # claim lease, renewed every lease_s/3; crashed splits retry after
     split_max_seconds: float = Field(default=3600.0, gt=0)  # wall-clock budget per split attempt
 
     @field_validator("metrics_token", mode="before")
