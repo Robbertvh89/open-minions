@@ -1,9 +1,10 @@
 ---
 id: TASK-15.1
 title: SIGSTOP/SIGCONT duty gating of the worker (GPU guard rung 1)
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 21:07'
+updated_date: '2026-10-20 04:14'
 labels:
   - executor
   - security
