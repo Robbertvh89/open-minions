@@ -284,6 +284,16 @@ def probe_available(
     return [e for e in requested if found.get(e.value)]
 
 
+def warn_if_ollama(available: list[Engine]) -> None:
+    """One startup warning when Ollama is enabled: its daemon runs outside the worker, so the GPU
+    duty cycle is only paced per request and is not metered or enforced by the duty guard
+    (ADR-0006 D17, ADR-0009). Fixed fields only."""
+    if Engine.OLLAMA in available:
+        structlog.get_logger("minion_executor.main").warning(
+            "ollama_duty_cycle_not_enforced", reason="daemon_outside_worker"
+        )
+
+
 def _validate_heartbeat(interval_s: float) -> None:
     """The interval must be finite and within [1 s, 1 h] (the upper bound keeps the refreshed
     presigned URL valid between beats). The server's heartbeat timeout must be >= 2x the interval,
@@ -392,6 +402,7 @@ async def _run(
         if not available:
             raise StartupError(NO_ENGINE_MSG)
         typer.echo(f"engines: {','.join(e.value for e in available)}")
+        warn_if_ollama(available)
         reg = RegisterRequest(
             hostname=socket.gethostname(),
             chip=_chip(),
