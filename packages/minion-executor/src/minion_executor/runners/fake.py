@@ -171,6 +171,7 @@ def _gpu_burn(seconds: float) -> None:
     reader, whatever else the host runs)."""
     import mlx.core as mx  # engine import, test hook only
 
+    # Process-wide limits: concurrent burns in one process are unsupported (restored in finally).
     old_mem = mx.set_memory_limit(1 << 30)  # bounded: a burn must never grow the host (TASK-44)
     old_cache = mx.set_cache_limit(128 << 20)
     try:

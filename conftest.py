@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 import boto3
 import pytest
@@ -56,21 +56,32 @@ _SAMPLE_INTERVAL_S = 1.0
 
 
 def _check(
-    footprint: int | None, limit_bytes: int, nodeid: str, exit_fn: Callable[[int], Any]
+    footprint: int | None,
+    limit_bytes: int,
+    nodeid: str,
+    exit_fn: Callable[[int], Any],
+    out: TextIO | None = None,
 ) -> bool:
-    """True (after reporting and calling `exit_fn(3)`) when `footprint` exceeds `limit_bytes`.
-    `limit_bytes <= 0` or an unknown footprint never trips."""
+    """True (after reporting to `out`, default stderr, and calling `exit_fn(3)`) when `footprint`
+    exceeds `limit_bytes`. `limit_bytes <= 0` or an unknown footprint never trips."""
     if footprint is None or limit_bytes <= 0 or footprint <= limit_bytes:
         return False
-    sys.stderr.write(
-        f"\nFOOTPRINT GUARD: {nodeid} reached {footprint / _GB:.1f} GB "
-        f"(limit {limit_bytes / _GB:.1f} GB, MINION_TEST_MAX_FOOTPRINT_GB); aborting pytest\n"
+    out = out or sys.stderr
+    out.write(
+        f"\nFOOTPRINT GUARD: {nodeid} reached {footprint / _GB:.2f} GB "
+        f"(limit {limit_bytes / _GB:.2f} GB, MINION_TEST_MAX_FOOTPRINT_GB); aborting pytest\n"
     )
-    sys.stderr.flush()
-    with contextlib.suppress(Exception):  # captured stderr has no fd: the message above stands
-        faulthandler.dump_traceback(all_threads=True)
+    out.flush()
+    with contextlib.suppress(Exception):  # no real fd (unit test): the message above stands
+        faulthandler.dump_traceback(file=out, all_threads=True)
     exit_fn(3)
     return True
+
+
+def _append_log(path: str, rec: dict[str, Any]) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
 
 
 class _FootprintGuard:
@@ -84,6 +95,9 @@ class _FootprintGuard:
         self.peak = 0
         self._stop = threading.Event()
         self.pid = os.getpid()
+        # The real stderr, saved before pytest's fd capture replaces fd 2: a breach must be
+        # visible even though os._exit discards the capture tmpfile.
+        self._err = os.fdopen(os.dup(2), "w")
 
     def sample(self) -> int | None:
         fp = self._read(self.pid)
@@ -93,7 +107,18 @@ class _FootprintGuard:
 
     def _run(self) -> None:
         while not self._stop.wait(_SAMPLE_INTERVAL_S):
-            _check(self.sample(), self.limit, self.nodeid, os._exit)
+            fp = self.sample()
+            if fp is not None and 0 < self.limit < fp and self.log_path:
+                with contextlib.suppress(OSError):
+                    _append_log(
+                        self.log_path,
+                        {
+                            "nodeid": self.nodeid,
+                            "breach_gb": round(fp / _GB, 3),
+                            "peak_gb": round(fp / _GB, 3),
+                        },
+                    )
+            _check(fp, self.limit, self.nodeid, os._exit, self._err)
 
     def start(self) -> None:
         if self.sample() is None:  # unsupported OS: stay out of the way
@@ -112,6 +137,9 @@ def pytest_configure(config: pytest.Config) -> None:
     try:
         limit = float(os.environ.get("MINION_TEST_MAX_FOOTPRINT_GB", _DEFAULT_MAX_FOOTPRINT_GB))
     except ValueError:
+        sys.stderr.write(
+            f"MINION_TEST_MAX_FOOTPRINT_GB is not a number: using {_DEFAULT_MAX_FOOTPRINT_GB:g}\n"
+        )
         limit = _DEFAULT_MAX_FOOTPRINT_GB
     log_path = os.environ.get("MINION_TEST_RSS_LOG") or None
     if limit <= 0 and not log_path:
@@ -145,8 +173,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
                 "peak_gb": round(g.peak / _GB, 3),
                 "delta_gb": round((end - start) / _GB, 3),
             }
-            with Path(g.log_path).open("a") as fh:
-                fh.write(json.dumps(rec) + "\n")
+            _append_log(g.log_path, rec)
         g.nodeid = "<between tests>"
 
 

@@ -180,6 +180,10 @@ def test_burn_hook_saturates_the_gpu(quiet_gpu: None) -> None:
             b, t1 = sum(read().get(child.pid, {}).values()), time.monotonic()
             shares.append((b - a) / 1e9 / (t1 - t0))
             peak = max(peak, process_footprint_bytes(child.pid) or 0)
+        rc = child.poll()
+        if rc not in (None, 0):
+            err = child.stderr.read().decode(errors="replace")[-2000:] if child.stderr else ""
+            raise AssertionError(f"burn child died rc={rc}: {err}")
         assert max(shares) >= 0.8, shares
         assert peak <= 2 << 30, f"burn footprint {peak / 2**30:.2f} GiB"
     finally:

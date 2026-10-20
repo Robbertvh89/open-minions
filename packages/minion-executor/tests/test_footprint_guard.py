@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from conftest import _check
@@ -21,7 +26,7 @@ def test_breach_exits_3_and_names_the_test(capsys: pytest.CaptureFixture[str]) -
     assert codes == [3]
     err = capsys.readouterr().err
     assert "t::runaway" in err
-    assert "20.0 GB" in err
+    assert "20.00 GB" in err
 
 
 def test_unknown_footprint_or_disabled_limit_never_trips() -> None:
@@ -29,3 +34,25 @@ def test_unknown_footprint_or_disabled_limit_never_trips() -> None:
     assert not _check(None, 16 * _GB, "t::a", codes.append)
     assert not _check(99 * _GB, 0, "t::a", codes.append)
     assert codes == []
+
+
+def test_guard_aborts_a_real_pytest_run_visibly(tmp_path: Path) -> None:
+    """End to end under default fd capture: rc 3 and the message reaches the real stderr."""
+    from minion_executor.worker.footprint import process_footprint_bytes
+
+    if process_footprint_bytes(os.getpid()) is None:
+        pytest.skip("no footprint reader on this OS")
+    (tmp_path / "test_slow.py").write_text("import time\n\ndef test_slow():\n    time.sleep(3)\n")
+    root = Path(__file__).resolve().parents[3]
+    env = {**os.environ, "MINION_TEST_MAX_FOOTPRINT_GB": "0.01"}
+    proc = subprocess.run(  # noqa: S603
+        [
+            sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(root),
+            "--confcutdir", str(root), "-c", str(root / "pyproject.toml"),
+            "--import-mode=importlib", "-p", "conftest", str(tmp_path / "test_slow.py"),
+        ],
+        cwd=root, env=env, capture_output=True, text=True, timeout=120,
+    )  # fmt: skip
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 3, out
+    assert "FOOTPRINT GUARD" in out and "test_slow" in out, out
