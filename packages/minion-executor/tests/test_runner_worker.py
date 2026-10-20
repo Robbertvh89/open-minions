@@ -934,7 +934,7 @@ def test_deeply_nested_json_reply_is_a_crash_not_an_exception() -> None:
     assert not proc.is_alive()
 
 
-def test_hard_reset_releases_an_ollama_model_and_graceful_unload_does_not(
+def test_hard_reset_and_graceful_unload_both_release_from_the_control_side(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import minion_executor.runners.ollama as om
@@ -948,6 +948,67 @@ def test_hard_reset_releases_an_ollama_model_and_graceful_unload_does_not(
     assert seen == ["q:1"]
     w.ensure_model(_model(), BUDGET)
     w._ollama_ref = "q:2"
-    w.unload()  # worker's runner released it already
-    assert seen == ["q:1"]
+    w.unload()  # the worker said ok, but its word is not trusted: the control side releases too
+    assert seen == ["q:1", "q:2"]
+    w.close()
+
+
+def test_a_failed_worker_unload_still_releases_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+    import minion_executor.worker.process as wp
+
+    seen: list[str] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append(ref))
+    monkeypatch.setattr(wp, "UNLOAD_TIMEOUT_S", 0.5)
+    w, proc = _hostile_worker("no_ok")
+    w._ollama_ref = "q:3"
+    w.unload()
+    assert not proc.is_alive() and seen == ["q:3"]
+
+
+def test_kill_then_the_failing_calls_reset_release_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[str] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append(ref))
+    for hard_stop in ("kill", "interrupt"):
+        seen.clear()
+        w = WorkerHandle([Engine.FAKE])
+        w.ensure_model(_model(), BUDGET)
+        w._ollama_ref = "q:4"
+        getattr(w, hard_stop)()
+        w._reset()  # what the in-flight call's failure path does
+        assert seen == ["q:4"], hard_stop
+        w.close()
+
+
+def test_kill_during_an_inflight_run_releases_the_ollama_model_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    seen: list[str] = []
+    monkeypatch.setattr(om, "release_model", lambda url, ref: seen.append(ref))
+    w = WorkerHandle([Engine.FAKE], test_hooks=True)
+    w.ensure_model(_model(), BUDGET)
+    w._ollama_ref = "q:5"
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def go() -> None:
+        started.set()
+        try:
+            w.run([{"id": 1, "sleep_s": 30}])
+        except BaseException as e:
+            errors.append(e)
+
+    t = threading.Thread(target=go)
+    t.start()
+    assert started.wait(5)
+    w.kill()
+    t.join(15)
+    assert not t.is_alive() and isinstance(errors[0], WorkerCrashed)
+    assert seen == ["q:5"]
     w.close()

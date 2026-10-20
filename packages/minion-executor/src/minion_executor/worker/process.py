@@ -629,6 +629,7 @@ class WorkerHandle:
         self._model_id: str | None = None
         self._model_revision: str | None = None  # of the loaded model (a bump reloads)
         self._ollama_ref: str | None = None  # set while an Ollama model may be resident
+        self._ref_lock = threading.Lock()  # guards the take-once of _ollama_ref
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
         self._deadline_factory: Callable[[Callable[[], None]], _Deadline] = _Deadline  # test seam
@@ -851,7 +852,8 @@ class WorkerHandle:
             elif self._model_id is not None or (self._sandbox is not None and self._proc):
                 self._reset()  # a sandboxed worker's grants are fixed: load into a fresh one
             # MLX workers never need torch: keep `transformers` from importing it (smaller surface).
-            self._ollama_ref = model.ref if model.engine == Engine.OLLAMA else None
+            with self._ref_lock:
+                self._ollama_ref = model.ref if model.engine == Engine.OLLAMA else None
             self._engine_env = {"USE_TORCH": "0"} if model.engine == Engine.MLX else {}
             self._call(
                 {
@@ -1132,7 +1134,7 @@ class WorkerHandle:
                         UNLOAD_TIMEOUT_S,
                         hard_deadline=time.monotonic() + UNLOAD_TIMEOUT_S,
                     )
-                    self._ollama_ref = None  # the runner released it; skip the second request
+                    # the runner's own release is not trusted: _reset sends the control-side one
         finally:
             self._reset()
 
@@ -1144,19 +1146,25 @@ class WorkerHandle:
         call it off the event loop.
         """
         self._closed = True
-        ref = self._ollama_ref
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 if reap:  # reap now: no <defunct> child until the next _reset
                     proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(ref)
+            self._release_ollama(self._take_ollama_ref())
+
+    def _take_ollama_ref(self) -> str | None:
+        """Read and clear the resident Ollama ref once: whoever gets it sends the one release
+        (a hard kill and the failing in-flight call's `_reset` must not both send one)."""
+        with self._ref_lock:
+            ref, self._ollama_ref = self._ollama_ref, None
+        return ref
 
     def _release_ollama(self, ref: str | None) -> None:
-        """After a hard kill the daemon still holds the weights for up to `keep_alive`: send a
-        best-effort `keep_alive: 0` from the control side (short timeout, no env proxies). Callers
-        run off the event loop (`asyncio.to_thread`)."""
+        """After a hard kill (or any worker end) the daemon may still hold the weights for up to
+        `keep_alive`: send a best-effort `keep_alive: 0` from the control side, bounded by
+        `RELEASE_TOTAL_S` in total (no env proxies). Callers run off the event loop."""
         if ref is not None:
             from minion_executor.runners.ollama import release_model
 
@@ -1171,14 +1179,13 @@ class WorkerHandle:
         the child, so call it off the event loop.
         """
         self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
-        ref = self._ollama_ref
         proc = self._proc
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 # reap now: no <defunct> child until the next _reset
                 proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(ref)
+            self._release_ollama(self._take_ollama_ref())
 
     def _reset(self) -> None:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
@@ -1190,7 +1197,7 @@ class WorkerHandle:
         with self._ctl_lock:
             self._sent_gen, self._unsent = self._ctl_gen, None  # the next run carries the state
             self._wire_gen = 0
-        ref, self._ollama_ref = self._ollama_ref, None
+        ref = self._take_ollama_ref()
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():

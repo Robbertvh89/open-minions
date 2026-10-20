@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -656,3 +657,88 @@ def test_a_pause_stops_new_requests_reaching_the_daemon_but_in_flight_ones_finis
     t.join(10)
     assert not t.is_alive() and chats() == 6
     assert [rec["id"] for rec in out] == list(range(6))
+
+
+# --- release_model: total cap, bounded threads (TASK-12) -------------------------------------
+
+
+@pytest.fixture
+def _clean_release_slots() -> Iterator[None]:
+    import minion_executor.runners.ollama as om
+
+    yield
+    # every stuck release thread must have ended: take both slots back, then give them up
+    got = [om._release_slots.acquire(timeout=10) for _ in range(om._MAX_RELEASE_THREADS)]
+    assert all(got)
+    for _ in got:
+        om._release_slots.release()
+
+
+@pytest.mark.usefixtures("_clean_release_slots")
+def test_release_model_has_a_total_cap_and_a_bounded_thread_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.runners.ollama as om
+
+    gate = threading.Event()
+    posts: list[str] = []
+
+    def stuck_post(base: str, ref: str) -> bool:
+        posts.append(ref)
+        return gate.wait(30) or True
+
+    monkeypatch.setattr(om, "_post_release", stuck_post)
+    url = "http://127.0.0.1:11434"
+    assert om.release_model(url, REF, total_s=0.05) is False  # slot 1 stuck
+    assert om.release_model(url, REF, total_s=0.05) is False  # slot 2 stuck
+    assert om.release_model(url, REF, total_s=5) is False  # no free slot: no thread, no wait
+    assert len(posts) == 2
+    gate.set()  # the stuck POSTs finish: the slots come back
+    for _ in range(om._MAX_RELEASE_THREADS):
+        assert om._release_slots.acquire(timeout=10)
+    for _ in range(om._MAX_RELEASE_THREADS):
+        om._release_slots.release()
+    assert om.release_model(url, REF, total_s=5) is True
+    assert len(posts) == 3
+
+
+def test_release_model_refuses_a_non_loopback_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minion_executor.runners.ollama as om
+
+    monkeypatch.setattr(om, "_post_release", lambda base, ref: pytest.fail("must not post"))
+    assert om.release_model("http://example.com:11434", REF) is False
+
+
+@pytest.mark.usefixtures("_clean_release_slots")
+def test_release_model_returns_within_its_cap_against_a_dripping_listener() -> None:
+    import socket
+
+    import minion_executor.runners.ollama as om
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(1)
+            with contextlib.suppress(OSError):
+                conn.recv(65536)
+                for byte in b"HTTP/1.1 200 OK\r\n":
+                    if stop.wait(0.1):
+                        return
+                    conn.send(bytes([byte]))  # one byte at a time: each resets the read timeout
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        t0 = time.monotonic()
+        assert om.release_model(f"http://127.0.0.1:{port}", REF, total_s=0.5) is False
+        assert time.monotonic() - t0 < 2
+    finally:
+        stop.set()
+        t.join(10)
+        srv.close()
