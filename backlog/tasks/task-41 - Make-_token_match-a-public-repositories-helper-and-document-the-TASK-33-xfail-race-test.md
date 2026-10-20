@@ -3,9 +3,10 @@ id: TASK-41
 title: >-
   Make _token_match a public repositories helper and document the TASK-33 xfail
   race test
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-19 06:58'
+updated_date: '2026-10-20 00:04'
 labels:
   - chore
 dependencies: []

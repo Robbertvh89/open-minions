@@ -1,9 +1,10 @@
 ---
 id: TASK-17
 title: 'minion-server: structured JSON logs (structlog JSONRenderer) like the watchdog'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-17 10:23'
+updated_date: '2026-10-20 00:04'
 labels:
   - server
 dependencies: []

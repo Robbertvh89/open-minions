@@ -1,10 +1,10 @@
 ---
 id: TASK-43
 title: GPU guard follow-ups from TASK-15 review
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-19 14:36'
-updated_date: '2026-10-19 14:47'
+updated_date: '2026-10-20 00:04'
 labels:
   - security
 dependencies: []
