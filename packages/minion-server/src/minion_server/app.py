@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -58,6 +59,18 @@ async def _preload_tokens(app: FastAPI) -> None:
             ExecutorPrincipal(i.executor_id, i.owner, i.pool, i.token_hash),
             i.token_expires_at,
         )
+
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _safe_loc_part(part: object) -> str | int:
+    """Field names and indexes only: a dict key in `loc` is data (could be an object key)."""
+    if isinstance(part, int):
+        return part
+    if isinstance(part, str) and _IDENT.match(part):
+        return part
+    return "<key>"
 
 
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
@@ -189,7 +202,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             route=getattr(route, "path", None),
             method=request.method,
             errors=[
-                {"loc": [str(part) for part in err.get("loc", ())], "type": str(err.get("type"))}
+                {"loc": [_safe_loc_part(part) for part in err.get("loc", ())], "type": str(err.get("type"))}
                 for err in exc.errors()
             ],
         )

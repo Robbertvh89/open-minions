@@ -201,7 +201,7 @@ async def test_response_validation_error_is_generic_500_and_log_has_no_values() 
 
 
 async def test_response_validation_error_stdout_has_no_values(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from minion_server.logging_config import configure_logging
 
@@ -216,3 +216,25 @@ async def test_response_validation_error_stdout_has_no_values(
     assert "int_parsing" in text
     assert "X-Amz-Signature" not in text
     assert "deadbeefcafe" not in text
+
+
+async def test_response_validation_error_dict_key_in_loc_is_masked() -> None:
+    from pydantic import BaseModel
+
+    class Out(BaseModel):
+        files: dict[str, int]
+
+    app = create_app()
+
+    @app.get("/keys", response_model=Out)
+    async def keys() -> Any:
+        return {"files": {"secret-object.jsonl": "not-an-int"}}
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    with structlog.testing.capture_logs() as logs:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/keys")
+    assert response.status_code == 500
+    [entry] = [e for e in logs if e["event"] == "response_validation_error"]
+    assert entry["errors"][0]["loc"] == ["response", "files", "<key>"]
+    assert "secret-object" not in repr(logs)
