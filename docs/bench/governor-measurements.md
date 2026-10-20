@@ -37,6 +37,12 @@ phase. Per profile about `warm-up + baseline + 2 x duration + 2 s` = 145 s plus 
 about 85 s), times `--repeats`. The footprint sampler (10 Hz) and the GPU sampler start before the
 model loads, so the footprint peak includes the load.
 
+Headroom (TASK-55): the table's `window headroom` column is `duty + 10 pp - max 10 s window` (the
+run-time guard's kill limit, ADR-0006 D17). Below 5 pp the row shows `WARN` and the JSON has
+`headroom_warning: true`: an early warning that this engine is drifting toward field kills. It does not
+change the verdict or the exit code (those stay the NF-8 hard bound, accuracy and memory). The honest
+gpu-marked tests (`test_gpu_guard_gpu.py`, `test_mlx_runners_gpu.py`) fail on the same 5 pp rule.
+
 Columns: `unpaced` / `measured` (worker GPU time share), `expected` = duty x unpaced, `pacer-reported`
 (worker `busy/wall`, advisory), `device idle/unpaced/paced` (device-wide utilization, informational
 only, never judged), `footprint GB` (peak `phys_footprint`) vs `budget GB`, and pass/fail:

@@ -630,3 +630,19 @@ def test_distinct_clients_counts_ids_over_the_run() -> None:
     s.append(gpu_meter.GpuSample(9.0, 0.0, None))
     assert bb.distinct_clients(s) == 3
     assert bb.distinct_clients([]) == 0
+
+
+def test_window_headroom_helper() -> None:
+    assert bb.window_headroom(0.3, 0.25) == pytest.approx(0.15)
+    assert bb.window_headroom(0.3, 0.45) == pytest.approx(-0.05)
+    bb.assert_window_headroom(0.3, 0.35)  # exactly 5 pp under the 0.40 limit: ok
+    bb.assert_window_headroom(0.6, 0.1)
+    with pytest.raises(AssertionError, match="headroom"):
+        bb.assert_window_headroom(0.3, 0.36)
+    with pytest.raises(AssertionError):
+        bb.assert_window_headroom(0.3, 0.45)  # over the limit
+    assert bb.within_headroom(0.5, 0.55) and not bb.within_headroom(0.5, 0.56)
+    with pytest.raises(ValueError):
+        bb.window_headroom(0.3, float("nan"))
+    with pytest.raises(ValueError):
+        bb.window_headroom(-0.1, 0.1)

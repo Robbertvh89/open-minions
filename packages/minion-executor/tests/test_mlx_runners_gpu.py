@@ -35,6 +35,7 @@ from minion_common.schemas import (
     ModelEntry,
     PresignedPost,
 )
+from minion_executor.bench_budget import assert_window_headroom
 from minion_executor.loop import ExecutorLoop
 from minion_executor.model_cache import FetchEnv, ModelCache
 from minion_executor.runners.base import EngineConfig, Record
@@ -598,6 +599,7 @@ def test_completion_gpu_share_respects_the_duty_cycle(completion: MlxCompletionR
     assert n0 == n == 16
     assert secs > 5, "run too short to measure"
     assert share <= duty + 0.10, f"worker GPU share {share:.2f} exceeds duty {duty}"
+    assert_window_headroom(duty, share)  # TASK-55: honest run, 5 pp under the guard limit
     assert share >= duty * unpaced - 0.10, (
         f"worker GPU share {share:.2f} under-uses the duty (expected ~{duty * unpaced:.2f})"
     )

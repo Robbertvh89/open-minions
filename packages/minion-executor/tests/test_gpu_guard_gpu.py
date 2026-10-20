@@ -28,6 +28,7 @@ from minion_common.schemas import (
     ModelEntry,
     PresignedPost,
 )
+from minion_executor.bench_budget import assert_window_headroom
 from minion_executor.capacity.governor import Decision, ProfileSource
 from minion_executor.capacity.gpu_guard import GpuAction, GpuGuardConfig
 from minion_executor.capacity.gpu_meter import default_gpu_reader
@@ -352,6 +353,7 @@ async def test_honest_mlx_worker_is_never_killed(
     assert loop._status_snapshot().gpu_violation is None
     assert reader.calls >= 5 and shares, "the guard never judged a window"
     assert max(shares) <= budget.gpu_duty_cycle + DEFAULTS.margin, shares
+    assert_window_headroom(budget.gpu_duty_cycle, max(shares), DEFAULTS.margin)  # TASK-55
 
 
 class OneShotClient(Client):
