@@ -1,10 +1,10 @@
 ---
 id: TASK-12
 title: Worker IPC and Ollama hardening follow-ups (from TASK-4.3 review)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-16 03:29'
-updated_date: '2026-10-20 03:06'
+updated_date: '2026-10-20 04:27'
 labels:
   - executor
   - security
