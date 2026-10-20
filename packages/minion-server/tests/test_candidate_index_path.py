@@ -170,7 +170,7 @@ async def test_new_statement_matches_old_order(fresh_url: str) -> None:
                     "pool": rng.choice(["default", "other"]),
                     "preference": pref,
                 }
-                for limit in (1, 16):
+                for limit in (1, 16, 256):
                     async with sm() as s:
                         old = (
                             await s.execute(
@@ -260,19 +260,30 @@ def _buffers(plan: dict[str, Any]) -> int:
     return int(root.get("Shared Hit Blocks", 0)) + int(root.get("Shared Read Blocks", 0))
 
 
-def assert_index_paths(plan: dict[str, Any], *, live_index: bool = True) -> None:
-    """Both partial indexes are used; no Seq Scan on minion_subtask; no Sort has a
-    minion_subtask scan anywhere in its subtree (the old plan sorted all pending rows)."""
+def assert_index_paths(plan: dict[str, Any]) -> None:
+    """The recursive ordered walk (TASK-54): a Recursive Union whose steps are Index Scans on the
+    live-queue index with a row-compare Index Cond; the pending probes use
+    ix_minion_subtask_pending; no Seq Scan on either table; no Sort ever sees more rows than the
+    window (a Sort over all live tasks or all pending subtasks is the failure this guards)."""
     nodes = _nodes(plan["Plan"])
     text_plan = json.dumps(plan)
     assert "ix_minion_subtask_pending" in text_plan, text_plan
-    if live_index:
-        assert "ix_minion_task_live_queue" in text_plan, text_plan
+    assert any(n["Node Type"] == "Recursive Union" for n in nodes), text_plan
+    steps = [n for n in nodes if n.get("Index Name") == "ix_minion_task_live_queue"]
+    assert steps, text_plan
+    assert all("ROW(" in n.get("Index Cond", "") for n in steps), text_plan
     for n in nodes:
         if n["Node Type"] == "Seq Scan":
-            assert n.get("Relation Name") != "minion_subtask", text_plan
-        if n["Node Type"] == "Sort":  # Incremental Sort = the bounded outer re-order
-            assert all(d.get("Relation Name") != "minion_subtask" for d in _nodes(n)), text_plan
+            assert n.get("Relation Name") not in ("minion_subtask", "minion_task"), text_plan
+        if n["Node Type"] == "Sort":
+            rows = int(n.get("Actual Rows", 0)) * int(n.get("Actual Loops", 1))
+            assert rows <= SORT_ROW_BOUND, (rows, text_plan)
+        assert n["Node Type"] != "Bitmap Heap Scan" or n.get("Relation Name") != "minion_task", (
+            text_plan
+        )
+
+
+SORT_ROW_BOUND = 16 * 100  # window x pending rows per task in the seeds (loose; scans of 10k+ fail)
 
 
 async def _seed_big(conn: Any, per_task: int, extra_empty_tasks: int = 0) -> None:
@@ -348,8 +359,7 @@ async def test_candidate_buffers_do_not_grow_with_queue_length(fresh_url: str) -
 async def test_candidate_buffers_bounded_with_many_empty_live_tasks(fresh_url: str) -> None:
     # ~3 buffers per eligible live task without pending subtasks ahead of the first match.
     plan = (await _plans(fresh_url, 100, extra_empty_tasks=2_000))["analyze"]
-    # With thousands of live tasks the planner may sort them instead of walking the index.
-    assert_index_paths(plan, live_index=False)
+    assert_index_paths(plan)
     assert _buffers(plan) < BUFFER_BOUND, _buffers(plan)
 
 
@@ -377,8 +387,8 @@ FROM generate_series(1, {n}) AS t, generate_series(1, 3) AS s;
 ANALYZE minion_task;
 ANALYZE minion_subtask;
 """
-# Measured: ~151 buffers, 2 subtask probes, <1 ms (both plan kinds; a bitmap scan of the ~5,012
-# live tasks on ix_minion_task_queue, junk filtered in the heap, the 12 runnable ones sorted).
+# Measured: ~161 buffers, 3 subtask probes, <1 ms (both plan kinds; the recursive walk scans the
+# ~5,012 live tasks in index order once, junk filtered in the heap, 12 runnable ones visited).
 # Bound = ~1.5x measured, so a regression to one subtask probe per junk task (>= 5,000 x 3
 # buffers) or a Seq Scan over the subtasks fails loudly.
 UNRUNNABLE_BUFFER_BOUND = 230
@@ -423,8 +433,8 @@ def _subtask_probes(plan: dict[str, Any]) -> int:
 @pytest.mark.parametrize("kind", ["analyze", "generic"])
 async def test_candidate_bounded_with_5k_unrunnable_live_tasks(fresh_url: str, kind: str) -> None:
     plan = (await _unrunnable_plans(fresh_url))[kind]
-    # No Seq Scan / Sort over minion_subtask; the 5k junk tasks sort first but are filtered out.
-    assert_index_paths(plan, live_index=False)
+    # The 5k junk tasks sort first but are filtered out in the walk's index scan.
+    assert_index_paths(plan)
     probes = _subtask_probes(plan)
     buffers = _buffers(plan)
     print(f"TASK-30 {kind}: probes={probes} buffers={buffers} ms={plan['Execution Time']:.1f}")

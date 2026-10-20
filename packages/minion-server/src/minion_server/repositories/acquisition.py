@@ -22,6 +22,7 @@ from sqlalchemy import (
     literal_column,
     select,
     true,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -73,6 +74,24 @@ def status_literal(status: TaskStatus | SubtaskStatus) -> ColumnElement[str]:
     return literal_column("'" + value + "'")
 
 
+def _pending_probe(key: Any, limit: int, *cols: ColumnElement[Any] | Any) -> Select[Any]:
+    """The first `limit` PENDING subtasks of the task `key` (anything with team, project,
+    task_name columns), ordered by subtask_id. The ORDER BY is load-bearing: without it the
+    planner may seq-scan the subtasks or flatten an EXISTS into a semi-join that drives the walk
+    from `minion_subtask`; with it a seq scan would need a full sort and is never chosen."""
+    return (
+        select(*cols)
+        .where(
+            Subtask.team == key.team,
+            Subtask.project == key.project,
+            Subtask.task_name == key.task_name,
+            Subtask.status == status_literal(SubtaskStatus.PENDING),
+        )
+        .order_by(Subtask.subtask_id)
+        .limit(literal_column(str(int(limit))))
+    )
+
+
 def candidates_stmt(
     *,
     engines: list[Engine],
@@ -85,20 +104,54 @@ def candidates_stmt(
 ) -> Select[Any]:
     """The candidate query (also what the scale harness EXPLAINs).
 
-    Two-step, index-driven: walk the eligible live tasks in FR-22 order on
-    `ix_minion_task_live_queue`, and for each take its first `limit` PENDING subtasks from
-    `ix_minion_subtask_pending` (LATERAL, ordered by subtask_id, LIMIT). Cost is
-    O(limit + live tasks), independent of the number of pending subtasks.
+    A `WITH RECURSIVE` ordered walk (TASK-54, ADR-0021). Each recursion step is a `LIMIT 1`
+    range scan on `ix_minion_task_live_queue ((-priority), created_at, team, project,
+    task_name) WHERE live` that starts after a row-compare cursor, so no plan can read every live
+    task and sort them. A step returns the next eligible live task that still has a PENDING
+    subtask and adds `min(limit, its pending count)` to the running total `got`; the recursion
+    stops once `got >= limit` or no such task is left. The final SELECT takes each visited
+    task's first `limit` PENDING subtasks (LATERAL, ordered by subtask_id) and re-sorts.
 
     Order equivalence with the single-join form `ORDER BY priority DESC, created_at, team,
-    project, task_name, subtask_id LIMIT k`: the task key (team, project, task_name) is the
-    primary key, so the sort key is a total order and rows of one task are contiguous, ordered
-    by subtask_id. The global first k rows therefore contain at most k rows of any one task, and
-    those are that task's first k PENDING subtasks by subtask_id, which is exactly what each
-    lateral branch returns. The outer ORDER BY + LIMIT then yields the same list.
+    project, task_name, subtask_id LIMIT k`: the task key is the primary key, so the order is
+    total and the rows of a task are contiguous and ordered by subtask_id. The walk visits tasks
+    in that order and stops only once the visited tasks hold >= k rows, so they contain the
+    global first k rows; the outer ORDER BY + LIMIT yields exactly that list.
+
+    Every LIMIT is a literal (a generic plan would otherwise assume 10 % of the rows). Cost:
+    O(contributing tasks x 3 probes + skipped live tasks); filtered tasks cost a heap filter,
+    drained tasks one probe each. The read stays unlocked; the acquirement INSERT remains the
+    only arbiter (invariant 2).
     """
-    live = (
+    if not 1 <= limit <= MAX_WINDOW:
+        raise ValueError(f"limit must be in 1..{MAX_WINDOW}, got {limit}")
+    lim: ColumnElement[Any] = literal_column(str(int(limit)))
+    # Sentinel row: one plan shape for every step; sorts before every real task. It carries
+    # NULL model_id so the final SELECT can drop it.
+    walk = select(
+        literal_column("-2147483647::integer").label("nprio"),
+        literal_column("'-infinity'::timestamptz").label("created_at"),
+        literal_column("''::varchar").label("team"),
+        literal_column("''::varchar").label("project"),
+        literal_column("''::varchar").label("task_name"),
+        literal_column("NULL::varchar").label("model_id"),
+        literal_column("NULL::text").label("output_uri"),
+        literal_column("NULL::jsonb").label("params"),
+        literal_column("NULL::integer").label("priority"),
+        literal_column("0::bigint").label("got"),
+    ).cte("walk", recursive=True)
+    nprio = -Task.priority
+    has_pending = _pending_probe(Task, 1, Subtask.subtask_id).scalar_subquery().is_not(None)
+    # .correlate(Task): without it the count becomes an uncorrelated cartesian product.
+    pending_count = (
+        select(func.count())
+        .select_from(_pending_probe(Task, limit, literal_column("1")).correlate(Task).subquery("c"))
+        .scalar_subquery()
+    )
+    step = (
         select(
+            nprio.label("nprio"),
+            Task.created_at,
             Task.team,
             Task.project,
             Task.task_name,
@@ -106,7 +159,7 @@ def candidates_stmt(
             Task.output_uri,
             Task.params,
             Task.priority,
-            Task.created_at,
+            (walk.c.got + pending_count).label("got"),
         )
         .where(
             Task.status.in_(
@@ -116,66 +169,59 @@ def candidates_stmt(
             Task.engine.in_([e.value for e in engines]),
             Task.model_memory_gb <= Decimal(str(memory_gb)),
             (Task.allowed_pool.is_(None)) | (Task.allowed_pool == pool),
+            has_pending,
+            tuple_(nprio, Task.created_at, Task.team, Task.project, Task.task_name)
+            > tuple_(
+                walk.c.nprio, walk.c.created_at, walk.c.team, walk.c.project, walk.c.task_name
+            ),
         )
-        .order_by(
-            Task.priority.desc(),
-            Task.created_at,
-            Task.team,
-            Task.project,
-            Task.task_name,
-        )
+        .order_by(nprio, Task.created_at, Task.team, Task.project, Task.task_name)
+        .limit(literal_column("1"))
     )
     if preference is not None:
         for col, value in zip((Task.team, Task.project, Task.task_name), preference, strict=True):
             if value is not None:
-                live = live.where(col == value)
-    t = live.subquery("t")
-    per_task = (
-        select(
-            Subtask.subtask_id,
-            Subtask.input_object_key,
-            Subtask.byte_start,
-            Subtask.byte_end,
-            Subtask.record_count,
-        )
-        .where(
-            Subtask.team == t.c.team,
-            Subtask.project == t.c.project,
-            Subtask.task_name == t.c.task_name,
-            Subtask.status == status_literal(SubtaskStatus.PENDING),
-        )
-        .order_by(Subtask.subtask_id)
-        .limit(limit)
-        .lateral("s")
-    )
+                step = step.where(col == value)
+    nx = step.lateral("nx")
+    walk = walk.union_all(select(*nx.c).select_from(walk).join(nx, true()).where(walk.c.got < lim))
+    s = _pending_probe(
+        walk.c,
+        limit,
+        Subtask.subtask_id,
+        Subtask.input_object_key,
+        Subtask.byte_start,
+        Subtask.byte_end,
+        Subtask.record_count,
+    ).lateral("s")
     cols: list[ColumnElement[Any]] = [
-        t.c.team,
-        t.c.project,
-        t.c.task_name,
-        per_task.c.subtask_id,
-        t.c.model_id,
-        per_task.c.input_object_key,
-        per_task.c.byte_start,
-        per_task.c.byte_end,
-        per_task.c.record_count,
-        t.c.output_uri,
-        t.c.params,
+        walk.c.team,
+        walk.c.project,
+        walk.c.task_name,
+        s.c.subtask_id,
+        walk.c.model_id,
+        s.c.input_object_key,
+        s.c.byte_start,
+        s.c.byte_end,
+        s.c.record_count,
+        walk.c.output_uri,
+        walk.c.params,
     ]
     if with_priority:
-        cols.append(t.c.priority)
+        cols.append(walk.c.priority)
     stmt = (
         select(*cols)
-        .select_from(t)
-        .join(per_task, true())
+        .select_from(walk)
+        .join(s, true())
+        .where(walk.c.model_id.is_not(None))
         .order_by(
-            t.c.priority.desc(),
-            t.c.created_at,
-            t.c.team,
-            t.c.project,
-            t.c.task_name,
-            per_task.c.subtask_id,
+            walk.c.nprio,
+            walk.c.created_at,
+            walk.c.team,
+            walk.c.project,
+            walk.c.task_name,
+            s.c.subtask_id,
         )
-        .limit(limit)
+        .limit(lim)
     )
     return cast("Select[Any]", stmt)
 
