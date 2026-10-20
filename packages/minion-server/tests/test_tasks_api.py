@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -810,6 +811,50 @@ async def test_iter_object_guards(storage: S3Storage, s3: S3Env) -> None:
         b"".join(storage.iter_object("inputs/fz7/g.jsonl", size=size + 1))
     with pytest.raises(PreconditionFailedError):  # If-Match with a stale ETag
         b"".join(storage.iter_object("inputs/fz7/g.jsonl", etag='"deadbeef"'))
+
+
+@pytest.mark.integration
+async def test_iter_object_get_etag_backstop_when_if_match_ignored(
+    storage: S3Storage, s3: S3Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.storage import PreconditionFailedError
+
+    key = "inputs/fz7b/g.jsonl"
+    _put(s3, key, _jsonl(5, "a"))
+    ((_, size, etag),) = await storage.list_objects("inputs/fz7b/")
+    _put(s3, key, _jsonl(5, "b"))  # same size, different bytes, after listing
+    real_get = storage._client.get_object
+
+    def ignore_if_match(**kw: Any) -> Any:
+        kw.pop("IfMatch", None)  # a backend that does not honour If-Match
+        return real_get(**kw)
+
+    monkeypatch.setattr(storage._client, "get_object", ignore_if_match)
+    with pytest.raises(PreconditionFailedError):
+        b"".join(storage.iter_object(key, etag=etag, size=size))
+
+
+@pytest.mark.integration
+async def test_iter_object_multipart_list_and_get_etags_agree(
+    storage: S3Storage, s3: S3Env
+) -> None:
+    """Guards against a false INPUT_CHANGED: LIST and GET must report the same multipart ETag."""
+    from boto3.s3.transfer import TransferConfig
+
+    key = "inputs/fz7c/big.jsonl"
+    data = _jsonl(200_000, "m")  # ~7 MiB, two parts at the 5 MiB threshold
+    assert len(data) > 5 * 1024 * 1024
+    s3.client.upload_fileobj(
+        io.BytesIO(data),
+        s3.bucket,
+        key,
+        Config=TransferConfig(multipart_threshold=5 << 20, multipart_chunksize=5 << 20),
+    )
+    ((_, size, etag),) = await storage.list_objects("inputs/fz7c/")
+    got = s3.client.get_object(Bucket=s3.bucket, Key=key)["ETag"]
+    print("multipart ETag LIST/GET:", etag, got)
+    assert etag.strip('"') == got.strip('"')
+    assert b"".join(storage.iter_object(key, etag=etag, size=size)) == data
 
 
 @pytest.mark.integration

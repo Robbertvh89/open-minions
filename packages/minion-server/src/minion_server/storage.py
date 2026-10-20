@@ -1,7 +1,7 @@
 """Object storage access. Sync boto3 wrapped in `asyncio.to_thread` (plan D3)."""
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -21,6 +21,14 @@ PROBE_PREFIX = "_preflight/check-storage/"  # operator `check-storage` probes on
 COPY_CONNECT_TIMEOUT_S = 5
 COPY_READ_TIMEOUT_S = 30
 COPY_MAX_ATTEMPTS = 2
+
+
+def _norm_etag(etag: str) -> str:
+    """Compare ETags regardless of weak prefix and quoting."""
+    e = etag.strip()
+    if e.startswith("W/"):
+        e = e[2:]
+    return e.strip('"')
 
 
 class PreconditionFailedError(Exception):
@@ -202,22 +210,27 @@ class S3Storage:
         *,
         etag: str | None = None,
         size: int | None = None,
-    ) -> Iterator[bytes]:
+    ) -> Generator[bytes]:
         """Blocking chunk iterator; call from a worker thread (splitter).
 
-        With `etag` the GET is conditional (`If-Match`); with `size` the stream is cut off and
-        `PreconditionFailedError` raised as soon as it exceeds (or ends short of) that many bytes,
-        so an object replaced after listing cannot be read past what was checked.
+        With `etag` the GET is conditional (`If-Match`) and the response `ETag` must equal it too
+        (a backend that ignores `If-Match` would otherwise serve a same-size replacement). With
+        `size` the stream is cut off and `PreconditionFailedError` raised as soon as it exceeds
+        (or ends short of) that many bytes, so an object replaced after listing cannot be read
+        past what was checked.
         """
         extra: dict[str, str] = {"IfMatch": etag} if etag else {}
         try:
-            body = self._client.get_object(Bucket=self._bucket, Key=key, **extra)["Body"]  # type: ignore[arg-type]
+            resp = self._client.get_object(Bucket=self._bucket, Key=key, **extra)  # type: ignore[arg-type]
         except self._client.exceptions.ClientError as exc:
             if exc.response.get("Error", {}).get("Code") in {"PreconditionFailed", "412"}:
                 raise PreconditionFailedError from exc
             raise
+        body = resp["Body"]
         read = 0
         try:
+            if etag and _norm_etag(str(resp.get("ETag", ""))) != _norm_etag(etag):
+                raise PreconditionFailedError  # fail closed, also when the GET has no ETag
             for chunk in body.iter_chunks(chunk_size):
                 read += len(chunk)
                 if size is not None and read > size:

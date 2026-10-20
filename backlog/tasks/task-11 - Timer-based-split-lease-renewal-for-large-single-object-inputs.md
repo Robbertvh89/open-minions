@@ -97,34 +97,45 @@ free while the read blocks in `to_thread`. That makes renewal independent of sli
 class _SplitAborted(Exception):
     """Internal: the read thread was asked to stop (shutdown); never escapes `_plan_batches`."""
 
+
 class _SplitGuard:
     """Abort flag for one split attempt, set on the event loop, checked by the read thread per chunk."""
-    def __init__(self) -> None: ...            # threading.Event + reason: type[Exception]
-    def trip(self, reason: type[Exception]) -> None: ...   # first reason wins; set reason before event
-    def check(self) -> None: ...               # raise reason() if tripped
-    def chunks(self, it: Iterator[bytes]) -> Iterator[bytes]: ...  # for c in it: self.check(); yield c
+
+    def __init__(self) -> None: ...  # threading.Event + reason: type[Exception]
+    def trip(
+        self, reason: type[Exception]
+    ) -> None: ...  # first reason wins; set reason before event
+    def check(self) -> None: ...  # raise reason() if tripped
+    def chunks(
+        self, it: Iterator[bytes]
+    ) -> Iterator[bytes]: ...  # for c in it: self.check(); yield c
 ```
 `reason` is `LeaseLostError`, `SplitTimeoutError` or `_SplitAborted`.
 
 ### 3.2 Renewer (new, `services/splitter.py`)
 ```python
 async def _renew_lease(
-    sessionmaker: async_sessionmaker[AsyncSession], task: Task, limits: SplitLimits,
-    deadline: float, guard: _SplitGuard,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    task: Task,
+    limits: SplitLimits,
+    deadline: float,
+    guard: _SplitGuard,
 ) -> None:
     interval = limits.lease_s / 3
     while True:
         await asyncio.sleep(max(0.0, min(interval, deadline - time.monotonic())))
         if time.monotonic() > deadline:
-            guard.trip(SplitTimeoutError); return
+            guard.trip(SplitTimeoutError)
+            return
         try:
-            async with sessionmaker() as s, s.begin():          # own short tx, one UPDATE
+            async with sessionmaker() as s, s.begin():  # own short tx, one UPDATE
                 held = await tasks_repo.renew_split_lease(s, task, limits.lease_s)
-        except Exception as exc:                               # DB blip: fencing keeps us safe, retry next tick
+        except Exception as exc:  # DB blip: fencing keeps us safe, retry next tick
             log.warning("task_split_renew_error", task=tid_of(task), error_class=type(exc).__name__)
             continue
-        if not held:                                           # re-claimed or cancelled (status != SPLITTING)
-            guard.trip(LeaseLostError); return
+        if not held:  # re-claimed or cancelled (status != SPLITTING)
+            guard.trip(LeaseLostError)
+            return
 ```
 - **Session and transactions:** each tick opens its own session from the same sessionmaker and runs one fenced
   `UPDATE` in a short transaction. No transaction is ever held across an S3 read. The main path holds none during
@@ -155,8 +166,10 @@ async def _renew_lease(
         try:
             return await asyncio.shield(fut)
         except asyncio.CancelledError:
-            guard.trip(_SplitAborted)                       # thread stops at its next chunk
-            await asyncio.wait([fut], timeout=STOP_WAIT_S)  # STOP_WAIT_S = 15.0 (> boto read_timeout 10 s)
+            guard.trip(_SplitAborted)  # thread stops at its next chunk
+            await asyncio.wait(
+                [fut], timeout=STOP_WAIT_S
+            )  # STOP_WAIT_S = 15.0 (> boto read_timeout 10 s)
             raise
     ```
     Then `guard.check()` after each returned chunk list.

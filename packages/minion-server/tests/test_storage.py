@@ -1,10 +1,12 @@
 import urllib.error
 import urllib.request
+from collections.abc import Generator
+from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
 from minion_server.settings import ServerSettings
-from minion_server.storage import S3Storage
+from minion_server.storage import PreconditionFailedError, S3Storage
 from pydantic import SecretStr
 
 from conftest import S3Env
@@ -201,3 +203,49 @@ async def test_promotion_copy_drops_executor_supplied_metadata_and_acl(s3: S3Env
     url = f"{s3.endpoint_url}/{s3.bucket}/post/meta-dst"
     async with httpx.AsyncClient(timeout=30) as c:
         assert not (await c.get(url)).is_success  # not anonymously readable
+
+
+class _Body:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def iter_chunks(self, n: int) -> Generator[bytes]:
+        yield b"abc\n"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _storage_with_get(resp: dict[str, Any]) -> S3Storage:
+    st = S3Storage(
+        ServerSettings(
+            database_url=SecretStr("postgresql+asyncpg://x@h/db"),
+            s3_endpoint_url="http://localhost:9000",
+            s3_access_key=SecretStr("ak"),
+            s3_secret_key=SecretStr("sk"),
+        )
+    )
+    st._client.get_object = lambda **kw: resp  # type: ignore[method-assign,assignment]
+    return st
+
+
+def test_iter_object_get_etag_mismatch_closes_body_and_raises() -> None:
+    body = _Body()
+    st = _storage_with_get({"ETag": '"b"', "Body": body})
+    with pytest.raises(PreconditionFailedError):
+        b"".join(st.iter_object("k", etag='"a"'))
+    assert body.closed
+
+
+@pytest.mark.parametrize("listed", ['"a"', "a", 'W/"a"'])
+def test_iter_object_get_etag_quoting_is_normalised(listed: str) -> None:
+    st = _storage_with_get({"ETag": '"a"', "Body": _Body()})
+    assert b"".join(st.iter_object("k", etag=listed)) == b"abc\n"
+
+
+def test_iter_object_missing_get_etag_fails_closed_and_no_pin_skips_check() -> None:
+    st = _storage_with_get({"Body": _Body()})
+    with pytest.raises(PreconditionFailedError):
+        b"".join(st.iter_object("k", etag='"a"'))
+    assert b"".join(st.iter_object("k")) == b"abc\n"
+    assert b"".join(st.iter_object("k", etag="")) == b"abc\n"
