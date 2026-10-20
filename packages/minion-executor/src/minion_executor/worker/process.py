@@ -14,12 +14,14 @@ import multiprocessing as mp
 import os
 import resource
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, replace
+from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -132,6 +134,98 @@ def _recv(conn: Connection, maxlength: int) -> dict[str, Any]:
 def _kill_quietly(proc: BaseProcess) -> None:
     with contextlib.suppress(OSError, ValueError, AttributeError):
         proc.kill()
+
+
+def _shutdown_quietly(conn: Connection) -> None:
+    """`shutdown(SHUT_RDWR)` the socketpair end of `conn`: a blocked read or write on it ends
+    (EOF / EPIPE) even if a grandchild of the worker still holds a copy of the peer fd, which a
+    plain kill of the worker pid cannot guarantee. Works on a dup of the fd; shutdown acts on the
+    socket, not the descriptor. A pipe or an already closed conn is ignored."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        fd = os.dup(conn.fileno())
+        try:
+            sock = socket.socket(fileno=fd)
+        except OSError:  # not a socket: the constructor did not take ownership of the dup
+            os.close(fd)
+            raise
+        with sock:
+            sock.shutdown(socket.SHUT_RDWR)
+
+
+class _Deadline:
+    """One daemon thread per `_call` instead of one `Timer` per received frame.
+
+    `arm(at)` sets an absolute `clock()` time; if `disarm()` has not been called by then the
+    thread marks the deadline fired and runs `on_fire` once. `fired` is set before `on_fire` runs
+    and `disarm()` waits for a running `on_fire` to finish, so a caller that sees `False` knows the
+    action never ran for that arm and a caller that sees `True` knows it is complete.
+    """
+
+    def __init__(
+        self, on_fire: Callable[[], None], *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._on_fire = on_fire
+        self._clock = clock
+        self._cond = threading.Condition()
+        self._at: float | None = None
+        self._fired = False
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        self._fire_done = threading.Event()
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    def arm(self, at: float) -> None:
+        with self._cond:
+            if self._closed or self._fired:
+                return
+            self._at = at
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="worker-deadline", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+
+    def disarm(self) -> bool:
+        """Cancel the armed deadline. True if it fired (the action has finished by then)."""
+        with self._cond:
+            fired = self._fired
+            if not fired:
+                self._at = None
+        if fired:
+            self._fire_done.wait(KILL_REAP_TIMEOUT_S + 3)
+        return fired
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._at = None
+            self._cond.notify_all()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(1.0)
+
+    def _run(self) -> None:
+        with self._cond:
+            while not self._closed and not self._fired:
+                if self._at is None:
+                    self._cond.wait()
+                    continue
+                remaining = self._at - self._clock()
+                if remaining <= 0:
+                    self._fired = True
+                    break
+                self._cond.wait(remaining)
+            fire = self._fired
+        if fire:
+            try:
+                with contextlib.suppress(Exception):
+                    self._on_fire()
+            finally:
+                self._fire_done.set()
 
 
 def _watch_parent(parent_pid: int, interval_s: float) -> None:
@@ -513,6 +607,7 @@ class WorkerHandle:
         self._ollama_ref: str | None = None  # set while an Ollama model may be resident
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
+        self._deadline_factory: Callable[[Callable[[], None]], _Deadline] = _Deadline  # test seam
 
     @property
     def pid(self) -> int | None:
@@ -591,11 +686,28 @@ class WorkerHandle:
                 raise WorkerCrashed("worker not started")
             op = msg.get("op")
             self._op = op if isinstance(op, str) else ""
+            # One watchdog thread for the whole call: armed around the request write and around
+            # each frame read. A fire kills the worker AND shuts the socket down, so neither a
+            # stalled peer nor a grandchild holding the peer fd can wedge this thread.
+            dl = self._deadline_factory(partial(self._fire, proc, conn))
             try:
-                with self._send_lock:  # serialises every _wire_gen writer with _send_ctl
+                start = time.monotonic()
+                deadline = start + timeout_s
+                send_limit = deadline if hard_deadline is None else min(deadline, hard_deadline)
+                if not self._send_lock.acquire(timeout=CTL_SEND_TIMEOUT_S + 1):
+                    raise WorkerCrashed("worker pipe busy")
+                try:  # serialises every _wire_gen writer with _send_ctl
                     if op == "run" and isinstance(msg.get("ctl"), dict):
                         self._wire_gen = max(self._wire_gen, int(msg["ctl"].get("gen", 0)))
-                    _send(conn, msg)
+                    dl.arm(send_limit)
+                    try:
+                        _send(conn, msg)
+                    finally:
+                        sent_late = dl.disarm()
+                finally:
+                    self._send_lock.release()
+                if sent_late:
+                    raise WorkerTimeout("worker timed out")
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
                 while True:
@@ -617,15 +729,13 @@ class WorkerHandle:
                     # frame. A watchdog kills the worker at the deadline so a partial or dripped
                     # frame ends in EOF (-> WorkerCrashed) instead of hanging this thread.
                     limit = deadline if hard_deadline is None else min(deadline, hard_deadline)
-                    watchdog = threading.Timer(
-                        max(0.0, limit - time.monotonic()), _kill_quietly, (proc,)
-                    )
-                    watchdog.daemon = True
-                    watchdog.start()
+                    dl.arm(limit)
                     try:
                         reply = _recv(conn, self._max_message_bytes)
                     finally:
-                        watchdog.cancel()
+                        timed_out = dl.disarm()
+                    if timed_out:  # the worker was killed meanwhile: whatever arrived is void
+                        raise WorkerTimeout("worker timed out")
                     if hard_deadline is not None and time.monotonic() > hard_deadline:
                         raise WorkerCrashed("worker exceeded its deadline")
                     if not isinstance(reply, dict):
@@ -656,7 +766,10 @@ class WorkerHandle:
             except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
                 proc.join(1)  # let the exit code settle
                 code = proc.exitcode
+                timed_out = dl.fired
                 self._reset()
+                if timed_out:
+                    raise WorkerTimeout("worker timed out") from e
                 if code == sbx.SELF_TEST_EXIT_CODE:
                     raise _self_test_error() from None
                 raise WorkerCrashed(f"worker pipe closed (exit code {code})") from e
@@ -668,6 +781,7 @@ class WorkerHandle:
                 raise WorkerCrashed("malformed worker reply") from None
             finally:
                 self._op = None
+                dl.close()
             ok = reply.get("ok")
             code, message = reply.get("code"), reply.get("message", "")
             valid = isinstance(ok, bool) and (
@@ -816,6 +930,11 @@ class WorkerHandle:
             self._send_ctl(conn, proc, ctl, wait=True)
         return ctl.gen
 
+    def _fire(self, proc: BaseProcess, conn: Connection) -> None:
+        """Watchdog action: kill the worker, then end any blocked read/write on its socket."""
+        _kill_quietly(proc)
+        _shutdown_quietly(conn)
+
     def _send_ctl(self, conn: Connection, proc: BaseProcess, ctl: WorkerCtl, *, wait: bool) -> bool:
         """Write one ctl frame without ever wedging the caller. True if it was written.
 
@@ -828,7 +947,7 @@ class WorkerHandle:
         if not self._send_lock.acquire(blocking=wait, timeout=CTL_SEND_TIMEOUT_S if wait else -1):
             return False  # a newer state will be re-sent by the in-flight call (_flush_unsent)
         done = threading.Event()  # set before cancel(): a timer already firing must stand down
-        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, done))
+        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, conn, done))
         watchdog.daemon = True
         watchdog.start()
         try:
@@ -847,7 +966,7 @@ class WorkerHandle:
                 self._unsent = None
         return True
 
-    def _abort_stuck_send(self, proc: BaseProcess, done: threading.Event) -> None:
+    def _abort_stuck_send(self, proc: BaseProcess, conn: Connection, done: threading.Event) -> None:
         """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
         worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`).
         No-op if the send finished meanwhile. The `done` check narrows the gap but cannot close it:
@@ -856,7 +975,7 @@ class WorkerHandle:
         if done.is_set():
             return
         self._interrupt_gen += 1
-        _kill_quietly(proc)
+        self._fire(proc, conn)
 
     def _flush_unsent(self, conn: Connection, proc: BaseProcess) -> None:
         """Re-send a control state whose send found the pipe busy (called by the in-flight call
