@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.exceptions import ResponseValidationError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.responses import JSONResponse, Response
 
@@ -172,6 +173,29 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         return JSONResponse(
             {"detail": {"code": "UNAUTHORIZED", "message": "invalid or missing credentials"}},
             status_code=401,
+        )
+
+    @app.exception_handler(ResponseValidationError)
+    async def response_validation_handler(
+        request: Request, exc: ResponseValidationError
+    ) -> Response:
+        """A handler returned data that violates its response model (a server bug). The default
+        message echoes the offending values (possibly presigned URLs, TASK-52): log the class,
+        route template and error loc/type only, answer a generic 500."""
+        route = request.scope.get("route")
+        structlog.get_logger().error(
+            "response_validation_error",
+            exc_class=type(exc).__name__,
+            route=getattr(route, "path", None),
+            method=request.method,
+            errors=[
+                {"loc": [str(part) for part in err.get("loc", ())], "type": str(err.get("type"))}
+                for err in exc.errors()
+            ],
+        )
+        return JSONResponse(
+            {"detail": {"code": "INTERNAL_ERROR", "message": "internal server error"}},
+            status_code=500,
         )
 
     @app.get("/healthz")

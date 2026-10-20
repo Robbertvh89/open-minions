@@ -160,3 +160,59 @@ def test_main_single_worker_refuses_an_unsafe_inherited_multiproc_dir(
     with pytest.raises(SystemExit) as exc:
         app_module.main()
     assert exc.value.code == 2
+
+
+_PRESIGNED = "https://s3.example/b/k?X-Amz-Signature=deadbeefcafe&X-Amz-Credential=AKIAXYZ"
+
+
+def _violating_app() -> FastAPI:
+    from pydantic import BaseModel
+
+    class Out(BaseModel):
+        count: int
+
+    app = create_app()
+
+    @app.get("/boom/{item_id}", response_model=Out)
+    async def boom(item_id: str) -> Any:
+        return {"count": _PRESIGNED}
+
+    return app
+
+
+async def test_response_validation_error_is_generic_500_and_log_has_no_values() -> None:
+    transport = httpx.ASGITransport(app=_violating_app(), raise_app_exceptions=False)
+    with structlog.testing.capture_logs() as logs:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/boom/secret-id")
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {"code": "INTERNAL_ERROR", "message": "internal server error"}
+    }
+    assert _PRESIGNED not in response.text
+    [entry] = [e for e in logs if e["event"] == "response_validation_error"]
+    assert entry["exc_class"] == "ResponseValidationError"
+    assert entry["route"] == "/boom/{item_id}"
+    assert entry["errors"] == [{"loc": ["response", "count"], "type": "int_parsing"}]
+    dumped = repr(logs)
+    assert "X-Amz-Signature" not in dumped
+    assert "deadbeefcafe" not in dumped
+    assert "secret-id" not in dumped
+
+
+async def test_response_validation_error_stdout_has_no_values(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from minion_server.logging_config import configure_logging
+
+    configure_logging()
+    transport = httpx.ASGITransport(app=_violating_app(), raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/boom/x")
+    assert response.status_code == 500
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert "response_validation_error" in text
+    assert "int_parsing" in text
+    assert "X-Amz-Signature" not in text
+    assert "deadbeefcafe" not in text
