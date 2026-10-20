@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import stat
+import sys
 from pathlib import Path
 
 import pytest
+
+# importlib import mode: make the sibling helper module importable by name
+sys.path.insert(0, str(Path(__file__).parent))
+
+from loop_fakes import BUDGET, FakeClient, FakeS3, FakeWorker, make_loop
 from minion_common.enums import Engine
 from minion_executor.capacity.gpu_quarantine import QUARANTINE_FILE
 from minion_executor.capacity.runtime import FixedGovernor
-
-from .test_loop import BUDGET, FakeClient, FakeS3, FakeWorker, make_loop  # type: ignore[import-not-found]
 
 WALL0 = 1_800_000_000.0
 
@@ -137,3 +141,11 @@ async def test_no_state_dir_writes_nothing(tmp_path: Path) -> None:
         loop._note_gpu_kill(Engine.MLX)
     assert loop._quarantined() == [Engine.MLX]
     assert not (tmp_path / QUARANTINE_FILE).exists()
+
+
+async def test_unknown_version_is_invalid(tmp_path: Path) -> None:
+    state = _state(tmp_path)
+    body = {"version": 2, "engines": {"mlx": {"duty": [WALL0 - 5] * 3}}}
+    (state / QUARANTINE_FILE).write_text(json.dumps(body))
+    (state / QUARANTINE_FILE).chmod(0o600)
+    assert _loop(tmp_path, state, [100.0], [WALL0])._quarantined() == []

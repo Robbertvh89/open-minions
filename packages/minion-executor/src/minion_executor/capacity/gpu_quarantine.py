@@ -5,14 +5,17 @@ stores them as UTC wall-clock instants in `gpu_quarantine.json` (0600, atomic re
 unsafe-state-dir refusal as status.json), so a restart cannot reset a quarantine. Only the control
 process writes it (the worker sandbox allows writes to its own tmp dir only).
 
-Loading never extends a quarantine and never raises: a missing file is empty, a corrupt or
-unsafe one is reported to the caller and treated as empty, entries older than the window or dated
-in the future (clock set back, hand-edited file) are dropped, and the list lengths are capped.
+Loading never raises and a corrupt file never extends a quarantine (a wall clock stepped
+backwards can extend one by at most that step, capped at the 1 h window): a missing file is
+empty, a corrupt or unsafe one is reported to the caller and treated as empty, entries older
+than the window or dated in the future (clock set back, hand-edited file) are dropped, and the
+list lengths are capped.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -33,7 +36,7 @@ class EngineKills(BaseModel):
 class QuarantineFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    version: int = 1
+    version: Literal[1] = 1
     engines: dict[str, EngineKills] = Field(default_factory=dict, max_length=16)
 
 

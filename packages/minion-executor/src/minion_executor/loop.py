@@ -1193,7 +1193,8 @@ class ExecutorLoop:
 
     def _load_quarantine(self) -> None:
         """Restore the kill book from gpu_quarantine.json (wall-clock ages -> this clock). Any
-        problem is logged once and treated as an empty book; it never extends a quarantine."""
+        problem is logged once and treated as an empty book; a corrupt file never extends a
+        quarantine (a backward clock step can, by at most that step, capped at the 1 h window)."""
         if self._status_dir is None:
             return
         ages, note = load_quarantine_ages(self._status_dir, self._wall_clock(), GPU_QUARANTINE_S)
@@ -1214,7 +1215,10 @@ class ExecutorLoop:
             log.warning("gpu_engine_quarantine_restored", engine=engine.value)
 
     def _save_quarantine(self, now: float) -> None:
-        """Persist the kill book as wall-clock instants. Best effort: failure is logged once."""
+        """Persist the kill book as wall-clock instants. Best effort: failure is logged once.
+
+        The blocking fsync on the event loop is intentional: kills are bounded by the GPU
+        back-off and the state dir is local."""
         if self._status_dir is None:
             return
         wall = self._wall_clock()
