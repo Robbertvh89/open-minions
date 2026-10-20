@@ -1,10 +1,10 @@
 ---
 id: TASK-56
 title: 'Splitter: count split failures separately from claims'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-20 04:46'
-updated_date: '2026-10-20 05:27'
+updated_date: '2026-10-20 06:05'
 labels:
   - server
   - splitter
