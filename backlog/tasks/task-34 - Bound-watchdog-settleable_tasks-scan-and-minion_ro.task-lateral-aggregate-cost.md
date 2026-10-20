@@ -1,10 +1,10 @@
 ---
 id: TASK-34
 title: Bound watchdog settleable_tasks scan and minion_ro.task lateral aggregate cost
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-18 10:22'
-updated_date: '2026-10-20 01:06'
+updated_date: '2026-10-20 02:42'
 labels:
   - perf
 dependencies: []
