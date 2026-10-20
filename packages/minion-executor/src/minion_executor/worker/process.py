@@ -14,12 +14,14 @@ import multiprocessing as mp
 import os
 import resource
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, replace
+from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -86,6 +88,29 @@ class _SelfTestFailedError(Exception):
     """The worker exited with `SELF_TEST_EXIT_CODE`: its sandbox did not confine it."""
 
 
+def _is_count(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _is_records(r: object) -> bool:
+    """A run result: a list of dicts."""
+    return isinstance(r, list) and all(isinstance(x, dict) for x in r)
+
+
+def _is_stats(r: object) -> bool:
+    """A stats result: the four non-negative integer counters."""
+    return isinstance(r, dict) and all(
+        _is_count(r.get(k)) for k in ("active_bytes", "peak_bytes", "max_rss_bytes", "trim_errors")
+    )
+
+
+def _is_probe(r: object) -> bool:
+    """A probe result: `{engine: version | None}`."""
+    return isinstance(r, dict) and all(
+        isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in r.items()
+    )
+
+
 class WorkerCrashed(Exception):  # noqa: N818 - name fixed by plan/API
     """The worker process died or its pipe closed unexpectedly."""
 
@@ -132,6 +157,111 @@ def _recv(conn: Connection, maxlength: int) -> dict[str, Any]:
 def _kill_quietly(proc: BaseProcess) -> None:
     with contextlib.suppress(OSError, ValueError, AttributeError):
         proc.kill()
+
+
+def _dup_socket(conn: Connection) -> socket.socket | None:
+    """A private dup of the socketpair end behind `conn` (None for a pipe or a closed conn).
+    `shutdown` on it acts on the socket, so it ends a blocked read or write on `conn` even if a
+    grandchild of the worker still holds a copy of the peer fd, which a kill of the worker pid
+    cannot guarantee. Owning the dup (instead of dup-ing at fire time) means the descriptor number
+    cannot have been recycled when the watchdog fires."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        fd = os.dup(conn.fileno())
+        try:
+            return socket.socket(fileno=fd)
+        except OSError:  # not a socket: the constructor did not take ownership of the dup
+            os.close(fd)
+    return None
+
+
+def _shutdown_sock(sock: socket.socket | None) -> None:
+    if sock is not None:
+        with contextlib.suppress(OSError, ValueError):
+            sock.shutdown(socket.SHUT_RDWR)
+
+
+def _shutdown_quietly(conn: Connection) -> None:
+    """One-shot variant of `_dup_socket` + `_shutdown_sock` (closes the dup)."""
+    sock = _dup_socket(conn)
+    if sock is not None:
+        with sock:
+            _shutdown_sock(sock)
+
+
+class _Deadline:
+    """One daemon thread per `_call` instead of one `Timer` per received frame.
+
+    `arm(at)` sets an absolute `clock()` time; if `disarm()` has not been called by then the
+    thread marks the deadline fired and runs `on_fire` once. `fired` is set before `on_fire` runs
+    and `disarm()` waits for a running `on_fire` to finish, so a caller that sees `False` knows the
+    action never ran for that arm and a caller that sees `True` knows it is complete.
+    """
+
+    def __init__(
+        self, on_fire: Callable[[], None], *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._on_fire = on_fire
+        self._clock = clock
+        self._cond = threading.Condition()
+        self._at: float | None = None
+        self._fired = False
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        self._fire_done = threading.Event()
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    def arm(self, at: float) -> None:
+        with self._cond:
+            if self._closed or self._fired:
+                return
+            self._at = at
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="worker-deadline", daemon=True
+                )
+                self._thread.start()
+            self._cond.notify_all()
+
+    def disarm(self) -> bool:
+        """Cancel the armed deadline. True if it fired (the action has finished by then)."""
+        with self._cond:
+            fired = self._fired
+            if not fired:
+                self._at = None
+        if fired:
+            self._fire_done.wait(KILL_REAP_TIMEOUT_S + 3)
+        return fired
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._at = None
+            self._cond.notify_all()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(1.0)
+
+    def _run(self) -> None:
+        with self._cond:
+            while not self._closed and not self._fired:
+                if self._at is None:
+                    self._cond.wait()
+                    continue
+                remaining = self._at - self._clock()
+                if remaining <= 0:
+                    self._fired = True
+                    break
+                self._cond.wait(remaining)
+            fire = self._fired
+        if fire:
+            try:
+                with contextlib.suppress(Exception):
+                    self._on_fire()
+            finally:
+                self._fire_done.set()
 
 
 def _watch_parent(parent_pid: int, interval_s: float) -> None:
@@ -510,9 +640,15 @@ class WorkerHandle:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._model_id: str | None = None
+        self._model_revision: str | None = None  # of the loaded model (a bump reloads)
         self._ollama_ref: str | None = None  # set while an Ollama model may be resident
+        self._sock_lock = threading.Lock()
+        self._sock: socket.socket | None = None  # our dup of the control socket end (see _fire)
+        self._sock_conn: Connection | None = None
+        self._ref_lock = threading.Lock()  # guards the take-once of _ollama_ref
         self._engine_env: dict[str, str] = {}  # per-engine env for the next spawn
         self._after_spawn_hook: Callable[[BaseProcess], None] | None = None  # test seam
+        self._deadline_factory: Callable[[Callable[[], None]], _Deadline] = _Deadline  # test seam
 
     @property
     def pid(self) -> int | None:
@@ -579,10 +715,12 @@ class WorkerHandle:
         on_progress: Callable[[int], None] | None = None,
         *,
         hard_deadline: float | None = None,
+        expect: Callable[[object], bool] | None = None,
     ) -> dict[str, Any]:
         """Send `msg`, wait for the reply. `timeout_s` is an inactivity limit: every tick from
         the worker resets it, and ticks are forwarded to `on_progress`. `hard_deadline` (absolute
-        `time.monotonic()`) is a total cap that ticks cannot extend."""
+        `time.monotonic()`) is a total cap that ticks cannot extend. `expect` validates the `result`
+        of an ok reply (under the call lock); a reply it rejects resets the worker."""
         with self._lock:
             gen = self._seen_gen
             conn = self._ensure_started()
@@ -591,11 +729,28 @@ class WorkerHandle:
                 raise WorkerCrashed("worker not started")
             op = msg.get("op")
             self._op = op if isinstance(op, str) else ""
+            # One watchdog thread for the whole call: armed around the request write and around
+            # each frame read. A fire kills the worker AND shuts the socket down, so neither a
+            # stalled peer nor a grandchild holding the peer fd can wedge this thread.
+            dl = self._deadline_factory(partial(self._fire, proc, self._sock_for(conn)))
             try:
-                with self._send_lock:  # serialises every _wire_gen writer with _send_ctl
+                start = time.monotonic()
+                deadline = start + timeout_s
+                send_limit = deadline if hard_deadline is None else min(deadline, hard_deadline)
+                if not self._send_lock.acquire(timeout=CTL_SEND_TIMEOUT_S + 1):
+                    raise WorkerCrashed("worker pipe busy")
+                try:  # serialises every _wire_gen writer with _send_ctl
                     if op == "run" and isinstance(msg.get("ctl"), dict):
                         self._wire_gen = max(self._wire_gen, int(msg["ctl"].get("gen", 0)))
-                    _send(conn, msg)
+                    dl.arm(send_limit)
+                    try:
+                        _send(conn, msg)
+                    finally:
+                        sent_late = dl.disarm()
+                finally:
+                    self._send_lock.release()
+                if sent_late:
+                    raise WorkerTimeout("worker timed out")
                 deadline = time.monotonic() + timeout_s
                 abortable = msg.get("op") != "shutdown"
                 while True:
@@ -617,15 +772,13 @@ class WorkerHandle:
                     # frame. A watchdog kills the worker at the deadline so a partial or dripped
                     # frame ends in EOF (-> WorkerCrashed) instead of hanging this thread.
                     limit = deadline if hard_deadline is None else min(deadline, hard_deadline)
-                    watchdog = threading.Timer(
-                        max(0.0, limit - time.monotonic()), _kill_quietly, (proc,)
-                    )
-                    watchdog.daemon = True
-                    watchdog.start()
+                    dl.arm(limit)
                     try:
                         reply = _recv(conn, self._max_message_bytes)
                     finally:
-                        watchdog.cancel()
+                        timed_out = dl.disarm()
+                    if timed_out:  # the worker was killed meanwhile: whatever arrived is void
+                        raise WorkerTimeout("worker timed out")
                     if hard_deadline is not None and time.monotonic() > hard_deadline:
                         raise WorkerCrashed("worker exceeded its deadline")
                     if not isinstance(reply, dict):
@@ -636,7 +789,14 @@ class WorkerHandle:
                         raise WorkerCrashed("unexpected tick outside a run")
                     try:  # new tick fields are validated strictly (a lie is a protocol violation)
                         usage = parse_usage(reply)
-                        ack = parse_ack(reply, issued=self._wire_gen, at=time.monotonic())
+                        in_force = self._ctl
+                        ack = parse_ack(
+                            reply,
+                            issued=self._wire_gen,
+                            at=time.monotonic(),
+                            prev=self._ack,
+                            expect_paused=(in_force.gen, in_force.paused) if in_force else None,
+                        )
                     except ValueError:
                         raise WorkerCrashed("malformed worker reply") from None
                     deadline = time.monotonic() + timeout_s  # liveness: restart the clock
@@ -656,7 +816,10 @@ class WorkerHandle:
             except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
                 proc.join(1)  # let the exit code settle
                 code = proc.exitcode
+                timed_out = dl.fired
                 self._reset()
+                if timed_out:
+                    raise WorkerTimeout("worker timed out") from e
                 if code == sbx.SELF_TEST_EXIT_CODE:
                     raise _self_test_error() from None
                 raise WorkerCrashed(f"worker pipe closed (exit code {code})") from e
@@ -668,6 +831,7 @@ class WorkerHandle:
                 raise WorkerCrashed("malformed worker reply") from None
             finally:
                 self._op = None
+                dl.close()
             ok = reply.get("ok")
             code, message = reply.get("code"), reply.get("message", "")
             valid = isinstance(ok, bool) and (
@@ -675,7 +839,7 @@ class WorkerHandle:
                 if ok
                 else isinstance(code, str) and isinstance(message, str)
             )
-            if not valid:
+            if not valid or (ok and expect is not None and not expect(reply.get("result"))):
                 self._reset()
                 raise WorkerCrashed("malformed worker reply")
             if op not in ("run", "shutdown"):  # back in the worker's main loop, reading
@@ -699,14 +863,20 @@ class WorkerHandle:
             if g != self._seen_gen:
                 self._seen_gen = g  # re-arm: later interrupts abort this call
                 self._reset()
-            if self._model_id == model.model_id and self._proc and self._proc.is_alive():
+            if (
+                self._model_id == model.model_id
+                and self._model_revision == model.revision
+                and self._proc
+                and self._proc.is_alive()
+            ):
                 return
             if self._model_id is not None and self._proc and self._proc.is_alive():
                 self._graceful_reset()  # model switch: let the runner free external memory
             elif self._model_id is not None or (self._sandbox is not None and self._proc):
                 self._reset()  # a sandboxed worker's grants are fixed: load into a fresh one
             # MLX workers never need torch: keep `transformers` from importing it (smaller surface).
-            self._ollama_ref = model.ref if model.engine == Engine.OLLAMA else None
+            with self._ref_lock:
+                self._ollama_ref = model.ref if model.engine == Engine.OLLAMA else None
             self._engine_env = {"USE_TORCH": "0"} if model.engine == Engine.MLX else {}
             self._call(
                 {
@@ -719,7 +889,7 @@ class WorkerHandle:
                 },
                 self._load_timeout_s,
             )
-            self._model_id = model.model_id
+            self._model_id, self._model_revision = model.model_id, model.revision
 
     def _sandbox_spec(
         self, model_path: Path | None, model: ModelEntry | None
@@ -775,17 +945,13 @@ class WorkerHandle:
             msg["ctl"] = ctl.to_msg()
         self._usage = None
         try:
-            reply = self._call(msg, self._step_timeout_s, on_progress)
+            reply = self._call(msg, self._step_timeout_s, on_progress, expect=_is_records)
         except RunnerError as exc:
             if exc.code == MODEL_INTEGRITY:  # a bad tag must not stay warm and churn
                 with self._lock:
                     self._graceful_reset()
             raise
-        result = reply["result"]
-        if not isinstance(result, list) or not all(isinstance(r, dict) for r in result):
-            with self._lock:
-                self._reset()
-            raise WorkerCrashed("malformed worker reply")
+        result: list[Record] = reply["result"]
         return result
 
     def control(self, *, duty: float, paused: bool, trim: bool = False) -> int:
@@ -816,6 +982,25 @@ class WorkerHandle:
             self._send_ctl(conn, proc, ctl, wait=True)
         return ctl.gen
 
+    def _sock_for(self, conn: Connection) -> socket.socket | None:
+        """The handle's own dup of `conn`'s socket, made on first use and closed by `_reset`.
+        Callers hold the call lock, so `conn` is still open here."""
+        with self._sock_lock:
+            if self._sock is None or self._sock_conn is not conn:
+                if self._sock is not None:
+                    self._sock.close()
+                self._sock, self._sock_conn = _dup_socket(conn), conn
+            return self._sock
+
+    def _existing_sock(self, conn: Connection) -> socket.socket | None:
+        with self._sock_lock:
+            return self._sock if self._sock_conn is conn else None
+
+    def _fire(self, proc: BaseProcess, sock: socket.socket | None) -> None:
+        """Watchdog action: kill the worker, then end any blocked read/write on its socket."""
+        _kill_quietly(proc)
+        _shutdown_sock(sock)
+
     def _send_ctl(self, conn: Connection, proc: BaseProcess, ctl: WorkerCtl, *, wait: bool) -> bool:
         """Write one ctl frame without ever wedging the caller. True if it was written.
 
@@ -828,7 +1013,9 @@ class WorkerHandle:
         if not self._send_lock.acquire(blocking=wait, timeout=CTL_SEND_TIMEOUT_S if wait else -1):
             return False  # a newer state will be re-sent by the in-flight call (_flush_unsent)
         done = threading.Event()  # set before cancel(): a timer already firing must stand down
-        watchdog = threading.Timer(CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, done))
+        watchdog = threading.Timer(
+            CTL_SEND_TIMEOUT_S, self._abort_stuck_send, (proc, self._existing_sock(conn), done)
+        )
         watchdog.daemon = True
         watchdog.start()
         try:
@@ -847,7 +1034,9 @@ class WorkerHandle:
                 self._unsent = None
         return True
 
-    def _abort_stuck_send(self, proc: BaseProcess, done: threading.Event) -> None:
+    def _abort_stuck_send(
+        self, proc: BaseProcess, sock: socket.socket | None, done: threading.Event
+    ) -> None:
         """Watchdog: a ctl write did not complete in time. Treated as a protocol violation by the
         worker: kill it and abort any call in flight (the handle stays usable, like `interrupt`).
         No-op if the send finished meanwhile. The `done` check narrows the gap but cannot close it:
@@ -856,7 +1045,7 @@ class WorkerHandle:
         if done.is_set():
             return
         self._interrupt_gen += 1
-        _kill_quietly(proc)
+        self._fire(proc, sock)
 
     def _flush_unsent(self, conn: Connection, proc: BaseProcess) -> None:
         """Re-send a control state whose send found the pipe busy (called by the in-flight call
@@ -939,7 +1128,8 @@ class WorkerHandle:
 
     def stats(self) -> dict[str, int]:
         """Worker memory: runner `active_bytes`/`peak_bytes` plus process `max_rss_bytes`."""
-        stats: dict[str, int] = self._call({"op": "stats"}, self._step_timeout_s)["result"]
+        reply = self._call({"op": "stats"}, self._step_timeout_s, expect=_is_stats)
+        stats: dict[str, int] = reply["result"]
         return stats
 
     def probe(self, timeout_s: float = 90.0) -> dict[str, str | None]:
@@ -954,6 +1144,7 @@ class WorkerHandle:
                         "sandbox": self._sandbox_spec(None, None),
                     },
                     timeout_s,
+                    expect=_is_probe,
                 )
                 result: dict[str, str | None] = reply["result"]
                 return result
@@ -984,7 +1175,7 @@ class WorkerHandle:
                         UNLOAD_TIMEOUT_S,
                         hard_deadline=time.monotonic() + UNLOAD_TIMEOUT_S,
                     )
-                    self._ollama_ref = None  # the runner released it; skip the second request
+                    # the runner's own release is not trusted: _reset sends the control-side one
         finally:
             self._reset()
 
@@ -996,19 +1187,31 @@ class WorkerHandle:
         call it off the event loop.
         """
         self._closed = True
-        ref = self._ollama_ref
         proc = self._proc
+        ref = self._ollama_ref  # read before the kill: it belongs to this worker
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 if reap:  # reap now: no <defunct> child until the next _reset
                     proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(ref)
+            self._release_ollama(self._take_ollama_ref(only=ref) if ref is not None else None)
+
+    def _take_ollama_ref(self, *, only: str | None = None) -> str | None:
+        """Read and clear the resident Ollama ref once: whoever gets it sends the one release
+        (a hard kill and the failing in-flight call's `_reset` must not both send one). With
+        `only`, take it just if it is still that value (compare-and-take): a ref that changed
+        during the kill belongs to a newer worker and is left alone."""
+        with self._ref_lock:
+            ref = self._ollama_ref
+            if only is not None and ref != only:
+                return None
+            self._ollama_ref = None
+        return ref
 
     def _release_ollama(self, ref: str | None) -> None:
-        """After a hard kill the daemon still holds the weights for up to `keep_alive`: send a
-        best-effort `keep_alive: 0` from the control side (short timeout, no env proxies). Callers
-        run off the event loop (`asyncio.to_thread`)."""
+        """After a hard kill (or any worker end) the daemon may still hold the weights for up to
+        `keep_alive`: send a best-effort `keep_alive: 0` from the control side, bounded by
+        `RELEASE_TOTAL_S` in total (no env proxies). Callers run off the event loop."""
         if ref is not None:
             from minion_executor.runners.ollama import release_model
 
@@ -1023,30 +1226,34 @@ class WorkerHandle:
         the child, so call it off the event loop.
         """
         self._interrupt_gen += 1  # kill() is async: don't trust is_alive() right after it
-        ref = self._ollama_ref
         proc = self._proc
+        ref = self._ollama_ref  # read before the kill: it belongs to this worker
         if proc is not None:
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 proc.kill()
                 # reap now: no <defunct> child until the next _reset
                 proc.join(timeout=KILL_REAP_TIMEOUT_S)
-            self._release_ollama(ref)
+            self._release_ollama(self._take_ollama_ref(only=ref) if ref is not None else None)
 
     def _reset(self) -> None:
         """Kill (if alive) and forget the worker. Callers hold the lock."""
         proc, conn = self._proc, self._conn
         self._proc = self._conn = None
-        self._model_id = None
+        self._model_id = self._model_revision = None
         self._ack = None
         self._tick_at = None
         with self._ctl_lock:
             self._sent_gen, self._unsent = self._ctl_gen, None  # the next run carries the state
             self._wire_gen = 0
-        ref, self._ollama_ref = self._ollama_ref, None
+        ref = self._take_ollama_ref()
         if proc is not None:
             with contextlib.suppress(OSError, ValueError):
                 if proc.is_alive():
                     proc.kill()
+        with self._sock_lock:
+            sock, self._sock, self._sock_conn = self._sock, None, None
+        if sock is not None:
+            sock.close()  # our dup only; the conn's own fd is closed below
         if conn is not None:
             # a control() write may be mid-flight on this conn (the kill above unblocks it): let it
             # finish before closing the fd; the watchdog bounds it, so proceed anyway on timeout

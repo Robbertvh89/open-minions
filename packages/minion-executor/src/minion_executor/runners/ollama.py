@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import math
+import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import partial
@@ -55,6 +56,9 @@ _PULL_MARGIN_S = 60.0  # a pull must end this long before the worker's load time
 _UNLOAD_TIMEOUT = httpx.Timeout(3.0, connect=1.0)  # < worker UNLOAD_TIMEOUT_S
 # phases sum to 3 s: the control-side release (loopback, tiny reply) is bounded by that in total
 _RELEASE_TIMEOUT = httpx.Timeout(connect=0.8, write=0.4, read=1.4, pool=0.4)
+RELEASE_TOTAL_S = 3.0  # total wall-clock cap on one control-side release (phases alone can drip)
+_MAX_RELEASE_THREADS = 2  # a stuck loopback listener can strand at most this many release threads
+_release_slots = threading.BoundedSemaphore(_MAX_RELEASE_THREADS)
 _NUM_CTX_HEADROOM = 4096  # constant context headroom (output tokens) on top of the prompt cap
 _NOT_FOUND_MARKERS = ("manifest unknown", "file does not exist", "not found")
 _OOM_MARKERS = ("more system memory", "out of memory", "insufficient memory")
@@ -83,16 +87,59 @@ def _release(detail: str) -> RunnerError:
     return RunnerError(ENGINE_UNAVAILABLE, detail, retryable=True, release=True)
 
 
-def release_model(url: str, ref: str) -> None:
+def _post_release(base: str, ref: str) -> bool:
+    """One `keep_alive: 0` POST. True only for a 2xx. Never raises, never logs.
+
+    Only the status line and headers are read: the body is never iterated, so an endless or huge
+    reply from a hostile listener on the port costs no memory. A timer closes the client at
+    `RELEASE_TOTAL_S`, which ends a request that drips bytes (each byte would reset the per-phase
+    httpx timeouts), so the thread and its slot are always released."""
+    client = httpx.Client(base_url=base, trust_env=False, follow_redirects=False)
+    cutoff = threading.Timer(RELEASE_TOTAL_S, client.close)
+    cutoff.daemon = True
+    cutoff.start()
+    try:
+        with client.stream(
+            "POST", "/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_RELEASE_TIMEOUT
+        ) as resp:
+            return resp.is_success
+    except Exception:
+        return False
+    finally:
+        cutoff.cancel()
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+def release_model(url: str, ref: str, *, total_s: float = RELEASE_TOTAL_S) -> bool:
     """Best-effort `keep_alive: 0` for `ref` on the loopback daemon (used by the control side
-    after a hard kill of the worker). Short timeout, no env proxies, never raises."""
-    with (
-        contextlib.suppress(Exception),
-        httpx.Client(
-            base_url=check_loopback(url), trust_env=False, follow_redirects=False
-        ) as client,
-    ):
-        client.post("/api/generate", json={"model": ref, "keep_alive": 0}, timeout=_RELEASE_TIMEOUT)
+    after a hard kill and after a graceful unload). Bounded by a TOTAL wall-clock cap: the
+    per-phase httpx timeouts reset on every received byte, so a listener that drips bytes could
+    otherwise hold the caller. The POST runs on a daemon thread; at most `_MAX_RELEASE_THREADS`
+    may be outstanding, beyond that this returns False at once. True only for a 2xx in time.
+    No env proxies; never raises, never logs."""
+    try:
+        base = check_loopback(url)
+    except RunnerError:
+        return False
+    if not _release_slots.acquire(blocking=False):
+        return False
+    done = threading.Event()
+    outcome = [False]
+
+    def work() -> None:
+        try:
+            outcome[0] = _post_release(base, ref)
+        finally:
+            _release_slots.release()
+            done.set()
+
+    try:
+        threading.Thread(target=work, name="ollama-release", daemon=True).start()
+    except BaseException:  # could not start: give the slot back
+        _release_slots.release()
+        return False
+    return done.wait(total_s) and outcome[0]
 
 
 def _status_error(resp: httpx.Response, *, pull: bool = False) -> RunnerError:

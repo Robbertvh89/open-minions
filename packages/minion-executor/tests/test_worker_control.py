@@ -289,6 +289,7 @@ def _adversary(conn: Any, payload: bytes) -> None:  # forked child: answer the r
         b'{"tick": 1, "ack": 99, "paused": false}',
         b'{"tick": 1, "ack": 0, "paused": "no"}',
         b'{"tick": 1, "paused": true}',
+        b'{"tick": 1, "ack": 0, "paused": true}',  # gen 0 is the unpaused default
         b'{"tick": 1, "busy_s": -1, "wall_s": 1}',
         b'{"tick": 1, "busy_s": NaN, "wall_s": 1}',
         b'{"tick": 1, "busy_s": 1}',
@@ -306,6 +307,53 @@ def test_malformed_ack_or_usage_is_a_protocol_violation(payload: bytes) -> None:
     child.close()
     w = WorkerHandle([Engine.FAKE], step_timeout_s=5.0)
     w._proc, w._conn, w._model_id = proc, parent, "m"
+    with pytest.raises(WorkerCrashed):
+        w.run([{"id": 1}])
+    assert not proc.is_alive() and w.pid is None and w.last_ack() is None
+
+
+def test_ack_must_not_go_backwards_or_contradict_the_issued_state() -> None:
+    from minion_executor.worker.control import WorkerAck
+
+    prev = WorkerAck(gen=2, at=0.0, paused=False)
+    with pytest.raises(ValueError):
+        parse_ack({"tick": 1, "ack": 1, "paused": False}, issued=3, at=1.0, prev=prev)
+    ok = parse_ack({"tick": 1, "ack": 2, "paused": False}, issued=3, at=1.0, prev=prev)
+    assert ok is not None and ok.gen == 2  # the same gen again is fine
+    # the newest issued generation (3, paused) must be acked as paused
+    with pytest.raises(ValueError):
+        parse_ack(
+            {"tick": 1, "ack": 3, "paused": False},
+            issued=3,
+            at=1.0,
+            expect_paused=(3, True),
+        )
+    good = parse_ack(
+        {"tick": 1, "ack": 3, "paused": True}, issued=3, at=1.0, expect_paused=(3, True)
+    )
+    assert good is not None and good.paused
+    # an older generation is not the one in force: any `paused` is accepted (no history)
+    older = parse_ack(
+        {"tick": 1, "ack": 2, "paused": True}, issued=3, at=1.0, expect_paused=(3, False)
+    )
+    assert older is not None
+    with pytest.raises(ValueError):
+        parse_ack({"tick": 1, "ack": 0, "paused": True}, issued=0, at=1.0)
+
+
+def test_an_ack_contradicting_the_pause_in_force_is_a_protocol_violation() -> None:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("fork")
+    parent, child = ctx.Pipe()
+    proc = ctx.Process(
+        target=_adversary, args=(child, b'{"tick": 1, "ack": 1, "paused": false}'), daemon=True
+    )
+    proc.start()
+    child.close()
+    w = WorkerHandle([Engine.FAKE], step_timeout_s=5.0)
+    w._proc, w._conn, w._model_id = proc, parent, "m"
+    w.control(duty=1.0, paused=True)  # gen 1: stored, carried by the next run
     with pytest.raises(WorkerCrashed):
         w.run([{"id": 1}])
     assert not proc.is_alive() and w.pid is None and w.last_ack() is None

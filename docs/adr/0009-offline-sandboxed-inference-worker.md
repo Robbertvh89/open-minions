@@ -130,7 +130,17 @@ together with `MINION_EXECUTOR_DEV=1`.
     cannot leave a grandchild serving a fake local service (e.g. Ollama on 11434) after
     `proc.kill()`. Fork denial is the control; there are no process groups or sessions (`killpg`
     on a reaped pid could hit an unrelated group after pid reuse). In the dev-only sandbox-off
-    mode grandchildren are not reaped (accepted, dev only).
+    mode grandchildren are not reaped (accepted, dev only), but every control-side watchdog
+    fire (request write, reply read, control write) kills the worker and then `shutdown`s the
+    control end of the socketpair, so a grandchild holding a copy of the peer fd cannot keep a
+    blocked read or write alive and wedge the control side. One deadline thread per call serves all
+    its reads and writes; a reply that races a fire is discarded (`WorkerTimeout`).
+    The shutdown uses a dup of the socket fd owned by the handle (made when the worker is first used,
+    closed by `_reset`), so a late fire can never hit a recycled descriptor number. `kill()` and
+    `interrupt()` (which take no lock) only kill the worker and do not shut the socket down: without
+    the lock the fd could be closed and reused under them. In the dev-only sandbox-off case a
+    grandchild holding the peer fd can therefore keep an in-flight write blocked after a stop until
+    that call's own deadline fires; accepted (dev only).
   - `needed` and the plan file sizes are child-reported, so a compromised fetch child could force
     eviction of the cache (DoS only, bounded by the free-disk reserve).
   - The localhost deny covers `localhost` only: the rest of 127/8 and the Mac's own LAN IP are not
@@ -162,16 +172,29 @@ together with `MINION_EXECUTOR_DEV=1`.
     non-retryably (`PARAMS_UNSUPPORTED`; no other engine is tried because the server already
     refused such tasks). Embedding `tokens` is `prompt_eval_count` per text (one `/api/embed` call
     each) and can under-report when the prompt cache holds a shared prefix. Over-long prompts are
-    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines); `num_ctx` is the constant
+    truncated by the daemon and not detectable (no `PROMPT_TOO_LONG` lines; accepted, the Ollama runner
+    does not compare `prompt_eval_count` with the cap); `num_ctx` is the constant
     `max_prompt_tokens + 4096` (constant so the daemon never reloads for a changed context; the cost
     is KV cache for that whole window per request). Requests carry a bounded `keep_alive`. The
     worker unloads the model (`keep_alive: 0`) on idle unload and on a model switch, under a total
     wall-clock deadline that always ends in a kill (a hostile reply or tick flood cannot keep it
     alive). After a hard kill (stop, cancel, 409, a failed or timed-out step, a model switch) the control side sends a best-effort
-    `keep_alive: 0` (short timeout, `trust_env=False`); if that fails the daemon drops the weights
-    when `keep_alive` expires (at most 300 s). A budget downgrade (M4) will reuse the same path.
+    `keep_alive: 0` (loopback only, `trust_env=False`) under a total wall-clock cap of 3 s on a daemon
+    thread, at most 2 such threads outstanding (a dripping listener can strand at most 2); the
+    resident ref is taken once, so a kill and the failing call's reset send one release, and a
+    graceful unload is always followed by the control-side release (the worker's word is not
+    trusted). If it fails the daemon drops the weights when `keep_alive` expires (at most 300 s). A budget downgrade (M4) will reuse the same path.
     Load-phase 5xx and transport errors are releases (the daemon is this Mac's problem); a run-phase
     404 (model removed locally) is a release too.
+  - **Ollama duty cycle.** The daemon runs outside the worker, so the GPU duty guard cannot meter it;
+    the duty cycle is only paced per request. Startup logs one `ollama_duty_cycle_not_enforced`
+    warning when Ollama is enabled.
+  - **MPSGraph cache (TASK-4.4).** Writes to `com.apple.MetalPerformanceShadersGraph` stay denied
+    and this is accepted: a second shared writable cache would widen the cross-worker poisoning
+    surface already accepted for `com.apple.metal`. The cost is stderr noise and no MPSGraph cache
+    reuse, so HF bench numbers may be slightly pessimistic.
+  - **Deferred (TASK-6.3).** A lenient `ModelEntry` response variant for executors is not hardening;
+    it waits for the first new `ModelEntry` field.
   - MLX workers are spawned with `USE_TORCH=0`, so `transformers` (used only for tokenisation) never
     imports `torch`; MLX loads pass `trust_remote_code=False` and `local_files_only` explicitly.
   - The HF runner (`torch` 2.14 / `transformers` 5.20 on `mps`) runs under the same profile with

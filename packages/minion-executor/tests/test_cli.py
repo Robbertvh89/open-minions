@@ -990,3 +990,21 @@ def test_probe_other_crash_text_is_unchanged(monkeypatch: pytest.MonkeyPatch) ->
     _probe_fixture(monkeypatch, None, "worker exited with code 9")
     with pytest.raises(WorkerCrashed, match="exited with code 9"):
         m.probe_available([Engine.MLX])
+
+
+def test_ollama_enabled_logs_one_duty_warning_and_other_engines_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minion_executor.main as m
+
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLog:
+        def warning(self, event: str, **kw: object) -> None:
+            events.append((event, kw))
+
+    monkeypatch.setattr(structlog, "get_logger", lambda *_a, **_k: FakeLog())
+    m.warn_if_ollama([Engine.MLX, Engine.HF, Engine.FAKE])
+    assert events == []
+    m.warn_if_ollama([Engine.MLX, Engine.OLLAMA])
+    assert events == [("ollama_duty_cycle_not_enforced", {"reason": "daemon_outside_worker"})]
