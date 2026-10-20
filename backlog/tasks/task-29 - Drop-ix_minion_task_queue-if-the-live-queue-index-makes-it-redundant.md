@@ -1,9 +1,10 @@
 ---
 id: TASK-29
 title: Drop ix_minion_task_queue if the live-queue index makes it redundant
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-18 04:08'
+updated_date: '2026-10-20 04:26'
 labels:
   - db
 dependencies: []

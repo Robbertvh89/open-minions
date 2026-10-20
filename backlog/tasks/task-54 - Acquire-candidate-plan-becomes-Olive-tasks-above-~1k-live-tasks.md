@@ -1,9 +1,10 @@
 ---
 id: TASK-54
 title: Acquire candidate plan becomes O(live tasks) above ~1k live tasks
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-20 03:30'
+updated_date: '2026-10-20 04:26'
 labels:
   - perf
   - scale
