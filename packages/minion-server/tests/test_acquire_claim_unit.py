@@ -163,7 +163,9 @@ async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.Monkey
     assert got is None and logs == []
 
 
-async def test_principal_without_token_hash_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stale_token_hash_is_refused_pre_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from minion_server.errors import ExecutorRevokedError
 
     async def live(*a: Any, **kw: Any) -> bool:
@@ -172,14 +174,17 @@ async def test_principal_without_token_hash_fails_closed(monkeypatch: pytest.Mon
     async def noop(*a: Any, **kw: Any) -> None:
         return None
 
+    async def stale(*a: Any, **kw: Any) -> bool:
+        return False  # the row no longer carries this digest (rotated away / revoked)
+
     async def boom(*a: Any, **kw: Any) -> Any:
-        raise AssertionError("must not be reached without a token digest")
+        raise AssertionError("must not be reached with a stale token digest")
 
     monkeypatch.setattr(executors_repo, "touch", live)
     monkeypatch.setattr(executors_repo, "get_preference", noop)
-    monkeypatch.setattr(repo, "lock_executor_for_claim", boom)
+    monkeypatch.setattr(repo, "lock_executor_for_claim", stale)
     monkeypatch.setattr(repo, "claim", boom)
-    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", token_hash=None)
+    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", "stale")
     with pytest.raises(ExecutorRevokedError):
         await svc.acquire(
             _FakeSession(),  # type: ignore[arg-type]

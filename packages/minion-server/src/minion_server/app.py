@@ -167,7 +167,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     async def revoked_handler(request: Request, exc: ExecutorRevokedError) -> Response:
         """A mutation found the token's executor revoked/rotated: refuse and forget the token."""
         cache = getattr(request.app.state, "executor_tokens", None)
-        if cache is not None and exc.token_hash is not None:
+        if cache is not None:
             cache.put_invalid(exc.token_hash)
         return JSONResponse(
             {"detail": {"code": "UNAUTHORIZED", "message": "invalid or missing credentials"}},
