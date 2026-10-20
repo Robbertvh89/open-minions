@@ -97,8 +97,7 @@ async def acquire(
                     # Per-executor cap (ADR-0019): lock own row, then a separate count statement;
                     # a capped round ends before any candidate read. Admission only: ownership is
                     # still decided by the claim INSERT ... ON CONFLICT DO NOTHING.
-                    # a principal without the digest it authenticated with is refused (fail closed)
-                    if principal.token_hash is None or not await repo.lock_executor_for_claim(
+                    if not await repo.lock_executor_for_claim(
                         session, principal.executor_id, principal.token_hash
                     ):
                         raise ExecutorRevokedError(principal.token_hash)

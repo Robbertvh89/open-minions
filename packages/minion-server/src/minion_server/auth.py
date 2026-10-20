@@ -65,7 +65,7 @@ class ExecutorPrincipal:
     owner: str
     pool: str
     # digest this request authenticated with (mutations match it); never in repr/logs
-    token_hash: str | None = field(default=None, repr=False)
+    token_hash: str = field(repr=False)
 
 
 @dataclass(frozen=True)

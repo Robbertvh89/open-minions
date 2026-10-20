@@ -20,7 +20,7 @@ Follow-up from TASK-41 review/security (LOW): ExecutorPrincipal.token_hash is st
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 mypy enforces non-None token_hash on every executor mutation
-- [ ] #2 No 'is None' token_hash guards remain in server src
-- [ ] #3 Server tests pass
+- [x] #1 mypy enforces non-None token_hash on every executor mutation
+- [x] #2 No 'is None' token_hash guards remain in server src
+- [x] #3 Server tests pass
 <!-- AC:END -->

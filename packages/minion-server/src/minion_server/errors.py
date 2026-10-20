@@ -38,6 +38,6 @@ class ExecutorRevokedError(Exception):
     away): answered 401 by an app-wide handler, which also drops the token from the auth cache so
     the next request is refused without a DB call (TASK-32, ADR-0018)."""
 
-    def __init__(self, token_hash: str | None) -> None:
+    def __init__(self, token_hash: str) -> None:
         super().__init__("executor token is no longer valid")
         self.token_hash = token_hash

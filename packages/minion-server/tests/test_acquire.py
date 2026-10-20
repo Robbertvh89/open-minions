@@ -344,6 +344,7 @@ async def test_revoked_executor_cannot_register(http: tuple[AsyncClient, Any]) -
             engines=["mlx"],
             profile="balanced",
             budget={},
+            token_hash=p.token_hash,
         )
     assert ok is False
     async with sm() as s:
