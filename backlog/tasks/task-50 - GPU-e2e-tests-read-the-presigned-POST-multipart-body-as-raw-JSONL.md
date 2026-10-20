@@ -1,10 +1,10 @@
 ---
 id: TASK-50
 title: GPU e2e tests read the presigned-POST multipart body as raw JSONL
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-19 23:45'
-updated_date: '2026-10-19 23:47'
+updated_date: '2026-10-20 00:03'
 labels:
   - test
   - executor
