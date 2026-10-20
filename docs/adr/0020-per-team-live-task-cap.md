@@ -53,8 +53,11 @@ unrunnable tasks need 10 teams at their cap. Measured with 5,000 such tasks
   `ix_minion_task_live_queue` plus SPLITTING, so the acquire candidate query could use it and the
   planner replaced the ordered live-queue walk with a bitmap scan plus sort: about 120x slower at
   10,000 same-priority live tasks (0.1 -> 13.5 ms, reviewer measurement). The shipped index is
-  `(team, status)`, which the candidate query cannot use (no `team` equality, wrong order); a guard
-  test (`test_cap_index_does_not_displace_live_queue_walk`) pins the walk with the cap index present.
+  `(team, status)`. It cannot serve the general candidate walk (no `team` equality, wrong order), so
+  the ordered live-queue walk is unchanged. With a team preference (`prefer --team`) the generic plan
+  may bitmap-scan that team's live tasks on it: O(preferred team's live tasks) <= cap, measured
+  0.10 / 0.15 / 0.30 / 0.58 ms at 50 / 100 / 250 / 500 live tasks. A guard test
+  (`test_cap_index_does_not_displace_live_queue_walk`) pins the walk with the cap index present.
 - **Index change on the candidate query.** The order needs `(priority DESC, created_at, team, project, task_name)` leading;
   `model_id IN`, `engine IN`, `memory <=` and `pool IS NULL OR =` are not prefix equalities, so they
   stay Filters. A leading `model_id` loses FR-22 order. `INCLUDE` columns help only an Index Only Scan,

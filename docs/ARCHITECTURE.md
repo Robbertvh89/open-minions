@@ -396,8 +396,9 @@ Notes:
   (measured at 100 / 1000 / 5000 such tasks: 0.20 / 1.33 / 5.2 ms). Live tasks that sort ahead but
   fail the model / engine / memory / pool filters (heap Filter, not Index Cond) cost the same walk and
   never a subtask probe; their number is bounded by the per-team live-task cap (FR-9, ADR-0020):
-  extra cost <= sum over teams of cap x cost per filtered task. With 5,000 such tasks the ordered walk
-  filters them in the heap and stops at the runnable ones: ~151 buffers, 2 subtask probes, <1 ms
+  extra cost <= sum over teams of cap x cost per filtered task. With 5,000 such tasks the planner
+  bitmap-scans the ~5,012 live tasks on `ix_minion_task_queue`, filters them in the heap and sorts the
+  12 runnable ones: ~151 buffers, 2 subtask probes, <1 ms
   (`test_candidate_bounded_with_5k_unrunnable_live_tasks`).
 - Alternative considered: `SELECT ... FOR UPDATE SKIP LOCKED`. Rejected for v1 to stay faithful to the
   paper and keep the ownership record explicit; revisit if NF-1 isn't met (ADR-0013).

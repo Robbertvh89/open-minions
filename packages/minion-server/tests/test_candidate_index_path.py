@@ -377,8 +377,8 @@ FROM generate_series(1, {n}) AS t, generate_series(1, 3) AS s;
 ANALYZE minion_task;
 ANALYZE minion_subtask;
 """
-# Measured: ~151 buffers, 2 subtask probes, <1 ms (both plan kinds; the ordered walk on
-# ix_minion_task_live_queue filters the junk in the heap and stops at the 12 runnable ones).
+# Measured: ~151 buffers, 2 subtask probes, <1 ms (both plan kinds; a bitmap scan of the ~5,012
+# live tasks on ix_minion_task_queue, junk filtered in the heap, the 12 runnable ones sorted).
 # Bound = ~1.5x measured, so a regression to one subtask probe per junk task (>= 5,000 x 3
 # buffers) or a Seq Scan over the subtasks fails loudly.
 UNRUNNABLE_BUFFER_BOUND = 230

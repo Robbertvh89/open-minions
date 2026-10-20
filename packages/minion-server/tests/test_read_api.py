@@ -485,10 +485,13 @@ async def test_multi_team_branches_use_team_created_index(
         plan = "\n".join(r[0] for r in (await s.execute(text("EXPLAIN " + sql))).all())
     # One scan per team branch; the final join lookup of the page rows may use any index (on this
     # 2-row table the planner ties between the PK, team_created and ix_minion_task_team_status).
-    scan_re = r"Index (?:Only )?Scan(?: Backward)? using ix_minion_task_team_created"
-    scans = re.findall(scan_re, plan)
-    assert len(scans) >= 2 and "Seq Scan" not in plan, plan
-    assert plan.count("(team = 'ra'") == 1 and plan.count("(team = 'rb'") == 1, plan
+    assert "Seq Scan" not in plan, plan
+    lines = plan.splitlines()
+    for team in ("ra", "rb"):
+        conds = [i for i, ln in enumerate(lines) if f"(team = '{team}'" in ln]
+        assert len(conds) == 1, plan
+        # the Index Cond line sits right under its scan node
+        assert "using ix_minion_task_team_created" in lines[conds[0] - 1], plan
 
 
 @pytest.mark.integration

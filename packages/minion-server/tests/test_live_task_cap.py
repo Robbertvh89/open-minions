@@ -166,3 +166,24 @@ async def test_count_plan_uses_team_status_index(capped: Live) -> None:
     for p in (plan, generic):
         assert "ix_minion_task_team_status" in p, p
         assert "Seq Scan on minion_task" not in p, p
+
+
+async def test_lock_timeout_answers_503_busy(capped: Live) -> None:
+    import time
+
+    async with capped.sm() as holder, holder.begin():
+        await holder.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended('minion_task_live:' || :t, 0))"),
+            {"t": TEAM},
+        )
+        async with httpx.AsyncClient(base_url=capped.url, timeout=30) as c:
+            t0 = time.monotonic()
+            r = await _post(c, capped, TEAM, "locked")
+            waited = time.monotonic() - t0
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"]["code"] == "SERVER_BUSY"
+        assert int(r.headers["Retry-After"]) >= 1
+        assert 1.5 <= waited < 4, waited  # the 2 s lock_timeout, not a hang
+    assert await capped.rows("SELECT 1 FROM minion_task WHERE task_name='locked'") == []
+    async with httpx.AsyncClient(base_url=capped.url) as c:  # lock released: works again
+        assert (await _post(c, capped, TEAM, "free")).status_code == 202
