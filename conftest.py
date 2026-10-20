@@ -356,7 +356,8 @@ async def make_executors(
     out = []
     for i in range(n):
         eid, token = await issue_executor_token(sm, owner=f"o{i}", pool=pool, ttl_days=1)
-        out.append((ExecutorPrincipal(uuid.UUID(eid), f"o{i}", pool), token))
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        out.append((ExecutorPrincipal(uuid.UUID(eid), f"o{i}", pool, digest), token))
     return out
 
 

@@ -28,7 +28,7 @@ class ExecutorIdentity:
     token_hash: str
 
 
-def _token_match(token_hash: str | None) -> list[Any]:
+def token_match(token_hash: str | None) -> list[Any]:
     """Extra WHERE terms: the row must still carry the token the caller authenticated with (a
     rotation inside the auth-cache TTL changes it). None = no check (internal callers/tests)."""
     return [] if token_hash is None else [Executor.token_hash == token_hash]
@@ -127,7 +127,7 @@ async def register(
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
-            *_token_match(token_hash),
+            *token_match(token_hash),
         )
         .values(
             hostname=hostname,
@@ -159,7 +159,7 @@ async def touch(
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
-            *_token_match(token_hash),
+            *token_match(token_hash),
         )
         .values(
             engines=engines,
@@ -192,7 +192,7 @@ async def report_state(
         .where(
             Executor.executor_id == executor_id,
             Executor.status != ExecutorStatus.REVOKED.value,
-            *_token_match(token_hash),
+            *token_match(token_hash),
         )
         .values(**values)
     )

@@ -152,12 +152,14 @@ async def test_concurrent_acquires_of_one_executor_never_exceed_the_cap(
 async def test_without_the_executor_lock_the_cap_overshoots(
     sm: async_sessionmaker[AsyncSession], fresh_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Documents why the lock exists: the count alone is a check-then-act race (best effort)."""
+    """Demonstrates, best effort, why the executor-row lock exists: without it the count alone is
+    a check-then-act race. Timing-dependent, hence xfail(strict=False); it proves nothing by
+    itself. `test_three_workers_share_one_cap` is the real, deterministic proof of the cap."""
     cfg = _settings(fresh_url).model_copy(update={"max_open_acquirements": 3})
     [(p, _)] = await make_executors(sm, 1)
     await seed_task(sm, "nolock", 40, team="nolock")
 
-    async def no_lock(session: AsyncSession, executor_id: uuid.UUID) -> bool:
+    async def no_lock(session: AsyncSession, executor_id: uuid.UUID, token_hash: str) -> bool:
         return True
 
     monkeypatch.setattr(acq_repo, "lock_executor_for_claim", no_lock)
@@ -322,14 +324,15 @@ async def test_lock_helper_refuses_missing_and_revoked(
     sm: async_sessionmaker[AsyncSession],
 ) -> None:
     [(p, _)] = await make_executors(sm, 1)
+    assert p.token_hash is not None
     async with sm() as s, s.begin():
-        assert await acq_repo.lock_executor_for_claim(s, p.executor_id)
-        assert not await acq_repo.lock_executor_for_claim(s, uuid.uuid4())
+        assert await acq_repo.lock_executor_for_claim(s, p.executor_id, p.token_hash)
+        assert not await acq_repo.lock_executor_for_claim(s, uuid.uuid4(), p.token_hash)
         assert not await acq_repo.lock_executor_for_claim(s, p.executor_id, "not-its-hash")
     async with sm() as s, s.begin():
         assert await executors_repo.revoke(s, p.executor_id)
     async with sm() as s, s.begin():
-        assert not await acq_repo.lock_executor_for_claim(s, p.executor_id)
+        assert not await acq_repo.lock_executor_for_claim(s, p.executor_id, p.token_hash)
 
 
 async def test_lock_wait_past_the_deadline_answers_503(

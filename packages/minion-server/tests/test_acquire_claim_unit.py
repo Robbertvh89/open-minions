@@ -54,7 +54,7 @@ async def test_claim_rejects_bad_window(bad: int) -> None:
 
 @pytest.mark.parametrize("bad", [0, 257])
 async def test_acquire_rejects_bad_window(bad: int) -> None:
-    p = ExecutorPrincipal(uuid.uuid4(), "o", "default")
+    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", "h")
     with pytest.raises(ValueError, match="window"):
         await svc.acquire(
             None,  # type: ignore[arg-type]
@@ -120,7 +120,7 @@ async def test_exhausted_rounds_are_logged(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(repo, "claim", claim)
     monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
     monkeypatch.setattr(repo, "count_open_acquirements", _zero)
-    p = ExecutorPrincipal(uuid.uuid4(), "o", "default")
+    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", "h")
     with structlog.testing.capture_logs() as logs:
         got = await svc.acquire(
             _FakeSession(),  # type: ignore[arg-type]
@@ -150,7 +150,7 @@ async def test_empty_queue_is_not_logged_as_exhausted(monkeypatch: pytest.Monkey
     monkeypatch.setattr(repo, "claim", claim)
     monkeypatch.setattr(repo, "lock_executor_for_claim", _lock_ok)
     monkeypatch.setattr(repo, "count_open_acquirements", _zero)
-    p = ExecutorPrincipal(uuid.uuid4(), "o", "default")
+    p = ExecutorPrincipal(uuid.uuid4(), "o", "default", "h")
     with structlog.testing.capture_logs() as logs:
         got = await svc.acquire(
             _FakeSession(),  # type: ignore[arg-type]

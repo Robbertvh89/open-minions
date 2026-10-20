@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-10-19 06:58'
-updated_date: '2026-10-20 00:04'
+updated_date: '2026-10-20 00:11'
 labels:
   - chore
 dependencies: []
@@ -21,7 +21,7 @@ From PR #57 review NITs: repositories/acquisition.py imports private _token_matc
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 token_match public, used by both repositories
-- [ ] #2 token_hash required in lock_executor_for_claim
-- [ ] #3 xfail test docstring explains its role
+- [x] #1 token_match public, used by both repositories
+- [x] #2 token_hash required in lock_executor_for_claim
+- [x] #3 xfail test docstring explains its role
 <!-- AC:END -->
