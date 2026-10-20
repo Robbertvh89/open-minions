@@ -15,6 +15,7 @@ from typing import Any
 
 from minion_common.enums import Engine
 from minion_server.repositories.acquisition import candidates_stmt
+from minion_server.repositories.completion import settleable_stmt
 from minion_server.repositories.reclaim import over_lease_stmt, stale_stmt
 from sqlalchemy import Select, text
 from sqlalchemy.dialects import postgresql
@@ -23,6 +24,24 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from minion_scale.seed import DEFAULT_POOL
 
 Sm = async_sessionmaker[AsyncSession]
+
+Statement = Select[Any] | str
+
+# Grafana panel SQL, copied verbatim from deploy/grafana/dashboards/tasks.json (a unit test fails
+# on drift). They run as written; there are no parameters.
+GRAFANA_STATEMENTS: dict[str, str] = {
+    "grafana_task_status": (
+        "SELECT status, count(*) AS tasks FROM minion_ro.task GROUP BY status ORDER BY status"
+    ),
+    "grafana_live_tasks": (
+        "SELECT team, project, task_name, status, succeeded_subtasks, failed_subtasks, "
+        "total_subtasks, updated_at\nFROM minion_ro.task\n"
+        "WHERE status IN ('SPLITTING', 'PENDING', 'RUNNING')\nORDER BY created_at DESC LIMIT 50"
+    ),
+    "grafana_subtask_status": (
+        "SELECT status, count(*) AS subtasks FROM minion_ro.subtask GROUP BY status ORDER BY status"
+    ),
+}
 
 EXPLAIN = "EXPLAIN (ANALYZE, BUFFERS) "
 STATEMENT_TIMEOUT_MS = 60_000
@@ -49,7 +68,8 @@ def hot_statements(
     memory_gb: float = 8.0,
     pool: str = DEFAULT_POOL,
     limit: int = 500,
-) -> dict[str, Select[Any]]:
+    settle_batch: int = 100,
+) -> dict[str, Statement]:
     common: dict[str, Any] = {
         "engines": [Engine.FAKE],
         "model_ids": model_ids,
@@ -61,6 +81,8 @@ def hot_statements(
         "candidate_preference": candidates_stmt(preference=(team, None, None), **common),
         "stale_heartbeat": stale_stmt(heartbeat_timeout_s, limit),
         "over_lease": over_lease_stmt(max_lease_s, limit),
+        "settleable_tasks": settleable_stmt(settle_batch),
+        **GRAFANA_STATEMENTS,
     }
 
 
@@ -81,10 +103,10 @@ def parse_plan(lines: list[str]) -> dict[str, Any]:
     }
 
 
-async def explain_all(sm: Sm, statements: dict[str, Select[Any]]) -> list[dict[str, Any]]:
+async def explain_all(sm: Sm, statements: dict[str, Statement]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for name, stmt in statements.items():
-        sql = compile_literal(stmt)
+        sql = stmt if isinstance(stmt, str) else compile_literal(stmt)
         async with sm() as session, session.begin():
             await session.execute(text(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}"))
             await session.execute(text("SET TRANSACTION READ ONLY"))
