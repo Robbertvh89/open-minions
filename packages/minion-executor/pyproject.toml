@@ -20,7 +20,7 @@ minion-executor = "minion_executor.main:app"
 [project.optional-dependencies]
 mlx = [
     "mlx==0.32.4; sys_platform=='darwin' and platform_machine=='arm64'",
-    "mlx-lm==0.32.0; sys_platform=='darwin' and platform_machine=='arm64'",
+    "mlx-lm==0.32.2; sys_platform=='darwin' and platform_machine=='arm64'",
 ]
 hf = [
     "safetensors>=0.8.0; sys_platform=='darwin' and platform_machine=='arm64'",
